@@ -33,7 +33,24 @@ CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 MAX_WAIT_SEC = 300   # 等用户登录的最长时间
 
 
+def _order_mode():
+    try:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+            return json.load(f).get("order_mode") or "http"
+    except Exception:
+        return "http"
+
+
 def main():
+    # 浏览器下单模式的会话活在 .browser_profile 里，本脚本那套 session_cookies.json
+    # 已经用不上了。要是还照旧开一个独立的临时浏览器，就会和 browser_order 抢
+    # 同一个 profile：两个窗口你开我关，用户看到的就是"网页一直在开启关闭"。
+    if _order_mode() == "browser":
+        print("[提示] 当前是浏览器下单模式，转交 browser_order 登录（会话存进 .browser_profile）")
+        sys.path.insert(0, HERE)
+        import browser_order
+        sys.exit(0 if browser_order.login() else 1)
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -93,10 +110,16 @@ def main():
         for c in cookies:
             # 只保留 12306 相关域（含 .12306.cn），过滤第三方
             if "12306.cn" in (c.get("domain") or "") and c.get("name"):
-                cookie_dict[c["name"]] = c["value"]
+                # 连 domain/path 一起存：12306 的 Cookie 作用域很严
+                # （_uab_collina 只属于 /otn/resources），拍平后会变成风控特征
+                cookie_dict[c["name"]] = {
+                    "value": c["value"],
+                    "domain": c.get("domain") or ".12306.cn",
+                    "path": c.get("path") or "/",
+                }
 
-        # 确保关键 cookie 在
-        needed = ["tk", "JSESSIONID", "BIGipServerotn", "RAIL_DEVICEID"]
+        # 确保关键 cookie 在（RAIL_DEVICEID 服务端已不再下发，勿再误报）
+        needed = ["tk", "JSESSIONID", "BIGipServerotn"]
         missing = [n for n in needed if n not in cookie_dict]
         if missing:
             print("[警告] 以下关键 Cookie 未捕获: {0}（不影响保存，但下单可能失败）".format(missing))

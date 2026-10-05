@@ -23,7 +23,7 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 import requests
 
@@ -38,7 +38,7 @@ except ImportError:
     SEAT_NAME_TO_CODE = {
         "商务座": "9", "特等座": "P", "一等座": "M", "二等座": "O",
         "高级软卧": "6", "软卧": "4", "动卧": "F", "硬卧": "3",
-        "软座": "2", "硬座": "1", "无座": "W",
+        "软座": "2", "硬座": "1", "无座": "WZ",
     }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,7 +59,12 @@ BASE_HEADERS = {
 
 
 def load_session(cookie_path=None):
-    """加载 saved 会话 Cookie，返回 requests.Session。"""
+    """加载 saved 会话 Cookie，返回 requests.Session。
+
+    必须保留服务端下发的 domain/path：12306 的 Cookie 有严格作用域
+    （_uab_collina 只属于 /otn/resources、_passport_session 只属于 /passport），
+    拍平成「全局 Cookie」会让每个接口收到本不该出现的 Cookie，属明显的非浏览器特征。
+    旧格式（纯 name->value）仍兼容，回落到原来的全局作用域。"""
     path = cookie_path or os.path.join(HERE, "session_cookies.json")
     if not os.path.exists(path):
         raise RuntimeError("未找到会话文件 {0}，请先运行：python capture_session.py".format(path))
@@ -68,8 +73,13 @@ def load_session(cookie_path=None):
 
     s = requests.Session()
     s.headers.update(BASE_HEADERS)
-    for name, value in cookies.items():
-        s.cookies.set(name, value, domain=".12306.cn", path="/")
+    for name, val in cookies.items():
+        if isinstance(val, dict):  # 新格式：带原始作用域
+            s.cookies.set(name, val.get("value", ""),
+                          domain=val.get("domain") or ".12306.cn",
+                          path=val.get("path") or "/")
+        else:                      # 旧格式：只有值
+            s.cookies.set(name, val, domain=".12306.cn", path="/")
     return s
 
 
@@ -80,7 +90,11 @@ def save_session(session, cookie_path=None):
     cookies = {}
     for c in session.cookies:
         if "12306.cn" in getattr(c, "domain", "") and c.name:
-            cookies[c.name] = c.value
+            cookies[c.name] = {
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path or "/",
+            }
     if not cookies:
         return
     tmp = path + ".tmp"
@@ -109,9 +123,13 @@ def verify_session(session):
                 if data.get("status"):
                     return True, user, True
                 return False, "接口返回 status=false", True
-            # 非 JSON：只有明确跳转登录页 / 提示未登录才是真的失效
-            if "/login" in (r.url or "") or "请先登录" in text or "未登录" in text[:500]:
-                return False, "已跳转登录页", True
+            # 非 JSON：只有明确跳转登录门户 / 提示未登录才是真的失效。
+            # 12306 踢会话时是 302 到 /otn/passport?redirect=...（不是 /login），
+            # 只认 /login 会把真失效误判成临时故障 -> 无限重试、永不下单。
+            final_url = r.url or ""
+            if ("/login" in final_url or "/passport" in final_url
+                    or "请先登录" in text or "未登录" in text[:500]):
+                return False, "已跳转登录门户：%s" % final_url, True
             last_err = "响应非 JSON（疑似系统繁忙/网关拦截）"
         except Exception as e:
             last_err = "{0}: {1}".format(type(e).__name__, e)
@@ -127,21 +145,30 @@ def check_login(session):
 
 
 def submit_order_request(session, ticket, seat_code, date, purpose="ADULT"):
-    """
+    """提交订单请求（现行参数集）。
+
+    现行 /otn/leftTicket/submitOrderRequest 只认 secretStr + train_date +
+    back_train_date + tour_flag + purpose_codes + 查询站名这几项。
+    老的 train_no/seatType/fromStationTelecode 参数集缺 tour_flag 等必需字段，
+    服务端无法识别，一律回「系统忙，请稍后重试」——看着像限流，其实是参数不认。
+    席别不在这里指定：选席别发生在后续确认页，seat_code 仅为兼容旧调用方保留。
+
     ticket: ticket.py parse_row 的结果
-    seat_code: 席别代码（如 'O'）
     purpose: ADULT=成人票, 0X00=学生票
     """
     url = "https://kyfw.12306.cn/otn/leftTicket/submitOrderRequest"
+    # 余票接口返回的 secretStr 本身是 URL 编码串；requests 会对 data 再编码一次，
+    # 先 unquote 还原，发出去的才是服务端要的原始形态。
+    secret_str = unquote(ticket.get("secret_str") or "")
     data = {
-        "secretStr": ticket["secret_str"],
+        "secretStr": secret_str,
         "train_date": date,
-        "train_no": ticket["train_no"],
-        "station_train_code": ticket["train_code"],
-        "seatType": seat_code,
-        "fromStationTelecode": ticket["from_code"],
-        "toStationTelecode": ticket["to_code"],
+        "back_train_date": time.strftime("%Y-%m-%d"),
+        "tour_flag": "dc",  # dc=单程，wc=往返
         "purpose_codes": purpose,
+        "query_from_station_name": ticket.get("from_name") or "",
+        "query_to_station_name": ticket.get("to_name") or "",
+        "undefined": "",
     }
     session.headers["Referer"] = "https://kyfw.12306.cn/otn/leftTicket/init"
     r = session.post(url, data=data, timeout=15)
@@ -179,22 +206,27 @@ def get_init_dc(session):
     """进入确认订单页，解析 repeatSubmitToken / leftTicketStr / key_check_isChange。"""
     url = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
     session.headers["Referer"] = "https://kyfw.12306.cn/otn/leftTicket/init"
-    r = session.get(url, timeout=15)
+    r = session.get(url, timeout=30)
     html = r.text
 
     def grab(pattern, group=1):
         m = re.search(pattern, html)
         return m.group(group) if m else None
 
-    token = grab(r"globalRepeatSubmitToken[^']*'([^']+)'") or grab(r"globalRepeatSubmitToken\s*=\s*\"([^\"]+)\"")
-    left_ticket_str = grab(r"leftTicketStr[^']*'([^']+)'") or grab(r"leftTicketStr\s*=\s*\"([^\"]+)\"")
-    key_check = grab(r"key_check_isChange[^']*'([^']+)'") or grab(r"key_check_isChange[^']*:\s*'([^']+)'")
-
-    # 有些版本 key_check_isChange 是数字，正则里未加引号，这里再做一次宽松匹配
-    if key_check is None:
-        m = re.search(r"key_check_isChange[=:]\s*['\"]*(\w+)['\"]*", html)
-        if m and m.group(1) != "null":
-            key_check = m.group(1)
+    # 现行页面把值嵌在单引号 JSON 里（'leftTicketStr':'xxx'）。旧的
+    # leftTicketStr[^']*'([^']+)' 会把键的结束引号当值的开始引号、把冒号捕获成值。
+    # JSON 形式优先，老式 JS 赋值形式兜底。
+    token = (grab(r"'globalRepeatSubmitToken'\s*:\s*'([^']+)'")
+             or grab(r"globalRepeatSubmitToken\s*=\s*'([^']+)'")
+             or grab(r"globalRepeatSubmitToken\s*=\s*\"([^\"]+)\""))
+    left_ticket_str = (grab(r"'leftTicketStr'\s*:\s*'([^']*)'")
+                       or grab(r"leftTicketStr\s*=\s*'([^']*)'")
+                       or grab(r"leftTicketStr\s*=\s*\"([^\"]*)\""))
+    key_check = (grab(r"'key_check_isChange'\s*:\s*'([^']*)'")
+                 or grab(r"key_check_isChange\s*=\s*'([^']*)'")
+                 or grab(r"key_check_isChange[=:]\s*['\"]*(\w+)['\"]*"))
+    if key_check == "null":
+        key_check = None
 
     return token, left_ticket_str, key_check, html
 
@@ -351,6 +383,9 @@ def check_order_info(session, token, passenger_ticket_str, old_passenger_str):
     data_ = d.get("data") or {}
     if data_.get("ifShowPassCode") == "Y" or data_.get("ifShowOtherPassCode") == "Y":
         return False, "触发滑块验证码，自动下单中止（请人工在网页完成）"
+    if data_.get("submitStatus") is False or data_.get("errMsg"):
+        # 业务失败藏在 data 里（如「非法的席别」），外层 status=true 不代表通过
+        return False, "checkOrderInfo 校验失败: {0}".format(data_.get("errMsg") or data_)
     return True, ""
 
 
@@ -425,7 +460,18 @@ def order_ticket(config, task, ticket, seat_name):
     """
     完整下单入口。成功返回 (True, 描述, 额外信息)，失败返回 (False, 错误, None)。
     描述中带订单号（尽力获取）。state 写入由调用方负责。
+
+    config["order_mode"] == "browser" 时转交 browser_order，用真实 Edge 下单：
+    纯 HTTP 的 confirmSingleForQueue 会被易盾设备指纹 / 阿里云验证拦住
+    （服务端伪装成「余票不足 / 系统繁忙」），浏览器才不会。
     """
+    if (config.get("order_mode") or "http") == "browser":
+        try:
+            import browser_order
+        except ImportError:
+            return False, "已配置 order_mode=browser，但缺少 browser_order 模块", None
+        return browser_order.order_ticket_via_browser(config, task, ticket, seat_name)
+
     sess = load_session(config.get("session_cookies_file", "session_cookies.json"))
     ok, who = check_login(sess)
     if not ok:
@@ -435,7 +481,9 @@ def order_ticket(config, task, ticket, seat_name):
     if not seat_code:
         return False, "未知席别: {0}".format(seat_name), None
 
-    date = ticket["start_date"]
+    # 必须用查询时的乘车日期：start_date 是列车始发日期（跨夜车会差一天），
+    # 且格式为 YYYYMMDD，而 submitOrderRequest 只接受 YYYY-MM-DD。
+    date = ticket.get("query_date") or ticket["start_date"]
     purpose = task.get("purpose_code") or "ADULT"
 
     # 智能排队机制："系统忙"类错误在单轮内自动重试（次数/间隔可配置），提升抢票成功率

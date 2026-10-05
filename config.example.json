@@ -1,12 +1,12 @@
 {
   "_说明": "本文件为配置模板。复制为 config.json 后按需修改，切勿把真实邮箱/授权码提交到仓库。密码/验证码一律不处理。",
-  "poll_interval_seconds": 45,
-  "min_interval_seconds": 30,
+  "poll_interval_seconds": 7,
+  "min_interval_seconds": 7,
   "order_retry_times": 3,
   "order_retry_delay_seconds": 2,
   "order_retry_cooldown_seconds": 7,
   "adaptive": {
-    "enabled": true,
+    "enabled": false,
     "peak_hours": [
       6,
       23

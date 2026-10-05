@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "passenger_names": [],
+  "from": "",
+  "to": "",
+  "trains": [],
+  "seat_types": [],
+  "date": "",
+  "date_to": "",
+  "start_time": "",
+  "remind_minutes": 3,
+  "warm_minutes": 1,
+  "poll_seconds": 3,
+  "presets": [],
+  "update_url": "",
+  "station_history": [],
+  "purpose_code": "ADULT",
+  "query_history": [],
+  "synced_trains": []
+}

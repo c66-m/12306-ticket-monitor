@@ -3,12 +3,23 @@
 config.json
 # 登录会话 Cookie
 session_cookies.json
+# Playwright 持久化浏览器 profile（含登录态与设备指纹）
+.browser_profile/
+.browser_state.json
 # 运行时状态与历史（含乘车人、订单信息）
 state.json
 order_history.json
 passengers.json
+# launcher 的本地配置（含乘车人、常用路线等个人数据）
+launcher_config.json
 # 日志
 logs/
+
+# ===== 开发调试产物（含个人测试数据，不上传）=====
+_*
+*.png
+.browser_profile.lock
+%SystemDrive%/
 
 # ===== Python 缓存 =====
 __pycache__/

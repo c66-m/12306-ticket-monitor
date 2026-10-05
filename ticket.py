@@ -56,7 +56,7 @@ STATION_JS_URL = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.
 SEAT_CODE_TO_NAME = {
     "9": "商务座", "P": "特等座", "M": "一等座", "O": "二等座",
     "6": "高级软卧", "4": "软卧", "F": "动卧", "3": "硬卧",
-    "2": "软座", "1": "硬座", "W": "无座",
+    "2": "软座", "1": "硬座", "WZ": "无座",
 }
 SEAT_NAME_TO_CODE = {v: k for k, v in SEAT_CODE_TO_NAME.items()}
 
@@ -104,6 +104,40 @@ def load_station_map(cache_path="station_name.json"):
     return name2code, code2name
 
 
+def load_station_index(cache_path="station_index.json"):
+    """下载并解析车站全量索引，返回 [{"name","code","py","spy"}, ...]（约 3300 站）。
+
+    py=全拼（beijingbei） spy=简拼（bjb），供启动器本地模糊搜索使用。
+    优先读本地缓存；缓存缺失/损坏时重新下载并写缓存。"""
+    import os
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_path)
+    if os.path.exists(here):
+        try:
+            with open(here, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("stations"):
+                    return data["stations"]
+        except Exception:
+            pass
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Referer": "https://kyfw.12306.cn/otn/leftTicket/init"})
+    r = s.get(STATION_JS_URL, timeout=20)
+    r.raise_for_status()
+
+    stations = []
+    # 格式：@bjb|北京北|VAP|beijingbei|bjb|0
+    for m in re.finditer(r"@([a-z]+)\|([^|]+)\|([A-Z]{3})\|([a-z]+)\|", r.text):
+        stations.append({"name": m.group(2), "code": m.group(3),
+                         "py": m.group(4), "spy": m.group(1)})
+    if not stations:
+        raise RuntimeError("车站索引解析失败，请检查 station_name.js 格式是否变更")
+
+    with open(here, "w", encoding="utf-8") as f:
+        json.dump({"stations": stations}, f, ensure_ascii=False)
+    return stations
+
+
 def query_tickets(from_code, to_code, date, purpose="ADULT"):
     """查询某天某区间余票，返回按车次分组的字典。免登录。
     purpose: ADULT=成人票, 0X00=学生票"""
@@ -122,8 +156,12 @@ def query_tickets(from_code, to_code, date, purpose="ADULT"):
     return data["data"]["result"]
 
 
-def parse_row(row, code2name):
-    """解析单个查询返回行（竖线分隔）。缺索引用 None，保证不崩。"""
+def parse_row(row, code2name, query_date=None):
+    """解析单个查询返回行（竖线分隔）。缺索引用 None，保证不崩。
+
+    query_date: 本次查询用的乘车日期（YYYY-MM-DD）。
+    p13（start_date）是列车「始发日期」且无横线（如 20261007），
+    跨夜车与乘车日可能差一天，下单必须用 query_date，不能用 p13。"""
     f = row.split("|")
 
     def get(i):
@@ -158,6 +196,7 @@ def parse_row(row, code2name):
         "duration": get(10),
         "can_buy": get(11),
         "start_date": get(13),
+        "query_date": query_date,
         "train_location": get(15),
         "available_seats": available,
     }

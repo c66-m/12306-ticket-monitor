@@ -4,8 +4,8 @@
 
 设计要点
     1. 任务调度：所有"监控中"状态的任务按各自频率独立轮询，每轮按优先级从高到低执行
-    2. 自适应频率：基准间隔(30~60s) × 时段系数(高峰/非高峰) × 优先级系数，且不低于
-       min_interval_seconds 下限（防 IP 封禁）；临近开车日期可临时提高频率
+    2. 轮询频率：adaptive 关闭时直接用 poll_interval_seconds；开启时按
+       基准 × 时段系数(高峰/非高峰) × 优先级系数，且不低于 min_interval_seconds 下限
     3. 防重复下单（三层）：
        a. 本地 state.json 记录 区间|日期|车次|席别|乘车人组合
        b. 下单前查询账号未完成订单 + 目标日期已完成订单（order.py）
@@ -41,6 +41,9 @@ import order as order_mod
 import ticket
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# 轮询间隔硬底线：低于该值会被提升，避免配置成 0 时无间隔空转打爆请求
+MIN_INTERVAL_FLOOR = 1
 
 STATUS_LABELS = {
     "monitoring": "监控中",
@@ -130,11 +133,11 @@ class MonitorEngine(object):
         self.tasks = self.config.get("tasks") or []
 
         self.base_interval = int(self.config.get("poll_interval_seconds", 45))
-        self.min_interval = int(self.config.get("min_interval_seconds", 30))
+        self.min_interval = max(MIN_INTERVAL_FLOOR,
+                                int(self.config.get("min_interval_seconds", 30)))
         if self.min_interval < 15:
-            LOG.warning("min_interval_seconds=%s 低于 15 秒，已自动提升到 15 秒（过低易被 12306 限流/封 IP）",
-                        self.min_interval)
-            self.min_interval = 15
+            LOG.info("min_interval_seconds=%s：轮询较激进，注意 12306 限流/封 IP 风险",
+                     self.min_interval)
 
         if setup_logging:
             self._setup_logging()
@@ -265,8 +268,8 @@ class MonitorEngine(object):
             LOG.warning("[配置] config.json 重新读取失败：%s", e)
             return False
         self.base_interval = int(self.config.get("poll_interval_seconds", 45))
-        min_iv = int(self.config.get("min_interval_seconds", 30))
-        self.min_interval = max(15, min_iv)
+        self.min_interval = max(MIN_INTERVAL_FLOOR,
+                                int(self.config.get("min_interval_seconds", 30)))
         self.tasks = self.config.get("tasks") or []
         self._ensure_task_names()
         self._resume_or_init_status()  # 仅补缺省状态，不覆盖已有状态
@@ -444,7 +447,7 @@ class MonitorEngine(object):
                 self._note_failure(task, "查询异常(%s): %s" % (date, e))
                 return True, True  # 网络类异常：本任务退避，实现自动恢复
             for row in rows:
-                info = ticket.parse_row(row, self.code2name)
+                info = ticket.parse_row(row, self.code2name, date)
                 train_code = info["train_code"]
                 if trains and train_code not in trains:
                     continue
@@ -457,32 +460,50 @@ class MonitorEngine(object):
                     continue
                 for seat_name in hit_seats:
                     hit_any = True
-                    LOG.info("[命中] %s %s %s->%s %s 有余票(码%s)",
-                             date, train_code, info["from_name"], info["to_name"],
+                    LOG.info("[有票] 任务「%s」%s %s %s->%s %s 有余票(码%s)",
+                             name, date, train_code, info["from_name"], info["to_name"],
                              seat_name, avail.get(seat_name))
                     # 先不查乘车人，直接用任务配置的乘车人组合做历史查重键
                     p_names = sorted(task.get("passenger_names") or []) or ["(账号默认)"]
                     key = dedup_key(task, date, train_code, seat_name,
                                     task.get("passenger_names") or [])
                     if key in self.state["dedup"]:
-                        LOG.info("  [跳过] 已有记录：%s", DEDUPE_VALUES.get(self.state["dedup"][key], self.state["dedup"][key]))
+                        LOG.info("[跳过] 任务「%s」已有记录：%s", name,
+                                 DEDUPE_VALUES.get(self.state["dedup"][key], self.state["dedup"][key]))
                         continue
                     if not auto_order:
+                        # 未开启自动下单：只报警不下单，供人工在 App/网页快速购买
                         self.state["dedup"][key] = "NO_ORDER"
                         self._save_state()
+                        subject = "[有票] {0} {1} {2}->{3} {4}".format(
+                            train_code, date, info["from_name"], info["to_name"], seat_name)
+                        body = (
+                            "监控到余票（本任务未开启自动下单，请人工尽快购买）：\n\n"
+                            "车次：{train}\n日期：{date}\n区间：{_from} -> {_to}\n"
+                            "发车：{start}  到达：{arrive}\n席别：{seat}  余票：{num}\n\n"
+                            "余票随时可能被抢走，请立即在 12306 App / 网页下单。\n"
+                        ).format(train=train_code, date=date, _from=info["from_name"],
+                                 _to=info["to_name"], start=info["start_time"],
+                                 arrive=info["arrive_time"], seat=seat_name,
+                                 num=avail.get(seat_name, ""))
+                        notify_results = self._notify(task, subject, body)
+                        notify_txt = "; ".join("{0}:{1}".format(k, "成功" if nok else msg)
+                                               for k, (nok, msg) in notify_results.items()) or "无通知渠道"
+                        LOG.info("[有票] 任务「%s」%s 有余票，已通知：%s", name, seat_name, notify_txt)
                         self._append_history({
                             "time": self._now(), "task": name, "result": "hit_no_order",
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
                             "passengers": p_names, "order_no": "",
-                            "message": "余票命中（任务未开启自动下单）", "notify": "auto_order=false，未通知",
+                            "message": "余票命中（任务未开启自动下单）", "notify": notify_txt,
                         })
                         continue
                     # 系统忙冷却：避免对同一目标过于频繁地下单请求（防止 IP 被限）
                     retry_map = self.state.setdefault("retry", {})
                     due_at = retry_map.get(key, 0)
                     if due_at and time.time() < due_at:
-                        LOG.info("  [冷却] 上次下单遇系统忙，%d 秒后自动重试" % int(due_at - time.time()))
+                        LOG.info("[冷却] 任务「%s」上次抢票遇系统忙，%d 秒后自动重试",
+                                 name, int(due_at - time.time()))
                         continue
                     if due_at:
                         # 冷却到期：恢复为监控中，本轮正常尝试下单
@@ -515,14 +536,14 @@ class MonitorEngine(object):
                             "order_no": (extra or {}).get("order_no", ""),
                             "message": "账号已有相同行程订单，防重复跳过", "notify": "未通知",
                         })
-                        LOG.info("  [防重] 账号已有相同行程订单，跳过")
+                        LOG.info("[防重] 任务「%s」账号已有相同行程订单，跳过", name)
                         continue
                     else:
                         msg = (extra or {}).get("msg", "")
                         if "会话已失效" in msg or "未找到会话文件" in msg:
                             self.set_task_status(task, "failed",
                                 "登录会话不可用，请重新运行 capture_session.py 登录后恢复任务")
-                            LOG.error("  [下单失败] %s", msg)
+                            LOG.error("[错误] 任务「%s」抢票失败：%s", name, msg)
                             return True, False
                         if order_mod.is_busy_error(msg):
                             # 系统忙：进入"等待重试"状态 + 冷却退避，避免刷请求与刷日志
@@ -538,7 +559,7 @@ class MonitorEngine(object):
                                 "下单遇系统忙（累计 %d 次），%d 秒后自动重试"
                                 % (entry["busy_count"], cooldown))
                             continue
-                        LOG.error("  [下单失败] %s", msg)
+                        LOG.error("[错误] 任务「%s」抢票失败：%s", name, msg)
                         self._append_history({
                             "time": self._now(), "task": name, "result": "failed",
                             "train": train_code, "date": date, "from": info["from_name"],
@@ -594,8 +615,8 @@ class MonitorEngine(object):
             "order_no": order_no, "message": "订单提交成功（未支付）",
             "notify": notify_txt,
         })
-        LOG.info("[下单成功] %s %s %s 乘车人:%s 订单号:%s",
-                 date, info["train_code"], seat_name,
+        LOG.info("[抢到] 任务「%s」已提交订单：%s %s %s 乘车人:%s 订单号:%s",
+                 name, date, info["train_code"], seat_name,
                  extra.get("passengers", ""), order_no or "未知")
 
     def _note_failure(self, task, message):
@@ -604,7 +625,7 @@ class MonitorEngine(object):
         entry["fail_streak"] = entry.get("fail_streak", 0) + 1
         entry["message"] = "{0}（连续失败 {1} 次，将自动退避重试）".format(message, entry["fail_streak"])
         self._save_state()
-        LOG.warning("[任务 %s] %s", name, entry["message"])
+        LOG.warning("[错误] 任务「%s」%s", name, entry["message"])
 
     def _query_with_retry(self, from_code, to_code, date, purpose="ADULT",
                           tries=3, backoff=2.0):
@@ -639,21 +660,45 @@ class MonitorEngine(object):
                       and self.task_status(t) in ACTIVE_STATUSES]
         if not auto_tasks:
             return
-        cookie_path = self.config.get("session_cookies_file", "session_cookies.json")
-        try:
-            s = order_mod.load_session(cookie_path)
-            ok, who, permanent = order_mod.verify_session(s)
-        except Exception as e:
-            ok, who, permanent = False, str(e), False
-        if ok:
+        browser_mode = (self.config.get("order_mode") or "http") == "browser"
+        if browser_mode:
+            # 浏览器模式下会话由 .browser_profile 承载，必须用真实页面校验；
+            # 继续验 session_cookies.json 只会得到已失效的旧结果。
             try:
-                order_mod.save_session(s, cookie_path)  # 回写轮换后的 Cookie，延长有效期
-            except Exception:
-                pass
+                import browser_order
+                if browser_order.busy():
+                    # 登录窗口/下单正在跑：这一轮不抢锁，1 分钟后再体检
+                    self._last_session_check = now - 1140
+                    return
+                ok, who = browser_order.check_session(timeout=6)
+                permanent = not ok
+            except Exception as e:
+                ok, who, permanent = False, "浏览器会话校验异常: %s" % str(e)[:100], False
+        else:
+            cookie_path = self.config.get("session_cookies_file", "session_cookies.json")
+            try:
+                s = order_mod.load_session(cookie_path)
+                ok, who, permanent = order_mod.verify_session(s)
+            except Exception as e:
+                ok, who, permanent = False, str(e), False
+        if ok:
+            if not browser_mode:
+                # 浏览器模式的会话在 profile 里，没有 cookie 需要回写
+                try:
+                    order_mod.save_session(s, cookie_path)  # 回写轮换后的 Cookie，延长有效期
+                except Exception:
+                    pass
             LOG.info("[会话] 登录状态正常：%s", who)
+            # 会话恢复：自动把因会话失效而失败的任务重新拉起
+            for t in self.tasks:
+                st = self.state["tasks"].get(t["name"], {})
+                if st.get("status") == "failed" and "登录会话失效" in st.get("message", ""):
+                    self.set_task_status(t, "monitoring", "会话已恢复，自动重新监控")
         elif permanent:
-            LOG.error("[会话] 登录会话已失效：%s", who)
-            LOG.error("[会话] 请重新运行 python capture_session.py 登录（任务已标记失败，登录后可恢复）")
+            LOG.error("[错误] 登录会话已失效：%s", who)
+            LOG.error("[错误] 以下任务的抢票已停止：%s",
+                      "、".join("「%s」" % t["name"] for t in auto_tasks))
+            LOG.error("[错误] 请重新登录后再恢复任务")
             for t in auto_tasks:
                 self.set_task_status(t, "failed", "登录会话失效，请重新登录后恢复任务")
         else:
@@ -670,7 +715,7 @@ class MonitorEngine(object):
         active_tasks = [t for t in self.tasks
                         if self.task_status(t) in ACTIVE_STATUSES]
         for t in self.tasks:
-            LOG.info("  任务: %s  状态: %s %s", t["name"],
+            LOG.info("[运行] 任务「%s」%s %s", t["name"],
                      STATUS_LABELS.get(self.task_status(t), self.task_status(t)),
                      "启用（优先级 %s，间隔约 %.0fs）" % (t.get("priority", 5), self.task_interval(t))
                      if t in active_tasks else "")
@@ -713,7 +758,7 @@ class MonitorEngine(object):
                     try:
                         broke, recoverable = self._run_task(task)
                     except Exception as e:
-                        LOG.error("[任务 %s] 内部异常: %s", task["name"], e)
+                        LOG.error("[错误] 任务「%s」内部异常: %s", task["name"], e)
                         self._note_failure(task, "内部异常: {0}".format(e))
                         broke, recoverable = True, True
                     entry = self.state["tasks"].setdefault(task["name"], {})
@@ -721,7 +766,7 @@ class MonitorEngine(object):
                     if recoverable and streak:
                         # 连续失败退避：间隔按失败次数拉长（上限 5 分钟），实现自动恢复
                         backoff_iv = min(max(interval, interval * min(streak, 10) * 0.5), 300)
-                        LOG.info("  [任务 %s] 连续失败 %s 次，下次轮询退避到 %.0fs 后",
+                        LOG.info("[运行] 任务「%s」连续失败 %s 次，下次轮询退避到 %.0fs 后",
                                  task["name"], streak, backoff_iv)
                         next_due[i] = time.time() + backoff_iv
                     else:

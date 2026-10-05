@@ -216,13 +216,14 @@ _RESULT_QUEUE = queue.Queue()
 
 def run_async(widget, fn, on_done):
     """在子线程执行 fn（网络等阻塞操作），完成后经队列回到 Tk 主线程调用 on_done(result, error)。
-    Tk 不允许跨线程直接调用 after，因此统一由 start_async_poller 在主线程分发。"""
+    Tk 不允许跨线程直接调用 after，因此统一由 start_async_poller 在主线程分发。
+    widget 用于分发前检查存活：对话框销毁后不再回调，避免 TclError。"""
     def worker():
         try:
             res, fn_err = fn(), None
         except Exception as e:
             res, fn_err = None, e
-        _RESULT_QUEUE.put((on_done, res, fn_err))
+        _RESULT_QUEUE.put((widget, on_done, res, fn_err))
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -231,9 +232,11 @@ def start_async_poller(root):
     """主线程轮询异步结果队列，执行各回调（应用启动时调用一次）。"""
     try:
         while True:
-            on_done, res, fn_err = _RESULT_QUEUE.get_nowait()
+            widget, on_done, res, fn_err = _RESULT_QUEUE.get_nowait()
             try:
-                on_done(res, fn_err)
+                # 对话框已销毁就不回调（winfo_exists=0），避免 invalid command name
+                if widget is None or widget.winfo_exists():
+                    on_done(res, fn_err)
             except Exception as e2:
                 LOG.exception("界面回调异常: %s", e2)
     except queue.Empty:
@@ -1735,8 +1738,9 @@ class NotifyDialog(tk.Toplevel):
 # ----------------------------- 登录会话 -----------------------------
 
 class SessionDialog(tk.Toplevel):
-    def __init__(self, master):
+    def __init__(self, master, app=None):
         super().__init__(master)
+        self.app = app          # MonitorApp：把登录态同步给侧边栏/小窗
         self.title("登录会话")
         self.geometry("520x440")
         body = ttk.Frame(self)
@@ -1762,6 +1766,24 @@ class SessionDialog(tk.Toplevel):
 
     def check(self):
         def do_check():
+            if (load_config().get("order_mode") or "http") == "browser":
+                # 浏览器模式：会话以 .browser_profile 为准
+                import browser_order
+                if browser_order.busy():
+                    # 登录窗口/下单还开着，抢锁只会超时。别把"没轮到"说成"已失效"。
+                    return None, "浏览器忙（登录或下单进行中），稍后再刷新", []
+                ok, who = browser_order.check_session(timeout=6)
+                passengers = []
+                if ok:
+                    # 乘车人列表仍需登录态接口，走 HTTP 会话取（取不到就留空）
+                    try:
+                        sess = order_mod.load_session(
+                            load_config().get("session_cookies_file"))
+                        passengers = order_mod.get_passengers(sess)
+                    except Exception:
+                        passengers = []
+                return ok, who, passengers
+
             sess = order_mod.load_session(load_config().get("session_cookies_file"))
             ok, who = order_mod.check_login(sess)
             passengers = order_mod.get_passengers(sess) if ok else []
@@ -1772,8 +1794,15 @@ class SessionDialog(tk.Toplevel):
                 self.status_label.config(text="会话检查失败：%s" % err)
                 return
             ok, who, passengers = res
+            if ok is None:
+                self.status_label.config(text=str(who))
+                return
             self.status_label.config(
                 text="会话有效（%s）" % who if ok else "会话失效：%s（请重新登录）" % who)
+            # 同步侧边栏/小窗：免得弹窗说已登录、左上角还挂着未登录
+            if self.app is not None:
+                self.app._set_account(
+                    ("已登录 %s" % who) if ok else "未登录", bool(ok))
             self.p_list.delete(0, "end")
             for p in passengers:
                 self.p_list.insert("end", "%s（%s）" % (
@@ -1786,19 +1815,35 @@ class SessionDialog(tk.Toplevel):
         script = os.path.join(HERE, "capture_session.py")
         self.status_label.config(text="浏览器已打开，请在弹出的窗口中完成登录（最多 5 分钟）...")
         self.p_list.delete(0, "end")
-        self.p_list.insert("end", "登录完成后点「刷新」查看账号乘车人")
+        self.p_list.insert("end", "登录完成后会自动刷新，稍候即可")
 
         def worker():
+            ok = False
             try:
-                subprocess.call([sys.executable, script], cwd=HERE)
+                if (load_config().get("order_mode") or "http") == "browser":
+                    # 浏览器模式：登录态要落进 .browser_profile，capture_session.py
+                    # 只写 session_cookies.json，两条路不通用。
+                    import browser_order
+                    ok = bool(browser_order.login())
+                else:
+                    subprocess.call([sys.executable, script], cwd=HERE)
+                    ok = True
             except Exception as e:
-                LOG.error("会话抓取脚本异常: %s", e)
-            try:
-                self.after(0, self.check)
-            except Exception:
-                pass
+                LOG.error("重新登录失败: %s", e)
+            # 跨线程调 after 违反 Tk 规则，走与 run_async 相同的队列
+            _RESULT_QUEUE.put((self, lambda _res, _err: self._after_relogin(ok), None, None))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _after_relogin(self, ok):
+        """登录流程一结束就先把界面切成已登录，不等下一次会话体检。
+
+        浏览器模式下引擎体检是 20 分钟一次，只靠它的话，用户明明刚在浏览器里
+        登录成功，侧边栏还要再挂十几分钟「未登录」。"""
+        if ok and self.app is not None:
+            self.app._set_account("已登录", True)
+            self.app._acct_time = time.time()
+        self.check()
 
 
 # ----------------------------- 余票速查 -----------------------------
@@ -2590,6 +2635,234 @@ class TaskEditDialog(tk.Toplevel):
 
 # ----------------------------- 主窗口 -----------------------------
 
+# ----------------------------- 小窗模式 -----------------------------
+
+# 小窗只展示"抢票相关"的事件：带这些标签的日志才进去。
+# 引擎启动横幅、每轮 [运行] 播报、[查询重试]、[配置] 同步之类全部过滤。
+MINI_LOG_TAGS = ("[有票]", "[抢到]", "[错误]", "[冷却]", "[防重]",
+                 "[跳过]", "[会话]", "[状态]")
+
+MINI_STAT_COLOR = {
+    "monitoring": "#1a7f37",
+    "retrying": "#d97706",
+    "success": "#0969da",
+    "failed": "#cf222e",
+    "paused": "#9a6700",
+    "cancelled": "#6e7781",
+}
+
+MINI_LOG_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d+ \[\w+\] (.*)$")
+
+
+class MiniWindow(tk.Toplevel):
+    """极简小窗：登录状态 + 正在进行的任务 + 抢票日志。
+
+    纯展示，不承载任何操作入口。关闭时隐藏而不销毁，再次打开日志是连续的。
+    """
+
+    MAX_LINES = 400
+    TRIM_LINES = 60
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.primed = False
+        self.pinned = False
+        self._wrap = 0
+        self._wrap_labels = []
+        self._last_sig = None
+
+        self.title("12306 抢票小窗")
+        self.geometry("460x420")
+        self.minsize(340, 260)
+        self.configure(bg=BG)
+        # 点 × 关闭小窗：隐藏小窗并恢复主窗口（回到打开小窗前的界面）
+        self.protocol("WM_DELETE_WINDOW", self.close_mini)
+
+        head = tk.Frame(self, bg=BLUE)
+        head.pack(fill="x")
+        tk.Label(head, text="抢票小窗", bg=BLUE, fg="white",
+                 font=(FONT, 11, "bold")).pack(side="left", padx=12, pady=8)
+
+        self.pin_btn = tk.Button(head, text="置顶", command=self.toggle_pin,
+                                 bg=BLUE, fg="white", activebackground=BLUE_DARK,
+                                 activeforeground="white", relief="flat", bd=0,
+                                 font=(FONT, 9), cursor="hand2")
+        self.pin_btn.pack(side="right", padx=(0, 12))
+
+        self.acct_label = tk.Label(head, text="检查中...", bg=BLUE, fg="white",
+                                   font=(FONT, 10))
+        self.acct_label.pack(side="right", padx=(0, 6))
+        self.acct_dot = tk.Label(head, text="●", bg=BLUE, fg="#DCEAFB",
+                                 font=(FONT, 9))
+        self.acct_dot.pack(side="right")
+
+        # 任务区：只有状态标识 + 备注
+        self.task_box = tk.Frame(self, bg=BG)
+        self.task_box.pack(fill="x", pady=(6, 4))
+
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=10)
+
+        log_wrap = tk.Frame(self, bg=BG)
+        log_wrap.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self.log_text = scrolledtext.ScrolledText(
+            log_wrap, state="disabled", wrap="word", font=("Consolas", 9),
+            bg=CARD, relief="flat", highlightthickness=0)
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.tag_configure("hit", foreground="#d97706")
+        self.log_text.tag_configure("bought", foreground="#0969da")
+        self.log_text.tag_configure("err", foreground="#cf222e")
+        self.log_text.tag_configure("misc", foreground=GRAY)
+
+        self.bind("<Configure>", self._on_resize)
+
+    # ---- 登录状态 ----
+
+    def set_account(self, text, logged_in):
+        self.acct_label.config(text=text or "未登录")
+        self.acct_dot.config(fg=("#5AE08A" if logged_in else "#DCEAFB"))
+
+    # ---- 任务区 ----
+
+    def _collect(self):
+        """活跃任务在后，已成功的任务置顶——抢到票是最终结果，不能从小窗里错过。"""
+        try:
+            tasks = load_config().get("tasks") or []
+            state = load_state().get("tasks") or {}
+        except Exception:
+            return []
+        live, done = [], []
+        for t in tasks:
+            name = t.get("name", "")
+            rec = state.get(name) or {}
+            st = rec.get("status", "paused")
+            if st == "success":
+                done.append((name, st, rec.get("message", "")))
+            elif st in engine_mod.ACTIVE_STATUSES:
+                live.append((name, st, rec.get("message", "")))
+        return done + live
+
+    def refresh_tasks(self):
+        rows = self._collect()
+        sig = repr(rows)
+        if sig == self._last_sig:
+            return
+        self._last_sig = sig
+
+        for w in self.task_box.winfo_children():
+            w.destroy()
+        self._wrap_labels = []
+
+        if not rows:
+            tk.Label(self.task_box, text="暂无正在进行的任务", bg=BG, fg=GRAY,
+                     font=(FONT, 10)).pack(anchor="w", padx=14, pady=8)
+            return
+
+        for name, st, msg in rows:
+            color = MINI_STAT_COLOR.get(st, GRAY)
+            card = tk.Frame(self.task_box, bg=CARD)
+            card.pack(fill="x", padx=10, pady=3)
+            tk.Frame(card, bg=color, width=3).pack(side="left", fill="y")
+            inner = tk.Frame(card, bg=CARD)
+            inner.pack(side="left", fill="x", expand=True, padx=9, pady=7)
+
+            top = tk.Frame(inner, bg=CARD)
+            top.pack(fill="x")
+            tk.Label(top, text="●", bg=CARD, fg=color,
+                     font=(FONT, 9)).pack(side="left")
+            tk.Label(top, text=engine_mod.STATUS_LABELS.get(st, st), bg=CARD,
+                     fg=color, font=(FONT, 10, "bold")).pack(side="left", padx=(4, 0))
+
+            self._wrap_labels.append(
+                self._mklabel(inner, name, TEXT, (FONT, 10), pady=(3, 0)))
+            if msg:
+                self._wrap_labels.append(
+                    self._mklabel(inner, msg, GRAY, (FONT, 9)))
+
+        self._apply_wrap(self._wrap or max(180, self.winfo_width() - 80))
+
+    def _mklabel(self, parent, text, fg, font, pady=0):
+        lbl = tk.Label(parent, text=text, bg=CARD, fg=fg, font=font,
+                       anchor="w", justify="left")
+        lbl.pack(fill="x", pady=pady)
+        return lbl
+
+    def _apply_wrap(self, w):
+        self._wrap = w
+        for lbl in self._wrap_labels:
+            try:
+                lbl.config(wraplength=w)
+            except Exception:
+                pass
+
+    def _on_resize(self, evt):
+        if evt.widget is not self:
+            return
+        w = max(180, evt.width - 80)
+        if abs(w - self._wrap) < 12:
+            return
+        self._apply_wrap(w)
+
+    # ---- 日志 ----
+
+    def feed_log(self, record):
+        m = MINI_LOG_RE.match(record or "")
+        if not m:
+            return
+        tstamp, msg = m.group(1), m.group(2)
+        if not any(tag in msg for tag in MINI_LOG_TAGS):
+            return
+
+        if "[抢到]" in msg:
+            tag = "bought"
+        elif "[有票]" in msg:
+            tag = "hit"
+        elif "[错误]" in msg:
+            tag = "err"
+        else:
+            tag = "misc"
+
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", "%s  %s\n" % (tstamp, msg), tag)
+        self.log_text.see("end")
+        try:
+            line_no = int(self.log_text.index("end-1c").split(".")[0])
+            if line_no > self.MAX_LINES:
+                self.log_text.delete("1.0", "%d.0" % (self.TRIM_LINES + 1))
+        except Exception:
+            pass
+        self.log_text.config(state="disabled")
+
+    def clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+    # ---- 窗口 ----
+
+    def toggle_pin(self):
+        self.pinned = not self.pinned
+        try:
+            self.attributes("-topmost", self.pinned)
+        except Exception:
+            pass
+        self.pin_btn.config(text="已置顶" if self.pinned else "置顶",
+                            bg=(BLUE_DARK if self.pinned else BLUE))
+
+    def hide(self):
+        """程序化隐藏小窗（不恢复主窗口）。"""
+        self.withdraw()
+
+    def close_mini(self):
+        """点击小窗 × 关闭：隐藏小窗，并让主窗口回到打开小窗前的界面状态。"""
+        self.withdraw()
+        try:
+            self.app.restore_main()
+        except Exception:
+            pass
+
+
 class MonitorApp:
     def __init__(self, root):
         self.root = root
@@ -2606,6 +2879,7 @@ class MonitorApp:
         self.engine_thread = None
         self.live_engine = None
         self._acct_time = 0.0
+        self.mini = None
 
         # 蓝色顶部栏：侧边栏开关 + 标题 + 引擎状态
         header = tk.Frame(root, bg=BLUE)
@@ -2621,6 +2895,11 @@ class MonitorApp:
         self.engine_label = tk.Label(header, text="引擎：未运行", bg=BLUE, fg="#DCEAFB",
                                      font=(FONT, 10))
         self.engine_label.pack(side="right", padx=16)
+        tk.Button(header, text="小窗模式", command=self.open_mini,
+                  bg=BLUE_DARK, fg="white", activebackground=BLUE,
+                  activeforeground="white", relief="flat", bd=0,
+                  font=(FONT, 10), cursor="hand2", padx=10).pack(
+                      side="right", padx=(0, 12), pady=8)
 
         body = tk.Frame(root, bg=BG)
         body.pack(fill="both", expand=True)
@@ -2659,6 +2938,7 @@ class MonitorApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Configure>", self._on_resize)
+        self.root.bind("<Control-m>", lambda _e: self.open_mini())
         start_async_poller(self.root)
         self.show_page("tasks")
         self.refresh_account()
@@ -2693,9 +2973,48 @@ class MonitorApp:
             self._auto_collapsed = False
             self.sidebar.set_expanded(True)
 
+    def _set_account(self, text, logged_in):
+        """登录态的唯一出口：侧边栏与小窗一起更新，两边不会再显示打架。"""
+        self.sidebar.set_account(text, logged_in)
+        if self.mini is not None and self.mini.winfo_exists():
+            self.mini.set_account(text, logged_in)
+
     def refresh_account(self):
-        """异步校验登录会话，更新侧边栏账号状态（已登录时显示手机尾号后四位）。"""
+        """异步校验登录会话，更新侧边栏账号状态（已登录时显示手机尾号后四位）。
+
+        浏览器模式下不再在这里自查：真实会话在 .browser_profile 里，而这里
+        只会去验已弃用的 session_cookies.json，结果显示的是假的"已登录"。
+        该模式的真实状态由引擎的会话体检日志驱动，见 poll_log。"""
         self._acct_time = time.time()
+
+        if (load_config().get("order_mode") or "http") == "browser":
+            # 浏览器模式：真实会话在 .browser_profile，必须用它校验；
+            # 查 session_cookies.json 只会得到一个跟现实无关的结果。
+            def do_check_browser():
+                import browser_order
+                # 登录窗口/下单正在跑的时候抢锁只会超时，这一轮直接跳过。
+                if browser_order.busy():
+                    return None
+                ok, who = browser_order.check_session(timeout=6)
+                return ok, who or ""
+
+            def on_done_browser(res, err):
+                # 浏览器忙（res=None）或校验本身失败（err）：都保持现有显示。
+                # 之前这两种情况一律落到"未登录"，于是刚在浏览器里登录成功，
+                # 侧边栏却是"未登录"——典型的误报。
+                if res is None:
+                    if err is not None:
+                        LOG.debug("会话校验未完成：%s", err)
+                    return
+                ok, who = res
+                if ok:
+                    self._set_account(
+                        "已登录 {0}".format(who) if who else "已登录", True)
+                else:
+                    self._set_account("未登录", False)
+
+            run_async(self.root, do_check_browser, on_done_browser)
+            return
 
         def do_check():
             try:
@@ -2709,12 +3028,12 @@ class MonitorApp:
             if ok:
                 digits = re.findall(r"\d", who or "")
                 tail = "".join(digits)[-4:]
-                self.sidebar.set_account("已登录 {0}".format(tail) if tail else "已登录", True)
+                self._set_account("已登录 {0}".format(tail) if tail else "已登录", True)
             elif permanent:
-                self.sidebar.set_account("未登录", False)
+                self._set_account("未登录", False)
             else:
                 # 临时网络故障：不显示"未登录"，避免误导
-                self.sidebar.set_account("登录校验失败（网络）", False)
+                self._set_account("登录校验失败（网络）", False)
 
         run_async(self.root, do_check, on_done)
 
@@ -2768,7 +3087,10 @@ class MonitorApp:
                 self.engine_label.config(text="引擎：运行中（%d 个任务）" % n)
             except Exception:
                 pass
-        if time.time() - self._acct_time > 60:
+        # 浏览器模式的校验要开一次浏览器，间隔放宽到 3 分钟
+        # （登录窗口开着时这一轮会被 busy() 跳过，不会去撞锁）
+        acct_iv = 180 if (load_config().get("order_mode") or "http") == "browser" else 60
+        if time.time() - self._acct_time > acct_iv:
             self.refresh_account()
         self.refresh_tasks()
         self.root.after(2000, self.tick)
@@ -2778,6 +3100,8 @@ class MonitorApp:
     def refresh_tasks(self):
         if hasattr(self, "task_page"):
             self.task_page.refresh()
+        if self.mini is not None and self.mini.winfo_exists():
+            self.mini.refresh_tasks()
 
     # ----------------------------- 日志 -----------------------------
 
@@ -2785,6 +3109,17 @@ class MonitorApp:
         try:
             while True:
                 record = LOG_QUEUE.get_nowait()
+                # 会话永久失效：立即弹窗提醒，避免用户一直蒙在鼓里
+                if "[错误] 登录会话已失效" in record:
+                    self._set_account("登录已失效", False)
+                    self._warn_session_dead()
+                elif "[会话] 登录状态正常" in record:
+                    self._session_dead_warned = False
+                    m = re.search(r"登录状态正常[:：]\s*(\S+)", record)
+                    self._set_account(
+                        "已登录 {0}".format(m.group(1)) if m else "已登录", True)
+                if self.mini is not None and self.mini.winfo_exists():
+                    self.mini.feed_log(record)
                 self.log_text.config(state="normal")
                 tag = None
                 if "[ERROR]" in record or "[FATAL]" in record:
@@ -2800,10 +3135,52 @@ class MonitorApp:
             pass
         self.root.after(300, self.poll_log)
 
+    def _warn_session_dead(self):
+        """会话永久失效时弹窗（只弹一次，重新登录成功后自动复位）。
+        点「是」直接拉起浏览器重登；登录完成后引擎会把因会话失效而失败的任务自动恢复。"""
+        if getattr(self, "_session_dead_warned", False):
+            return
+        self._session_dead_warned = True
+        if messagebox.askyesno(
+                "登录会话已失效",
+                "12306 登录已失效，自动下单已停止。\n\n"
+                "点「是」立即打开浏览器重新登录（登录成功后任务自动恢复）；\n"
+                "点「否」稍后自行处理。",
+                parent=self.root):
+            if (load_config().get("order_mode") or "http") == "browser":
+                # 必须在本进程里开线程，不能 Popen 新进程：_BROWSER_LOCK 是进程内
+                # 的，另一个进程照样会去抢同一个 .browser_profile，浏览器启动即退
+                # （exitCode=21），而且会和 GUI 自己的体检撞车。
+                def _relogin():
+                    ok = False
+                    try:
+                        import browser_order
+                        ok = bool(browser_order.login())
+                    except Exception as e:
+                        LOG.error("重新登录失败: %s", e)
+                    _RESULT_QUEUE.put((self.root,
+                                       lambda _r, _e: self._after_warn_relogin(ok),
+                                       None, None))
+
+                threading.Thread(target=_relogin, daemon=True).start()
+            else:
+                subprocess.Popen(
+                    [sys.executable, os.path.join(HERE, "capture_session.py")], cwd=HERE)
+
+    def _after_warn_relogin(self, ok):
+        """弹窗触发的重登结束后立刻恢复界面登录态并复查。"""
+        if ok:
+            self._session_dead_warned = False
+            self._set_account("已登录", True)
+            self._acct_time = time.time()
+            self.refresh_account()
+
     def clear_log(self):
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+        if self.mini is not None and self.mini.winfo_exists():
+            self.mini.clear_log()
 
     # ----------------------------- 对话框 -----------------------------
 
@@ -2823,10 +3200,52 @@ class MonitorApp:
         self.show_page("notify")
 
     def open_session(self):
-        SessionDialog(self.root)
+        SessionDialog(self.root, app=self)
 
     def open_quick_check(self):
         QuickCheckDialog(self.root)
+
+    # ----------------------------- 小窗模式 -----------------------------
+
+    def open_mini(self):
+        """打开极简小窗；已打开则前置。首次打开会回灌主窗口里已有的日志。
+        小窗模式下隐藏主窗口，界面只显示小窗内容；点 × 关闭后自动恢复主窗口。"""
+        if self.mini is None or not self.mini.winfo_exists():
+            try:
+                self.mini = MiniWindow(self)
+            except Exception as e:
+                messagebox.showerror("小窗模式", "小窗创建失败：%s" % e,
+                                     parent=self.root)
+                return
+        try:
+            self.mini.deiconify()
+            self.mini.lift()
+        except Exception:
+            return
+        self.mini.refresh_tasks()
+        if not self.mini.primed:
+            self.mini.primed = True
+            try:
+                text = self.log_text.get("1.0", "end")
+            except Exception:
+                text = ""
+            for line in text.splitlines():
+                self.mini.feed_log(line)
+        # 只显示小窗：主窗口隐藏（widget 不销毁，页面/侧边栏状态原样保留）
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+
+    def restore_main(self):
+        """小窗关闭后恢复主窗口，回到打开小窗前的界面状态。
+        页面、侧边栏、窗口尺寸等从未改动，仅重新显示并前置。"""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
 
     def on_close(self):
         if self.engine_thread and self.engine_thread.is_alive():
@@ -2837,8 +3256,45 @@ class MonitorApp:
         self.root.destroy()
 
 
+def _ensure_stdio():
+    """pythonw 下没有控制台，sys.stdout / sys.stderr 是 None。
+
+    Playwright 启动浏览器时会往标准输出写日志并调用 flush()，
+    在 None 上调用会抛 AttributeError，浏览器进程随即退出（exitCode=21）。
+    这里把它们接到日志上：既不再崩，也能在运行日志里看到浏览器说了什么。
+    """
+    class _Writer(object):
+        def __init__(self, level):
+            self._level = level
+            self._buf = ""
+
+        def write(self, s):
+            if not s:
+                return 0
+            self._buf += s
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line.strip():
+                    LOG.log(self._level, "[stdio] %s", line)
+            return len(s)
+
+        def flush(self):
+            if self._buf.strip():
+                LOG.log(self._level, "[stdio] %s", self._buf)
+            self._buf = ""
+
+        def isatty(self):
+            return False
+
+    if sys.stdout is None:
+        sys.stdout = _Writer(logging.INFO)
+    if sys.stderr is None:
+        sys.stderr = _Writer(logging.WARNING)
+
+
 def main():
     setup_logging()
+    _ensure_stdio()
     if not os.path.exists(CONFIG_PATH):
         root = tk.Tk()
         root.withdraw()
