@@ -1,0 +1,39 @@
+{
+  "_说明": "本文件为配置模板。复制为 config.json 后按需修改，切勿把真实邮箱/授权码提交到仓库。密码/验证码一律不处理。",
+  "poll_interval_seconds": 45,
+  "min_interval_seconds": 30,
+  "order_retry_times": 3,
+  "order_retry_delay_seconds": 2,
+  "order_retry_cooldown_seconds": 7,
+  "adaptive": {
+    "enabled": true,
+    "peak_hours": [
+      6,
+      23
+    ],
+    "peak_multiplier": 1.0,
+    "offpeak_multiplier": 1.6,
+    "rush_within_hours": 24,
+    "rush_multiplier": 0.75
+  },
+  "session_cookies_file": "session_cookies.json",
+  "state_file": "state.json",
+  "history_file": "order_history.json",
+  "passengers_file": "passengers.json",
+  "log_dir": "logs",
+  "http_timeout": 15,
+  "notify": {
+    "email": {
+      "enabled": false,
+      "smtp_host": "smtp.qq.com",
+      "smtp_port": 465,
+      "username": "your_account@qq.com",
+      "password": "your_smtp_auth_code",
+      "from": "your_account@qq.com",
+      "to": [
+        "your_account@qq.com"
+      ]
+    }
+  },
+  "tasks": []
+}

@@ -1,0 +1,29 @@
+# ===== 隐私与运行时数据（禁止上传）=====
+# 真实配置（含邮箱、SMTP 授权码、乘车人等隐私）
+config.json
+# 登录会话 Cookie
+session_cookies.json
+# 运行时状态与历史（含乘车人、订单信息）
+state.json
+order_history.json
+passengers.json
+# 日志
+logs/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# ===== 编辑器/系统 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log
+
+# ===== 本地临时文件 =====
+*.tmp
+*.guisave

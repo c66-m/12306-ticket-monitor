@@ -1,0 +1,532 @@
+# -*- coding: utf-8 -*-
+"""
+下单模块：基于已保存的登录会话，自动完成 "提交订单 -> 选取乘车人 -> 提交排队"，
+最后停在【未完成订单】状态，不支付。
+
+流程（2026 经验，每一步都保留原始响应便于排查接口变更）
+    1. POST /otn/leftTicket/submitOrderRequest      -- 提交订单（带 secretStr 等）
+    2. GET  /otn/confirmPassenger/initDc            -- 拿 repeatSubmitToken / leftTicketStr / key_check_isChange
+    3. GET  /otn/confirmPassenger/getPassengerDTOs  -- 拉取已保存的常用乘车人（优先用配置里的名字；没配就全用）
+    4. POST /otn/confirmPassenger/checkOrderInfo    -- 校验乘车人信息（若触发滑块验证码则中止并提示）
+    5. POST /otn/confirmPassenger/confirmSingleForQueue -- 提交排队，成功即生成未支付订单
+
+不做什么
+    - 不支付、不解决滑块验证码（那属于绕过安全验证，不做）
+    - 若中途触发验证码或接口变化，会明确打印出来，由你人工介入
+
+用法（一般不单独跑，由 monitor.py 调用）
+    python order.py
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from urllib.parse import urlencode
+
+import requests
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+try:
+    from ticket import SEAT_NAME_TO_CODE
+except ImportError:
+    SEAT_NAME_TO_CODE = {
+        "商务座": "9", "特等座": "P", "一等座": "M", "二等座": "O",
+        "高级软卧": "6", "软卧": "4", "动卧": "F", "硬卧": "3",
+        "软座": "2", "硬座": "1", "无座": "W",
+    }
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+BASE_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": "https://kyfw.12306.cn",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def load_session(cookie_path=None):
+    """加载 saved 会话 Cookie，返回 requests.Session。"""
+    path = cookie_path or os.path.join(HERE, "session_cookies.json")
+    if not os.path.exists(path):
+        raise RuntimeError("未找到会话文件 {0}，请先运行：python capture_session.py".format(path))
+    with open(path, "r", encoding="utf-8") as f:
+        cookies = json.load(f)
+
+    s = requests.Session()
+    s.headers.update(BASE_HEADERS)
+    for name, value in cookies.items():
+        s.cookies.set(name, value, domain=".12306.cn", path="/")
+    return s
+
+
+def save_session(session, cookie_path=None):
+    """把会话 Cookie 回写文件。12306 会轮换 tk 等关键 Cookie，
+    定期回写可延长会话有效期（避免一直用旧 Cookie 被判定过期）。"""
+    path = cookie_path or os.path.join(HERE, "session_cookies.json")
+    cookies = {}
+    for c in session.cookies:
+        if "12306.cn" in getattr(c, "domain", "") and c.name:
+            cookies[c.name] = c.value
+    if not cookies:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
+
+
+def verify_session(session):
+    """校验会话是否有效。返回 (ok, who, permanent)：
+    - ok=True：会话有效
+    - permanent=True：确认会话已失效（跳转登录页 / 接口明确未登录）
+    - permanent=False：临时故障（网络异常/非 JSON 响应，如系统繁忙页），稍后重试即可
+    非 JSON 响应会重试 3 次，避免把 12306 的临时繁忙误判成登录失效。"""
+    last_err = "未知错误"
+    for _ in range(3):
+        try:
+            r = session.get(CHECK_URL, timeout=15)
+            text = r.text or ""
+            if text.lstrip().startswith("{") or "json" in r.headers.get("Content-Type", ""):
+                data = r.json()
+                user = (data.get("data") or {}).get("user_name")
+                if data.get("status"):
+                    return True, user, True
+                return False, "接口返回 status=false", True
+            # 非 JSON：只有明确跳转登录页 / 提示未登录才是真的失效
+            if "/login" in (r.url or "") or "请先登录" in text or "未登录" in text[:500]:
+                return False, "已跳转登录页", True
+            last_err = "响应非 JSON（疑似系统繁忙/网关拦截）"
+        except Exception as e:
+            last_err = "{0}: {1}".format(type(e).__name__, e)
+        time.sleep(1.2)
+    return False, last_err, False
+
+
+def check_login(session):
+    """校验会话是否有效（调用需登录接口）。返回 (ok, 用户名或错误)。
+    兼容旧调用方：临时故障也返回 False（提示信息说明原因，稍后可重试）。"""
+    ok, who, _permanent = verify_session(session)
+    return ok, who
+
+
+def submit_order_request(session, ticket, seat_code, date, purpose="ADULT"):
+    """
+    ticket: ticket.py parse_row 的结果
+    seat_code: 席别代码（如 'O'）
+    purpose: ADULT=成人票, 0X00=学生票
+    """
+    url = "https://kyfw.12306.cn/otn/leftTicket/submitOrderRequest"
+    data = {
+        "secretStr": ticket["secret_str"],
+        "train_date": date,
+        "train_no": ticket["train_no"],
+        "station_train_code": ticket["train_code"],
+        "seatType": seat_code,
+        "fromStationTelecode": ticket["from_code"],
+        "toStationTelecode": ticket["to_code"],
+        "purpose_codes": purpose,
+    }
+    session.headers["Referer"] = "https://kyfw.12306.cn/otn/leftTicket/init"
+    r = session.post(url, data=data, timeout=15)
+    return r
+
+
+def is_busy_error(msg):
+    """判断是否为可自动重试的"系统忙"类临时错误。"""
+    for kw in ("系统忙", "请稍后重试", "访问太频繁", "网络繁忙", "请求过于频繁"):
+        if kw in (msg or ""):
+            return True
+    return False
+
+
+def submit_with_busy_retry(session, ticket, seat_code, date, tries, delay, purpose="ADULT"):
+    """提交订单请求，遇"系统忙"类错误自动重试（间隔递增）。返回 (ok, msg)。"""
+    for attempt in range(1, tries + 1):
+        try:
+            resp = submit_order_request(session, ticket, seat_code, date, purpose)
+            d = resp.json()
+        except Exception as e:
+            raw = getattr(locals().get("resp"), "text", "") or ""
+            return False, "submitOrderRequest 异常: {0} 原始响应: {1}".format(e, raw[:300])
+        if d.get("status"):
+            return True, ""
+        msg = str(d.get("validateMessages") or d.get("messages") or "")
+        if is_busy_error(msg) and attempt < tries:
+            time.sleep(delay * attempt)
+            continue
+        return False, "submitOrderRequest 失败: {0}".format(msg)
+    return False, "submitOrderRequest 连续 {0} 次系统忙，稍后自动重试".format(tries)
+
+
+def get_init_dc(session):
+    """进入确认订单页，解析 repeatSubmitToken / leftTicketStr / key_check_isChange。"""
+    url = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+    session.headers["Referer"] = "https://kyfw.12306.cn/otn/leftTicket/init"
+    r = session.get(url, timeout=15)
+    html = r.text
+
+    def grab(pattern, group=1):
+        m = re.search(pattern, html)
+        return m.group(group) if m else None
+
+    token = grab(r"globalRepeatSubmitToken[^']*'([^']+)'") or grab(r"globalRepeatSubmitToken\s*=\s*\"([^\"]+)\"")
+    left_ticket_str = grab(r"leftTicketStr[^']*'([^']+)'") or grab(r"leftTicketStr\s*=\s*\"([^\"]+)\"")
+    key_check = grab(r"key_check_isChange[^']*'([^']+)'") or grab(r"key_check_isChange[^']*:\s*'([^']+)'")
+
+    # 有些版本 key_check_isChange 是数字，正则里未加引号，这里再做一次宽松匹配
+    if key_check is None:
+        m = re.search(r"key_check_isChange[=:]\s*['\"]*(\w+)['\"]*", html)
+        if m and m.group(1) != "null":
+            key_check = m.group(1)
+
+    return token, left_ticket_str, key_check, html
+
+
+def get_passengers(session):
+    """获取已保存的常用乘车人列表。返回 [{name,id_type,id_no,mobile,is_adult}]"""
+    url = "https://kyfw.12306.cn/otn/confirmPassenger/getPassengerDTOs"
+    session.headers["Referer"] = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+    r = session.post(url, timeout=15)
+    data = r.json().get("data") or {}
+
+    passengers = []
+    for key, adult_field, name_f, idt_f, idno_f, mob_f in (
+        ("normalPassengers", "isAdult", "passenger_name", "passenger_id_type_code", "passenger_id_no", "mobile_no"),
+        ("passengerDTOs", "isAdult", "passenger_name", "passenger_id_type_code", "passenger_id_no", "mobile_no"),
+    ):
+        lst = data.get(key)
+        if lst:
+            for p in lst:
+                passengers.append({
+                    "name": p.get(name_f),
+                    "id_type": p.get(idt_f, "1"),
+                    "id_no": p.get(idno_f),
+                    "mobile": p.get(mob_f) or "",
+                    "is_adult": p.get(adult_field, 1) != 0,
+                    "type_name": p.get("passenger_type_name") or "",
+                })
+            break
+
+    # 兜底：若上面接口字段路径变了，用 passengers/query
+    if not passengers:
+        r2 = session.post("https://kyfw.12306.cn/otn/passengers/query",
+                          data={"pageIndex": 1, "pageSize": 10}, timeout=15)
+        for p in (r2.json().get("data") or {}).get("datas") or []:
+            passengers.append({
+                "name": p.get("passenger_name"),
+                "id_type": p.get("passenger_id_type_code", "1"),
+                "id_no": p.get("passenger_id_no"),
+                "mobile": p.get("mobile_no") or "",
+                "is_adult": p.get("isAdult", 1) != 0,
+                "type_name": p.get("passenger_type_name") or "",
+            })
+    return passengers
+
+
+def select_passengers(all_passengers, wanted_names):
+    """按偏好选乘车人：配置点名 > 本地默认乘车人 > 账号内全部成人乘车人。"""
+    if wanted_names:
+        # 按 wanted_names 的顺序挑选，保持用户指定的组合顺序
+        picked = []
+        for name in wanted_names:
+            for p in all_passengers:
+                if p["name"] == name:
+                    picked.append(p)
+                    break
+        if picked:
+            return picked
+    return [p for p in all_passengers if p.get("is_adult", True) and p.get("id_no")]
+
+
+def _normalize_order_item(item, status):
+    """把 queryMyOrderNoComplete / queryMyOrder 里的订单项解析成统一结构。"""
+    passengers = []
+    for p in item.get("passengerDTOList") or []:
+        name = p.get("passenger_name")
+        if name:
+            passengers.append(name)
+    start = item.get("start_train_date_page") or ""
+    return {
+        "order_no": item.get("sequence_no") or item.get("order_no") or "",
+        "train": (item.get("train_code_page") or "").replace(" ", ""),
+        "from": item.get("from_station_name_page") or "",
+        "to": item.get("to_station_name_page") or "",
+        "date": start[:10] if start else (item.get("order_date") or "").replace(" ", "")[:10],
+        "status": status or item.get("order_status_name_cn") or "",
+        "passengers": passengers,
+    }
+
+
+def check_existing_orders(session, target_date):
+    """查询账号中的未完成订单 + 目标日期已完成订单，返回统一订单列表（尽力解析）。"""
+    orders = []
+    # 未完成订单（未支付 + 待支付等）
+    try:
+        r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
+                         data={"_json_att": ""}, timeout=15)
+        for item in ((r.json().get("data") or {}).get("orderDBList") or []):
+            orders.append(_normalize_order_item(item, "未完成/未支付"))
+    except Exception:
+        pass
+    # 已完成（历史）订单：按目标日期窗口查询
+    try:
+        data = {"_json_att": "", "queryType": "1",
+                "queryStartDate": target_date, "queryEndDate": target_date,
+                "come_from_flag": "my_order"}
+        r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrder",
+                         data=data, timeout=15)
+        for item in ((r.json().get("data") or {}).get("orderDBList") or []):
+            orders.append(_normalize_order_item(item, item.get("order_status_name_cn") or "已完成/已支付"))
+    except Exception:
+        pass
+    return orders
+
+
+def find_duplicate(orders, date, train_code, passenger_names):
+    """
+    在账号已有订单里查重：同一日期 + 同一车次 + 乘车人有交集 = 重复。
+    若订单解析不出乘车人列表，则保守地只按 日期+车次 判定。
+    """
+    for o in orders:
+        if not o["date"] or not o["train"]:
+            continue
+        if o["date"] == date and o["train"] == train_code:
+            if not o["passengers"]:
+                return o  # 乘车人解析失败，保守判定为重复
+            if not passenger_names or set(passenger_names) & set(o["passengers"]):
+                return o
+    return None
+
+
+def build_ticket_strs(passengers, seat_code):
+    """构造 passengerTicketStr / oldPassengerStr（多乘客用 _ 连接，与官网一致）。"""
+    passenger_ticket_str = "".join(
+        "{0},0,1,{1},1,{2},{3},N,0_".format(seat_code, p["name"], p["id_no"], p["mobile"])
+        if p["mobile"]
+        else "{0},0,1,{1},1,{2},,N,0_".format(seat_code, p["name"], p["id_no"])
+        for p in passengers
+    )
+    old_passenger_str = "".join(
+        "{0},1,{1},1_".format(p["name"], p["id_no"]) for p in passengers
+    )
+    return passenger_ticket_str, old_passenger_str
+
+
+def check_order_info(session, token, passenger_ticket_str, old_passenger_str):
+    """校验订单信息。若要求动态验证码则返回 (False, '需要验证码')。"""
+    url = "https://kyfw.12306.cn/otn/confirmPassenger/checkOrderInfo"
+    session.headers["Referer"] = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+    data = {
+        "cancel_flag": "2",
+        "bed_level_order_num": "000000000000000000000000000000",
+        "passengerTicketStr": passenger_ticket_str,
+        "oldPassengerStr": old_passenger_str,
+        "tour_flag": "dc",
+        "randCode": "",
+        "whatsSelect": "1",
+        "_json_att": "",
+        "REPEAT_SUBMIT_TOKEN": token,
+    }
+    r = session.post(url, data=data, timeout=15)
+    d = r.json()
+    if not d.get("status"):
+        return False, "checkOrderInfo 返回 status=false: {0}".format(d.get("messages", d.get("validateMessages")))
+    data_ = d.get("data") or {}
+    if data_.get("ifShowPassCode") == "Y" or data_.get("ifShowOtherPassCode") == "Y":
+        return False, "触发滑块验证码，自动下单中止（请人工在网页完成）"
+    return True, ""
+
+
+def confirm_order(session, token, left_ticket_str, key_check, train_location,
+                  passenger_ticket_str, old_passenger_str, purpose="ADULT"):
+    """提交排队下单。成功即生成未支付订单。返回 (ok, 详情/错误)。"""
+    url = "https://kyfw.12306.cn/otn/confirmPassenger/confirmSingleForQueue"
+    session.headers["Referer"] = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+    data = {
+        "passengerTicketStr": passenger_ticket_str,
+        "oldPassengerStr": old_passenger_str,
+        "randCode": "",
+        "purpose_codes": "00" if purpose == "ADULT" else purpose,  # 00=成人票，0X00=学生票
+        "key_check_isChange": key_check or "",
+        "leftTicketStr": left_ticket_str or "",
+        "train_location": train_location or "P3",
+        "choose_seats": "",
+        "seatDetailType": "000",
+        "whatsSelect": "1",
+        "roomType": "00",
+        "dwAll": "N",
+        "_json_att": "",
+        "REPEAT_SUBMIT_TOKEN": token,
+    }
+    r = session.post(url, data=data, timeout=20)
+    try:
+        d = r.json()
+    except Exception:
+        return False, "confirmSingleForQueue 返回非 JSON（可能接口变更）: {0}".format(r.text[:300])
+    if not d.get("status"):
+        return False, "下单失败: {0}".format(d.get("messages", d.get("validateMessages")))
+    data_ = d.get("data") or {}
+    if data_.get("submitStatus"):
+        return True, "订单已提交，处于【未完成订单】状态（未支付，请在 App/网页 45 分钟内支付）"
+    return False, "排队未成功: {0}".format(data_)
+
+
+def confirm_with_busy_retry(session, token, left_ticket_str, key_check, train_location,
+                            passenger_ticket_str, old_passenger_str, tries, delay,
+                            purpose="ADULT"):
+    """提交排队下单，遇"系统忙"类错误自动重试（间隔递增）。返回 (ok, msg)。"""
+    msg = ""
+    for attempt in range(1, tries + 1):
+        try:
+            ok, msg = confirm_order(session, token, left_ticket_str, key_check,
+                                    train_location, passenger_ticket_str,
+                                    old_passenger_str, purpose)
+        except Exception as e:
+            return False, "confirmSingleForQueue 异常: {0}".format(e)
+        if ok or not is_busy_error(msg) or attempt >= tries:
+            return ok, msg
+        time.sleep(delay * attempt)
+    return False, msg or "confirmSingleForQueue 连续 {0} 次系统忙，稍后自动重试".format(tries)
+
+
+def fetch_unpaid_order_no(session):
+    """尽力获取最近一笔未完成订单号（失败不影响主流程）。"""
+    try:
+        url = "https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete"
+        session.headers["Referer"] = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+        r = session.post(url, data={"_json_att": ""}, timeout=15)
+        data = r.json().get("data") or {}
+        for item in data.get("orderDBList") or []:
+            if item.get("order_status_name_cn") in ("未完成", ""):
+                return item.get("sequence_no") or item.get("order_no")
+    except Exception:
+        pass
+    return None
+
+
+def order_ticket(config, task, ticket, seat_name):
+    """
+    完整下单入口。成功返回 (True, 描述, 额外信息)，失败返回 (False, 错误, None)。
+    描述中带订单号（尽力获取）。state 写入由调用方负责。
+    """
+    sess = load_session(config.get("session_cookies_file", "session_cookies.json"))
+    ok, who = check_login(sess)
+    if not ok:
+        return False, "会话已失效（{0}）。请重新运行 capture_session.py 登录。".format(who), None
+
+    seat_code = SEAT_NAME_TO_CODE.get(seat_name)
+    if not seat_code:
+        return False, "未知席别: {0}".format(seat_name), None
+
+    date = ticket["start_date"]
+    purpose = task.get("purpose_code") or "ADULT"
+
+    # 智能排队机制："系统忙"类错误在单轮内自动重试（次数/间隔可配置），提升抢票成功率
+    try:
+        tries = max(1, int(config.get("order_retry_times", 3)))
+    except (TypeError, ValueError):
+        tries = 3
+    try:
+        delay = float(config.get("order_retry_delay_seconds", 2))
+    except (TypeError, ValueError):
+        delay = 2.0
+
+    ok1, msg1 = submit_with_busy_retry(sess, ticket, seat_code, date, tries, delay, purpose)
+    if not ok1:
+        return False, msg1, None
+
+    token = left_str = key_check = None
+    try:
+        token, left_str, key_check, _ = get_init_dc(sess)
+        if not token:
+            return False, "initDc 解析失败，拿不到 repeatSubmitToken（接口可能变更）", None
+    except Exception as e:
+        return False, "initDc 异常: {0}".format(e), None
+
+    try:
+        passengers = get_passengers(sess)
+        wanted = list(task.get("passenger_names") or [])
+        if not wanted:
+            # 未在任务里点名时，优先使用本地加密库中的"默认乘车人"
+            try:
+                import passengers as passengers_mod
+                wanted = passengers_mod.default_names(config.get("passengers_file"))
+            except Exception:
+                wanted = []
+        picked = select_passengers(passengers, wanted)
+        if not picked:
+            return False, "没有可用乘车人（请确认账号已保存常用联系人和乘车人）", None
+    except Exception as e:
+        return False, "拉取乘车人异常: {0}".format(e), None
+
+    # 防重复下单：检查账号中是否已有同日期 + 同车次 + 同乘车人的订单
+    try:
+        existing = check_existing_orders(sess, date)
+    except Exception:
+        existing = []
+    dup = None
+    try:
+        dup = find_duplicate(existing, date, ticket["train_code"],
+                             [p["name"] for p in picked])
+    except Exception as e:
+        print("    [查重异常] {0}（忽略，继续下单）".format(e))
+    if dup:
+        return (False,
+                "账号中已存在相同行程订单（{0} 状态：{1}），按防重复规则跳过".format(
+                    ("订单号 " + dup["order_no"]) if dup.get("order_no") else "订单",
+                    dup.get("status") or "未知"),
+                {"reason": "dup", "order_no": dup.get("order_no")})
+
+    p_ticket_str, old_str = build_ticket_strs(picked, seat_code)
+
+    try:
+        ok2, msg2 = check_order_info(sess, token, p_ticket_str, old_str)
+        if not ok2:
+            return False, msg2, None
+    except Exception as e:
+        return False, "checkOrderInfo 异常: {0}".format(e), None
+
+    ok3, msg3 = confirm_with_busy_retry(sess, token, left_str, key_check,
+                                        ticket["train_location"], p_ticket_str,
+                                        old_str, tries, delay, purpose)
+    if not ok3:
+        return False, msg3, None
+
+    order_no = fetch_unpaid_order_no(sess)
+    passenger_names = "、".join(p["name"] for p in picked)
+    extra = {"order_no": order_no, "passengers": passenger_names, "date": date,
+             "train": ticket["train_code"], "seat": seat_name,
+             "from": ticket["from_name"], "to": ticket["to_name"],
+             "start": ticket["start_time"], "arrive": ticket["arrive_time"]}
+    return True, msg3 + (" 订单号: {0}".format(order_no) if order_no else ""), extra
+
+
+if __name__ == "__main__":
+    # 单独运行：先测会话有效性与乘车人列表
+    try:
+        cfg = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8"))
+        s = load_session(cfg.get("session_cookies_file", "session_cookies.json"))
+        ok, who = check_login(s)
+        print("会话有效: {0}".format(who) if ok else "会话失效: {0}".format(who))
+        if ok:
+            ps = get_passengers(s)
+            print("已保存乘车人 {0} 位：{1}".format(len(ps), "、".join(p["name"] for p in ps if p["name"]) or "无"))
+    except Exception as e:
+        print("错误: {0}".format(e))
