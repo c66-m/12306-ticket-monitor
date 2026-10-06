@@ -347,12 +347,23 @@ def find_duplicate(orders, date, train_code, passenger_names):
     return None
 
 
-def build_ticket_strs(passengers, seat_code):
-    """构造 passengerTicketStr / oldPassengerStr（多乘客用 _ 连接，与官网一致）。"""
+def build_ticket_strs(passengers, seat_code, purpose_map=None):
+    """构造 passengerTicketStr / oldPassengerStr（多乘客用 _ 连接，与官网一致）。
+
+    purpose_map: {姓名: 票种代码}；ADULT=成人票（ticket_type=1），0X00=学生票（=3）。
+    缺省按成人票。票种按人写，同一订单里成人票 / 学生票可以混选。
+    """
+    pm = purpose_map or {}
+
+    def _ttype(p):
+        return "3" if pm.get(p["name"]) == "0X00" else "1"
+
     passenger_ticket_str = "".join(
-        "{0},0,1,{1},1,{2},{3},N,0_".format(seat_code, p["name"], p["id_no"], p["mobile"])
+        "{0},0,{1},{2},1,{3},{4},N,0_".format(
+            seat_code, _ttype(p), p["name"], p["id_no"], p["mobile"])
         if p["mobile"]
-        else "{0},0,1,{1},1,{2},,N,0_".format(seat_code, p["name"], p["id_no"])
+        else "{0},0,{1},{2},1,{3},,N,0_".format(
+            seat_code, _ttype(p), p["name"], p["id_no"])
         for p in passengers
     )
     old_passenger_str = "".join(
@@ -485,6 +496,12 @@ def order_ticket(config, task, ticket, seat_name):
     # 且格式为 YYYYMMDD，而 submitOrderRequest 只接受 YYYY-MM-DD。
     date = ticket.get("query_date") or ticket["start_date"]
     purpose = task.get("purpose_code") or "ADULT"
+    # 按人票种：勾选乘车人全是学生票时才用学生余票口径，否则按成人票请求
+    purpose_map = task.get("pax_purpose") or {}
+    wanted_names = list(task.get("passenger_names") or [])
+    if purpose_map and wanted_names:
+        codes = [purpose_map.get(n) or purpose for n in wanted_names]
+        purpose = "0X00" if all(c == "0X00" for c in codes) else "ADULT"
 
     # 智能排队机制："系统忙"类错误在单轮内自动重试（次数/间隔可配置），提升抢票成功率
     try:
@@ -542,7 +559,7 @@ def order_ticket(config, task, ticket, seat_name):
                     dup.get("status") or "未知"),
                 {"reason": "dup", "order_no": dup.get("order_no")})
 
-    p_ticket_str, old_str = build_ticket_strs(picked, seat_code)
+    p_ticket_str, old_str = build_ticket_strs(picked, seat_code, purpose_map)
 
     try:
         ok2, msg2 = check_order_info(sess, token, p_ticket_str, old_str)

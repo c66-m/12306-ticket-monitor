@@ -130,8 +130,37 @@ _DEFAULT_LC = {
     "update_url": "",
     "station_history": ["长葛", "确山"],
     "purpose_code": "ADULT",
+    "pax_purpose": {},
     "query_history": [],
 }
+
+# 票种：界面按乘车人分别选择（成人票 / 学生票），下单按人写入 ticket_type
+PURPOSE_LABELS = {"ADULT": "成人票", "0X00": "学生票"}
+LABEL_TO_PURPOSE = {v: k for k, v in PURPOSE_LABELS.items()}
+
+
+def purpose_of(lc, name=None):
+    """按人取票种代码；name=None 时返回余票查询口径（全是学生才用 0X00）。
+
+    12306 的 queryLeftTicket 用 ADULT / 0X00 切换余票口径；下单时每个乘车人的
+    ticket_type 由本人票种决定（成人=1，学生=3），所以两者分开提供。
+    """
+    lc = lc or {}
+    pm = lc.get("pax_purpose") or {}
+    default = lc.get("purpose_code") or "ADULT"
+    if name is not None:
+        return pm.get(name) or default
+    names = lc.get("passenger_names") or []
+    codes = [pm.get(n) or default for n in names] or [default]
+    return "0X00" if all(c == "0X00" for c in codes) else "ADULT"
+
+
+def purpose_map_of(lc):
+    """{姓名: 票种代码}，只含本次勾选的乘车人（下单按人写 ticket_type 用）。"""
+    lc = lc or {}
+    pm = lc.get("pax_purpose") or {}
+    default = lc.get("purpose_code") or "ADULT"
+    return {n: (pm.get(n) or default) for n in (lc.get("passenger_names") or [])}
 
 
 def load_launcher_config():
@@ -152,6 +181,39 @@ def load_launcher_config():
 def save_launcher_config(lc):
     with open(LAUNCHER_CFG_PATH, "w", encoding="utf-8") as f:
         json.dump(lc, f, ensure_ascii=False, indent=2)
+
+
+# ----------------------------- 抢票任务库（多任务管理） -----------------------------
+
+GRAB_TASKS_PATH = os.path.join(HERE, "grab_tasks.json")
+
+
+def load_grab_tasks():
+    """读取全部抢票任务（每个任务 = 一份独立配置 + id/name/status）。"""
+    if os.path.exists(GRAB_TASKS_PATH):
+        try:
+            with open(GRAB_TASKS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("tasks"), list):
+                return data["tasks"]
+        except Exception as e:
+            log("[错误] grab_tasks.json 读取失败：%s" % e)
+    return []
+
+
+def save_grab_tasks(tasks):
+    with open(GRAB_TASKS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"tasks": tasks}, f, ensure_ascii=False, indent=2)
+
+
+def new_grab_task(seq):
+    """新建一个空任务模板（配置与主配置同构，各任务互不影响）。"""
+    t = dict(_DEFAULT_LC)
+    t["id"] = uuid.uuid4().hex[:8]
+    t["name"] = "任务 %d" % seq
+    t["status"] = "idle"
+    t["date"] = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    return t
 
 
 # ----------------------------- 掩码 -----------------------------
@@ -248,21 +310,29 @@ def ip_locate(timeout=6):
 
 # ----------------------------- 抢票引擎 -----------------------------
 
+_SESSION_LOCK = threading.Lock()  # 多任务并发时，浏览器会话校验/登录串行化
+
+
 class Grabber(threading.Thread):
     """后台抢票线程：校验会话 → 循环查询 → 命中即下单。
 
     result: 结束时写入 (ok, msg)。GUI 通过 LOGQ 收到过程日志。"""
 
-    def __init__(self, lc):
+    def __init__(self, lc, logq=None):
         super().__init__(daemon=True, name="grabber")
         self.lc = lc
+        self.logq = logq or LOGQ
         self.stop_event = threading.Event()
         self.result = None
+
+    def _log(self, msg):
+        self.logq.put(msg)
 
     def stop(self):
         self.stop_event.set()
 
     def run(self):
+        log = self._log
         try:
             self._run()
         except Exception as e:
@@ -272,6 +342,7 @@ class Grabber(threading.Thread):
     # ---- 内部 ----
 
     def _run(self):
+        log = self._log
         lc = self.lc
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
@@ -305,20 +376,21 @@ class Grabber(threading.Thread):
             self.result = (False, "车站无法识别：%s → %s" % (from_, to_))
             return
 
-        # 1) 会话
+        # 1) 会话（多任务并发时串行校验，避免两个线程同时操作同一个浏览器）
         log("[会话] 正在校验登录状态…（复用本机登录信息，全程无浏览器窗口）")
-        try:
-            ok, who = browser_order.check_session()
-        except Exception as e:
-            log("[错误] 会话校验失败：%s" % e)
-            ok, who = False, str(e)
-        if not ok:
-            log("[会话] 当前未登录（%s），尝试拉起登录窗口，请在浏览器里完成登录…" % who)
+        with _SESSION_LOCK:
             try:
-                browser_order.login(timeout_sec=240)
                 ok, who = browser_order.check_session()
             except Exception as e:
-                log("[错误] 登录过程异常：%s" % e)
+                log("[错误] 会话校验失败：%s" % e)
+                ok, who = False, str(e)
+            if not ok:
+                log("[会话] 当前未登录（%s），尝试拉起登录窗口，请在浏览器里完成登录…" % who)
+                try:
+                    browser_order.login(timeout_sec=240)
+                    ok, who = browser_order.check_session()
+                except Exception as e:
+                    log("[错误] 登录过程异常：%s" % e)
         if not ok:
             self.result = (False, "登录失败或超时：%s" % who)
             log("[错误] %s" % self.result[1])
@@ -366,13 +438,13 @@ class Grabber(threading.Thread):
         last_target = None   # (车次, 席别)：同一目标连续失败计数用
         fail_streak = 0
         busy_n = 0           # 系统繁忙连续次数，用于冷却退避
+        bad = set()          # {(车次, 席别)}：网页端下单页不下发的组合，永久跳过
         MAX_ORDER_FAILS = 5  # 同一目标连续失败这么多次就停，不再无限重复
         try:
             while not self.stop_event.is_set():
                 n += 1
                 try:
-                    rows = tk_mod.query_tickets(fc, tc, date,
-                                                 purpose=lc.get("purpose_code") or "ADULT")
+                    rows = tk_mod.query_tickets(fc, tc, date, purpose=purpose_of(lc))
                 except Exception as e:
                     log("[错误] 余票查询失败：%s（%s 秒后重试）" % (e, int(poll)))
                     if self.stop_event.wait(poll):
@@ -384,13 +456,13 @@ class Grabber(threading.Thread):
                 for row in rows:
                     p = tk_mod.parse_row(row, code2name, date)
                     by_code.setdefault(p.get("train_code"), p)
-                for code in trains:   # 按点选顺序：优先抢选中的第一个
+                for code in (trains or list(by_code)):   # 按点选顺序（留空=全部车次）
                     p = by_code.get(code)
                     if not p:
                         continue
                     avail = p.get("available_seats") or {}
                     for s in sorted(seats, key=lambda x: SEAT_ORDER.get(x, 99)):
-                        if s in avail:
+                        if s in avail and (code, s) not in bad:
                             info, seat = p, s
                             break
                     if info:
@@ -402,9 +474,14 @@ class Grabber(threading.Thread):
                         info["available_seats"].get(seat), info["start_time"]))
                     try:
                         sc = tk_mod.SEAT_NAME_TO_CODE[seat]
+                        # 网页端下单页不下发「无座」：同价改判为硬座下单
+                        sc, _alias = tk_mod.order_seat_code(seat, sc)
+                        if _alias:
+                            log("[席别] %s 网页端下单页不下发，按同价改判为 %s 下单" % (seat, _alias))
                         ok, msg, extra = browser_order.order_via_browser(
                             info, seat, sc, names, date, headless=False, verify_timeout=90,
-                            purpose=lc.get("purpose_code") or "ADULT", warm=warm)
+                            purpose=purpose_of(lc), purpose_map=purpose_map_of(lc),
+                            warm=warm, alias_name=_alias)
                     except RuntimeError as e:
                         log("[错误] %s（5 秒后重试）" % e)
                         if self.stop_event.wait(5):
@@ -431,7 +508,30 @@ class Grabber(threading.Thread):
                         self.result = (False, "触发滑块验证：%s（脚本不自动过验证码，已停止）" % msg)
                         log("[错误] %s" % self.result[1])
                         return
-                    if "页面上没有" in msg or "网页端不提供席别" in msg:
+                    if extra.get("alias_seat") and any(
+                            k in msg for k in ("余票", "不足", "无票", "不下发", "改判")):
+                        # 勾选无座、实际按同价硬座下单：硬座此刻没票/不可售属车次状态问题，
+                        # 继续监控，不计入「同目标连续失败」
+                        log("[提醒] %s（按 %s 监控中，继续等待）" % (msg, seat))
+                        if self.stop_event.wait(2):
+                            break
+                        continue
+                    if extra.get("reason") == "seat_unavailable" or "网页端不提供席别" in msg:
+                        # 网页端下单页的可售席别由服务端下发（普速车常常没有「无座」）：
+                        # 这个组合再点多少次都不会变，加入跳过名单，只在剩余席别里继续抢
+                        bad.add((info["train_code"], seat))
+                        log("[提醒] %s；已跳过 %s %s" % (msg, info["train_code"], seat))
+                        remain = [(c, s) for c in (trains or list(by_code))
+                                  for s in seats if (c, s) not in bad]
+                        if not remain:
+                            self.result = (False, "勾选的席别在 12306 网页端下单页都不可选，"
+                                                  "已停止：%s" % msg)
+                            log("[错误] %s" % self.result[1])
+                            return
+                        if self.stop_event.wait(2):
+                            break
+                        continue
+                    if "页面上没有" in msg:
                         # 抢输竞速/席别已售罄：不是下单失败，继续监控即可
                         log("[提醒] %s（继续监控）" % msg)
                         if self.stop_event.wait(3):
@@ -471,6 +571,7 @@ class Grabber(threading.Thread):
                     pass
 
     def _notify_success(self, info, seat, msg):
+        log = self._log
         try:
             with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8") as f:
                 cfg = json.load(f)
@@ -490,7 +591,7 @@ class Grabber(threading.Thread):
 
 # ----------------------------- 与监控系统联动 -----------------------------
 
-def merge_trains_from_monitor(lc):
+def merge_trains_from_monitor(lc, saver=None):
     """把监控系统（config.json tasks）里的车次合并进启动器车次列表。
 
     规则：监控里新出现的车次自动加入启动器；被同步过的车次记录在
@@ -518,7 +619,7 @@ def merge_trains_from_monitor(lc):
     if added or synced != set(lc.get("synced_trains") or []):
         lc["trains"] = cur
         lc["synced_trains"] = sorted(synced)
-        save_launcher_config(lc)
+        (saver or save_launcher_config)(lc)
         if added:
             log("[运行] 监控系统新增车次已同步：%s" % "、".join(added))
         return True
@@ -552,7 +653,7 @@ def check_update(lc):
 
 def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
                        passengers, purpose_code, auto_order, stop_after_order,
-                       priority):
+                       priority, pax_purpose=None):
     """按监控系统的任务结构组装任务字典（与 gui.py QuickMonitorDialog 一致）。"""
     name = "%s-%s %s %s" % (
         from_name, to_name, "/".join(trains) if trains else "全部车次",
@@ -571,6 +672,7 @@ def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
         "passenger_names": passengers,
         "priority": int(priority),
         "purpose_code": purpose_code,
+        "pax_purpose": dict(pax_purpose or {}),
         "notify_channels": ["email"],
     }
 
@@ -978,7 +1080,7 @@ class CalendarDialog(tk.Toplevel):
             self.cur = datetime.now()
         self.title("选择乘车日期")
         self.resizable(False, False)
-        self.transient(master)
+        self.transient(master.winfo_toplevel())
         self.body = ttk.Frame(self, padding=10)
         self.body.pack(fill="both", expand=True)
         self._render()
@@ -1072,7 +1174,7 @@ class DateTimeDialog(tk.Toplevel):
         self.s_var = tk.StringVar(value="%02d" % self.sel.second)
         self.title("选择开抢时间")
         self.resizable(False, False)
-        self.transient(master)
+        self.transient(master.winfo_toplevel())
         self.body = ttk.Frame(self, padding=10)
         self.body.pack(fill="both", expand=True)
         self._render()
@@ -1191,7 +1293,7 @@ class QueryHistoryDialog(tk.Toplevel):
         self.on_pick = on_pick
         self.title("历史查询记录")
         self.geometry("380x320")
-        self.transient(master)
+        self.transient(master.winfo_toplevel())
         body = ttk.Frame(self, padding=10)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="双击一条记录填回行程：", foreground="#6e7781").pack(anchor="w")
@@ -1364,15 +1466,34 @@ class TrainCardList(ttk.Frame):
         return codes
 
 
-class LauncherApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.lc = load_launcher_config()
+class LauncherApp(tk.Frame):
+    """抢票主界面。master 为空 = 独立窗口（launcher.py 直接运行）；
+    master 给定时 = 嵌入宿主界面（监控系统侧边栏「抢票中心」页）。"""
+
+    def __init__(self, master=None, task=None, on_config_saved=None):
+        self._standalone = master is None
+        if self._standalone:
+            master = tk.Tk()
+        self._top = master if self._standalone else master.winfo_toplevel()
+        super().__init__(master)
+        self._mp = self._top          # 弹窗父窗口：独立=窗口自身，嵌入=宿主主窗口
+        self.task_id = (task or {}).get("id")
+        self.task_name = (task or {}).get("name") or ""
+        # 任务模式：配置来自任务条目，保存时写回任务库（由 on_config_saved 完成）
+        if task:
+            self.lc = dict(_DEFAULT_LC)
+            self.lc.update(task)
+        else:
+            self.lc = load_launcher_config()
+        self._save_cfg = on_config_saved or save_launcher_config
+        # 每个实例独立日志队列：任务窗口只显示自己的日志，多窗口互不串台
+        self.logq = queue.Queue()
         self.grabber = None
         self.armed = False
         self.auto_fired = False
         self.reminded = False
         self.pax_vars = {}
+        self.pax_purpose_vars = {}
         self.seat_vars = {}
         self.update_info = None
         self._monitor_mtime = 0.0
@@ -1383,17 +1504,21 @@ class LauncherApp(tk.Tk):
         self._train_rows = {}
         self._train_infos = []
 
-        self.title("12306 抢票启动器 v%s" % __version__)
-        self.minsize(780, 620)
         self._build()
         self._sync_from_lc()
-        # 高度按内容实测，屏幕放不下时压缩到可视区内
-        self.update_idletasks()
-        need_h = self.winfo_reqheight()
-        win_h = min(need_h, max(620, self.winfo_screenheight() - 70))
-        win_x = max(0, (self.winfo_screenwidth() - 820) // 2)
-        self.geometry("820x%d+%d+%d" % (win_h, win_x, 14))
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        if self._standalone:
+            self._top.title("12306 抢票启动器 v%s" % __version__)
+            self._top.minsize(780, 620)
+            self.pack(fill="both", expand=True)
+            # 高度按内容实测，屏幕放不下时压缩到可视区内
+            self.update_idletasks()
+            need_h = self.winfo_reqheight()
+            win_h = min(need_h, max(620, self.winfo_screenheight() - 70))
+            win_x = max(0, (self.winfo_screenwidth() - 820) // 2)
+            self._top.geometry("820x%d+%d+%d" % (win_h, win_x, 14))
+            self._top.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self.after(500, self._tick)
         self.after(200, self._drain)
         self.after(1200, self._check_update_async)
@@ -1423,7 +1548,7 @@ class LauncherApp(tk.Tk):
 
         top = ttk.Frame(self, padding=(12, 8))
         top.grid(row=0, column=0, sticky="ew")
-        ttk.Label(top, text="12306 抢票启动器", font=(FONT[0], 15, "bold")).pack(side="left")
+        ttk.Label(top, text=self.task_name or "12306 抢票启动器", font=(FONT[0], 15, "bold")).pack(side="left")
         ttk.Label(top, text="v" + __version__, foreground="#6e7781").pack(side="left", padx=(8, 0))
         self.update_lbl = ttk.Label(top, text="", foreground="#8250df", cursor="hand2")
         self.update_lbl.pack(side="right")
@@ -1516,19 +1641,13 @@ class LauncherApp(tk.Tk):
         self.cardlist.pack(fill="x", pady=(6, 0))
         self.cardlist.render([])
 
-        # 票种与席别（第 4 段）
+        # 席别（第 4 段）。票种不在这里——已下移到「乘车人」区，按每个人分别选成人/学生
         self.sf = ttk.LabelFrame(
-            self, text=" 票种与席别（点车次卡片可按该车实际余票刷新） ", padding=8)
+            self, text=" 席别（点车次卡片可按该车实际余票刷新） ", padding=8)
         sf = self.sf
         sf.grid(row=4, column=0, sticky="ew", padx=12, pady=(3, 0))
         s0 = ttk.Frame(sf)
         s0.pack(fill="x")
-        ttk.Label(s0, text="票种").pack(side="left")
-        self.purpose_var = tk.StringVar(value="ADULT")
-        ttk.Radiobutton(s0, text="成人票", value="ADULT", variable=self.purpose_var,
-                        command=self._on_purpose_change).pack(side="left", padx=(6, 0))
-        ttk.Radiobutton(s0, text="学生票", value="0X00", variable=self.purpose_var,
-                        command=self._on_purpose_change).pack(side="left", padx=(6, 0))
         self.seat_box = ttk.Frame(s0)
         self.seat_box.pack(side="left", fill="x", expand=True)
         self._rebuild_seats()
@@ -1606,7 +1725,7 @@ class LauncherApp(tk.Tk):
         self.trains_var.set(",".join(lc.get("trains") or []))
         self.date_var.set(lc.get("date") or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
         self.date_to_var.set(lc.get("date_to") or "")
-        self.purpose_var.set(lc.get("purpose_code") or "ADULT")
+        # 票种不再全局设置：_refresh_pax() 里按每个乘车人各自的保存值建下拉
         for s, v in self.seat_vars.items():
             v.set(s in (lc.get("seat_types") or []))
         self.start_var.set(lc.get("start_time") or "")
@@ -1617,7 +1736,7 @@ class LauncherApp(tk.Tk):
         if names:
             self.preset_cb.current(0)
         self._refresh_pax()
-        if merge_trains_from_monitor(self.lc):
+        if merge_trains_from_monitor(self.lc, self._save_cfg):
             self.trains_var.set(",".join(self.lc["trains"]))
         try:
             self._monitor_mtime = os.path.getmtime(os.path.join(HERE, "config.json"))
@@ -1636,7 +1755,6 @@ class LauncherApp(tk.Tk):
         lc = self.lc
         lc["from"] = self.from_ent.get()
         lc["to"] = self.to_ent.get()
-        lc["purpose_code"] = self.purpose_var.get() or "ADULT"
         lc["trains"] = [t.strip().upper() for t in re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
         lc["seat_types"] = [s for s, v in self.seat_vars.items() if v.get()]
         lc["date"] = self.date_var.get().strip()
@@ -1645,18 +1763,26 @@ class LauncherApp(tk.Tk):
         lc["remind_minutes"] = max(0, min(120, int(self.remind_var.get() or 10)))
         lc["warm_minutes"] = max(0, min(30, int(self.warm_var.get() or 10)))
         lc["passenger_names"] = [n for n, v in self.pax_vars.items() if v.get()]
+        if self.pax_purpose_vars:
+            lc["pax_purpose"] = {
+                n: (LABEL_TO_PURPOSE.get(v.get()) or "ADULT")
+                for n, v in self.pax_purpose_vars.items()}
+        # 兼容监控引擎 / 旧配置：全局口径 = 勾选乘车人的余票查询口径
+        lc["purpose_code"] = purpose_of(lc)
         hist = list(lc.get("station_history") or [])
         for stn in (lc["from"], lc["to"]):
             if stn and stn not in hist:
                 hist.insert(0, stn)
         lc["station_history"] = hist[:20]
-        save_launcher_config(lc)
+        self._save_cfg(lc)
 
     def _refresh_pax(self):
         cur_sel = {n for n, v in self.pax_vars.items() if v.get()}
+        cur_pp = {n: v.get() for n, v in self.pax_purpose_vars.items()}
         for w in self.pax_box.winfo_children():
             w.destroy()
         self.pax_vars.clear()
+        self.pax_purpose_vars.clear()
         try:
             plist = pax_mod.load_passengers()
         except Exception as e:
@@ -1667,13 +1793,27 @@ class LauncherApp(tk.Tk):
                       foreground="#6e7781").pack(side="left")
             return
         sel = cur_sel or self.lc.get("passenger_names") or pax_mod.default_names() or [plist[0]["name"]]
+        saved = self.lc.get("pax_purpose") or {}
+        default_code = self.lc.get("purpose_code") or "ADULT"
         for p in plist:
-            v = tk.BooleanVar(value=p["name"] in sel)
-            self.pax_vars[p["name"]] = v
-            label = "%s · %s" % (p["name"], mask_id(p.get("id_no")))
+            name = p["name"]
+            row = ttk.Frame(self.pax_box)
+            row.pack(side="left", padx=(0, 14))
+            v = tk.BooleanVar(value=name in sel)
+            self.pax_vars[name] = v
+            label = "%s · %s" % (name, mask_id(p.get("id_no")))
             if p.get("mobile"):
                 label += " · " + mask_mobile(p.get("mobile"))
-            ttk.Checkbutton(self.pax_box, text=label, variable=v).pack(side="left", padx=(0, 12))
+            ttk.Checkbutton(row, text=label, variable=v).pack(side="left")
+            # 票种按人：优先本次界面值 > 已保存值 > 全局兜底
+            code = (LABEL_TO_PURPOSE.get(cur_pp.get(name) or "")
+                    or saved.get(name) or default_code)
+            pv = tk.StringVar(value=PURPOSE_LABELS.get(code) or "成人票")
+            self.pax_purpose_vars[name] = pv
+            cb = ttk.Combobox(row, textvariable=pv, width=6, state="readonly",
+                              values=["成人票", "学生票"])
+            cb.pack(side="left", padx=(4, 0))
+            cb.bind("<<ComboboxSelected>>", self._on_pax_purpose_change)
 
     # ---- 车次查询与席别联动 ----
 
@@ -1691,9 +1831,9 @@ class LauncherApp(tk.Tk):
         names += sorted((s for s in (available or {}) if s not in SEAT_OPTIONS),
                         key=lambda x: SEAT_ORDER.get(x, 99))
         if available is not None:
-            self.sf.configure(text=" 票种与席别（已按所选车次刷新：%d 种可购席别） " % len(names))
+            self.sf.configure(text=" 席别（已按所选车次刷新：%d 种可购席别） " % len(names))
         else:
-            self.sf.configure(text=" 票种与席别（点车次卡片可按该车实际余票刷新，票价以官方下单页为准） ")
+            self.sf.configure(text=" 席别（点车次卡片可按该车实际余票刷新，票价以官方下单页为准） ")
         if not names:
             ttk.Label(self.seat_box, text="（该车次暂无可购席别）",
                       foreground="#6e7781").grid(row=0, column=0, sticky="w")
@@ -1730,16 +1870,20 @@ class LauncherApp(tk.Tk):
                 self._put_log("[提醒] 行程信息不完整，已关闭余票自动刷新")
             else:
                 messagebox.showwarning("参数不完整",
-                                       "请填写出发站 / 到达站，日期格式 YYYY-MM-DD", parent=self)
+                                       "请填写出发站 / 到达站，日期格式 YYYY-MM-DD", parent=self._mp)
             return
         self._querying = True
         self._last_query_ts = time.time()
         self.query_btn.configure(state="disabled")
         self.query_state.configure(text="查询中…", foreground="#d97706")
         lc = dict(self.lc)
-        self._put_log("[查询] %s → %s %s（%s）…" % (
-            lc.get("from"), lc.get("to"), lc.get("date"),
-            "学生票" if lc.get("purpose_code") == "0X00" else "成人票"))
+        _pm = lc.get("pax_purpose") or {}
+        _ptxt = "、".join(
+            "%s%s" % (n, "（学生票）" if _pm.get(n) == "0X00" else "")
+            for n in (lc.get("passenger_names") or [])) or "账号默认乘车人"
+        self._put_log("[查询] %s → %s %s（乘车人：%s；余票口径 %s）…" % (
+            lc.get("from"), lc.get("to"), lc.get("date"), _ptxt,
+            PURPOSE_LABELS.get(purpose_of(lc)) or "成人票"))
         threading.Thread(target=self._query_work, args=(lc,), daemon=True,
                          name="train-query").start()
 
@@ -1772,8 +1916,7 @@ class LauncherApp(tk.Tk):
                 raise RuntimeError("车站无法识别：%s / %s" % (lc.get("from"), lc.get("to")))
             infos = []
             for dt in self._resolve_dates(lc):
-                rows = tk_mod.query_tickets(fc, tc, dt,
-                                            purpose=lc.get("purpose_code") or "ADULT")
+                rows = tk_mod.query_tickets(fc, tc, dt, purpose=purpose_of(lc))
                 for r in rows:
                     info = tk_mod.parse_row(r, code2name, dt)
                     info["_date"] = dt
@@ -1844,10 +1987,16 @@ class LauncherApp(tk.Tk):
         self.query_state.configure(text="查询失败", foreground="#cf222e")
         self._put_log("[错误] 车次查询失败：%s" % err)
 
-    def _on_purpose_change(self):
-        self.lc["purpose_code"] = self.purpose_var.get() or "ADULT"
-        self._put_log("[票种] 已切换为%s（余票口径随之变化，建议重新查询）" % (
-            "学生票" if self.purpose_var.get() == "0X00" else "成人票"))
+    def _on_pax_purpose_change(self, *_):
+        """某个乘车人的票种改了：立刻落盘，并提示余票口径可能随之变化。"""
+        self._ui_to_lc()
+        lc = self.lc
+        pm = lc.get("pax_purpose") or {}
+        picked = [n for n, v in self.pax_vars.items() if v.get()]
+        txt = "、".join("%s=%s" % (n, PURPOSE_LABELS.get(pm.get(n)) or "成人票")
+                        for n in picked) or "未勾选乘车人"
+        self._put_log("[票种] %s；余票口径 %s（建议重新查询车次）" % (
+            txt, PURPOSE_LABELS.get(purpose_of(lc)) or "成人票"))
 
     def _clear_train_rows(self):
         self._train_infos = []
@@ -1882,12 +2031,12 @@ class LauncherApp(tk.Tk):
                         and h.get("date") == item["date"])]
         hist.insert(0, item)
         lc["query_history"] = hist[:10]
-        save_launcher_config(lc)
+        self._save_cfg(lc)
 
     def _show_query_history(self):
         hist = self.lc.get("query_history") or []
         if not hist:
-            messagebox.showinfo("历史查询记录", "还没有查询记录。", parent=self)
+            messagebox.showinfo("历史查询记录", "还没有查询记录。", parent=self._mp)
             return
         QueryHistoryDialog(self, hist, self._apply_history)
 
@@ -1926,7 +2075,7 @@ class LauncherApp(tk.Tk):
                 if ok:
                     self.auto_fired = True
                     self._set_status("ok", "抢票成功！")
-                    self.bell()
+                    self._top.bell()
                 else:
                     self._set_status("idle", msg or "已停止")
             if not self.grabber:
@@ -1946,9 +2095,9 @@ class LauncherApp(tk.Tk):
                         if self.armed and not self.reminded and remind > 0 and diff <= remind * 60:
                             self.reminded = True
                             self._put_log("[提醒] 距离开抢不到 %d 分钟！" % remind)
-                            self.bell()
+                            self._top.bell()
                             messagebox.showinfo("开抢提醒", "距离开抢不到 %d 分钟！\n开抢时间：%s" % (
-                                remind, st.strftime("%Y-%m-%d %H:%M:%S")), parent=self)
+                                remind, st.strftime("%Y-%m-%d %H:%M:%S")), parent=self._mp)
                     else:
                         if self.armed and not self.auto_fired and (now - st).total_seconds() <= max(90, lead):
                             self.auto_fired = True
@@ -1958,7 +2107,7 @@ class LauncherApp(tk.Tk):
                             else:
                                 self._put_log("[自动] 已到点，自动开始抢票（%s）" % st.strftime("%H:%M:%S"))
                             self._put_log("[提示] 抢票在后台运行，浏览器无窗口，请勿关闭本窗口")
-                            self.bell()
+                            self._top.bell()
                             self.start_grab(auto=True)
                         elif self.armed and not self.auto_fired:
                             self.armed = False
@@ -1968,7 +2117,10 @@ class LauncherApp(tk.Tk):
                 else:
                     self.countdown_lbl.configure(text="未设置开抢时间")
         finally:
-            self.after(500, self._tick)
+            try:
+                self.after(500, self._tick)
+            except tk.TclError:
+                pass  # 窗口已销毁，停止循环
 
     # ---- 与监控系统实时联动 ----
 
@@ -1982,7 +2134,7 @@ class LauncherApp(tk.Tk):
         if mt == self._monitor_mtime:
             return
         self._monitor_mtime = mt
-        if merge_trains_from_monitor(self.lc):
+        if merge_trains_from_monitor(self.lc, self._save_cfg):
             self.trains_var.set(",".join(self.lc["trains"]))
 
     def _sync_pax(self):
@@ -2000,7 +2152,7 @@ class LauncherApp(tk.Tk):
     def _drain(self):
         try:
             while True:
-                self._put_log(LOGQ.get_nowait())
+                self._put_log(self.logq.get_nowait())
         except queue.Empty:
             pass
         try:
@@ -2012,7 +2164,10 @@ class LauncherApp(tk.Tk):
                     self._apply_train_error(payload)
         except queue.Empty:
             pass
-        self.after(200, self._drain)
+        try:
+            self.after(200, self._drain)
+        except tk.TclError:
+            pass  # 窗口已销毁，停止循环
 
     def _put_log(self, line):
         txt = self.log_text
@@ -2035,16 +2190,16 @@ class LauncherApp(tk.Tk):
     def _validate(self):
         lc = self.lc
         if not lc.get("from") or not lc.get("to"):
-            messagebox.showwarning("参数不完整", "请填写出发站和到达站", parent=self)
+            messagebox.showwarning("参数不完整", "请填写出发站和到达站", parent=self._mp)
             return False
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", lc.get("date") or ""):
-            messagebox.showwarning("参数不完整", "日期格式应为 YYYY-MM-DD", parent=self)
+            messagebox.showwarning("参数不完整", "日期格式应为 YYYY-MM-DD", parent=self._mp)
             return False
         if not lc.get("seat_types"):
-            messagebox.showwarning("参数不完整", "请至少勾选一种席别", parent=self)
+            messagebox.showwarning("参数不完整", "请至少勾选一种席别", parent=self._mp)
             return False
         if not lc.get("passenger_names"):
-            if not messagebox.askyesno("未选乘车人", "未勾选乘车人，将使用账号默认乘车人，继续？", parent=self):
+            if not messagebox.askyesno("未选乘车人", "未勾选乘车人，将使用账号默认乘车人，继续？", parent=self._mp):
                 return False
         return True
 
@@ -2062,7 +2217,7 @@ class LauncherApp(tk.Tk):
         self._ui_to_lc()
         if not self._validate():
             return
-        self.grabber = Grabber(dict(self.lc))
+        self.grabber = Grabber(dict(self.lc), logq=self.logq)
         self.grabber.start()
         self._set_status("running", "抢票中…（后台运行，无窗口）")
         self.go_btn.configure(text="停 止", bg="#57606a")
@@ -2089,7 +2244,7 @@ class LauncherApp(tk.Tk):
         def worker():
             try:
                 ok, who = browser_order.check_session()
-                LOGQ.put("[会话] 校验结果：%s（%s）" % ("已登录" if ok else "未登录", who))
+                self.logq.put("[会话] 校验结果：%s（%s）" % ("已登录" if ok else "未登录", who))
             except Exception as e:
                 LOGQ.put("[错误] 会话校验异常：%s" % e)
         threading.Thread(target=worker, daemon=True).start()
@@ -2098,7 +2253,7 @@ class LauncherApp(tk.Tk):
         self._put_log("[运行] 正在定位当前 IP 位置…")
 
         def worker():
-            LOGQ.put("[提醒] 当前位置：%s" % ip_locate())
+            self.logq.put("[提醒] 当前位置：%s" % ip_locate())
         threading.Thread(target=worker, daemon=True).start()
 
     def _check_update_async(self):
@@ -2119,7 +2274,7 @@ class LauncherApp(tk.Tk):
             ver, notes, url = self.update_info
             self.update_lbl.configure(text="新版本 v%s 可用，点击查看" % ver)
             self.update_lbl.bind("<Button-1>", lambda e: messagebox.showinfo(
-                "版本更新", "新版本：v%s\n\n%s\n\n下载地址：%s" % (ver, notes or "（无说明）", url or "（未提供）"), parent=self))
+                "版本更新", "新版本：v%s\n\n%s\n\n下载地址：%s" % (ver, notes or "（无说明）", url or "（未提供）"), parent=self._mp))
 
     # ---- 预设 ----
 
@@ -2144,7 +2299,7 @@ class LauncherApp(tk.Tk):
 
     def _save_preset(self):
         self._ui_to_lc()
-        name = simpledialog.askstring("存为预设", "给这个常用行程起个名字：", parent=self,
+        name = simpledialog.askstring("存为预设", "给这个常用行程起个名字：", parent=self._mp,
                                       initialvalue=self.preset_cb.get())
         if not name:
             return
@@ -2159,7 +2314,7 @@ class LauncherApp(tk.Tk):
         presets = [p for p in (self.lc.get("presets") or []) if (p.get("name") or "") != entry["name"]]
         presets.append(entry)
         self.lc["presets"] = presets
-        save_launcher_config(self.lc)
+        self._save_cfg(self.lc)
         self.preset_cb.configure(values=[p["name"] for p in presets])
         self.preset_cb.set(entry["name"])
         self._put_log("[运行] 常用行程「%s」已保存" % entry["name"])
@@ -2167,11 +2322,11 @@ class LauncherApp(tk.Tk):
     def _delete_preset(self):
         p = self._current_preset()
         if not p:
-            messagebox.showinfo("删除预设", "请先在下拉框里选中要删除的行程", parent=self)
+            messagebox.showinfo("删除预设", "请先在下拉框里选中要删除的行程", parent=self._mp)
             return
-        if messagebox.askyesno("删除预设", "确定删除常用行程「%s」？" % p.get("name"), parent=self):
+        if messagebox.askyesno("删除预设", "确定删除常用行程「%s」？" % p.get("name"), parent=self._mp):
             self.lc["presets"] = [x for x in (self.lc.get("presets") or []) if x is not p]
-            save_launcher_config(self.lc)
+            self._save_cfg(self.lc)
             self.preset_cb.configure(values=[x.get("name") or "" for x in self.lc["presets"]])
             self.preset_cb.set("")
             self._put_log("[运行] 常用行程「%s」已删除" % p.get("name"))
@@ -2203,7 +2358,10 @@ class LauncherApp(tk.Tk):
             self._ui_to_lc()
         except Exception:
             pass
-        self.destroy()
+        if self._standalone:
+            self._top.destroy()
+        else:
+            self.destroy()
 
 
 class NewMonitorTaskDialog(tk.Toplevel):
@@ -2226,7 +2384,7 @@ class NewMonitorTaskDialog(tk.Toplevel):
             self.destroy()
             return
         self._build()
-        self.transient(app)
+        self.transient(app.winfo_toplevel())
         self.grab_set()
 
     def _build(self):
@@ -2368,7 +2526,8 @@ class NewMonitorTaskDialog(tk.Toplevel):
         task = build_monitor_task(from_name, to_name, dates, date_range, trains,
                                   seats, passengers, self.purpose_var.get(),
                                   self.auto_var.get(), self.stop_var.get(),
-                                  self.prio_var.get())
+                                  self.prio_var.get(),
+                                  pax_purpose=self.app.lc.get("pax_purpose") or {})
         try:
             name = append_monitor_task(task, start_now)
         except Exception as e:
@@ -2382,12 +2541,11 @@ class NewMonitorTaskDialog(tk.Toplevel):
                 "完成",
                 "任务「%s」已创建并开始监视。\n\n监控软件运行中会自动加载"
                 "（约 2 秒），引擎运行时立即自动开抢；\n若监控软件未开启，"
-                "下次启动后该任务已在监控中。" % name, parent=self.app)
+                "下次启动后该任务已在监控中。" % name)
         else:
             messagebox.showinfo(
                 "完成",
-                "任务「%s」已创建。\n\n在监控软件里勾选「启动」后开始监视。" % name,
-                parent=self.app)
+                "任务「%s」已创建。\n\n在监控软件里勾选「启动」后开始监视。" % name)
 
 
 class PassengerDialog(tk.Toplevel):
@@ -2400,7 +2558,7 @@ class PassengerDialog(tk.Toplevel):
         self.title("乘车人信息")
         self.geometry("380x330")
         self.resizable(False, False)
-        self.transient(master)
+        self.transient(master.winfo_toplevel())
         self.grab_set()
         try:
             self.plist = pax_mod.load_passengers()
@@ -2555,10 +2713,298 @@ def ensure_passengers():
         log("[错误] 乘车人导入失败：%s" % e)
 
 
+class GrabTaskWindow(tk.Toplevel):
+    """单个抢票任务的独立窗口：内嵌一套完整的 LauncherApp 抢票界面。
+
+    各任务配置 / 日志 / 状态完全隔离，多窗口可同时并行抢票；
+    关闭窗口 = 停止该任务抢票并保存配置。"""
+
+    def __init__(self, manager, task):
+        super().__init__(manager.winfo_toplevel())
+        self.manager = manager
+        self.task = task
+        self.title("抢票任务 · %s" % (task.get("name") or "未命名"))
+        self.app = LauncherApp(self, task=task, on_config_saved=self._save_task)
+        self.app.pack(fill="both", expand=True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 尺寸按内容实测，居中偏上放置，避免遮住任务列表
+        self.update_idletasks()
+        w, h = 860, min(760, self.winfo_screenheight() - 60)
+        x = max(0, (self.winfo_screenwidth() - w) // 2)
+        y = max(0, (self.winfo_screenheight() - h) // 3)
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self.minsize(780, 620)
+        self.lift()
+        self.focus_set()
+
+    def _save_task(self, lc):
+        """保存回调：界面配置写回任务库，并刷新管理器列表。"""
+        lc["id"] = self.task.get("id")
+        lc["name"] = self.task.get("name") or lc.get("name") or "未命名"
+        lc["status"] = lc.get("status") or "idle"
+        self.task.update(lc)
+        self.manager._upsert_task(lc)
+
+    def _on_close(self):
+        try:
+            if self.app.grabber:
+                self.app.stop_grab()
+            self.app.lc["status"] = "idle"
+            self._save_task(self.app.lc)
+        finally:
+            self.manager._on_window_closed(self.task.get("id"))
+            self.destroy()
+
+
+class TaskManagerPanel(tk.Frame):
+    """抢票多任务管理器：任务列表 + 每任务独立窗口（可并行抢票）+ 全局日志。
+
+    master 为空 = 独立窗口（launcher.py 直接运行）；
+    master 给定时 = 嵌入宿主界面（监控系统侧边栏「抢票任务」页）。"""
+
+    STATUS_LABELS = {
+        "idle": ("就绪", "#6e7781"),
+        "running": ("抢票中", "#d97706"),
+        "ok": ("已抢到", "#1a7f37"),
+        "stopped": ("已停止", "#6e7781"),
+    }
+
+    def __init__(self, master=None):
+        self._standalone = master is None
+        if self._standalone:
+            master = tk.Tk()
+        self._top = master if self._standalone else master.winfo_toplevel()
+        super().__init__(master)
+        self._mp = self._top
+        self.tasks = load_grab_tasks()
+        self._windows = {}       # task_id -> GrabTaskWindow
+        self._row_widgets = {}   # task_id -> (row_frame, status_lbl)
+        self._build()
+        self._refresh_list()
+        if self._standalone:
+            self._top.title("12306 抢票任务管理 v%s" % __version__)
+            self._top.minsize(760, 520)
+            self.pack(fill="both", expand=True)
+            self.update_idletasks()
+            win_h = min(max(560, self.winfo_reqheight()), self.winfo_screenheight() - 60)
+            win_x = max(0, (self.winfo_screenwidth() - 820) // 2)
+            self._top.geometry("820x%d+%d+%d" % (win_h, win_x, 40))
+            self._top.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(200, self._drain)
+        self.after(800, self._tick)
+
+    # ---- 界面 ----
+
+    def _build(self):
+        self.grid_columnconfigure(0, weight=1)
+
+        top = ttk.Frame(self, padding=(12, 10))
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, text="抢票任务管理", font=(FONT[0], 15, "bold")).pack(side="left")
+        ttk.Label(top, text="每个任务独立窗口、独立配置，可同时抢多个车次/日期",
+                  foreground="#6e7781").pack(side="left", padx=(10, 0))
+        ttk.Button(top, text="＋ 新建任务", command=self._new_task).pack(side="right")
+        ttk.Button(top, text="测试会话", command=self._test_session).pack(side="right", padx=(0, 8))
+
+        lf = ttk.LabelFrame(self, text=" 任务列表 ", padding=8)
+        lf.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 0))
+        self.list_box = ttk.Frame(lf)
+        self.list_box.pack(fill="x")
+
+        lg = ttk.LabelFrame(self, text=" 系统日志（全局：登录 / 下单细节 / 通用消息） ", padding=4)
+        lg.grid(row=2, column=0, sticky="nsew", padx=12, pady=(8, 12))
+        self.grid_rowconfigure(2, weight=1)
+        txt = tk.Text(lg, height=3, wrap="word", state="disabled", font=(FONT[0], 9))
+        sb = ttk.Scrollbar(lg, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        self.log_text = txt
+        for tag, color in LOG_COLOR.items():
+            txt.tag_configure(tag, foreground=color)
+
+    # ---- 任务列表 ----
+
+    def _refresh_list(self):
+        for w in self.list_box.winfo_children():
+            w.destroy()
+        self._row_widgets.clear()
+        if not self.tasks:
+            ttk.Label(self.list_box, text="还没有任务，点右上角「＋ 新建任务」创建第一个抢票任务",
+                      foreground="#6e7781").pack(pady=10)
+            return
+        for t in self.tasks:
+            self._add_row(t)
+
+    def _add_row(self, task):
+        tid = task.get("id")
+        row = ttk.Frame(self.list_box)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text=task.get("name") or "未命名",
+                  font=(FONT[0], 10, "bold"), width=12, anchor="w").pack(side="left")
+        bits = ["%s → %s" % (task.get("from") or "?", task.get("to") or "?"),
+                (task.get("date") or "?") + ("~%s" % task["date_to"] if task.get("date_to") else "")]
+        if task.get("trains"):
+            bits.append("/".join(task.get("trains")))
+        ttk.Label(row, text=" · ".join(bits), foreground="#57606a").pack(
+            side="left", padx=(6, 0), fill="x", expand=True)
+        label, color = self.STATUS_LABELS.get(task.get("status") or "idle", ("就绪", "#6e7781"))
+        status_lbl = ttk.Label(row, text=label, foreground=color, width=8, anchor="center")
+        status_lbl.pack(side="left", padx=6)
+        ttk.Button(row, text="打开", width=6,
+                   command=lambda t=task: self._open_task(t.get("id"))).pack(side="left", padx=2)
+        ttk.Button(row, text="改名", width=6,
+                   command=lambda t=task: self._rename_task(t.get("id"))).pack(side="left", padx=2)
+        ttk.Button(row, text="删除", width=6,
+                   command=lambda t=task: self._delete_task(t.get("id"))).pack(side="left", padx=2)
+        self._row_widgets[tid] = (row, status_lbl)
+
+    # ---- 任务操作 ----
+
+    def _find(self, tid):
+        for t in self.tasks:
+            if t.get("id") == tid:
+                return t
+        return None
+
+    def _new_task(self):
+        task = new_grab_task(len(self.tasks) + 1)
+        self.tasks.append(task)
+        save_grab_tasks(self.tasks)
+        self._refresh_list()
+        self._open_task(task["id"])
+        self._put_log("[任务] 已创建「%s」" % task["name"])
+
+    def _open_task(self, tid):
+        w = self._windows.get(tid)
+        if w and w.winfo_exists():
+            w.deiconify()
+            w.lift()
+            w.focus_set()
+            return
+        task = self._find(tid)
+        if task is None:
+            return
+        self._windows[tid] = GrabTaskWindow(self, task)
+
+    def _rename_task(self, tid):
+        task = self._find(tid)
+        if task is None:
+            return
+        name = simpledialog.askstring("重命名任务", "新的任务名：", parent=self._mp,
+                                      initialvalue=task.get("name") or "")
+        if not name:
+            return
+        task["name"] = name.strip() or task.get("name")
+        save_grab_tasks(self.tasks)
+        w = self._windows.get(tid)
+        if w and w.winfo_exists():
+            w.title("抢票任务 · %s" % task["name"])
+            w.app.task_name = task["name"]
+        self._refresh_list()
+        self._put_log("[任务] 已重命名为「%s」" % task["name"])
+
+    def _delete_task(self, tid):
+        task = self._find(tid)
+        if task is None:
+            return
+        if not messagebox.askyesno("删除任务", "确定删除抢票任务「%s」？" % (task.get("name") or "未命名"),
+                                   parent=self._mp):
+            return
+        w = self._windows.pop(tid, None)
+        if w and w.winfo_exists():
+            w.destroy()
+        self.tasks = [t for t in self.tasks if t.get("id") != tid]
+        save_grab_tasks(self.tasks)
+        self._refresh_list()
+        self._put_log("[任务] 已删除「%s」" % task.get("name"))
+
+    def _upsert_task(self, lc):
+        """任务窗口保存回调：按 id 写回任务库并刷新列表。"""
+        tid = lc.get("id")
+        for i, t in enumerate(self.tasks):
+            if t.get("id") == tid:
+                self.tasks[i] = lc
+                break
+        else:
+            self.tasks.append(lc)
+        save_grab_tasks(self.tasks)
+        self._refresh_list()
+
+    def _on_window_closed(self, tid):
+        self._windows.pop(tid, None)
+        for t in self.tasks:
+            if t.get("id") == tid:
+                t["status"] = "idle"
+        save_grab_tasks(self.tasks)
+        self._refresh_list()
+        self._put_log("[任务] 「%s」窗口已关闭（已停止抢票并保存配置）"
+                      % (next((t.get("name") for t in self.tasks if t.get("id") == tid), "?")))
+
+    # ---- 定时刷新 / 日志 ----
+
+    def _tick(self):
+        try:
+            for tid, (row, status_lbl) in list(self._row_widgets.items()):
+                w = self._windows.get(tid)
+                if w and w.winfo_exists() and w.app.grabber and w.app.grabber.is_alive():
+                    label, color = "抢票中", "#d97706"
+                else:
+                    t = self._find(tid)
+                    label, color = self.STATUS_LABELS.get((t or {}).get("status") or "idle",
+                                                          ("就绪", "#6e7781"))
+                status_lbl.configure(text=label, foreground=color)
+        finally:
+            try:
+                self.after(800, self._tick)
+            except tk.TclError:
+                pass
+
+    def _drain(self):
+        try:
+            while True:
+                self._put_log(LOGQ.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            self.after(200, self._drain)
+        except tk.TclError:
+            pass
+
+    def _put_log(self, line):
+        txt = self.log_text
+        txt.configure(state="normal")
+        txt.insert("end", line + "\n")
+        for tag in LOG_COLOR:
+            if tag in line:
+                txt.tag_add(tag, "end-2l", "end-1l")
+                break
+        txt.configure(state="disabled")
+        txt.see("end")
+
+    def _test_session(self):
+        def worker():
+            try:
+                ok, who = browser_order.check_session()
+                log("[会话] 校验结果：%s（%s）" % ("已登录" if ok else "未登录", who))
+            except Exception as e:
+                log("[错误] 会话校验异常：%s" % e)
+        threading.Thread(target=worker, daemon=True).start()
+        self._put_log("[会话] 正在校验登录状态…")
+
+    def _on_close(self):
+        for w in list(self._windows.values()):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._top.destroy()
+
+
 def main():
     ensure_passengers()
-    app = LauncherApp()
-    app.mainloop()
+    panel = TaskManagerPanel()
+    panel._top.mainloop()
 
 
 if __name__ == "__main__":

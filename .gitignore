@@ -12,6 +12,8 @@ order_history.json
 passengers.json
 # launcher 的本地配置（含乘车人、常用路线等个人数据）
 launcher_config.json
+# 抢票任务数据（含乘车人、行程等个人数据）
+grab_tasks.json
 # 日志
 logs/
 

@@ -46,6 +46,7 @@ import notify as notify_mod
 import order as order_mod
 import passengers as passengers_mod
 import ticket
+import launcher
 
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
@@ -2070,6 +2071,7 @@ class SidebarPanel(tk.Frame):
 
         # 导航项（固定顺序）
         self._add_item("tasks", "▤", "任务状态", lambda: self.app.show_page("tasks"))
+        self._add_item("grab", "⚡", "抢票任务", lambda: self.app.show_page("grab"))
         self._add_item("history", "◷", "购票历史", lambda: self.app.show_page("history"))
         self._add_item("notify", "✉", "通知设置", lambda: self.app.show_page("notify"))
 
@@ -2918,6 +2920,9 @@ class MonitorApp:
         self.pages["tasks"] = TaskPage(self.content, self)
         self.pages["history"] = HistoryPanel(self.content, self)
         self.pages["notify"] = NotifyPanel(self.content, self)
+        # 抢票任务：多任务管理器（每个任务独立窗口、独立配置，可并行抢票）
+        self.pages["grab"] = launcher.TaskManagerPanel(self.content)
+        self.pages["grab"].configure(bg=BG)
         self.task_page = self.pages["tasks"]
 
         log_head = tk.Frame(right, bg=BG)
@@ -2953,7 +2958,8 @@ class MonitorApp:
         for page in self.pages.values():
             page.pack_forget()
         self.pages[key].pack(fill="both", expand=True)
-        mapping = {"tasks": "tasks", "history": "history", "notify": "notify"}
+        mapping = {"tasks": "tasks", "history": "history", "notify": "notify",
+                   "grab": "grab"}
         self.sidebar.set_active(mapping[key])
 
     def toggle_sidebar(self):

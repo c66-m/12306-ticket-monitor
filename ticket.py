@@ -60,6 +60,24 @@ SEAT_CODE_TO_NAME = {
 }
 SEAT_NAME_TO_CODE = {v: k for k, v in SEAT_CODE_TO_NAME.items()}
 
+# 12306 网页端确认页的可售席别由服务端下发，普速车不下发「无座」（实测 K925/K225/K1969
+# 长葛→确山各日期都只给 硬座/硬卧/软卧）。无座与硬座同价，按同价原则改判为硬座下单，
+# 监控侧仍按用户勾选的席别判断有无票。
+ORDER_SEAT_ALIAS = {"WZ": "1"}
+
+
+def order_seat_code(seat_name, seat_code=None):
+    """下单实际要用的席位代码 + 别名目标名。
+
+    返回 (code, alias_name)：命中同价改判时 code 为别名代码、alias_name 为其中文名；
+    没命中时 alias_name 为 None、code 原样返回。
+    """
+    code = seat_code or SEAT_NAME_TO_CODE.get(seat_name)
+    alias = ORDER_SEAT_ALIAS.get(code)
+    if alias:
+        return alias, SEAT_CODE_TO_NAME.get(alias)
+    return code, None
+
 _SESSION = None
 
 

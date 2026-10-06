@@ -62,6 +62,8 @@ DEDUPE_VALUES = {
     "ACCOUNT_DUP": "账号已有订单(防重跳过)",
     "NO_ORDER": "已记录(不自动下单)",
     "MANUAL": "人工确认",
+    # 网页端下单页不下发该席别（如普速车的「无座」）：重试无用，永久跳过
+    "SEAT_UNAVAILABLE": "网页端不提供该席别(已跳过)",
 }
 
 LOG = logging.getLogger("monitor")
@@ -502,7 +504,7 @@ class MonitorEngine(object):
                     retry_map = self.state.setdefault("retry", {})
                     due_at = retry_map.get(key, 0)
                     if due_at and time.time() < due_at:
-                        LOG.info("[冷却] 任务「%s」上次抢票遇系统忙，%d 秒后自动重试",
+                        LOG.info("[冷却] 任务「%s」上次下单未成需等待（系统忙/改判席别此刻不可售），%d 秒后自动重试",
                                  name, int(due_at - time.time()))
                         continue
                     if due_at:
@@ -540,6 +542,40 @@ class MonitorEngine(object):
                         continue
                     else:
                         msg = (extra or {}).get("msg", "")
+                        if (extra or {}).get("reason") == "seat_unavailable":
+                            # 确认页可售席别由 12306 服务端下发（普速车常常没有「无座」），
+                            # 换时间点重试也不会有：记入 dedup 永久跳过，别无限重试刷日志
+                            self.state["dedup"][key] = "SEAT_UNAVAILABLE"
+                            self._save_state()
+                            self._append_history({
+                                "time": self._now(), "task": name, "result": "seat_unavailable",
+                                "train": train_code, "date": date, "from": info["from_name"],
+                                "to": info["to_name"], "seat": seat_name,
+                                "passengers": p_names, "order_no": "",
+                                "message": msg, "notify": "",
+                            })
+                            that = (extra or {}).get("seat_options") or "未知"
+                            entry["message"] = "席别不可选：%s %s（服务端只下发 %s）" % (
+                                train_code, seat_name, that)
+                            LOG.warning("[跳过] 任务「%s」%s %s %s 在网页端下单页不可选"
+                                        "（服务端只下发：%s），已加入跳过名单；"
+                                        "如需该席位请改勾其他席别或换车次",
+                                        name, date, train_code, seat_name, that)
+                            continue
+                        if (extra or {}).get("reason") == "alias_no_stock":
+                            # 勾选无座→同价改判硬座，但硬座此刻不可售：属车次状态问题，
+                            # 冷确一段时间再试，别按普通失败每轮刷提交请求
+                            try:
+                                cooldown = max(5, int(self.config.get(
+                                    "order_retry_cooldown_seconds", 7)))
+                            except (TypeError, ValueError):
+                                cooldown = 7
+                            retry_map[key] = time.time() + cooldown
+                            self._prune_retry_map(retry_map)
+                            LOG.info("[等待] 任务「%s」%s %s 勾选 %s、改判 %s 此刻不可售，%d 秒后重试",
+                                     name, date, train_code, seat_name,
+                                     (extra or {}).get("alias_seat") or "?", cooldown)
+                            continue
                         if "会话已失效" in msg or "未找到会话文件" in msg:
                             self.set_task_status(task, "failed",
                                 "登录会话不可用，请重新运行 capture_session.py 登录后恢复任务")
@@ -586,11 +622,19 @@ class MonitorEngine(object):
             return "ok", extra or {}
         if extra and extra.get("reason") == "dup":
             return "dup", extra
-        return "fail", {"msg": msg}
+        # 保留下单层返回的机器可读信息（reason / seat_codes / seat_options / need_captcha…），
+        # 否则这些线索在上层被丢掉，只剩一句人类文案，无法做分类处理
+        packed = dict(extra) if isinstance(extra, dict) else {}
+        packed["msg"] = msg
+        return "fail", packed
 
     def _record_success(self, task, info, date, seat_name, extra):
         name = task["name"]
         order_no = extra.get("order_no") or ""
+        alias_seat = extra.get("alias_seat") or ""
+        # 勾选无座→网页端同价按硬座出票：通知与历史里要如实写清楚
+        seat_display = seat_name + ("（勾选 %s，网页端同价按 %s 出票）" % (
+            extra.get("selected_seat") or seat_name, alias_seat) if alias_seat else "")
         subject = "[购票成功] {0} {1} 有余票且已提交订单".format(info["train_code"], date)
         body = (
             "已自动提交订单（未支付，请在 12306 45 分钟内完成支付）：\n\n"
@@ -599,7 +643,7 @@ class MonitorEngine(object):
             "乘车人：{passengers}\n"
         ).format(train=info["train_code"], date=date, _from=info["from_name"],
                  _to=info["to_name"], start=info["start_time"],
-                 arrive=info["arrive_time"], seat=seat_name,
+                 arrive=info["arrive_time"], seat=seat_display,
                  passengers=extra.get("passengers", ""))
         if order_no:
             body += "订单号：{0}\n".format(order_no)
@@ -612,11 +656,13 @@ class MonitorEngine(object):
             "train": info["train_code"], "date": date, "from": info["from_name"],
             "to": info["to_name"], "seat": seat_name,
             "passengers": (extra.get("passengers") or "").split("、") if extra else [],
-            "order_no": order_no, "message": "订单提交成功（未支付）",
+            "order_no": order_no,
+            "message": "订单提交成功（未支付）" + ("，勾选 %s 同价按 %s 出票" % (
+                extra.get("selected_seat") or seat_name, alias_seat) if alias_seat else ""),
             "notify": notify_txt,
         })
         LOG.info("[抢到] 任务「%s」已提交订单：%s %s %s 乘车人:%s 订单号:%s",
-                 name, date, info["train_code"], seat_name,
+                 name, date, info["train_code"], seat_display,
                  extra.get("passengers", ""), order_no or "未知")
 
     def _note_failure(self, task, message):
