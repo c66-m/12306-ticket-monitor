@@ -38,8 +38,8 @@ import ticket
 
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
-SEAT_CHOICES = ["商务座", "特等座", "一等座", "二等座", "高级软卧",
-                "软卧", "动卧", "硬卧", "软座", "硬座", "无座"]
+# 席别勾选列表：唯一定义在 ticket.py（含优选一等座与动卧），此处只引用
+SEAT_CHOICES = list(ticket.SEAT_CHOICES)
 
 
 def fresh_engine():

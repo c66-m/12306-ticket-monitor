@@ -51,8 +51,8 @@ import launcher
 
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
-SEAT_CHOICES = ["商务座", "特等座", "优选一等座", "一等座", "二等座",
-                "高级软卧", "软卧", "硬卧", "软座", "硬座", "无座"]
+# 席别勾选列表：唯一定义在 ticket.py（含动卧），此处只引用
+SEAT_CHOICES = list(ticket.SEAT_CHOICES)
 
 BLUE = "#4A90E2"
 BLUE_DARK = "#3D7ED9"
@@ -558,11 +558,14 @@ class ScrollFrame(ttk.Frame):
             w = self.winfo_containing(e.x_root, e.y_root)
             while w is not None and w is not self.canvas:
                 w = w.master
+            if w is None:
+                return  # 指针不在本滚动区上：不接管，别的滚动区/控件自己处理
+            if self.canvas.winfo_exists():
+                self.canvas.yview_scroll(int(-e.delta / 120), "units")
+        except tk.TclError:
+            pass  # 窗口/控件销毁竞态
         except Exception:
             return
-        if w is None:
-            return  # 指针不在本滚动区上：不接管，别的滚动区/控件自己处理
-        self.canvas.yview_scroll(int(-e.delta / 120), "units")
 
     def clear(self):
         for w in self.inner.winfo_children():

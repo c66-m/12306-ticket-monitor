@@ -56,12 +56,11 @@ __version__ = "1.0.0"
 LAUNCHER_CFG_PATH = os.path.join(HERE, "launcher_config.json")
 LOG_DIR = os.path.join(HERE, "logs")
 
-SEAT_OPTIONS = ["商务座", "特等座", "优选一等座", "一等座", "二等座", "高级软卧",
-               "软卧", "硬卧", "软座", "硬座", "无座"]
+# 席别勾选列表：唯一定义在 ticket.py（含动卧），此处只引用
+SEAT_OPTIONS = list(tk_mod.SEAT_CHOICES)
 SEAT_ORDER = {v: i for i, v in enumerate(SEAT_OPTIONS)}
-# 监控系统任务的完整席别表（与 gui.py 的 SEAT_CHOICES 一致）
-MONITOR_SEAT_CHOICES = ["商务座", "特等座", "优选一等座", "一等座", "二等座",
-                       "高级软卧", "软卧", "硬卧", "软座", "硬座", "无座"]
+# 监控系统任务的席别表：与 SEAT_OPTIONS 同一份（原先三处拷贝已收敛）
+MONITOR_SEAT_CHOICES = SEAT_OPTIONS
 LOG_COLOR = {
     "[有票]": "#d97706", "[抢到]": "#0969da", "[错误]": "#cf222e",
     "[会话]": "#6e7781", "[运行]": "#57606a", "[提醒]": "#9a6700", "[更新]": "#8250df",
@@ -799,12 +798,23 @@ def append_monitor_task(task, start_now=True):
             with open(state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
         except Exception as e:
-            # state.json 存在但读不出来：绝不能拿空状态覆盖——那会丢掉其它
-            # 全部任务的运行状态。只跳过状态写入（config 里的任务已加成功，
-            # 引擎下次启动会把它当新任务按"未启动"补状态），坏档留给用户处理。
-            log("[错误] 读取 state.json 失败，本次只写任务不写状态"
-                "（避免空状态覆盖丢失其它任务）：%s" % e)
-            return task["name"]
+            # state.json 损坏：挪档留证（带时间戳，反复损坏不互相覆盖），再按
+            # 只含本任务的新状态重建——保住「立即启动」语义，不让它静默降级成
+            # 未启动。其它任务的状态/防重记录在坏档里，引擎会按未启动重建。
+            bad = "%s.bad-%s" % (state_path, time.strftime("%Y%m%d-%H%M%S"))
+            try:
+                os.replace(state_path, bad)
+            except OSError:
+                # 挪不动（如杀毒软件占用）：保住坏档要紧，跳过状态写入，
+                # 任务将以「未启动」落库——这点必须让用户知道
+                log("[错误] 读取 state.json 失败且挪档失败（文件被占用？）：%s；"
+                    "本次只写任务不写状态，任务「%s」将按未启动落库，"
+                    "请人工处理坏档后再启动它" % (e, task["name"]))
+                return task["name"]
+            log("[错误] state.json 损坏（%s），已挪档为 %s 并按空状态重建。"
+                "其它任务的运行状态与防重记录都在坏档里——请尽快到 12306"
+                "「未支付订单」核对在途行程，避免重复下单" % (e, bad))
+            state = {}
     else:
         state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
     entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
@@ -1542,11 +1552,14 @@ class TrainCardList(ttk.Frame):
             w = self.winfo_containing(event.x_root, event.y_root)
             while w is not None and w is not self.canvas:
                 w = w.master
+            if w is None:
+                return  # 指针不在本滚动区上：不接管
+            if self.canvas.winfo_exists():
+                self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+        except tk.TclError:
+            pass  # 窗口/控件销毁竞态
         except Exception:
             return
-        if w is None:
-            return  # 指针不在本滚动区上：不接管
-        self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
 
     def render(self, infos, empty_text="（没有符合条件的车次）"):
         for w in self.inner.winfo_children():

@@ -43,4 +43,4 @@ desktop.ini
 *.tmp*
 *.guisave*
 *.launcher
-state.json.bad
+state.json.bad*
