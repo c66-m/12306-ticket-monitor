@@ -46,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import appcommon
 import browser_order
 import filelock
 import logutil
@@ -2143,22 +2144,16 @@ class LauncherApp(tk.Frame):
 
     @staticmethod
     def _resolve_dates(lc):
-        """把「从 / 到」解析为待查日期列表（与监控系统一致：从到相差最多 5 天 = 6 天）。"""
-        d0s = (lc.get("date") or "").strip()
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", d0s):
-            raise RuntimeError("日期格式应为 YYYY-MM-DD")
-        dates = [d0s]
-        d1s = (lc.get("date_to") or "").strip()
-        if d1s and d1s != d0s:
-            if not re.match(r"^\d{4}-\d{2}-\d{2}$", d1s):
-                raise RuntimeError("「到」日期格式应为 YYYY-MM-DD")
-            d0 = datetime.strptime(d0s, "%Y-%m-%d").date()
-            d1 = datetime.strptime(d1s, "%Y-%m-%d").date()
-            if d1 < d0:
-                raise RuntimeError("「到」不能早于「从」")
-            if (d1 - d0).days > 5:  # 与 gui.py 三处入口同一口径：6 个日期
-                raise RuntimeError("日期区间最多相差 5 天")
-            dates = [(d0 + timedelta(days=i)).strftime("%Y-%m-%d")
+        """把「从 / 到」解析为待查日期列表（appcommon 单点口径：相差最多 5 天）。"""
+        try:
+            dates, date_range = appcommon.parse_date_range(
+                (lc.get("date") or "").strip(), (lc.get("date_to") or "").strip())
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        if date_range:  # launcher 契约：区间展开成逐日列表
+            d0 = datetime.strptime(date_range[0], "%Y-%m-%d").date()
+            d1 = datetime.strptime(date_range[1], "%Y-%m-%d").date()
+            dates = [(d0 + timedelta(days=i)).isoformat()
                      for i in range((d1 - d0).days + 1)]
         return dates
 

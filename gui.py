@@ -41,6 +41,7 @@ if HERE not in sys.path:
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
+import appcommon
 import engine as engine_mod
 import logutil
 import notify as notify_mod
@@ -795,24 +796,12 @@ class TaskWizard(tk.Toplevel):
         if from_name == to_name:
             messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
             return
-        # 解析乘车日期：只填「从」= 单日；「到」也填 = 连续区间（最多相差 5 天）
+        # 解析乘车日期：只填「从」= 单日；「到」也填 = 连续区间（appcommon 单点口径）
         try:
-            d0 = datetime.date.fromisoformat(self.date_var.get().strip())
-            raw1 = self.date_end_var.get().strip()
-            if raw1:
-                d1 = datetime.date.fromisoformat(raw1)
-                if d1 < d0:
-                    messagebox.showwarning("提示", "「到」不能早于「从」", parent=self)
-                    return
-                if (d1 - d0).days > 5:
-                    messagebox.showwarning("提示", "日期跨度最多相差 5 天", parent=self)
-                    return
-                dates = [d0 + datetime.timedelta(days=i)
-                         for i in range((d1 - d0).days + 1)]
-            else:
-                dates = [d0]
-        except ValueError:
-            messagebox.showwarning("提示", "日期格式错误，请按 2026-10-06 格式填写", parent=self)
+            dates, _date_range = appcommon.parse_date_range(
+                self.date_var.get().strip(), self.date_end_var.get().strip())
+        except ValueError as e:
+            messagebox.showwarning("提示", str(e), parent=self)
             return
         self.monitor_dates = [d.isoformat() for d in dates]
         self.query_date = self.monitor_dates[0]
@@ -1347,7 +1336,8 @@ class QuickMonitorDialog(tk.Toplevel):
         self.date_entry = tk.Entry(row, textvariable=self.date_var, width=30,
                                    font=(FONT, 10))
         self.date_entry.pack(side="left")
-        attach_calendar(self.date_entry, support_range=True, max_span_days=5)
+        attach_calendar(self.date_entry, support_range=True,
+                       max_span_days=appcommon.MAX_DATE_SPAN_DAYS)
         tk.Label(body, text="单日：2026-10-06　范围：2026-10-06~2026-10-08",
                  bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
 
@@ -1424,16 +1414,7 @@ class QuickMonitorDialog(tk.Toplevel):
             fill="x", padx=18, pady=(0, 10))
 
     def _parse_dates(self):
-        raw = self.date_var.get().strip()
-        if "~" in raw:
-            a, b = [x.strip() for x in raw.split("~", 1)]
-            d0, d1 = datetime.date.fromisoformat(a), datetime.date.fromisoformat(b)
-            if d1 < d0:
-                raise ValueError("结束日期不能早于开始日期")
-            if (d1 - d0).days > 5:
-                raise ValueError("日期跨度最多相差 5 天")
-            return [], [d0.isoformat(), d1.isoformat()]
-        return [datetime.date.fromisoformat(raw).isoformat()], []
+        return appcommon.parse_date_range(self.date_var.get().strip())
 
     def create(self, start_now):
         from_name, to_name = self.from_field.get(), self.to_field.get()
@@ -2485,7 +2466,8 @@ class TaskEditDialog(tk.Toplevel):
         self.date_entry = tk.Entry(row, textvariable=self.date_var, width=30,
                                    font=(FONT, 10))
         self.date_entry.pack(side="left")
-        attach_calendar(self.date_entry, support_range=True, max_span_days=5)
+        attach_calendar(self.date_entry, support_range=True,
+                       max_span_days=appcommon.MAX_DATE_SPAN_DAYS)
         tk.Label(body, text="单日：2026-10-07　范围：2026-10-07~2026-10-09",
                  bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
 

@@ -30,6 +30,7 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+import appcommon
 import engine as engine_mod
 import notify as notify_mod
 import order as order_mod
@@ -132,23 +133,18 @@ def input_dates():
         if raw is None:
             return None, None
         try:
-            if "~" in raw:
-                a, b = [x.strip() for x in raw.split("~", 1)]
-                d0, d1 = datetime.date.fromisoformat(a), datetime.date.fromisoformat(b)
-                if d1 < d0:
-                    print("  结束日期不能早于开始日期。")
-                    continue
-                if d0 < datetime.date.today():
-                    print("  提示：开始日期已是过去日期（监控时会自动跳过过期日期）。")
-                return [], [d0.isoformat(), d1.isoformat()]
-            d = datetime.date.fromisoformat(raw)
-            if d < datetime.date.today():
-                print("  提示：该日期已过期，请确认是否仍要创建任务。")
-                if read("  仍要创建？(y/n)：" , "n").lower() != "y":
-                    continue
-            return [raw], []
-        except ValueError:
-            print("  日期格式错误，请按 YYYY-MM-DD 格式输入。")
+            dates, date_range = appcommon.parse_date_range(raw)
+        except ValueError as e:
+            print("  %s。" % e)
+            continue
+        today = datetime.date.today()
+        if date_range and datetime.date.fromisoformat(date_range[0]) < today:
+            print("  提示：开始日期已是过去日期（监控时会自动跳过过期日期）。")
+        elif dates and datetime.date.fromisoformat(dates[0]) < today:
+            print("  提示：该日期已过期，请确认是否仍要创建任务。")
+            if read("  仍要创建？(y/n)：", "n").lower() != "y":
+                continue
+        return dates, date_range
 
 
 def ask_priority():
