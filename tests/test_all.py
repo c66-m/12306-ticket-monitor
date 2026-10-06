@@ -789,6 +789,89 @@ class TestConfigKeys(TempDirCase):
                         sorted(config_keys.LAUNCHER_CONFIG_KEYS - set(live)))
 
 
+class TestStateStore(TempDirCase):
+    """state.json 三写方共享层：读/坏档挪档/写 的机械层（策略在调用方）。"""
+
+    def test_read_state_or_none_shapes(self):
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        self.assertEqual(appcommon.read_state_or_none(p), ({}, None))   # 不存在
+        json.dump({"tasks": {}}, open(p, "w", encoding="utf-8"))
+        st, err = appcommon.read_state_or_none(p)
+        self.assertIsNone(err)
+        self.assertEqual(st, {"tasks": {}})
+        open(p, "w", encoding="utf-8").write("{corrupt")
+        st2, err2 = appcommon.read_state_or_none(p)
+        self.assertIsNone(st2)
+        self.assertIsInstance(err2, ValueError)
+
+    def test_quarantine_timestamped_and_keeps_evidence(self):
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        open(p, "w", encoding="utf-8").write("{corrupt")
+        bad = appcommon.quarantine_corrupt(p)
+        self.assertIsNotNone(bad)
+        self.assertTrue(os.path.basename(bad).startswith("state.json.bad-"))
+        self.assertEqual(open(bad, encoding="utf-8").read(), "{corrupt")
+        self.assertFalse(os.path.exists(p))
+        # 挪移失败(占用):证据保留原地,返回 None
+        open(p, "w", encoding="utf-8").write("{corrupt2")
+        import appcommon as ac
+        with mock.patch.object(ac.os, "replace", side_effect=OSError("busy")):
+            self.assertIsNone(ac.quarantine_corrupt(p))
+        self.assertEqual(open(p, encoding="utf-8").read(), "{corrupt2")
+
+    def test_three_writers_concurrent(self):
+        """三写方(engine/gui/launcher 形态)并发写:全部落盘且文件始终可解析。"""
+        import appcommon, threading
+        p = os.path.join(self.tmp, "state.json")
+        appcommon.write_state(p, {"tasks": {}, "dedup": {}})
+        errs = []
+
+        def engine_like(i):
+            try:
+                for n in range(30):
+                    st, err = appcommon.read_state_or_none(p)
+                    if err is not None:
+                        errs.append(err)
+                        continue
+                    st = st or {}
+                    st.setdefault("tasks", {})["e%d" % i] = n
+                    appcommon.write_state(p, st, fallback_direct=True)
+            except Exception as e:
+                errs.append(e)
+
+        def gui_like(i):
+            try:
+                for n in range(30):
+                    st, _ = appcommon.read_state_or_none(p)
+                    st = st or {}
+                    st.setdefault("tasks", {})["g%d" % i] = n
+                    appcommon.write_state(p, st, tmp_kind="guisave")
+            except Exception as e:
+                errs.append(e)
+
+        def launcher_like(i):
+            try:
+                for n in range(30):
+                    st, _ = appcommon.read_state_or_none(p)
+                    st = st or {}
+                    st.setdefault("tasks", {})["l%d" % i] = n
+                    appcommon.write_state(p, st, tmp_kind="launcher")
+            except Exception as e:
+                errs.append(e)
+
+        ths = ([threading.Thread(target=engine_like, args=(i,)) for i in range(2)]
+               + [threading.Thread(target=gui_like, args=(i,)) for i in range(2)]
+               + [threading.Thread(target=launcher_like, args=(i,)) for i in range(2)])
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+        self.assertEqual(errs, [])
+        final = json.load(open(p, encoding="utf-8"))     # 始终是合法 JSON
+        self.assertIn("tasks", final)
+        self.assertFalse([f for f in os.listdir(self.tmp) if ".tmp" in f])
+
+
 # ----------------------------- 辅助 -----------------------------
 
 import logging  # noqa: E402

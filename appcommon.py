@@ -93,3 +93,45 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=3,
         json.dump(obj, f, ensure_ascii=False, indent=2)
     replace_with_retry(tmp, path, tries=replace_tries, delay=replace_delay,
                        fallback_direct=fallback_direct)
+
+
+# ----------------------------- state.json 共享 plumbing -----------------------------
+# 三个写方（engine 引擎线程 / gui 界面 / launcher append_monitor_task）各自的
+# 防护策略（deepcopy 快照、直写兜底、mtime 跟踪、坏档后重建 or 跳过）留在
+# 调用方；这里只统一「读（含坏档检测）+ 坏档时间戳挪档 + 原子写」的机械层。
+
+def read_state_or_none(path):
+    """读 state.json。返回 (state, error)：
+    (dict, None) = 正常；(None, Exception) = 损坏/读失败；（{}, None) = 不存在。"""
+    if not os.path.exists(path):
+        return {}, None
+    # 读句柄持有可能与写方的 os.replace 撞车（Windows 对正被打开的目标执行
+    # replace 报拒绝访问），短暂退避重试——只影响撞上的那一瞬
+    for i in range(3):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f), None
+        except PermissionError:
+            if i == 2:
+                return None, PermissionError("读 %s 被占用（重试后仍失败）" % path)
+            time.sleep(0.05)
+        except Exception as e:
+            return None, e
+    return None, RuntimeError("unreachable")
+
+
+def quarantine_corrupt(path):
+    """坏档时间戳挪档（state.json → state.json.bad-YYYYmmdd-HHMMSS，反复损坏
+    不互相覆盖）。返回挪档后的路径；None = 挪移失败（文件被占用，证据保留原地）。"""
+    bad = "{0}.bad-{1}".format(path, time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        os.replace(path, bad)
+    except OSError:
+        return None
+    return bad
+
+
+def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
+    """原子写 state.json（见 atomic_write_json）。"""
+    atomic_write_json(path, state, tmp_kind=tmp_kind,
+                      fallback_direct=fallback_direct)

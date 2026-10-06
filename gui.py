@@ -132,7 +132,7 @@ def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
-    appcommon.atomic_write_json(path, state, tmp_kind="guisave")
+    appcommon.write_state(path, state, tmp_kind="guisave")
 
 
 def mark_task_created(app, task, start_now):

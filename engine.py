@@ -168,33 +168,24 @@ class MonitorEngine(object):
     # ----------------------------- 状态持久化 -----------------------------
 
     def _load_state(self):
-        state = {}
-        state_ok = True
-        if os.path.exists(self.state_path):
-            try:
-                with open(self.state_path, encoding="utf-8") as f:
-                    state = json.load(f)
-            except Exception as e:
-                state_ok = False
-                LOG.warning("state.json 读取失败: %s", e)
-                # 读不出来 ≠ 空状态：挪档留证（带时间戳，反复损坏不互相覆盖），
-                # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
-                # 重复下单——必须醒目提示去核对在途行程。
-                bad = "{0}.bad-{1}".format(
-                    self.state_path, time.strftime("%Y%m%d-%H%M%S"))
-                try:
-                    os.replace(self.state_path, bad)
-                except OSError:
-                    # 挪不动（如杀毒软件占用）：本次不落盘，免得下面的
-                    # _save_state 把仅存的坏档覆盖掉
-                    LOG.warning("坏档挪移失败（文件被占用？），本次不落盘以保留证据")
-                    state = {}
-                else:
-                    LOG.warning(
-                        "坏档已挪为 %s，从空状态重建。其它任务的运行状态与"
-                        "防重记录都在坏档里——请尽快到 12306「未支付订单」"
-                        "核对在途行程，避免重复下单", bad)
-                    state = {}
+        state, err = appcommon.read_state_or_none(self.state_path)
+        state_ok = err is None
+        if err is not None:
+            LOG.warning("state.json 读取失败: %s", err)
+            # 读不出来 ≠ 空状态：挪档留证（时间戳名，见 appcommon.quarantine_corrupt），
+            # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
+            # 重复下单——必须醒目提示去核对在途行程。
+            bad = appcommon.quarantine_corrupt(self.state_path)
+            if bad is None:
+                # 挪不动（如杀毒软件占用）：本次不落盘，免得下面的
+                # _save_state 把仅存的坏档覆盖掉
+                LOG.warning("坏档挪移失败（文件被占用？），本次不落盘以保留证据")
+            else:
+                LOG.warning(
+                    "坏档已挪为 %s，从空状态重建。其它任务的运行状态与"
+                    "防重记录都在坏档里——请尽快到 12306「未支付订单」"
+                    "核对在途行程，避免重复下单", bad)
+            state = {}
         # 兼容旧版：把平铺的 "区间|日期|车次|席别" 键迁到 dedup 下
         if "dedup" not in state:
             dedup, tasks = {}, {}

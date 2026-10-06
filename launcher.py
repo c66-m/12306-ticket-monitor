@@ -870,10 +870,7 @@ def append_monitor_task(task, start_now=True):
             entry.setdefault("last_poll", 0)
             entry["message"] = ("启动器创建，立即启动" if start_now
                                 else "启动器创建，未启动")
-            tmp2 = state_path + ".launcher%s" % threading.get_ident()
-            with open(tmp2, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-            _atomic_replace(tmp2, state_path)
+            appcommon.write_state(state_path, state, tmp_kind="launcher")
         return task["name"]
 
 
