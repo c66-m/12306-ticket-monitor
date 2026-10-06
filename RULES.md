@@ -34,3 +34,10 @@
 - 改完提醒重启才生效：`Get-CimInstance Win32_Process | ? { $_.CommandLine -match "gui\.py|launcher\.py" } | % { Stop-Process -Id $_.ProcessId -Force }`
 - 下单优先级按界面点选顺序；开抢前按 `warm_minutes` 预热；耗时看 `logs/order_timing.jsonl`（`python browser_order.py timing`）。
 - 待办：K225 2026-10-09 长葛→确山 的未支付订单该去「未完成订单」确认或放弃。
+
+## 七、结构重构门禁（2026-10-07 起，重构批次 649db10..0dd5c57 落地后的约定）
+- 单点口径清单，改这些语义必须同时核对三个调用方：`appcommon.parse_date_range`（日期区间，gui/monitor/launcher 五个入口）、`appcommon.atomic_write_json / replace_with_retry / write_state`（原子写，全库 11 处）、`appcommon.read_state_or_none / quarantine_corrupt`（state.json 三写方 engine/gui/launcher 共享 plumbing）、`config_keys.py`（配置键 ⊆ example 模板，tests 有防漂移回归）。
+- 各写方的防护语义是**参数**不是噪音，别「统一」掉：engine 的 deepcopy 快照 + 直写兜底（`fallback_direct=True`）、launcher 的 `_CFG_WRITE_LOCK` + mtime 二次检测、gui 的 guisave 临时名。Windows 读侧 `read_state_or_none` 有 PermissionError 退避重试（与写方 os.replace 撞车窗口）。
+- **拆 launcher.py（约 3000 行）门禁**：必须等一次真实抢票验证通过 + 工作树无在途功能；拆前单独出拆分清单（4+ 文件 + launcher.py 门面保 `import launcher` / `python launcher.py` 兼容）给用户确认。
+- **拆 browser_order._order_impl（约 579 行）门禁**：必须等「重新登录 + 真实下单取证核对窗原文」的验证窗口；拆时 `mark()` 计时点原样保留、日志格式一行不动。
+- 两项拆分做完前，禁止往这两个函数/文件里加新功能（新功能先进 ticket.py/appcommon.py 层）。
