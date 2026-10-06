@@ -47,6 +47,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import browser_order
+import filelock
 import logutil
 import notify
 import passengers as pax_mod
@@ -119,6 +120,7 @@ _DEFAULT_LC = {
     "to": "确山",
     "trains": ["K225", "K1969", "K925"],
     "seat_types": ["硬座"],
+    "seat_priority": "",
     "date": "",
     "date_to": "",
     "start_time": "",
@@ -412,6 +414,7 @@ class Grabber(threading.Thread):
         date = (lc.get("date") or "").strip()
         trains = [t.strip().upper() for t in (lc.get("trains") or []) if t and t.strip()]
         seats = [s for s in (lc.get("seat_types") or []) if s]
+        pri_raw = lc.get("seat_priority") or ""
         names = [n for n in (lc.get("passenger_names") or []) if n]
 
         if not (from_ and to_ and date):
@@ -431,6 +434,15 @@ class Grabber(threading.Thread):
         if not seats:
             self.result = (False, "勾选的席别都无法自动下单，请改选其他席别")
             return
+        parsed_pri = tk_mod.seat_rules_parse(pri_raw)
+        if parsed_pri["rules"] or parsed_pri["bare"]:
+            summary = ["%s=%s" % (tr, "/".join(ss))
+                       for tr, ss in parsed_pri["rules"].items()]
+            if parsed_pri["bare"]:
+                summary.append("其余车次：%s" % "/".join(parsed_pri["bare"]))
+            log("[席别] 席别规则：%s（每趟车按各自候选抢，车次顺序优先）" % "；".join(summary))
+        for warn in parsed_pri["warnings"]:
+            log("[提醒] 首选席别：%s" % warn)
         if not names:
             log("[提醒] 未选择乘车人，将尝试使用账号默认乘车人（可能失败）")
 
@@ -535,7 +547,7 @@ class Grabber(threading.Thread):
                         break
                     continue
     
-                info, seat = None, None
+                info, seat, seat_rank = None, None, None
                 by_code = {}
                 for row in rows:
                     p = tk_mod.parse_row(row, code2name, date)
@@ -545,21 +557,28 @@ class Grabber(threading.Thread):
                     if not p:
                         continue
                     avail = p.get("available_seats") or {}
-                    for s in sorted(seats, key=lambda x: SEAT_ORDER.get(x, 99)):
-                        if s in avail and (code, s) not in bad:
-                            info, seat = p, s
+                    # 每趟车各自的席别候选（唯一口径 ticket.seat_candidates_for）：
+                    # 「车次=席别」专属规则 ∩ 勾选集，交集空=该车跳过；无规则的车
+                    # 按全局偏好排序。候选永远与该车实际有票求交。
+                    cand = tk_mod.seat_candidates_for(code, seats, pri_raw, avail)
+                    for rank, s in enumerate(cand, 1):
+                        if (code, s) not in bad:
+                            info, seat, seat_rank = p, s, (rank, len(cand))
                             break
                     if info:
                         break
-    
+
                 if info:
-                    log("[有票] %s %s %s %s→%s 余%s（%s发车）！开始下单…" % (
-                        date, info["train_code"], seat, info["from_name"], info["to_name"],
-                        info["available_seats"].get(seat), info["start_time"]))
+                    log("[有票] %s %s %s %s→%s 余%s（%s发车）！开始下单…%s" % (
+                        date, info["train_code"], seat,
+                        info["from_name"], info["to_name"],
+                        info["available_seats"].get(seat), info["start_time"],
+                        "（候选 %d/%d）" % seat_rank if seat_rank else ""))
                     try:
                         sc = tk_mod.SEAT_NAME_TO_CODE[seat]
-                        # 网页端下单页不下发「无座」：同价改判为硬座下单
-                        sc, _alias = tk_mod.order_seat_code(seat, sc)
+                        # 网页端下单页不下发「无座」：按同价席别改判（动车组→二等座，
+                        # 普速→硬座，见 ticket.ORDER_SEAT_ALIAS / EMU_SEAT_ALIAS）
+                        sc, _alias = tk_mod.order_seat_code(seat, sc, info.get("train_code"))
                         if _alias:
                             log("[席别] %s 网页端下单页不下发，按同价改判为 %s 下单" % (seat, _alias))
                         ok, msg, extra = browser_order.order_via_browser(
@@ -753,7 +772,7 @@ def check_update(lc):
 
 def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
                        passengers, purpose_code, auto_order, stop_after_order,
-                       priority, pax_purpose=None):
+                       priority, pax_purpose=None, seat_priority=None):
     """按监控系统的任务结构组装任务字典（与 gui.py QuickMonitorDialog 一致）。"""
     name = "%s-%s %s %s" % (
         from_name, to_name, "/".join(trains) if trains else "全部车次",
@@ -767,6 +786,8 @@ def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
         "date_range": date_range,
         "trains": trains,
         "seat_types": seats,
+        "seat_priority": (str(seat_priority).strip()
+                          if isinstance(seat_priority, str) else list(seat_priority or [])),
         "auto_order": bool(auto_order),
         "stop_after_order": bool(stop_after_order),
         "passenger_names": passengers,
@@ -777,71 +798,97 @@ def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
     }
 
 
+# 同进程对 config.json/state.json 的读-改-写串行锁：mtime 冲突检测在
+# Windows 上有 ~15.6ms 系统时钟量化盲区，同进程并发必须靠锁兜住；
+# 跨进程仍靠 mtime 比对（盲区可接受，见 RULES）。
+_CFG_WRITE_LOCK = threading.Lock()
+
+
+def _atomic_replace(src, dst, tries=3):
+    """os.replace 带 Windows 占用重试：目标/源被并发读写句柄占用的瞬间会
+    PermissionError（杀毒扫描、对方 json.load 持有读句柄），短暂退避重试。"""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.05)
+
+
 def append_monitor_task(task, start_now=True):
     """把任务写入监控系统的 config.json 与 state.json，并返回任务名。
     监控引擎主循环每轮 _sync_config() 检测 mtime 变化后自动重建调度表，
     处于「监控中」状态的新任务会被自动捡起来，无需重启监控软件。"""
-    cfg_path = os.path.join(HERE, "config.json")
-    tmp = cfg_path + ".launcher"
-    # 读-改-写并发防护：写回前确认 config.json 没被监控 GUI 动过；
-    # 被动过就丢弃本轮重读重写（最多 3 次），避免覆盖掉对方刚保存的任务/设置
-    for _ in range(3):
-        try:
-            before = os.path.getmtime(cfg_path)
-        except OSError:
-            before = None
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        cfg.setdefault("tasks", []).append(task)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        try:
-            after = os.path.getmtime(cfg_path)
-        except OSError:
-            after = None
-        if after == before:
-            os.replace(tmp, cfg_path)
-            break
-        # 撞车：本轮作废，带着对方的新内容重来
-    else:
-        os.replace(tmp, cfg_path)  # 三次都撞车：以本方落盘收场（低概率，双方都是追加型写）
-    # state.json 条目（与 gui.mark_task_created 的无 app 分支保持一致）
-    state_path = os.path.join(HERE, cfg.get("state_file", "state.json"))
-    if os.path.exists(state_path):
-        try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except Exception as e:
-            # state.json 损坏：挪档留证（带时间戳，反复损坏不互相覆盖），再按
-            # 只含本任务的新状态重建——保住「立即启动」语义，不让它静默降级成
-            # 未启动。其它任务的状态/防重记录在坏档里，引擎会按未启动重建。
-            bad = "%s.bad-%s" % (state_path, time.strftime("%Y%m%d-%H%M%S"))
-            try:
-                os.replace(state_path, bad)
-            except OSError:
-                # 挪不动（如杀毒软件占用）：保住坏档要紧，跳过状态写入，
-                # 任务将以「未启动」落库——这点必须让用户知道
-                log("[错误] 读取 state.json 失败且挪档失败（文件被占用？）：%s；"
-                    "本次只写任务不写状态，任务「%s」将按未启动落库，"
-                    "请人工处理坏档后再启动它" % (e, task["name"]))
-                return task["name"]
-            log("[错误] state.json 损坏（%s），已挪档为 %s 并按空状态重建。"
-                "其它任务的运行状态与防重记录都在坏档里——请尽快到 12306"
-                "「未支付订单」核对在途行程，避免重复下单" % (e, bad))
-            state = {}
-    else:
-        state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
-    entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
-    entry["status"] = "monitoring" if start_now else "paused"
-    entry.setdefault("fail_streak", 0)
-    entry.setdefault("last_poll", 0)
-    entry["message"] = ("启动器创建，立即启动" if start_now
-                        else "启动器创建，未启动")
-    tmp2 = state_path + ".launcher"
-    with open(tmp2, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp2, state_path)
-    return task["name"]
+    with _CFG_WRITE_LOCK:  # 同进程多窗口并发串行化
+        cfg_path = os.path.join(HERE, "config.json")
+        # 临时名带线程标识：同进程多窗口并发追加时共用一个名字会互相踩
+        # （Windows 下 os.replace 撞上别人打开的句柄直接 PermissionError）
+        tmp = cfg_path + ".launcher%s" % threading.get_ident()
+        # 读-改-写必须串行化：监控系统 GUI 是独立进程，也在改同一个 config.json。
+        # 只比 mtime 是 TOCTOU——实测 3 个线程并发追加任务，最后只剩 1 条。
+        # 锁文件用 filelock（进程被强杀时由系统释放）；mtime 比对留作第二道，
+        # 能发现「锁外」的改动（手工编辑、其它工具）。
+        with filelock.file_lock(cfg_path + ".lock"):
+            for _ in range(3):
+                try:
+                    before = os.path.getmtime(cfg_path)
+                except OSError:
+                    before = None
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                cfg.setdefault("tasks", []).append(task)
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                try:
+                    after = os.path.getmtime(cfg_path)
+                except OSError:
+                    after = None
+                if after == before:
+                    _atomic_replace(tmp, cfg_path)
+                    break
+                # 撞车：本轮作废，带着对方的新内容重来
+            else:
+                _atomic_replace(tmp, cfg_path)  # 三次都撞车：以本方落盘收场（低概率，双方都是追加型写）
+        # state.json 条目（与 gui.mark_task_created 的无 app 分支保持一致）
+        state_path = os.path.join(HERE, cfg.get("state_file", "state.json"))
+        with filelock.file_lock(state_path + ".lock"):
+            if os.path.exists(state_path):
+                try:
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+                except Exception as e:
+                    # state.json 损坏：挪档留证（带时间戳，反复损坏不互相覆盖），再按
+                    # 只含本任务的新状态重建——保住「立即启动」语义，不让它静默降级成
+                    # 未启动。其它任务的状态/防重记录在坏档里，引擎会按未启动重建。
+                    bad = "%s.bad-%s" % (state_path, time.strftime("%Y%m%d-%H%M%S"))
+                    try:
+                        os.replace(state_path, bad)
+                    except OSError:
+                        # 挪不动（如杀毒软件占用）：保住坏档要紧，跳过状态写入，
+                        # 任务将以「未启动」落库——这点必须让用户知道
+                        log("[错误] 读取 state.json 失败且挪档失败（文件被占用？）：%s；"
+                            "本次只写任务不写状态，任务「%s」将按未启动落库，"
+                            "请人工处理坏档后再启动它" % (e, task["name"]))
+                        return task["name"]
+                    log("[错误] state.json 损坏（%s），已挪档为 %s 并按空状态重建。"
+                        "其它任务的运行状态与防重记录都在坏档里——请尽快到 12306"
+                        "「未支付订单」核对在途行程，避免重复下单" % (e, bad))
+                    state = {}
+            else:
+                state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
+            entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
+            entry["status"] = "monitoring" if start_now else "paused"
+            entry.setdefault("fail_streak", 0)
+            entry.setdefault("last_poll", 0)
+            entry["message"] = ("启动器创建，立即启动" if start_now
+                                else "启动器创建，未启动")
+            tmp2 = state_path + ".launcher%s" % threading.get_ident()
+            with open(tmp2, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            _atomic_replace(tmp2, state_path)
+        return task["name"]
 
 
 import tkinter as tk
@@ -941,23 +988,25 @@ def station_kind(code):
 
 
 def _merge_kind(code, kind):
-    """把一次观测合并进缓存：既有高铁又有普速时拼成 "高铁+普速"。"""
+    """把一次观测合并进缓存：既有高铁又有普速时拼成 "高铁+普速"。
+
+    kind 可能是多值串（`probe_city_kinds` 一次返回 "高铁+动车+普速"），必须拆开逐个
+    合并：整串当成一个 part 会写出 "高铁+普速+高铁+动车+普速" 这种重复值
+    （station_kind.json 里已经出现过，缓存文件被这么写脏过）。"""
     code = (code or "").upper()
     if len(code) != 3 or not kind:
+        return False
+    new_parts = {p for p in str(kind).split("+") if p}
+    if not new_parts:
         return False
     load_station_kinds()  # 确保已加载（内部自带锁）
     with _kind_lock:  # 探测线程与主线程都会调这里：变更必须锁内做，
         old = _station_kinds.get(code)  # 否则与 save_station_kinds 的拷贝撞并发修改
-        if old == kind:
+        parts = {p for p in (old or "").split("+") if p}
+        if new_parts <= parts:
             return False
-        if not old:
-            _station_kinds[code] = kind
-            return True
-        parts = old.split("+")
-        if kind in parts:
-            return False
-        parts.append(kind)
-        _station_kinds[code] = "+".join(sorted(set(parts), key=lambda k: _KIND_ORDER.get(k, 9)))
+        parts |= new_parts
+        _station_kinds[code] = "+".join(sorted(parts, key=lambda k: _KIND_ORDER.get(k, 9)))
         return True
 
 
@@ -1798,11 +1847,31 @@ class LauncherApp(tk.Frame):
         self.cardlist.pack(fill="x", pady=(6, 0))
         self.cardlist.render([])
 
+        # 该车次全部席别（含无票）：点卡片选中车次后在这里列出来（车型参考见 KIND_SEAT_HINT）
+        self.seat_detail = tk.Frame(qf, bg="#ffffff", highlightthickness=1,
+                                    highlightbackground="#eaeef2")
+        self.seat_detail.pack(fill="x", pady=(4, 0))
+        self._render_seat_detail([])
+
         # 席别（第 4 段）。票种不在这里——已下移到「乘车人」区，按每个人分别选成人/学生
         self.sf = ttk.LabelFrame(
             self, text=" 席别（点车次卡片可按该车实际余票刷新） ", padding=8)
         sf = self.sf
         sf.grid(row=4, column=0, sticky="ew", padx=12, pady=(3, 0))
+        # 首选席别：填了就先抢它（可逗号分隔多个），首选都没票才按下面勾选顺序
+        t0 = ttk.Frame(sf)
+        t0.pack(fill="x")
+        ttk.Label(t0, text="首选席别").pack(side="left")
+        self.seat_pri_var = tk.StringVar()
+        ttk.Entry(t0, textvariable=self.seat_pri_var, width=18).pack(side="left", padx=(4, 6))
+        ttk.Label(t0, text="可填 硬座/无座/二等座/软卧/硬卧 等，逗号分隔，先填的先抢；"
+                          "可指定车次：K225=硬座/无座, K1969=硬卧（只作用该趟车，∩勾选）；"
+                          "无座=硬座，认不出按硬座",
+                  foreground="#6e7781").pack(side="left")
+        self.seat_pri_hint = ttk.Label(sf, foreground="#6e7781")
+        self.seat_pri_hint.pack(fill="x", pady=(2, 4))
+        self.seat_pri_var.trace_add("write", self._on_seat_pri_change)
+        self._on_seat_pri_change()
         s0 = ttk.Frame(sf)
         s0.pack(fill="x")
         self.seat_box = ttk.Frame(s0)
@@ -1885,6 +1954,7 @@ class LauncherApp(tk.Frame):
         # 票种不再全局设置：_refresh_pax() 里按每个乘车人各自的保存值建下拉
         for s, v in self.seat_vars.items():
             v.set(s in (lc.get("seat_types") or []))
+        self.seat_pri_var.set(str(lc.get("seat_priority") or ""))
         self.start_var.set(lc.get("start_time") or "")
         self.remind_var.set(int(lc.get("remind_minutes") or 10))
         self.warm_var.set(max(0, min(30, int(lc.get("warm_minutes") or 10))))
@@ -1914,6 +1984,7 @@ class LauncherApp(tk.Frame):
         lc["to"] = self.to_ent.get()
         lc["trains"] = [t.strip().upper() for t in re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
         lc["seat_types"] = [s for s, v in self.seat_vars.items() if v.get()]
+        lc["seat_priority"] = self.seat_pri_var.get().strip()
         lc["date"] = self.date_var.get().strip()
         lc["date_to"] = self.date_to_var.get().strip()
         lc["start_time"] = self.start_var.get().strip()
@@ -1974,23 +2045,41 @@ class LauncherApp(tk.Frame):
 
     # ---- 车次查询与席别联动 ----
 
-    def _rebuild_seats(self, available=None):
+    def _on_seat_pri_change(self, *_a):
+        """「首选席别」输入框的即时解析反馈（含 车次=席别 专属规则）。"""
+        checked = [s for s, v in self.seat_vars.items() if v.get()]
+        text, bad = tk_mod.seat_priority_feedback(self.seat_pri_var.get(), checked=checked)
+        self.seat_pri_hint.configure(text=text,
+                                     foreground="#cf222e" if bad else "#6e7781")
+
+    def _rebuild_seats(self, available=None, allnames=None, houbu=False):
         """重建席别勾选区。
 
         available=None：显示全量可选席别（SEAT_OPTIONS）。
-        available={席别: 余票}：按该车次实际可购席别显示并带余票数。
+        allnames 非空（选中了车次）：按该车实际提供的全部席别显示 —— **含当前无票的**，
+            抢票时可以把暂时无票的席别勾上，放票/退票回流后按勾选顺序抢。
+        available={席别: 余票}：带余票数；无票的标「无」，该车可候补时标「候补」。
         勾选策略：优先保留原勾选；原勾选与新列表无交集时自动勾第一个可购席别。"""
         keep = {s for s, v in self.seat_vars.items() if v.get()}
         for w in self.seat_box.winfo_children():
             w.destroy()
         self.seat_vars = {}
-        names = [s for s in SEAT_OPTIONS if available is None or s in available]
-        names += sorted((s for s in (available or {}) if s not in SEAT_OPTIONS),
-                        key=lambda x: SEAT_ORDER.get(x, 99))
-        if available is not None:
-            self.sf.configure(text=" 席别（已按所选车次刷新：%d 种可购席别） " % len(names))
+        avail = available or {}
+        if allnames:
+            names = list(allnames)
+            names += sorted((s for s in avail if s not in names),
+                            key=lambda x: SEAT_ORDER.get(x, 99))
+            self.sf.configure(text=" 席别（该车次共 %d 种席别，%d 种有票；无票的也能勾，"
+                                   "放票/退票回流后按勾选顺序抢） "
+                              % (len(names), len([s for s in names if avail.get(s)])))
         else:
-            self.sf.configure(text=" 席别（点车次卡片可按该车实际余票刷新，票价以官方下单页为准） ")
+            names = [s for s in SEAT_OPTIONS if available is None or s in avail]
+            names += sorted((s for s in avail if s not in SEAT_OPTIONS),
+                            key=lambda x: SEAT_ORDER.get(x, 99))
+            if available is not None:
+                self.sf.configure(text=" 席别（已按所选车次刷新：%d 种可购席别） " % len(names))
+            else:
+                self.sf.configure(text=" 席别（点车次卡片可按该车实际余票刷新，票价以官方下单页为准） ")
         if not names:
             ttk.Label(self.seat_box, text="（该车次暂无可购席别）",
                       foreground="#6e7781").grid(row=0, column=0, sticky="w")
@@ -2000,12 +2089,20 @@ class LauncherApp(tk.Frame):
         for i, s in enumerate(names):
             v = tk.BooleanVar(value=s in chosen)
             self.seat_vars[s] = v
-            val = (available or {}).get(s)
-            label = "%s · %s" % (s, val) if val else s
+            val = avail.get(s)
+            if val:
+                label = "%s · %s" % (s, val)
+            elif allnames or available is not None:
+                label = "%s · %s" % (s, "候补" if houbu else "无")
+            else:
+                label = s
+            if s not in tk_mod.SEAT_NAME_TO_CODE:
+                label += "（不能自动下单）"
             ttk.Checkbutton(self.seat_box, text=label, variable=v).grid(
                 row=i // 6, column=i % 6, sticky="w", padx=(0, 6), pady=1)
-        if available is not None and not (keep & set(names)):
-            self._put_log("[席别] 该车次可购席别与原勾选无交集，已自动勾选 %s" % chosen[0])
+        if (allnames or available is not None) and not (keep & set(names)):
+            self._put_log("[席别] 该车次%s与原勾选无交集，已自动勾选 %s"
+                          % ("席别" if allnames else "可购席别", chosen[0]))
 
     def _sync_inputs(self):
         """把界面行程输入落到 lc 并做基本校验（查询车次用，不弹窗）。"""
@@ -2128,15 +2225,100 @@ class LauncherApp(tk.Frame):
             return          # _build 尚未建好席别区
         codes = self.cardlist.selected_codes()
         merged = {}
+        allnames = []
+        houbu = False
         for i in infos:
             for k, v in (i.get("available_seats") or {}).items():
                 merged.setdefault(k, v)
+            for n in (i.get("seats_all") or []):
+                if n not in allnames:
+                    allnames.append(n)
+            if i.get("houbu"):
+                houbu = True
+        order = {n: idx for idx, n in enumerate(tk_mod.SEAT_SHOW_ORDER)}
+        allnames.sort(key=lambda x: order.get(x, 99))
         self.trains_var.set(",".join(codes))
-        self._rebuild_seats(merged if merged else None)
-        self.sel_state.configure(text="已选 %d 趟车 · %d 种席别" % (len(codes), len(merged)))
+        # 选中车次后席别区按「该车提供的全部席别」刷新（含无票），抢票时也能勾
+        self._rebuild_seats(merged if merged else None, allnames, houbu)
+        self._render_seat_detail(infos)
+        self.sel_state.configure(text="已选 %d 趟车 · %d 种席别（%d 种有票）"
+                                 % (len(codes), len(allnames),
+                                    len([s for s in allnames if merged.get(s)])))
         if codes:
-            self._put_log("[选择] 已选 %d 趟车（%s），可购席别 %d 种" % (
-                len(codes), ",".join(codes), len(merged)))
+            self._put_log("[选择] 已选 %d 趟车（%s）：全部席别 %d 种 —— %s" % (
+                len(codes), ",".join(codes), len(allnames),
+                " · ".join("%s %s" % (n, merged.get(n) or ("候补" if houbu else "无"))
+                           for n in allnames)))
+
+    # 车型 → 常见席别参考（没选车次时显示；选中车次后按该车实际席别码串显示）
+    KIND_SEAT_HINT = ("G 高铁：商务座/特等座/一等座/二等座/无座    "
+                      "D 动车：商务座/一等座/二等座/动卧（一等卧·二等卧）/无座    "
+                      "C 城际：一等座/二等座（部分商务座）/无座    "
+                      "Z·T·K 普速：软卧/硬卧/软座/硬座/无座")
+
+    def _render_seat_detail(self, infos):
+        """车次列表下方：列出选中车次的全部席别（含无票）。
+
+        席别名来自该车 queryLeftTicket 的 p35(seat_types) 码串（ticket.seat_names_all），
+        余票取 available_seats；没选车次时给车型参考表。"""
+        if not hasattr(self, "seat_detail"):
+            return
+        bg = "#ffffff"
+        for w in self.seat_detail.winfo_children():
+            w.destroy()
+        head = tk.Frame(self.seat_detail, bg=bg)
+        head.pack(fill="x", padx=8, pady=(4, 0))
+        line = tk.Frame(self.seat_detail, bg=bg)
+        line.pack(fill="x", padx=8, pady=(1, 4))
+        tk.Label(head, text="该车全部席别", fg="#57606a", bg=bg,
+                 font=(FONT[0], 9, "bold")).pack(side="left")
+        infos = [i for i in infos if i]
+        if not infos:
+            tk.Label(head, text="　　选中车次卡片后，这里列出这趟车提供的全部席别（无票也列）",
+                     fg="#8c959f", bg=bg, font=(FONT[0], 9)).pack(side="left")
+            tk.Label(line, text="车型参考　" + self.KIND_SEAT_HINT, fg="#8c959f",
+                     bg=bg, font=(FONT[0], 9)).pack(side="left")
+            return
+        merged = {}
+        names = []
+        for i in infos:
+            for n in (i.get("seats_all") or []):
+                if n not in names:
+                    names.append(n)
+            for k, v in (i.get("available_seats") or {}).items():
+                merged.setdefault(k, v)
+                if k not in names:
+                    names.append(k)
+        order = {n: idx for idx, n in enumerate(tk_mod.SEAT_SHOW_ORDER)}
+        names.sort(key=lambda x: order.get(x, 99))
+        hit = [n for n in names if merged.get(n)]
+        codes = [i.get("train_code") or "?" for i in infos]
+        kinds = []
+        for c in codes:
+            k = train_kind(c)
+            if k and k not in kinds:
+                kinds.append(k)
+        houbu = any(i.get("houbu") for i in infos)
+        tk.Label(head, text="　%s（%s）　共 %d 种席别，有票 %d 种%s" % (
+            "、".join(codes), "、".join(kinds), len(names), len(hit),
+            "　售完可候补" if houbu else ""),
+            fg="#57606a", bg=bg, font=(FONT[0], 9)).pack(side="left")
+        # 一行最多排 8 个席别，多了换行：多选车次（如高铁+普速）时席别名会到
+        # 十几个，单行排不下会被窗口右边裁掉
+        chunks = [names[i:i + 8] for i in range(0, len(names), 8)]
+        for ci, chunk in enumerate(chunks):
+            row = line if ci == 0 else tk.Frame(self.seat_detail, bg=bg)
+            if ci:
+                row.pack(fill="x", padx=8, pady=(1, 4))
+            for n in chunk:
+                v = merged.get(n)
+                if v:
+                    txt, fg, ft = "%s %s" % (n, v), "#1a7f37", (FONT[0], 9, "bold")
+                elif houbu:
+                    txt, fg, ft = "%s 候补" % n, "#9a6700", (FONT[0], 9)
+                else:
+                    txt, fg, ft = "%s 无" % n, "#8c959f", (FONT[0], 9)
+                tk.Label(row, text=txt, fg=fg, bg=bg, font=ft).pack(side="left", padx=(0, 12))
 
     def _apply_train_error(self, err):
         self._querying = False
@@ -2162,6 +2344,7 @@ class LauncherApp(tk.Frame):
         self.query_state.configure(text="", foreground="#6e7781")
         self.sel_state.configure(text="已选 0 趟车 · 0 种席别")
         self._rebuild_seats()
+        self._render_seat_detail([])
 
     def _swap_stations(self):
         a, b = self.from_ent.get(), self.to_ent.get()
@@ -2464,6 +2647,7 @@ class LauncherApp(tk.Frame):
         self.trains_var.set(",".join(p.get("trains") or []))
         for s, v in self.seat_vars.items():
             v.set(s in (p.get("seat_types") or []))
+        self.seat_pri_var.set(str(p.get("seat_priority") or ""))
         self.date_var.set(p.get("date") or "")
         self._put_log("[运行] 已载入常用行程「%s」" % p.get("name"))
 
@@ -2479,6 +2663,7 @@ class LauncherApp(tk.Frame):
             "to": self.lc.get("to"),
             "trains": list(self.lc.get("trains") or []),
             "seat_types": list(self.lc.get("seat_types") or []),
+            "seat_priority": self.lc.get("seat_priority") or "",
             "date": self.lc.get("date") or "",
         }
         presets = [p for p in (self.lc.get("presets") or []) if (p.get("name") or "") != entry["name"]]
@@ -2562,6 +2747,16 @@ class NewMonitorTaskDialog(tk.Toplevel):
         self.transient(app.winfo_toplevel())
         self.grab_set()
 
+    def _mp_seat_pri_change(self, *_a):
+        """监控对话框里「首选席别」输入框的即时解析反馈（含 车次=席别 规则）。"""
+        checked = [s for s, v in self.seat_vars.items() if v.get()]
+        trains = [t.strip().upper() for t in
+                  re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
+        text, bad = tk_mod.seat_priority_feedback(self.seat_pri_var.get(),
+                                                  checked=checked, trains=trains)
+        self.seat_pri_hint.configure(text=text,
+                                     foreground="#cf222e" if bad else "#6e7781")
+
     def _build(self):
         # 行程
         tf = ttk.LabelFrame(self, text=" 行程 ", padding=8)
@@ -2602,11 +2797,23 @@ class NewMonitorTaskDialog(tk.Toplevel):
         # 席别
         sf = ttk.LabelFrame(self, text=" 监控席别（至少选一个） ", padding=8)
         sf.pack(fill="x", padx=10, pady=4)
+        pro = ttk.Frame(sf)
+        pro.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(pro, text="首选席别").pack(side="left")
+        self.seat_pri_var = tk.StringVar(value=str(self.app.lc.get("seat_priority") or ""))
+        ttk.Entry(pro, textvariable=self.seat_pri_var, width=18).pack(side="left", padx=4)
+        ttk.Label(pro, text="逗号分隔，先填的先抢；可指定车次：K1969=硬卧（只作用该趟车）；"
+                          "无座=硬座，认不出按硬座",
+                  foreground="#6e7781").pack(side="left")
+        self.seat_pri_hint = ttk.Label(sf, foreground="#6e7781")
+        self.seat_pri_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        self.seat_pri_var.trace_add("write", self._mp_seat_pri_change)
         for i, s in enumerate(MONITOR_SEAT_CHOICES):
             v = tk.BooleanVar(value=s in (self.app.lc.get("seat_types") or []))
             self.seat_vars[s] = v
             ttk.Checkbutton(sf, text=s, variable=v).grid(
-                row=i // 3, column=i % 3, sticky="w", padx=(0, 8))
+                row=i // 3 + 2, column=i % 3, sticky="w", padx=(0, 8))
+        self._mp_seat_pri_change()
 
         # 乘车人
         gf = ttk.LabelFrame(self, text=" 乘车人（不选=下单时用默认乘车人） ", padding=8)
@@ -2711,11 +2918,23 @@ class NewMonitorTaskDialog(tk.Toplevel):
         trains = [t.strip().upper() for t in
                   re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
         passengers = [n for n, v in self.pax_vars.items() if v.get()]
+        pri_raw = self.seat_pri_var.get().strip()
         task = build_monitor_task(from_name, to_name, dates, date_range, trains,
                                   seats, passengers, self.purpose_var.get(),
                                   self.auto_var.get(), self.stop_var.get(),
                                   self.prio_var.get(),
-                                  pax_purpose=self.app.lc.get("pax_purpose") or {})
+                                  pax_purpose=self.app.lc.get("pax_purpose") or {},
+                                  seat_priority=pri_raw)
+        if pri_raw:
+            parsed = tk_mod.seat_rules_parse(pri_raw)
+            summary = []
+            for tr, ss in parsed["rules"].items():
+                summary.append("%s=%s" % (tr, "/".join(ss)))
+            if parsed["bare"]:
+                summary.append("其余车次：%s" % "/".join(parsed["bare"]))
+            for warn in parsed["warnings"]:
+                self.app._put_log("[提醒] 首选席别：%s" % warn)
+            self.app._put_log("[运行] 监控任务席别规则：%s" % "；".join(summary))
         try:
             name = append_monitor_task(task, start_now)
         except Exception as e:

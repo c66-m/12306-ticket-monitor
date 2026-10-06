@@ -173,7 +173,31 @@ class TestTicket(TempDirCase):
         self.assertEqual(ticket.seat_names_all("JOIO"),
                          ["二等座", "一等卧", "二等卧", "无座"])
         self.assertEqual(ticket.seat_names_all("", {"硬座": "5"}), ["硬座", "无座"])
-        self.assertEqual(ticket.seat_names_all(None), ["无座"])
+
+    def test_seat_names_all_kind_fallback(self):
+        """p35 缺失（未放票/接口没回码串）时按车型兜底，抢票也能看到全部席别。"""
+        self.assertEqual(ticket.train_seat_kind("G1305"), "G")
+        self.assertEqual(ticket.train_seat_kind("d941"), "D")
+        self.assertEqual(ticket.train_seat_kind("K225"), "普速")
+        self.assertEqual(ticket.train_seat_kind(None), "普速")
+        self.assertEqual(ticket.seat_names_all(None, None, "G1305"),
+                         ["商务座", "特等座", "一等座", "二等座", "无座"])
+        self.assertEqual(ticket.seat_names_all("", {}, "D941"),
+                         ["商务座", "一等座", "二等座", "动卧", "无座"])
+        self.assertEqual(ticket.seat_names_all(None, None, "1462"),
+                         ["软卧", "硬卧", "软座", "硬座", "无座"])
+        # 有码串时不受车型兜底影响
+        self.assertEqual(ticket.seat_names_all("9MOO", None, "D941"),
+                         ["商务座", "一等座", "二等座", "无座"])
+
+    def test_parse_row_houbu_flag(self):
+        """p37=houbu_train_flag：售完可候补的车次要能识别出来（界面显示「候补」）。"""
+        self.assertFalse(ticket.parse_row(synthetic_row(), {}, None)["houbu"])
+        row = synthetic_row().split("|")
+        row[37] = "1"
+        info = ticket.parse_row("|".join(row), {}, None)
+        self.assertTrue(info["houbu"])
+        self.assertIn("无座", info["seats_all"])
 
     def test_parse_row_seats_all(self):
         info = ticket.parse_row(synthetic_row(), {}, "2026-10-10")
@@ -409,8 +433,19 @@ class TestLauncherUnit(TempDirCase):
         self.assertIn("code", sts[0])
 
     def test_merge_kind_concurrent(self):
+        # 必须把缓存文件也指向临时目录：只清 _station_kinds 的话，_merge_kind 里
+        # 的 load_station_kinds() 会把真实 station_kind.json 又读回来（VNP 实际
+        # 是 "高铁+动车"），用例就变成跟真实缓存赛跑。
         snapshot = dict(launcher._station_kinds)
-        self.addCleanup(lambda: launcher._station_kinds.update(snapshot))
+        old_path = launcher.STATION_KIND_PATH
+        launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
+
+        def _restore():
+            launcher._station_kinds.clear()
+            launcher._station_kinds.update(snapshot)
+            launcher.STATION_KIND_PATH = old_path
+
+        self.addCleanup(_restore)
         launcher._station_kinds.clear()
         ts = [threading.Thread(target=lambda k=k: [launcher._merge_kind("VNP", k)
                                                    for _ in range(100)])
@@ -418,6 +453,11 @@ class TestLauncherUnit(TempDirCase):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(launcher._station_kinds["VNP"], "高铁+普速")
+        # 多值串（探测返回 "高铁+动车+普速"）必须拆开合并，不能整串塞进去
+        self.assertTrue(launcher._merge_kind("VNP", "高铁+动车+普速"))
+        self.assertEqual(launcher._station_kinds["VNP"], "高铁+动车+普速")
+        self.assertFalse(launcher._merge_kind("VNP", "动车"))
+        self.assertEqual(launcher._station_kinds["VNP"], "高铁+动车+普速")
 
 
 class TestGuiUnit(TempDirCase):
@@ -573,6 +613,74 @@ class TestLauncherIntegration(TempDirCase):
         self.assertEqual(errs, [])
         cfg = json.load(open(os.path.join(self.tmp, "config.json"), encoding="utf-8"))
         self.assertEqual(len(cfg["tasks"]), 3)
+
+
+class TestSeatRules(TempDirCase):
+    """「车次=席别」专属规则：解析、候选解析、feedback（RULES.md 第一节）。"""
+
+    def test_parse_mixed(self):
+        r = ticket.seat_rules_parse("K225=硬座/无座, K1969=硬卧, 硬座")
+        self.assertEqual(r["rules"]["K225"], ["硬座", "无座"])   # 无座展开在后
+        self.assertEqual(r["rules"]["K1969"], ["硬卧"])
+        self.assertEqual(r["bare"], ["硬座"])
+        self.assertEqual(r["warnings"], [])
+
+    def test_parse_duplicate_last_wins(self):
+        r = ticket.seat_rules_parse("K225=硬卧, k225=硬座")
+        self.assertEqual(r["rules"]["K225"], ["硬座"])           # 大小写不敏感+后者覆盖
+        self.assertTrue(any("重复" in w for w in r["warnings"]))
+
+    def test_parse_unknown_word_and_empty(self):
+        r = ticket.seat_rules_parse("K225=硬坐, K1969=, 硬座")
+        self.assertEqual(r["rules"]["K225"], ["硬座"])           # 无法识别按硬座
+        self.assertNotIn("K1969", r["rules"])                    # 空值忽略
+        self.assertEqual(len(r["warnings"]), 2)
+
+    def test_parse_legacy_list_and_string(self):
+        r = ticket.seat_rules_parse(["硬卧", "硬座"])
+        self.assertEqual(r["rules"], {})
+        self.assertEqual(r["bare"], ["硬卧", "硬座"])
+        r2 = ticket.seat_rules_parse("硬卧 硬座")                # 旧格式：空白分隔
+        self.assertEqual(r2["bare"], ["硬卧", "硬座"])
+
+    def test_candidates_scenario1(self):
+        """车次1要硬座、车次2要硬卧：互不串。"""
+        checked = ["硬座", "硬卧"]
+        pri = "K225=硬座, K1969=硬卧"
+        self.assertEqual(ticket.seat_candidates_for("K225", checked, pri), ["硬座"])
+        self.assertEqual(ticket.seat_candidates_for("K1969", checked, pri), ["硬卧"])
+
+    def test_candidates_intersection_empty_skips(self):
+        self.assertEqual(ticket.seat_candidates_for("K225", ["硬卧"], "K225=硬座"), [])
+
+    def test_candidates_unchecked_means_unrestricted(self):
+        self.assertEqual(ticket.seat_candidates_for("K225", [], "K225=硬座"),
+                         ["硬座"])
+
+    def test_candidates_bare_can_exceed_checked(self):
+        cand = ticket.seat_candidates_for("K1969", ["硬座"], "硬卧", avail=None)
+        self.assertEqual(cand, ["硬卧", "硬座"])                 # 首选可超出勾选（旧口径）
+
+    def test_candidates_nothing_restricted_uses_avail(self):
+        avail = {"硬座": "5", "硬卧": "有"}
+        self.assertEqual(ticket.seat_candidates_for("K225", [], "", avail),
+                         ["硬座", "硬卧"])
+
+    def test_candidates_avail_filter_and_lowercase(self):
+        avail = {"硬座": "5"}
+        self.assertEqual(ticket.seat_candidates_for("k225", ["硬座", "硬卧"],
+                                                    "K225=硬卧/硬座", avail),
+                         ["硬座"])                               # 规则顺序,avail 过滤
+
+    def test_feedback_train_checks(self):
+        text, warn = ticket.seat_priority_feedback(
+            "K999=硬座, K225=硬卧", checked=["硬座"], trains=["K225"])
+        self.assertTrue(warn)
+        self.assertIn("不在车次列表", text)
+        self.assertIn("无交集", text)
+        text2, warn2 = ticket.seat_priority_feedback("硬座/硬卧")
+        self.assertFalse(warn2)
+        self.assertIn("优先席别", text2)
 
 
 # ----------------------------- 辅助 -----------------------------

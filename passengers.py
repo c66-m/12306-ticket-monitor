@@ -176,7 +176,7 @@ def load_passengers(path=None):
         with open(path, "r", encoding="utf-8") as f:
             box = json.load(f)
     except Exception as e:
-        print("[警告] passengers.json 读取失败：%s" % e)
+        print("[警告] 乘车人文件 %s 读取失败：%s" % (path, e))
         return []
     try:
         text = _decrypt(box.get("enc", "none"), box.get("data", "[]"))
@@ -185,7 +185,7 @@ def load_passengers(path=None):
             return data
         return data.get("passengers", []) if isinstance(data, dict) else []
     except Exception as e:
-        print("[警告] 乘车人数据解密失败：%s" % e)
+        print("[警告] 乘车人文件 %s 解密失败：%s" % (path, e))
         return []
 
 

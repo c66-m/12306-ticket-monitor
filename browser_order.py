@@ -1198,8 +1198,8 @@ def order_ticket_via_browser(config, task, ticket, seat_name):
     try:
         from ticket import SEAT_NAME_TO_CODE, order_seat_code
         seat_code = SEAT_NAME_TO_CODE.get(seat_name)
-        # 网页端下单页不下发「无座」：同价改判为硬座（记账仍按勾选的席别）
-        seat_code, alias_name = order_seat_code(seat_name, seat_code)
+        # 网页端下单页不下发「无座」：按同价席别改判（记账仍按勾选的席别）
+        seat_code, alias_name = order_seat_code(seat_name, seat_code, ticket.get("train_code"))
     except Exception:
         seat_code = None
     if not seat_code:

@@ -43,4 +43,5 @@ desktop.ini
 *.tmp*
 *.guisave*
 *.launcher
+*.lock
 state.json.bad*

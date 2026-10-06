@@ -485,8 +485,13 @@ class MonitorEngine(object):
                 avail = info["available_seats"]
                 if not avail:
                     continue
-                hit_seats = ([s for s in seats_want if s in avail] if seats_want
-                             else list(avail.keys()))
+                # 每趟车各自的席别候选（唯一口径 ticket.seat_candidates_for）：
+                # 「车次=席别」专属规则 ∩ 当日勾选集，交集空=该车跳过（不回退
+                # 全局）；无规则的车 = 首选在前 + 勾选顺序；两者皆空 = 不限席别。
+                # 候选永远与该车实际有票求交。
+                cand = ticket.seat_candidates_for(
+                    train_code, seats_want, task.get("seat_priority") or [])
+                hit_seats = [s for s in cand if s in avail]
                 if not hit_seats:
                     continue
                 for seat_name in hit_seats:

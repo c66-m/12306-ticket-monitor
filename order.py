@@ -41,9 +41,13 @@ except ImportError:
         "软座": "2", "硬座": "1", "无座": "WZ",
     }
 
-    def order_seat_code(seat_name, seat_code=None):
-        """兜底实现（ticket.py 缺席时）：不做同价改判。"""
-        return seat_code or SEAT_NAME_TO_CODE.get(seat_name), None
+    def order_seat_code(seat_name, seat_code=None, train_code=None):
+        """兜底实现（ticket.py 缺席时）：无座按同价席别改判（动车组→二等座，其余→硬座）。"""
+        code = seat_code or SEAT_NAME_TO_CODE.get(seat_name)
+        if code == "WZ":
+            emu = str(train_code or "")[:1].upper() in ("G", "D", "C")
+            return ("O", "二等座") if emu else ("1", "硬座")
+        return code, None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -493,8 +497,9 @@ def order_ticket(config, task, ticket, seat_name):
         return False, "会话已失效（{0}）。请重新运行 capture_session.py 登录。".format(who), None
 
     # 席别同价改判（与 browser_order 同一规则）：网页端不下发「无座」，
-    # 勾「无座」按硬座提交；HTTP 路径此前漏了这一步，导致无座任务必失败
-    seat_code, _alias_name = order_seat_code(seat_name)
+    # 勾「无座」按同价席别提交（动车组→二等座，普速→硬座）；
+    # HTTP 路径此前漏了这一步，导致无座任务必失败
+    seat_code, _alias_name = order_seat_code(seat_name, None, ticket.get("train_code"))
     if not seat_code:
         return False, "未知席别: {0}".format(seat_name), None
 
