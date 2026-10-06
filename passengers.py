@@ -195,8 +195,11 @@ def save_passengers(passengers, path=None):
     payload = json.dumps({"passengers": list(passengers)}, ensure_ascii=False, indent=2)
     enc_name, data_text = _encrypt(payload)
     box = {"version": 1, "enc": enc_name, "data": data_text}
-    with open(path, "w", encoding="utf-8") as f:
+    # 原子写：写一半被杀不留半截密文（密文损坏 = 乘车人数据全丢）
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(box, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 # ----------------------------- 业务辅助 -----------------------------

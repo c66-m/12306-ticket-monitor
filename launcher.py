@@ -502,7 +502,8 @@ class Grabber(threading.Thread):
             try:
                 log("[预热] 开始预热（登录 + 打开车票列表页）…")
                 warm = browser_order.warm_up(warm_info, date, headless=False,
-                                             wait_code=(trains[0] if trains else None))
+                                             wait_code=(trains[0] if trains else None),
+                                             stop_event=self.stop_event)
                 log("[预热] 预热就绪，浏览器保持在线，等待 %s 到点立即下单" % st.strftime("%H:%M:%S"))
             except Exception as e:
                 log("[预热] 预热失败（%s），到点改用普通下单流程" % e)
@@ -581,7 +582,20 @@ class Grabber(threading.Thread):
                         self._notify_success(info, seat, msg)
                         return
                     extra = extra or {}
+                    if extra.get("reason") == "ambiguous":
+                        # 提交确认后结果未知：订单可能已在服务端生成，盲目重试有
+                        # 重复下单风险——停下让用户先核对「未支付订单」
+                        self.result = (False, "订单提交后结果未知——请先到 12306 查「未支付订单」："
+                                              "有单就支付或取消，确认无单后再重新开抢")
+                        log("[错误] %s（下单返回：%s）" % (self.result[1], msg))
+                        return
                     if extra.get("reason") == "dup":
+                        if extra.get("dup_kind") == "行程冲突":
+                            # 行程冲突 ≠ 本行程已有订单：别报"票已到手"误导去支付
+                            self.result = (False, "12306 提示行程冲突——可能是其它行程的未支付订单挡路，"
+                                                  "请到「未完成订单」查证处理后重新开抢")
+                            log("[提醒] 下单返回：%s" % msg)
+                            return
                         # 账号已有该行程订单（多为未支付）→ 票已到手，继续重试只会被拒
                         self.result = (True, "检测到该行程已有订单（多为未支付），请尽快去 12306 完成支付")
                         log("[提示] 下单返回：%s" % msg)
@@ -2681,6 +2695,19 @@ class NewMonitorTaskDialog(tk.Toplevel):
         if not seats:
             messagebox.showwarning("提示", "请至少选择一个席别", parent=self)
             return
+        if self.auto_var.get():
+            # 席别区会按车次余票补出「一等卧/二等卧/高级动卧」这类不支持下单的席别名，
+            # 开着自动下单又带上它们 → engine 每轮都以「未知席别」失败刷日志，任务永远抢不到。
+            # 与抢票路径同一条规则（见 Grabber._run）：开自动下单时剔除并说明。
+            bad = [s for s in seats if s not in tk_mod.SEAT_NAME_TO_CODE]
+            if bad:
+                seats = [s for s in seats if s in tk_mod.SEAT_NAME_TO_CODE]
+                self.app._put_log("[提醒] 席别 %s 暂不支持自动下单，已从该监控任务移除" % "、".join(bad))
+            if not seats:
+                messagebox.showwarning(
+                    "提示", "勾选的席别暂不支持自动下单。\n"
+                    "可改选其他席别，或关掉「自动下单」只做有票提醒。", parent=self)
+                return
         trains = [t.strip().upper() for t in
                   re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
         passengers = [n for n, v in self.pax_vars.items() if v.get()]

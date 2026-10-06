@@ -39,6 +39,9 @@ LEFT_TICKET_URL = "https://kyfw.12306.cn/otn/leftTicket/init"
 LOGIN_URL = "https://kyfw.12306.cn/otn/resources/login.html"
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 
+# 滑块出现后保留浏览器等用户手动完成的时长（脚本不绕过验证码）
+_SLIDE_WAIT_SEC = 180
+
 
 def _log(msg):
     print(msg)
@@ -252,8 +255,12 @@ def save_state(ctx):
         if not ({"tk", "uamtk"} & {c.get("name") for c in cookies}):
             if os.path.exists(STATE_PATH):
                 return False
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
+        # 原子写：写一半被杀会留下半截 JSON，下次 launch() 注不回 cookie，
+        # 开抢时刻变成"未登录"
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"cookies": cookies}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_PATH)
         return True
     except Exception:
         return False
@@ -375,24 +382,40 @@ def _record_timing(tm, total, ok, msg, info, seat_name, warm):
 # 查询命中判定，两档：
 #   _QUERY_ROW_JS —— 只要车次行渲染出来即可（预热用，此时多半无票，没有「预订」）
 #   _QUERY_HIT_JS —— 还要有「预订」按钮，才是真能下单的信号
-_QUERY_ROW_JS = """(code) => {
+_QUERY_ROW_JS = r"""(code) => {
     const tb = document.querySelector('#queryLeftTable');
     if (!tb) return false;
     const ld = document.querySelector('#queryLoading');
     if (ld && ld.offsetParent !== null) return false;
     const rows = Array.from(tb.querySelectorAll('tr'));
     if (!code) return rows.length > 0;
-    return rows.some(tr => tr.innerText.indexOf(code) >= 0);
+    for (const tr of rows) {
+        const s = tr.querySelector('strong');
+        if (s && s.textContent.trim() === code) return true;
+    }
+    // 词界正则兜底：G1 不得命中 G11/G100（此前用子串匹配曾可能认错车次行）
+    const re = new RegExp('(^|[^A-Za-z0-9])' +
+        code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
+    return rows.some(tr => re.test(tr.innerText || ''));
 }"""
 
-_QUERY_HIT_JS = """(code) => {
+_QUERY_HIT_JS = r"""(code) => {
     const tb = document.querySelector('#queryLeftTable');
     if (!tb) return false;
     const ld = document.querySelector('#queryLoading');
     if (ld && ld.offsetParent !== null) return false;
-    return Array.from(tb.querySelectorAll('tr')).some(
-        tr => tr.innerText.indexOf(code) >= 0
-           && tr.innerText.indexOf('预订') >= 0);
+    const rows = Array.from(tb.querySelectorAll('tr'));
+    for (const tr of rows) {
+        const s = tr.querySelector('strong');
+        if (!(s && s.textContent.trim() === code)) continue;
+        if (Array.from(tr.querySelectorAll('a')).some(
+                a => (a.innerText || '').indexOf('预订') >= 0)) return true;
+    }
+    const re = new RegExp('(^|[^A-Za-z0-9])' +
+        code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
+    return rows.some(tr => re.test(tr.innerText || '')
+        && Array.from(tr.querySelectorAll('a')).some(
+            a => (a.innerText || '').indexOf('预订') >= 0));
 }"""
 
 
@@ -499,12 +522,34 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
             mark("goto")
             mark("query")
 
-            # 3) 点该车次的「预订」
-            book = page.locator(
-                "#queryLeftTable tr:has-text('%s') a:has-text('预订')" % info["train_code"]).first
-            if book.count() == 0:
+            # 3) 点该车次的「预订」——精确匹配车次行。:has-text() 是子串匹配，
+            #    查 G1 曾可能点中排在前面的 G11/G100 的「预订」，把订单下给别的车次
+            book_ok = page.evaluate(
+                r"""(code) => {
+                    const tb = document.querySelector('#queryLeftTable');
+                    if (!tb) return false;
+                    const rows = Array.from(tb.querySelectorAll('tr'));
+                    let row = null;
+                    for (const tr of rows) {
+                        const s = tr.querySelector('strong');
+                        if (s && s.textContent.trim() === code) { row = tr; break; }
+                    }
+                    if (!row) {
+                        const re = new RegExp('(^|[^A-Za-z0-9])' +
+                            code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
+                        for (const tr of rows) {
+                            if (re.test(tr.innerText || '')) { row = tr; break; }
+                        }
+                    }
+                    if (!row) return false;
+                    const a = Array.from(row.querySelectorAll('a')).find(
+                        a => (a.innerText || '').indexOf('预订') >= 0);
+                    if (!a) return false;
+                    a.click();
+                    return true;
+                }""", info["train_code"])
+            if not book_ok:
                 return False, "页面上没有 %s 的『预订』按钮（可能已无票或不可预订）" % info["train_code"], None
-            book.click(timeout=8000, no_wait_after=True)
             _log("  [浏览器] 已点 %s 的『预订』" % info["train_code"])
             mark("book")
 
@@ -545,14 +590,30 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
             if not people:
                 return False, "确认页没有可用乘车人（账号里没保存常用联系人？）", None
 
-            targets = []
+            targets, missed = [], []
             for name in (passenger_names or []):
-                for p in people:
-                    if p["text"].startswith(name):
-                        targets.append(p)
-                        break
+                exact = [p for p in people if p["text"] == name]
+                if exact:
+                    targets.append(exact[0])
+                    continue
+                # 前缀兜底取最短命中（适配"张三（学生）"这类带标注的展示文本），
+                # 避免「张三」按前缀匹配到排在更前面的「张三丰」
+                pref = sorted((p for p in people if p["text"].startswith(name)),
+                              key=lambda p: len(p["text"]))
+                if pref:
+                    targets.append(pref[0])
+                else:
+                    missed.append(name)
+            if missed:
+                # 点了名但没匹配到：绝不能悄悄改勾别人（此前会静默勾第一位）
+                return (False,
+                        "乘车人 %s 在确认页没匹配到（可用：%s）。已中止，未提交订单——"
+                        "请核对姓名或账号常用联系人" % (
+                            "、".join(missed),
+                            "、".join(p["text"] for p in people[:8])),
+                        None)
             if not targets:
-                targets = [people[0]]
+                targets = [people[0]]  # 未点名：沿用账号第一位（既有约定）
 
             picked = []
             for t in targets:
@@ -568,6 +629,17 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     arg=[t["id"] for t in targets], timeout=5000)
             except Exception:
                 pass
+            # 读回勾选状态：12306 会把未核验/证件过期的联系人置灰，click 无效；
+            # 勾不上还往下走就是给页面残留的勾选下单
+            unchecked_ids = page.evaluate(
+                """(ids) => ids.filter(i => { const e = document.getElementById(i);
+                                              return !e || !e.checked; })""",
+                [t["id"] for t in targets])
+            if unchecked_ids:
+                bad_names = [t["text"] for t in targets if t["id"] in unchecked_ids]
+                return (False,
+                        "乘车人 %s 勾选未生效（可能未核验/证件过期）。已中止，未提交订单"
+                        % "、".join(bad_names), None)
             _log("  [浏览器] 乘车人：%s" % "、".join(picked))
             mark("passenger")
 
@@ -704,6 +776,23 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     arg=tt_args, timeout=3000)
             except Exception:
                 pass
+            # 读回校验（与席别段同一纪律）：内部状态可读时不一致即中止——
+            # 学生票没核验时盲提交必被拒，白耗抢票窗口（此前只 best-effort 等待）
+            try:
+                tt_now = page.evaluate(
+                    """() => (window.limit_tickets || []).map(
+                        t => ({name: t.name, tt: String(t.ticket_type)}))""")
+            except Exception:
+                tt_now = []
+            if tt_now:
+                tt_bad = [t for t in tt_now
+                          if t["tt"] != str((tt_args["map"] or {}).get(t["name"]) or tt_args["code"])]
+                if tt_bad:
+                    return (False,
+                            "票种未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单"
+                            % (json.dumps(tt_args, ensure_ascii=False),
+                               json.dumps(tt_bad, ensure_ascii=False)),
+                            {"limit_ticket_types": tt_now})
             mark("ticket_type")
 
             # 7) 提交订单。#submitOrder_id 是 <a href="javascript:">，
@@ -756,7 +845,21 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 except Exception:
                     return []
 
+            def _wait_slide_gone(sec):
+                """等用户在浏览器窗口手动完成滑块（脚本不绕过验证码）。
+                浏览器和锁都保持原状；返回 False 表示超时。"""
+                t_slide = time.time()
+                while time.time() - t_slide < sec:
+                    page.wait_for_timeout(500)
+                    try:
+                        if not _slide_up():
+                            return True
+                    except Exception:
+                        return True
+                return False
+
             clicked = False
+            captcha_waited = False
             dlg_seat = ""     # 12306 核对窗里显示的席别（取证：万一与所选不一致，日志里有原文）
             t_confirm = time.time()
             while time.time() - t_confirm < 15.0:
@@ -799,9 +902,13 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                                               "一等座", "商务座")
                                   if w in dlg_text and w not in (seat_name, alias_name or "")]
                         if others:
-                            dlg_seat = others[0]
-                            _log("  [浏览器] 注意：核对窗显示席别 %s，与本次提交的 %s 不一致"
-                                 "（同价席别，照常提交，结果以订单详情为准）" % (dlg_seat, seat_name))
+                            # 服务端渲染的核对窗与页面内部状态不一致：按 RULES.md
+                            # 的纪律"不一致就中止、不提交"——此前照常提交，可能
+                            # 买到与所选不符（更贵）的席别
+                            return (False,
+                                    "核对窗显示席别 %s，与所选 %s 不一致。已中止，未提交订单（原文：%s）"
+                                    % (others[0], seat_name, dlg_text[:160]),
+                                    {"seat_in_dialog": others[0]})
                     page.evaluate(
                         "() => { const e = document.querySelector('#qr_submit_id'); if (e) e.click(); }")
                     _log("  [浏览器] qr_submit 倒计时结束已启用（%.1fs），已点确认" % (
@@ -809,25 +916,29 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     clicked = True
                     break
                 if _slide_up():
-                    return (False,
-                            "触发滑块验证，请在浏览器窗口手动完成（脚本不绕过验证码）",
-                            {"need_captcha": True})
+                    # 浏览器和锁都保持原状等用户完成滑块；此前直接返回，
+                    # 毫秒级关窗让"请手动完成滑块"根本做不到
+                    _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
+                    if not _wait_slide_gone(_SLIDE_WAIT_SEC):
+                        return (False, "滑块验证等待超时（%d 秒），本次下单中止" % _SLIDE_WAIT_SEC,
+                                {"need_captcha": True})
+                    _log("  [浏览器] 滑块已消失，继续等确认按钮…")
                 page.wait_for_timeout(200)
             if not clicked:
-                # 旧版页面回退：点可见确认控件里的「确定/确认」
+                # 旧版页面回退：只点文本确认为「确定/确认/是/好的」的可见控件；
+                # #qr_submit_id 交给主轮询管（此刻可能还在倒计时禁用态），并且
+                # 不再盲点第一个控件——点错按钮置 clicked=True 会白白烧掉一次重试
                 btns = _visible_ok_btns()
                 _log("  [浏览器] 未等到 qr_submit，回退旧确认控件：%s" % json.dumps(
                     btns, ensure_ascii=False))
                 for b in btns:
+                    if b["id"] == "qr_submit_id":
+                        continue
                     if b["txt"] in ("确定", "确认", "是", "好的"):
                         page.evaluate("(id) => { const e = document.getElementById(id); if (e) e.click(); }", b["id"])
                         _log("  [浏览器] 已点确认框：%s" % b["txt"])
                         clicked = True
                         break
-                if not clicked and btns:
-                    page.evaluate("(b) => { const e = document.getElementById(b.id); if (e) e.click(); }", btns[0])
-                    _log("  [浏览器] 已点第一个确认控件：%s" % btns[0]["txt"])
-                    clicked = True
             _log("  [浏览器] 等待出票结果...")
             mark("submit")            # 8) 判定结果
             deadline = time.time() + verify_timeout
@@ -843,9 +954,16 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 if tick % 4 == 1:
                     sp = page.locator("#slide_passcode").first
                     if sp.count() and sp.is_visible():
-                        return (False,
-                                "触发滑块验证，请在浏览器窗口手动完成（脚本不绕过验证码）",
-                                {"need_captcha": True})
+                        if not captcha_waited:
+                            captcha_waited = True
+                            _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
+                            if not _wait_slide_gone(_SLIDE_WAIT_SEC):
+                                return (False, "滑块验证等待超时（%d 秒），请重试" % _SLIDE_WAIT_SEC,
+                                        {"need_captcha": True})
+                            _log("  [浏览器] 滑块已消失，继续等出票结果…")
+                        else:
+                            return (False, "滑块验证再次出现，已中止（脚本不绕过验证码）",
+                                    {"need_captcha": True})
                 url = page.url
                 if any(k in url for k in ("payOrder", "MyOrderNoComplete", "order/init")):
                     _log("  [浏览器] 结果页用时 %.1fs（%d 轮）" % (time.time() - t_submit, tick))
@@ -883,13 +1001,25 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         mark("result")
                         if any(k in _body for k in _dup_keys):
                             # 不是「没抢到」，是「账号已有（未支付）订单」——
-                            # 再重试只会得到同样的拒绝，必须停下让用户去支付
-                            return False, body, {"reason": "dup"}
+                            # 再重试只会得到同样的拒绝，必须停下让用户去支付。
+                            # dup_kind 让上层区分"行程冲突"和"本行程已有订单"
+                            return False, body, {"reason": "dup",
+                                                 "dup_kind": next(k for k in _dup_keys if k in _body)}
                         return False, body, None
             mark("result")
+            if clicked:
+                # 确认已点出去：订单可能已在服务端生成。结果未知时绝不能让上层
+                # 当普通失败盲目重试（重复下单窗口），标记 ambiguous 交人工核对
+                return (False,
+                        "提交后 %d 秒未收到明确结果（当前页：%s）——结果未知，请先到 12306 核对未完成订单"
+                        % (verify_timeout, page.url), {"reason": "ambiguous"})
             return False, "提交后 %d 秒未收到明确结果（当前页：%s）" % (verify_timeout, page.url), None
         except Exception as e:
             mark("result")
+            if clicked:
+                return (False,
+                        "提交确认后异常（结果未知，请先到 12306 核对未完成订单）：%s: %s"
+                        % (type(e).__name__, str(e)[:150]), {"reason": "ambiguous"})
             return False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
         # 无 finally：冷启动路径的收尾（save_state + ctx.close）挂在 ExitStack
         # 回调上，预热路径不关窗、留给 WarmSession 继续用。
@@ -936,7 +1066,8 @@ class WarmSession:
     不走 with exclusive，因为要跨函数长持有）；close() 必须被调用，否则别的
     进程会被一直挡在门外。进程被强杀时 OS 自动释放文件锁，不会留死锁。"""
 
-    def __init__(self, info, date, headless=False, timeout=120, wait_code=None):
+    def __init__(self, info, date, headless=False, timeout=120, wait_code=None,
+                 stop_event=None):
         self.info = info
         self.date = date
         self._p = None
@@ -947,6 +1078,7 @@ class WarmSession:
         self._file_locked = False
         self._owner = threading.get_ident()
         self._timeout = timeout
+        self._stop_event = stop_event
         self.error = None
         self.ready = False
         self._setup(headless, wait_code)
@@ -966,14 +1098,22 @@ class WarmSession:
         return self._page
 
     def _setup(self, headless, wait_code):
+        def _stopped():
+            return self._stop_event is not None and self._stop_event.is_set()
         try:
+            if _stopped():
+                raise RuntimeError("预热已手动停止")
             if not _BROWSER_LOCK.acquire(timeout=self._timeout):
                 raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），预热失败")
             self._local_locked = True
+            if _stopped():
+                raise RuntimeError("预热已手动停止")
             if not _PROFILE_LOCK.acquire(timeout=self._timeout):
                 raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），预热失败")
             self._file_locked = True
             _LOCK_LOCAL.depth = 1   # 同线程重入标记：order_via_browser 的装饰器会放行
+            if _stopped():
+                raise RuntimeError("预热已手动停止")
             from playwright.sync_api import sync_playwright
             self._p = sync_playwright().start()
             self._ctx = launch(self._p, headless=headless)
@@ -982,8 +1122,13 @@ class WarmSession:
             ok, who = session_ok(self._ctx, page=self._page)
             if not ok:
                 raise RuntimeError("预热时会话不可用：%s" % who)
-            _goto_and_query(self._page, self.info, self.date,
-                            want_hit=False, timeout=30000, wait_code=wait_code)
+            if _stopped():
+                raise RuntimeError("预热已手动停止")
+            hit = _goto_and_query(self._page, self.info, self.date,
+                                  want_hit=False, timeout=30000, wait_code=wait_code)
+            if not hit:
+                # 掩盖预热失败没有意义：到点下单时 refresh() 会重查，如实记录
+                _log("  [预热] 目标车次行未出现（可能无票/未放票），到点下单时会重新查询")
             self.ready = True
         except Exception as e:
             self.error = str(e)
@@ -1020,22 +1165,28 @@ class WarmSession:
                 self._p.stop()
         except Exception:
             pass
-        if getattr(_LOCK_LOCAL, "depth", 0):
+        if self._owner == threading.get_ident() and getattr(_LOCK_LOCAL, "depth", 0):
             _LOCK_LOCAL.depth = 0
         if self._file_locked:
             _PROFILE_LOCK.release()
             self._file_locked = False
         if self._local_locked:
-            _BROWSER_LOCK.release()
+            if self._owner == threading.get_ident():
+                _BROWSER_LOCK.release()
+            else:
+                # RLock 只能由持锁线程释放：跨线程收尾放不掉进程内锁，只能明示
+                _log("[警告] WarmSession 由非创建线程收尾，进程内浏览器锁未能释放，"
+                     "本进程后续 exclusive() 可能超时——建议重启该程序")
             self._local_locked = False
 
 
-def warm_up(info, date, headless=False, timeout=120, wait_code=None):
+def warm_up(info, date, headless=False, timeout=120, wait_code=None, stop_event=None):
     """开抢前预热：打开浏览器、确认登录、停在目标车次的列表页。
 
+    stop_event: threading.Event，置位后预热尽快中止（ RuntimeError）。
     返回 WarmSession；失败抛 RuntimeError（调用方回退到普通下单）。"""
     return WarmSession(info, date, headless=headless, timeout=timeout,
-                       wait_code=wait_code)
+                       wait_code=wait_code, stop_event=stop_event)
 
 
 def order_ticket_via_browser(config, task, ticket, seat_name):
@@ -1054,7 +1205,11 @@ def order_ticket_via_browser(config, task, ticket, seat_name):
     if not seat_code:
         return False, "未知席别: %s" % seat_name, None
 
-    date = ticket.get("query_date") or ticket.get("start_date")
+    date = ticket.get("query_date")
+    if not date:
+        # start_date(p13) 是无横线的始发日期，跨夜车与乘车日可能差一天——
+        # 宁可拒绝下单也不能静默订错日期
+        return False, "查询结果缺少乘车日期（query_date），拒绝下单以防订错日期", None
     names = list(task.get("passenger_names") or [])
     # 按人票种：任务里存了 {姓名: 票种代码} 就逐人下发，覆盖到的走本人票种
     purpose_map = dict(task.get("pax_purpose") or {})

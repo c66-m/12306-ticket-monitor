@@ -571,6 +571,22 @@ class MonitorEngine(object):
                         continue
                     else:
                         msg = (extra or {}).get("msg", "")
+                        if (extra or {}).get("reason") == "ambiguous":
+                            # 提交确认后结果未知：订单可能已在服务端生成，继续自动
+                            # 重试有重复下单风险——停任务交人工核对
+                            self.set_task_status(task, "failed",
+                                "订单提交后结果未知——请先到 12306「未支付订单」核对："
+                                "有单就支付/取消，确认无单后再恢复本任务")
+                            LOG.error("[警告] 任务「%s」%s %s 提交后结果未知，已停止自动重试",
+                                      name, date, train_code)
+                            self._append_history({
+                                "time": self._now(), "task": name, "result": "ambiguous",
+                                "train": train_code, "date": date, "from": info["from_name"],
+                                "to": info["to_name"], "seat": seat_name,
+                                "passengers": p_names, "order_no": "",
+                                "message": msg, "notify": "",
+                            })
+                            return True, False
                         if (extra or {}).get("reason") == "seat_unavailable":
                             # 确认页可售席别由 12306 服务端下发（普速车常常没有「无座」），
                             # 换时间点重试也不会有：记入 dedup 永久跳过，别无限重试刷日志

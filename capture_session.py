@@ -124,8 +124,11 @@ def main():
         if missing:
             print("[警告] 以下关键 Cookie 未捕获: {0}（不影响保存，但下单可能失败）".format(missing))
 
-        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+        # 原子写：写一半被杀会留下半截 JSON，下次下单直接"未登录"
+        tmp = COOKIE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cookie_dict, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, COOKIE_PATH)
 
         browser.close()
         print("\n[完成] 已保存 {0} 个 Cookie 到 {1}".format(len(cookie_dict), COOKIE_PATH))

@@ -1632,7 +1632,8 @@ def _mask_id(id_no):
 # ----------------------------- 购票历史 -----------------------------
 
 HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
-                        "failed": "下单失败", "hit_no_order": "命中未下单"}
+                        "failed": "下单失败", "hit_no_order": "命中未下单",
+                        "ambiguous": "结果待人工核对"}
 
 
 def read_history_records(limit=200):
