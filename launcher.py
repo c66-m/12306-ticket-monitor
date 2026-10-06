@@ -769,23 +769,44 @@ def append_monitor_task(task, start_now=True):
     监控引擎主循环每轮 _sync_config() 检测 mtime 变化后自动重建调度表，
     处于「监控中」状态的新任务会被自动捡起来，无需重启监控软件。"""
     cfg_path = os.path.join(HERE, "config.json")
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    cfg.setdefault("tasks", []).append(task)
     tmp = cfg_path + ".launcher"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, cfg_path)
+    # 读-改-写并发防护：写回前确认 config.json 没被监控 GUI 动过；
+    # 被动过就丢弃本轮重读重写（最多 3 次），避免覆盖掉对方刚保存的任务/设置
+    for _ in range(3):
+        try:
+            before = os.path.getmtime(cfg_path)
+        except OSError:
+            before = None
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg.setdefault("tasks", []).append(task)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        try:
+            after = os.path.getmtime(cfg_path)
+        except OSError:
+            after = None
+        if after == before:
+            os.replace(tmp, cfg_path)
+            break
+        # 撞车：本轮作废，带着对方的新内容重来
+    else:
+        os.replace(tmp, cfg_path)  # 三次都撞车：以本方落盘收场（低概率，双方都是追加型写）
     # state.json 条目（与 gui.mark_task_created 的无 app 分支保持一致）
     state_path = os.path.join(HERE, cfg.get("state_file", "state.json"))
-    try:
-        with open(state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except Exception as e:
-        # state.json 损坏时这里会退化成空状态，等于丢掉其它任务的运行状态，
-        # 至少要在日志里留痕，别让它悄悄发生。
-        log("[提醒] 读取 state.json 失败，将按空状态写入新任务条目：%s" % e)
-        state = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            # state.json 存在但读不出来：绝不能拿空状态覆盖——那会丢掉其它
+            # 全部任务的运行状态。只跳过状态写入（config 里的任务已加成功，
+            # 引擎下次启动会把它当新任务按"未启动"补状态），坏档留给用户处理。
+            log("[错误] 读取 state.json 失败，本次只写任务不写状态"
+                "（避免空状态覆盖丢失其它任务）：%s" % e)
+            return task["name"]
+    else:
+        state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
     entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
     entry["status"] = "monitoring" if start_now else "paused"
     entry.setdefault("fail_streak", 0)
@@ -1512,10 +1533,19 @@ class TrainCardList(ttk.Frame):
                         lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>",
                          lambda e: self.canvas.itemconfigure(self._win, width=e.width))
-        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
-        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        # 滚轮绑到所属 Toplevel（add 叠加，不占全局 bind_all 槽位），由指针位置
+        # 决定滚谁：多任务窗口并存时不再互抢全局绑定、也不会把别的窗口滚跑
+        self.winfo_toplevel().bind("<MouseWheel>", self._wheel, add="+")
 
     def _wheel(self, event):
+        try:
+            w = self.winfo_containing(event.x_root, event.y_root)
+            while w is not None and w is not self.canvas:
+                w = w.master
+        except Exception:
+            return
+        if w is None:
+            return  # 指针不在本滚动区上：不接管
         self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
 
     def render(self, infos, empty_text="（没有符合条件的车次）"):
@@ -1682,7 +1712,7 @@ class LauncherApp(tk.Frame):
         self.to_ent = StationEntry(r1, width=13, history=self.lc.get("station_history"))
         self.to_ent.pack(side="left", padx=(4, 6))
         ttk.Button(r1, text="定位", width=5, command=self._locate).pack(side="left")
-        ttk.Label(r1, text="车次留空=全部；日期「到」留空=只查那一天（区间最多 5 天）",
+        ttk.Label(r1, text="车次留空=全部；日期「到」留空=只查那一天（区间最多相差 5 天，共 6 天）",
                   foreground="#6e7781").pack(side="left", padx=(10, 0))
 
         r2 = ttk.Frame(tf)
@@ -1989,7 +2019,7 @@ class LauncherApp(tk.Frame):
 
     @staticmethod
     def _resolve_dates(lc):
-        """把「从 / 到」解析为待查日期列表（最多 5 天）。"""
+        """把「从 / 到」解析为待查日期列表（与监控系统一致：从到相差最多 5 天 = 6 天）。"""
         d0s = (lc.get("date") or "").strip()
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", d0s):
             raise RuntimeError("日期格式应为 YYYY-MM-DD")
@@ -2002,7 +2032,7 @@ class LauncherApp(tk.Frame):
             d1 = datetime.strptime(d1s, "%Y-%m-%d").date()
             if d1 < d0:
                 raise RuntimeError("「到」不能早于「从」")
-            if (d1 - d0).days > 4:
+            if (d1 - d0).days > 5:  # 与 gui.py 三处入口同一口径：6 个日期
                 raise RuntimeError("日期区间最多相差 5 天")
             dates = [(d0 + timedelta(days=i)).strftime("%Y-%m-%d")
                      for i in range((d1 - d0).days + 1)]

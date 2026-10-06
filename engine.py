@@ -174,6 +174,12 @@ class MonitorEngine(object):
                     state = json.load(f)
             except Exception as e:
                 LOG.warning("state.json 读取失败: %s", e)
+                # 别让随后的 _save_state 用空状态覆盖坏档：先把损坏文件挪走留证
+                # （state.json.bad，可人工抢救），之后从空状态重建
+                try:
+                    os.replace(self.state_path, self.state_path + ".bad")
+                except OSError:
+                    pass
                 state = {}
         # 兼容旧版：把平铺的 "区间|日期|车次|席别" 键迁到 dedup 下
         if "dedup" not in state:

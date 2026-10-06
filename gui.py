@@ -549,12 +549,19 @@ class ScrollFrame(ttk.Frame):
                         lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>",
                          lambda e: self.canvas.itemconfigure(self._win, width=e.width))
-        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
-        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
-        self.inner.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
-        self.inner.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        # 滚轮绑到所属 Toplevel（add 叠加，不占全局 bind_all 槽位），由指针位置
+        # 决定滚哪个滚动区：多窗口/多滚动区并存时互不抢占、也不会把别的窗口滚跑
+        self.winfo_toplevel().bind("<MouseWheel>", self._wheel, add="+")
 
     def _wheel(self, e):
+        try:
+            w = self.winfo_containing(e.x_root, e.y_root)
+            while w is not None and w is not self.canvas:
+                w = w.master
+        except Exception:
+            return
+        if w is None:
+            return  # 指针不在本滚动区上：不接管，别的滚动区/控件自己处理
         self.canvas.yview_scroll(int(-e.delta / 120), "units")
 
     def clear(self):
@@ -1621,9 +1628,23 @@ def _mask_id(id_no):
 
 # ----------------------------- 购票历史 -----------------------------
 
+HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
+                        "failed": "下单失败", "hit_no_order": "命中未下单"}
+
+
+def read_history_records(limit=200):
+    """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表。"""
+    path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
+    try:
+        with open(path, encoding="utf-8") as f:
+            history = json.load(f)
+    except Exception:
+        return []
+    return list(reversed(history[-limit:]))
+
+
 class HistoryDialog(tk.Toplevel):
-    RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
-                    "failed": "下单失败", "hit_no_order": "命中未下单"}
+    RESULT_LABEL = HISTORY_RESULT_LABEL
 
     def __init__(self, master):
         super().__init__(master)
@@ -1652,13 +1673,7 @@ class HistoryDialog(tk.Toplevel):
         self.load()
 
     def load(self):
-        path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
-        try:
-            with open(path, encoding="utf-8") as f:
-                history = json.load(f)
-        except Exception:
-            history = []
-        for r in reversed(history[-200:]):
+        for r in read_history_records():
             self.tree.insert("", "end", values=(
                 r.get("time", ""), r.get("task", ""), r.get("train", ""),
                 r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
@@ -1669,16 +1684,13 @@ class HistoryDialog(tk.Toplevel):
 
 # ----------------------------- 通知设置 -----------------------------
 
-class NotifyDialog(tk.Toplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("邮件通知设置（SMTP）")
-        self.geometry("500x420")
-        cfg = load_config()
-        self.email = cfg.setdefault("notify", {}).setdefault("email", {})
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=12, pady=10)
+class NotifyFormMixin:
+    """邮件通知表单公共实现（NotifyDialog 与 NotifyPanel 共用，勿两处各改一份）。
 
+    子类先把 self.email 指到 config 里的 email 字典，再调 _build_notify_fields；
+    collect/save/test 三个方法两边完全一致，统一放这里。"""
+
+    def _build_notify_fields(self, body, hint_wraplength):
         def row(label, var, show=None, width=34):
             r = ttk.Frame(body)
             r.pack(fill="x", pady=4)
@@ -1702,12 +1714,7 @@ class NotifyDialog(tk.Toplevel):
         self.to_var = tk.StringVar(value=",".join(self.email.get("to") or []))
         row("收件人", self.to_var)
         ttk.Label(body, text="收件人多个用逗号分隔；发件人地址留空则默认同发件邮箱；QQ/163 邮箱需在邮箱设置中开启 SMTP 服务并生成授权码",
-                  foreground=GRAY, wraplength=460).pack(anchor="w", pady=4)
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="保存", command=self.save).pack(side="right", padx=6)
-        ttk.Button(btns, text="发送测试邮件", command=self.test).pack(side="right", padx=6)
+                  foreground=GRAY, wraplength=hint_wraplength).pack(anchor="w", pady=4)
 
     def collect(self):
         self.email.update({
@@ -1752,6 +1759,22 @@ class NotifyDialog(tk.Toplevel):
                 (messagebox.showinfo if ok else messagebox.showerror)("测试结果", msg, parent=self)
 
         run_async(self, do_test, on_done)
+
+
+class NotifyDialog(NotifyFormMixin, tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("邮件通知设置（SMTP）")
+        self.geometry("500x420")
+        cfg = load_config()
+        self.email = cfg.setdefault("notify", {}).setdefault("email", {})
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+        self._build_notify_fields(body, hint_wraplength=460)
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="保存", command=self.save).pack(side="right", padx=6)
+        ttk.Button(btns, text="发送测试邮件", command=self.test).pack(side="right", padx=6)
 
 
 # ----------------------------- 登录会话 -----------------------------
@@ -2184,13 +2207,7 @@ class HistoryPanel(ttk.Frame):
 
     def load(self):
         self.tree.delete(*self.tree.get_children())
-        path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
-        try:
-            with open(path, encoding="utf-8") as f:
-                history = json.load(f)
-        except Exception:
-            history = []
-        for r in reversed(history[-200:]):
+        for r in read_history_records():
             self.tree.insert("", "end", values=(
                 r.get("time", ""), r.get("task", ""), r.get("train", ""),
                 r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
@@ -2201,7 +2218,7 @@ class HistoryPanel(ttk.Frame):
 
 # ----------------------------- 通知设置页 -----------------------------
 
-class NotifyPanel(ttk.Frame):
+class NotifyPanel(NotifyFormMixin, ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
@@ -2213,80 +2230,12 @@ class NotifyPanel(ttk.Frame):
 
         body = ttk.Frame(self, padding=8)
         body.pack(fill="both", expand=True)
-
-        def row(label, var, show=None, width=34):
-            r = ttk.Frame(body)
-            r.pack(fill="x", pady=5)
-            ttk.Label(r, text=label, width=12).pack(side="left")
-            ttk.Entry(r, textvariable=var, width=width, show=show).pack(
-                side="left", fill="x", expand=True)
-            return r
-
-        self.enabled_var = tk.BooleanVar(value=bool(self.email.get("enabled", True)))
-        ttk.Checkbutton(body, text="启用邮件通知", variable=self.enabled_var).pack(anchor="w", pady=2)
-        self.host_var = tk.StringVar(value=self.email.get("smtp_host", "smtp.qq.com"))
-        row("SMTP 服务器", self.host_var)
-        self.port_var = tk.StringVar(value=str(self.email.get("smtp_port", 465)))
-        row("端口", self.port_var, width=10)
-        self.user_var = tk.StringVar(value=self.email.get("username", ""))
-        row("发件邮箱", self.user_var)
-        self.pwd_var = tk.StringVar(value=notify_mod.secret_of(self.email.get("password", "")))
-        row("邮箱授权码", self.pwd_var, show="*")
-        self.from_var = tk.StringVar(value=self.email.get("from", ""))
-        row("发件人地址", self.from_var)
-        self.to_var = tk.StringVar(value=",".join(self.email.get("to") or []))
-        row("收件人", self.to_var)
-        ttk.Label(body, text="收件人多个用逗号分隔；发件人地址留空则默认同发件邮箱；QQ/163 邮箱需在邮箱设置中开启 SMTP 服务并生成授权码",
-                  foreground=GRAY, wraplength=640).pack(anchor="w", pady=6)
+        self._build_notify_fields(body, hint_wraplength=640)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=8)
         ttk.Button(btns, text="保存", style="Blue.TButton", command=self.save).pack(side="right", padx=6)
         ttk.Button(btns, text="发送测试邮件", style="White.TButton", command=self.test).pack(side="right", padx=6)
-
-    def collect(self):
-        self.email.update({
-            "enabled": bool(self.enabled_var.get()),
-            "smtp_host": self.host_var.get().strip(),
-            "smtp_port": int(self.port_var.get().strip() or 465),
-            "username": self.user_var.get().strip(),
-            "password": notify_mod.protect_secret(self.pwd_var.get().strip()),
-            "from": self.from_var.get().strip(),
-            "to": [x.strip() for x in self.to_var.get().replace("，", ",").split(",")
-                   if x.strip()],
-        })
-        return normalize_email_settings(self.email)
-
-    def save(self):
-        try:
-            email = self.collect()
-        except ValueError as e:
-            messagebox.showwarning("无法保存", str(e), parent=self)
-            return
-        cfg = load_config()
-        cfg.setdefault("notify", {})["email"] = email
-        save_config(cfg)
-        messagebox.showinfo("完成", "通知设置已保存", parent=self)
-
-    def test(self):
-        try:
-            email = self.collect()
-        except ValueError as e:
-            messagebox.showwarning("无法发送", str(e), parent=self)
-            return
-
-        def do_test():
-            return notify_mod.send_email(email, "测试邮件：12306 监控系统",
-                                         "这是一封测试邮件，收到说明邮件通知可用。")
-
-        def on_done(res, err):
-            if err:
-                messagebox.showerror("失败", "测试发送异常：%s" % err, parent=self)
-            else:
-                ok, msg = res
-                (messagebox.showinfo if ok else messagebox.showerror)("测试结果", msg, parent=self)
-
-        run_async(self, do_test, on_done)
 
 
 # ----------------------------- 任务状态页 -----------------------------
@@ -2685,14 +2634,7 @@ class TaskEditDialog(tk.Toplevel):
 MINI_LOG_TAGS = ("[有票]", "[抢到]", "[错误]", "[冷却]", "[防重]",
                  "[跳过]", "[会话]", "[状态]")
 
-MINI_STAT_COLOR = {
-    "monitoring": "#1a7f37",
-    "retrying": "#d97706",
-    "success": "#0969da",
-    "failed": "#cf222e",
-    "paused": "#9a6700",
-    "cancelled": "#6e7781",
-}
+MINI_STAT_COLOR = STATUS_COLOR  # 与任务页状态色同一份（改色只改 STATUS_COLOR）
 
 MINI_LOG_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d+ \[\w+\] (.*)$")

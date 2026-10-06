@@ -38,5 +38,9 @@ desktop.ini
 *.log
 
 # ===== 本地临时文件 =====
+# 原子写的临时名带 pid 后缀（config.json.tmp123 / state.json.guisave456 等）
 *.tmp
-*.guisave
+*.tmp*
+*.guisave*
+*.launcher
+state.json.bad
