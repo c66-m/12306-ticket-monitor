@@ -25,6 +25,7 @@ import sys
 import time
 from urllib.parse import unquote, urlencode
 
+import appcommon
 import requests
 
 try:
@@ -105,10 +106,7 @@ def save_session(session, cookie_path=None):
             }
     if not cookies:
         return
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    appcommon.atomic_write_json(path, cookies)
 
 
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"

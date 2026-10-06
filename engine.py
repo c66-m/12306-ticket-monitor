@@ -36,6 +36,7 @@ try:
 except Exception:
     pass
 
+import appcommon
 import notify as notify_mod
 import order as order_mod
 import ticket
@@ -229,20 +230,9 @@ class MonitorEngine(object):
             if snapshot is None:
                 snapshot = copy.deepcopy(dict(state))
             # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
-            tmp_path = "{0}.tmp{1}".format(
-                self.state_path, threading.get_ident())
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=2)
-            for _ in range(3):
-                try:
-                    os.replace(tmp_path, self.state_path)
-                    break
-                except OSError:
-                    time.sleep(0.05)
-            else:
-                # 极端情况兜底（如杀毒软件占用目标文件）：直接覆盖写
-                with open(self.state_path, "w", encoding="utf-8") as f:
-                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            # 临时名/重试/直写兜底语义由 appcommon 参数化保留
+            appcommon.atomic_write_json(self.state_path, snapshot,
+                                        fallback_direct=True)
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
         except OSError:
@@ -426,11 +416,7 @@ class MonitorEngine(object):
                 except Exception:
                     history = []
             history.append(record)
-            tmp_path = "{0}.tmp{1}".format(
-                self.history_path, threading.get_ident())
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(history[-500:], f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self.history_path)
+            appcommon.atomic_write_json(self.history_path, history[-500:])
 
     # ----------------------------- 单任务扫描 -----------------------------
 

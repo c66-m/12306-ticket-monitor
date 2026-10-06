@@ -234,10 +234,7 @@ def load_launcher_config():
 
 def save_launcher_config(lc):
     # 原子写：写一半被杀会损坏全部配置（同文件 append_monitor_task 已是此范式）
-    tmp = LAUNCHER_CFG_PATH + ".tmp%s" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(lc, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, LAUNCHER_CFG_PATH)
+    appcommon.atomic_write_json(LAUNCHER_CFG_PATH, lc)
 
 
 # ----------------------------- 抢票任务库（多任务管理） -----------------------------
@@ -260,10 +257,7 @@ def load_grab_tasks():
 
 def save_grab_tasks(tasks):
     # 原子写：grab_tasks.json 是全部抢票任务的唯一存储，中途崩溃不能截断
-    tmp = GRAB_TASKS_PATH + ".tmp%s" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"tasks": tasks}, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, GRAB_TASKS_PATH)
+    appcommon.atomic_write_json(GRAB_TASKS_PATH, {"tasks": tasks})
 
 
 def new_grab_task(seq):
@@ -805,17 +799,8 @@ def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
 _CFG_WRITE_LOCK = threading.Lock()
 
 
-def _atomic_replace(src, dst, tries=3):
-    """os.replace 带 Windows 占用重试：目标/源被并发读写句柄占用的瞬间会
-    PermissionError（杀毒扫描、对方 json.load 持有读句柄），短暂退避重试。"""
-    for i in range(tries):
-        try:
-            os.replace(src, dst)
-            return
-        except OSError:
-            if i == tries - 1:
-                raise
-            time.sleep(0.05)
+# Windows 占用退避重试的 os.replace（实现单点在 appcommon）
+_atomic_replace = appcommon.replace_with_retry
 
 
 def append_monitor_task(task, start_now=True):

@@ -683,6 +683,74 @@ class TestSeatRules(TempDirCase):
         self.assertIn("优先席别", text2)
 
 
+class TestAppCommon(TempDirCase):
+    def test_parse_date_range_shapes(self):
+        import appcommon
+        self.assertEqual(appcommon.parse_date_range("2026-10-07"),
+                         (["2026-10-07"], []))
+        self.assertEqual(appcommon.parse_date_range("2026-10-07~2026-10-12"),
+                         ([], ["2026-10-07", "2026-10-12"]))
+        self.assertEqual(appcommon.parse_date_range("2026-10-07", "2026-10-12"),
+                         ([], ["2026-10-07", "2026-10-12"]))
+        self.assertEqual(appcommon.parse_date_range("2026-10-07", "2026-10-07"),
+                         (["2026-10-07"], []))
+        for bad in ("2026-10-07~2026-10-06", "20261007", "", "abc"):
+            with self.assertRaises(ValueError):
+                appcommon.parse_date_range(bad)
+        with self.assertRaises(ValueError):
+            appcommon.parse_date_range("2026-10-07", "2026-10-14")  # 超 5 天跨度
+
+    def test_atomic_write_json_basic_and_unique_tmp(self):
+        import appcommon, threading
+        path = os.path.join(self.tmp, "a.json")
+        appcommon.atomic_write_json(path, {"k": 1})
+        self.assertEqual(json.load(open(path, encoding="utf-8")), {"k": 1})
+        self.assertFalse([f for f in os.listdir(self.tmp) if "tmp" in f])
+        seen = set()
+
+        real_dump = json.dump
+
+        def spy_dump(obj, f, **kw):
+            seen.add(f.name)
+            return real_dump(obj, f, **kw)
+
+        with mock.patch.object(json, "dump", spy_dump):
+            ths = [threading.Thread(
+                       target=lambda i=i: appcommon.atomic_write_json(
+                           path, {"i": i}))
+                   for i in range(4)]
+            [t.start() for t in ths]
+            [t.join() for t in ths]
+        self.assertEqual(len(seen), 4)          # 临时名线程唯一
+        self.assertTrue(json.load(open(path, encoding="utf-8")))
+
+    def test_replace_retry_and_fallback(self):
+        import appcommon
+        src = os.path.join(self.tmp, "src")
+        dst = os.path.join(self.tmp, "dst")
+        open(src, "w", encoding="utf-8").write("data")
+        calls = {"n": 0}
+        real_replace = appcommon.os.replace
+
+        def flaky(a, b):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise OSError("busy")
+            return real_replace(a, b)
+        with mock.patch.object(appcommon.os, "replace", flaky):
+            appcommon.replace_with_retry(src, dst)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(open(dst, encoding="utf-8").read(), "data")
+        # 重试耗尽 + fallback_direct：内容直写落地
+        # （段一已把 src 改名为 dst：先重建 src，否则源缺失时兜底正确地抛错）
+        open(src, "w", encoding="utf-8").write("data")
+        dst2 = os.path.join(self.tmp, "dst2")
+        with mock.patch.object(appcommon.os, "replace",
+                               side_effect=OSError("busy forever")):
+            appcommon.replace_with_retry(src, dst2, fallback_direct=True)
+        self.assertEqual(open(dst2, encoding="utf-8").read(), "data")
+
+
 # ----------------------------- 辅助 -----------------------------
 
 import logging  # noqa: E402

@@ -119,10 +119,7 @@ def load_config():
 
 def save_config(config):
     # 原子写：写一半被杀（关窗强退/断电）不会留下截断的 config.json 导致任务全丢
-    tmp = CONFIG_PATH + ".tmp%s" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG_PATH)
+    appcommon.atomic_write_json(CONFIG_PATH, config)
 
 
 def load_state():
@@ -135,10 +132,7 @@ def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
-    tmp = path + ".guisave%s" % os.getpid()  # 带 pid：多个窗口同存时互不踩临时文件
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    appcommon.atomic_write_json(path, state, tmp_kind="guisave")
 
 
 def mark_task_created(app, task, start_now):

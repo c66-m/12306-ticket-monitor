@@ -29,6 +29,8 @@
 
 import base64
 import json
+
+import appcommon
 import os
 import sys
 
@@ -196,10 +198,7 @@ def save_passengers(passengers, path=None):
     enc_name, data_text = _encrypt(payload)
     box = {"version": 1, "enc": enc_name, "data": data_text}
     # 原子写：写一半被杀不留半截密文（密文损坏 = 乘车人数据全丢）
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(box, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    appcommon.atomic_write_json(path, box)
 
 
 # ----------------------------- 业务辅助 -----------------------------
