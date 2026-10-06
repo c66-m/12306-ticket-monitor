@@ -39,6 +39,7 @@ except Exception:
 import notify as notify_mod
 import order as order_mod
 import ticket
+import logutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -151,15 +152,14 @@ class MonitorEngine(object):
     def _setup_logging(self):
         log_dir = os.path.join(HERE, self.config.get("log_dir", "logs"))
         os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, "monitor_{0}.log".format(
-            datetime.date.today().strftime("%Y%m%d")))
-        LOG.setLevel(logging.INFO)
-        for h in list(LOG.handlers):
-            LOG.removeHandler(h)
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        # 按天滚动：长跑跨天后日志自动切到新日期的文件
+        fh = logutil.DayFileHandler(log_dir, "monitor")
         fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         sh = logging.StreamHandler()
         sh.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        LOG.setLevel(logging.INFO)
+        for h in list(LOG.handlers):
+            LOG.removeHandler(h)
         LOG.addHandler(fh)
         LOG.addHandler(sh)
         LOG.propagate = False
@@ -392,16 +392,25 @@ class MonitorEngine(object):
         return results
 
     def _append_history(self, record):
-        history = []
-        if os.path.exists(self.history_path):
-            try:
-                with open(self.history_path, encoding="utf-8") as f:
-                    history = json.load(f)
-            except Exception:
-                history = []
-        history.append(record)
-        with open(self.history_path, "w", encoding="utf-8") as f:
-            json.dump(history[-500:], f, ensure_ascii=False, indent=2)
+        # 加锁串行化 + 原子写：与 _save_state 同一范式，防止并发追加丢记录、
+        # 写一半崩溃截断 order_history.json
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:  # 兼容未初始化锁的旧实例
+            lock = self._history_lock = threading.Lock()
+        with lock:
+            history = []
+            if os.path.exists(self.history_path):
+                try:
+                    with open(self.history_path, encoding="utf-8") as f:
+                        history = json.load(f)
+                except Exception:
+                    history = []
+            history.append(record)
+            tmp_path = "{0}.tmp{1}".format(
+                self.history_path, threading.get_ident())
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(history[-500:], f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.history_path)
 
     # ----------------------------- 单任务扫描 -----------------------------
 

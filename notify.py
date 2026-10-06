@@ -12,6 +12,37 @@ from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
+_DPAPI_PREFIX = "dpapi1:"
+
+
+def protect_secret(text):
+    """敏感串（SMTP 授权码）用 Windows DPAPI 加密后落盘。
+
+    返回带 "dpapi1:" 前缀的密文；非 Windows / 加密失败时原样返回明文
+    （保持向后兼容）。已加密的原样返回，避免二次包裹。"""
+    if not text or text.startswith(_DPAPI_PREFIX):
+        return text
+    try:
+        import base64
+        import passengers as pax_mod
+        blob = pax_mod._dpapi_protect(text.encode("utf-8"))
+        return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
+    except Exception:
+        return text
+
+
+def secret_of(text):
+    """取回敏感串明文：带 dpapi1: 前缀则解密；旧明文原样返回。"""
+    if text and text.startswith(_DPAPI_PREFIX):
+        try:
+            import base64
+            import passengers as pax_mod
+            return pax_mod._dpapi_unprotect(
+                base64.b64decode(text[len(_DPAPI_PREFIX):])).decode("utf-8")
+        except Exception:
+            return ""
+    return text or ""
+
 
 def send_email(cfg, subject, body):
     """
@@ -24,7 +55,7 @@ def send_email(cfg, subject, body):
         host = cfg["smtp_host"]
         port = int(cfg.get("smtp_port", 465))
         user = cfg["username"]
-        pwd = cfg["password"]
+        pwd = secret_of(cfg["password"])  # 兼容明文与 DPAPI 密文两种存储
         from_addr = cfg["from"]
         to_addrs = cfg.get("to") or [user]
     except KeyError as e:

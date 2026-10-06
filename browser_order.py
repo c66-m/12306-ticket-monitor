@@ -154,7 +154,8 @@ def _exclusive(lock_timeout=150):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            with exclusive(timeout=lock_timeout):
+            # 允许调用方用 lock_timeout= 覆盖等待上限（如抢票线程不想等 420 秒）
+            with exclusive(timeout=kwargs.pop("lock_timeout", lock_timeout)):
                 return fn(*args, **kwargs)
         return wrapper
     return deco
@@ -289,8 +290,11 @@ def session_ok(ctx, page=None):
 
 
 @_exclusive(lock_timeout=420)
-def login(timeout_sec=300):
-    """打开浏览器让用户完成登录；profile 会自动持久化，之后不必重复。"""
+def login(timeout_sec=300, stop_event=None):
+    """打开浏览器让用户完成登录；profile 会自动持久化，之后不必重复。
+
+    stop_event: threading.Event，置位后尽快关浏览器返回 False（抢票线程的
+    「停止」按钮不必再干等登录超时）。"""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         ctx = launch(p, headless=False)
@@ -301,7 +305,10 @@ def login(timeout_sec=300):
         next_probe = 0.0
         ok, who = False, ""
         while time.time() < deadline:
-            time.sleep(2)
+            if stop_event is not None and stop_event.wait(2):
+                ctx.close()
+                _log("[停止] 登录已被手动停止。")
+                return False
             now = time.time()
             landed = False
             try:

@@ -42,6 +42,7 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 import engine as engine_mod
+import logutil
 import notify as notify_mod
 import order as order_mod
 import passengers as passengers_mod
@@ -95,10 +96,8 @@ def setup_logging():
         log.removeHandler(h)
     log_dir = os.path.join(HERE, "logs")
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        fh = logging.FileHandler(
-            os.path.join(log_dir, "monitor_{0}.log".format(
-                datetime.date.today().strftime("%Y%m%d"))), encoding="utf-8")
+        # 按天滚动：长跑跨天后日志自动切到新日期的文件
+        fh = logutil.DayFileHandler(log_dir, "monitor")
         fh.setFormatter(fmt)
         log.addHandler(fh)
     except Exception:
@@ -118,8 +117,11 @@ def load_config():
 
 
 def save_config(config):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    # 原子写：写一半被杀（关窗强退/断电）不会留下截断的 config.json 导致任务全丢
+    tmp = CONFIG_PATH + ".tmp%s" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
 
 
 def load_state():
@@ -132,7 +134,7 @@ def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
-    tmp = path + ".guisave"
+    tmp = path + ".guisave%s" % os.getpid()  # 带 pid：多个窗口同存时互不踩临时文件
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
@@ -254,6 +256,10 @@ def apply_style(root):
         style.theme_use("clam")
     except Exception:
         pass
+    try:
+        launcher.install_tick_indicator(style)   # clam 的选中是叉，换成对勾
+    except Exception:
+        LOG.exception("复选框对勾样式安装失败")
     style.configure(".", font=(FONT, 10))
     style.configure("TFrame", background=BG)
     style.configure("TLabel", background=BG)
@@ -803,12 +809,14 @@ class TaskWizard(tk.Toplevel):
         self.query_hint.config(text="正在查询 %d 天车次  %s → %s ..."
                                % (len(self.monitor_dates), from_name, to_name))
 
+        # Tk 变量只能在主线程读：先取值再进子线程（worker 里调 get() 会跨线程访问 Tcl）
+        purpose = self.purpose_var.get()
+
         def do_query():
             out = {}
             for d in self.monitor_dates:
                 rows = ticket.query_tickets(self.name2code[from_name],
-                                            self.name2code[to_name], d,
-                                            self.purpose_var.get())
+                                            self.name2code[to_name], d, purpose)
                 out[d] = rows
             return self.code2name, out, from_name, to_name
 
@@ -1536,7 +1544,17 @@ class PassengerDialog(tk.Toplevel):
         combo.set("1 - 二代身份证")
         row("证件类型", combo)
         id_var = tk.StringVar(value=(p or {}).get("id_no", ""))
-        row("证件号码", ttk.Entry(body, textvariable=id_var))
+        id_entry = ttk.Entry(body, textvariable=id_var, show="*")
+        id_row = row("证件号码", id_entry)
+        # 小眼睛：证件号默认掩码，点一下切明文、再点还原
+        id_visible = tk.BooleanVar(value=False)
+
+        def _toggle_id():
+            id_entry.configure(show="" if id_visible.get() else "*")
+            eye_btn.config(text="🙈" if id_visible.get() else "👁")
+
+        eye_btn = ttk.Button(id_row, text="👁", width=3, command=_toggle_id)
+        eye_btn.pack(side="left", padx=(6, 0))
         mobile_var = tk.StringVar(value=(p or {}).get("mobile", ""))
         row("手机号", ttk.Entry(body, textvariable=mobile_var))
         default_var = tk.BooleanVar(value=bool((p or {}).get("is_default")))
@@ -1677,7 +1695,7 @@ class NotifyDialog(tk.Toplevel):
         row("端口", self.port_var, width=10)
         self.user_var = tk.StringVar(value=self.email.get("username", ""))
         row("发件邮箱", self.user_var)
-        self.pwd_var = tk.StringVar(value=self.email.get("password", ""))
+        self.pwd_var = tk.StringVar(value=notify_mod.secret_of(self.email.get("password", "")))
         row("邮箱授权码", self.pwd_var, show="*")
         self.from_var = tk.StringVar(value=self.email.get("from", ""))
         row("发件人地址", self.from_var)
@@ -1697,7 +1715,7 @@ class NotifyDialog(tk.Toplevel):
             "smtp_host": self.host_var.get().strip(),
             "smtp_port": int(self.port_var.get().strip() or 465),
             "username": self.user_var.get().strip(),
-            "password": self.pwd_var.get().strip(),
+            "password": notify_mod.protect_secret(self.pwd_var.get().strip()),
             "from": self.from_var.get().strip(),
             "to": [x.strip() for x in self.to_var.get().replace("，", ",").split(",")
                    if x.strip()],
@@ -1827,7 +1845,8 @@ class SessionDialog(tk.Toplevel):
                     import browser_order
                     ok = bool(browser_order.login())
                 else:
-                    subprocess.call([sys.executable, script], cwd=HERE)
+                    # capture_session.py 若挂住不能永久卡住重登线程
+                    subprocess.run([sys.executable, script], cwd=HERE, timeout=300)
                     ok = True
             except Exception as e:
                 LOG.error("重新登录失败: %s", e)
@@ -2211,7 +2230,7 @@ class NotifyPanel(ttk.Frame):
         row("端口", self.port_var, width=10)
         self.user_var = tk.StringVar(value=self.email.get("username", ""))
         row("发件邮箱", self.user_var)
-        self.pwd_var = tk.StringVar(value=self.email.get("password", ""))
+        self.pwd_var = tk.StringVar(value=notify_mod.secret_of(self.email.get("password", "")))
         row("邮箱授权码", self.pwd_var, show="*")
         self.from_var = tk.StringVar(value=self.email.get("from", ""))
         row("发件人地址", self.from_var)
@@ -2231,7 +2250,7 @@ class NotifyPanel(ttk.Frame):
             "smtp_host": self.host_var.get().strip(),
             "smtp_port": int(self.port_var.get().strip() or 465),
             "username": self.user_var.get().strip(),
-            "password": self.pwd_var.get().strip(),
+            "password": notify_mod.protect_secret(self.pwd_var.get().strip()),
             "from": self.from_var.get().strip(),
             "to": [x.strip() for x in self.to_var.get().replace("，", ",").split(",")
                    if x.strip()],
@@ -2332,26 +2351,48 @@ class TaskPage(ttk.Frame):
             state = load_state().get("tasks", {})
         except Exception:
             return
-        self.tree.delete(*self.tree.get_children())
-        self._task_by_iid = {}
         engine_running = bool(self.app.engine_thread
                               and self.app.engine_thread.is_alive())
+        rows = []
         for i, t in enumerate(tasks, 1):
             st = state.get(t.get("name"), {}).get("status", "paused")
             msg = state.get(t.get("name"), {}).get("message", "")
             # 启动状态：引擎运行中且任务处于 监控中/等待重试 = 已启动
             started = engine_running and st in engine_mod.ACTIVE_STATUSES
-            start_text = "● 已启动" if started else "○ 未启动"
-            iid = self.tree.insert("", "end", values=(
-                start_text,
+            rows.append((
+                "● 已启动" if started else "○ 未启动",
                 i, t.get("name", ""), "%s-%s" % (t.get("from", ""), t.get("to", "")),
                 format_dates(t),
                 "/".join(t.get("trains") or []) or "全部",
                 "/".join(t.get("seat_types") or []),
                 t.get("priority", 5),
-                engine_mod.STATUS_LABELS.get(st, st), msg),
-                tags=("started" if started else "stopped", st))
-            self._task_by_iid[iid] = (t, st)
+                engine_mod.STATUS_LABELS.get(st, st), msg,
+                "started" if started else "stopped", st))
+        # 内容没变就不重建：避免每 2 秒清空用户选中的行、重置滚动位置
+        sig = repr(rows)
+        if sig == getattr(self, "_last_rows_sig", None):
+            return
+        self._last_rows_sig = sig
+        sel_names = set()
+        for i in self.tree.selection():
+            t = self._task_by_iid.get(i, (None, None))[0]
+            if t:
+                sel_names.add(t.get("name"))
+        yview = self.tree.yview()
+        self.tree.delete(*self.tree.get_children())
+        self._task_by_iid = {}
+        for i, t in enumerate(tasks, 1):
+            row = rows[i - 1]
+            iid = self.tree.insert("", "end", values=row[:10],
+                                   tags=(row[10], row[11]))
+            self._task_by_iid[iid] = (t, row[11])
+        # 恢复刷新前的选中任务与滚动位置
+        for iid, (t, _st) in self._task_by_iid.items():
+            if t.get("name") in sel_names:
+                self.tree.selection_set(iid)
+                break
+        if yview:
+            self.tree.yview_moveto(yview[0])
         self._on_select()
 
     def _on_select(self, _evt=None):
@@ -3095,11 +3136,19 @@ class MonitorApp:
                 pass
         # 浏览器模式的校验要开一次浏览器，间隔放宽到 3 分钟
         # （登录窗口开着时这一轮会被 busy() 跳过，不会去撞锁）
-        acct_iv = 180 if (load_config().get("order_mode") or "http") == "browser" else 60
-        if time.time() - self._acct_time > acct_iv:
-            self.refresh_account()
-        self.refresh_tasks()
-        self.root.after(2000, self.tick)
+        try:
+            acct_iv = 180 if (load_config().get("order_mode") or "http") == "browser" else 60
+            if time.time() - self._acct_time > acct_iv:
+                self.refresh_account()
+            self.refresh_tasks()
+        except Exception:
+            LOG.exception("tick 刷新失败（不影响下一轮）")
+        finally:
+            # after 必须无条件重排：否则任何一次刷新异常都会永久杀死 2 秒轮询链
+            try:
+                self.root.after(2000, self.tick)
+            except tk.TclError:
+                pass
 
     # ----------------------------- 任务列表 -----------------------------
 
@@ -3112,9 +3161,14 @@ class MonitorApp:
     # ----------------------------- 日志 -----------------------------
 
     def poll_log(self):
-        try:
-            while True:
+        # 单条日志处理异常（如控件被销毁的 TclError）不能逃出循环，
+        # 否则 after 轮询链断掉，主日志/小窗/会话失效弹窗全部静默停摆
+        while True:
+            try:
                 record = LOG_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            try:
                 # 会话永久失效：立即弹窗提醒，避免用户一直蒙在鼓里
                 if "[错误] 登录会话已失效" in record:
                     self._set_account("登录已失效", False)
@@ -3137,9 +3191,12 @@ class MonitorApp:
                     self.log_text.delete("1.0", "100.0")
                 self.log_text.see("end")
                 self.log_text.config(state="disabled")
-        except queue.Empty:
+            except Exception:
+                pass
+        try:
+            self.root.after(300, self.poll_log)
+        except tk.TclError:
             pass
-        self.root.after(300, self.poll_log)
 
     def _warn_session_dead(self):
         """会话永久失效时弹窗（只弹一次，重新登录成功后自动复位）。
@@ -3277,7 +3334,11 @@ def _ensure_stdio():
         def write(self, s):
             if not s:
                 return 0
-            self._buf += s
+            # \r 结尾的进度条输出没有换行，会让缓冲无限增长：统一按换行处理
+            self._buf += s.replace("\r\n", "\n").replace("\r", "\n")
+            if len(self._buf) > 65536:  # 兜底：超长无换行输出强制落日志
+                line, self._buf = self._buf, ""
+                LOG.log(self._level, "[stdio] %s", line[:60000])
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
                 if line.strip():

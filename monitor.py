@@ -53,8 +53,11 @@ def load_config():
 
 
 def save_config(config):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    # 原子写：写一半被杀不留截断文件
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
 
 
 def pause():

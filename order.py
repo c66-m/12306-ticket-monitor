@@ -33,13 +33,17 @@ except Exception:
     pass
 
 try:
-    from ticket import SEAT_NAME_TO_CODE
+    from ticket import SEAT_NAME_TO_CODE, order_seat_code
 except ImportError:
     SEAT_NAME_TO_CODE = {
         "商务座": "9", "特等座": "P", "一等座": "M", "二等座": "O",
         "高级软卧": "6", "软卧": "4", "动卧": "F", "硬卧": "3",
         "软座": "2", "硬座": "1", "无座": "WZ",
     }
+
+    def order_seat_code(seat_name, seat_code=None):
+        """兜底实现（ticket.py 缺席时）：不做同价改判。"""
+        return seat_code or SEAT_NAME_TO_CODE.get(seat_name), None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -488,7 +492,9 @@ def order_ticket(config, task, ticket, seat_name):
     if not ok:
         return False, "会话已失效（{0}）。请重新运行 capture_session.py 登录。".format(who), None
 
-    seat_code = SEAT_NAME_TO_CODE.get(seat_name)
+    # 席别同价改判（与 browser_order 同一规则）：网页端不下发「无座」，
+    # 勾「无座」按硬座提交；HTTP 路径此前漏了这一步，导致无座任务必失败
+    seat_code, _alias_name = order_seat_code(seat_name)
     if not seat_code:
         return False, "未知席别: {0}".format(seat_name), None
 

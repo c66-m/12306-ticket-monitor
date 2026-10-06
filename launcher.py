@@ -47,6 +47,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import browser_order
+import logutil
 import notify
 import passengers as pax_mod
 import ticket as tk_mod
@@ -98,8 +99,7 @@ LOG.setLevel(logging.INFO)
 if not LOG.handlers:
     if not os.path.isdir(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
-    _fh = logging.FileHandler(os.path.join(
-        LOG_DIR, "launcher_%s.log" % datetime.now().strftime("%Y%m%d")), encoding="utf-8")
+    _fh = logutil.DayFileHandler(LOG_DIR, "launcher")  # 按天滚动，长跑跨天不丢日志
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     LOG.addHandler(_fh)
     _qh = _QHandler()
@@ -163,6 +163,58 @@ def purpose_map_of(lc):
     return {n: (pm.get(n) or default) for n in (lc.get("passenger_names") or [])}
 
 
+# ===== 复选框指示器：clam 主题选中时画的是「叉」(✗)，容易被当成取消，改成「对勾」(✓) =====
+_CHECK_ICONS = {}   # 保持 PhotoImage 引用，防止被垃圾回收后图标消失
+
+
+def _make_check_icon(checked, size=14):
+    """内存生成复选框指示器图标（不依赖外部图片文件）：空框 / 框内对勾。"""
+    img = tk.PhotoImage(width=size, height=size)
+    border, fill = "#8A94A6", "#FFFFFF"
+    img.put(fill, to=(0, 0, size, size))
+    img.put(border, to=(0, 0, size, 1))
+    img.put(border, to=(0, size - 1, size, size))
+    img.put(border, to=(0, 1, 1, size - 1))
+    img.put(border, to=(size - 1, 1, size, size - 1))
+    if checked:
+        tick = "#1A73E8"
+        pts = [(3, 6), (4, 7), (5, 8), (6, 9), (7, 8), (8, 7), (9, 6), (10, 4)]
+        for x, y in pts:
+            img.put(tick, to=(x, y, x + 2, y + 2))
+    return img
+
+
+def _patch_tick_layout(items):
+    """把 TCheckbutton 布局里的 indicator element 换成自定义的对勾。"""
+    out = []
+    for name, opts in items:
+        opts = dict(opts)
+        if name == "Checkbutton.indicator":
+            name = "Tick.indicator"
+        if "children" in opts:
+            opts["children"] = _patch_tick_layout(opts["children"])
+        out.append((name, opts))
+    return out
+
+
+def install_tick_indicator(style=None):
+    """让所有 ttk.Checkbutton 选中时显示对勾（clam 主题默认画叉）。
+
+    gui.apply_style() 与 launcher 独立运行时各调用一次；换主题后需重新调用。
+    """
+    style = style or ttk.Style()
+    try:
+        if "Tick.indicator" not in style.element_names():
+            off = _make_check_icon(False)
+            on = _make_check_icon(True)
+            _CHECK_ICONS["off"], _CHECK_ICONS["on"] = off, on
+            style.element_create("Tick.indicator", "image", off, ("selected", on),
+                                 border=1, sticky="")
+        style.layout("TCheckbutton", _patch_tick_layout(style.layout("TCheckbutton")))
+    except Exception as e:
+        log("[警告] 复选框对勾样式安装失败：%s" % e)
+
+
 def load_launcher_config():
     lc = dict(_DEFAULT_LC)
     if os.path.exists(LAUNCHER_CFG_PATH):
@@ -179,8 +231,11 @@ def load_launcher_config():
 
 
 def save_launcher_config(lc):
-    with open(LAUNCHER_CFG_PATH, "w", encoding="utf-8") as f:
+    # 原子写：写一半被杀会损坏全部配置（同文件 append_monitor_task 已是此范式）
+    tmp = LAUNCHER_CFG_PATH + ".tmp%s" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(lc, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, LAUNCHER_CFG_PATH)
 
 
 # ----------------------------- 抢票任务库（多任务管理） -----------------------------
@@ -202,8 +257,11 @@ def load_grab_tasks():
 
 
 def save_grab_tasks(tasks):
-    with open(GRAB_TASKS_PATH, "w", encoding="utf-8") as f:
+    # 原子写：grab_tasks.json 是全部抢票任务的唯一存储，中途崩溃不能截断
+    tmp = GRAB_TASKS_PATH + ".tmp%s" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"tasks": tasks}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, GRAB_TASKS_PATH)
 
 
 def new_grab_task(seq):
@@ -248,6 +306,12 @@ def parse_dt(s):
                 dt = dt.replace(year=now.year, month=now.month, day=now.day)
                 if dt < now - timedelta(hours=1):
                     dt += timedelta(days=1)
+            elif fmt.startswith("%m-%d"):
+                # strptime 对 MM-DD 默认年份是 1900：先归位到今年；
+                # 只填月日不跨年——12 月填「01-05」应理解为明年，而不是"已过"
+                dt = dt.replace(year=now.year)
+                if dt < now - timedelta(hours=1):
+                    dt = dt.replace(year=now.year + 1)
             return dt
         except ValueError:
             continue
@@ -326,6 +390,7 @@ class Grabber(threading.Thread):
         self.result = None
 
     def _log(self, msg):
+        LOG.info(msg)  # 也落 logs/launcher_*.log：事后排查抢票过程全靠它
         self.logq.put(msg)
 
     def stop(self):
@@ -379,20 +444,39 @@ class Grabber(threading.Thread):
         # 1) 会话（多任务并发时串行校验，避免两个线程同时操作同一个浏览器）
         log("[会话] 正在校验登录状态…（复用本机登录信息，全程无浏览器窗口）")
         with _SESSION_LOCK:
-            try:
-                ok, who = browser_order.check_session()
-            except Exception as e:
-                log("[错误] 会话校验失败：%s" % e)
-                ok, who = False, str(e)
-            if not ok:
+            ok, who = False, ""
+            for attempt in range(60):
+                if self.stop_event.is_set():
+                    break
+                if browser_order.busy():
+                    # 多任务并行：另一任务正占着浏览器（预热/下单/登录）。
+                    # 抢锁超时 ≠ 未登录——等对方放锁再试，别把自己的任务误杀。
+                    log("[会话] 浏览器被其他任务占用，15 秒后再试（已等 %d 次）" % (attempt + 1))
+                    if self.stop_event.wait(15):
+                        break
+                    continue
+                try:
+                    ok, who = browser_order.check_session()
+                    break
+                except Exception as e:
+                    if browser_order.busy():
+                        # 竞态：busy() 探完到拿锁之间被其他任务抢先——回到等待
+                        continue
+                    log("[错误] 会话校验失败：%s" % e)
+                    ok, who = False, str(e)
+                    break
+            if not self.stop_event.is_set() and not ok:
                 log("[会话] 当前未登录（%s），尝试拉起登录窗口，请在浏览器里完成登录…" % who)
                 try:
-                    browser_order.login(timeout_sec=240)
-                    ok, who = browser_order.check_session()
+                    browser_order.login(timeout_sec=240, stop_event=self.stop_event,
+                                        lock_timeout=120)
+                    if not self.stop_event.is_set():
+                        ok, who = browser_order.check_session()
                 except Exception as e:
                     log("[错误] 登录过程异常：%s" % e)
         if not ok:
-            self.result = (False, "登录失败或超时：%s" % who)
+            msg = "已手动停止" if self.stop_event.is_set() else "登录失败或超时：%s" % who
+            self.result = (False, msg)
             log("[错误] %s" % self.result[1])
             return
         log("[会话] 已登录：%s" % who)
@@ -549,6 +633,7 @@ class Grabber(threading.Thread):
                         if self.stop_event.wait(wait_s):
                             break
                         continue
+                    busy_n = 0  # 非繁忙类失败：退避计数复位，别一直卡在 30 秒档
                     log("[错误] 下单未成功：%s（同目标第 %d 次失败）" % (msg, fail_streak))
                     if fail_streak >= MAX_ORDER_FAILS:
                         self.result = (False, "同一车次席别连续 %d 次下单失败，已自动停止：%s" % (fail_streak, msg))
@@ -558,6 +643,7 @@ class Grabber(threading.Thread):
                         break
                     continue
     
+                busy_n = 0  # 本轮无下单繁忙：复位退避，恢复正常轮询节奏
                 if n % 4 == 1 or n == 1:
                     log("[运行] 第 %d 轮无票（%s %s %s），%s 秒后再查" % (
                         n, date, "/".join(trains) or "全部车次", from_ + "→" + to_, int(poll)))
@@ -599,7 +685,8 @@ def merge_trains_from_monitor(lc, saver=None):
     try:
         with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8") as f:
             cfg = json.load(f)
-    except Exception:
+    except Exception as e:
+        log("[提醒] 读取监控系统 config.json 失败，本轮不合并车次：%s" % e)
         return False
     mon = []
     for t in (cfg.get("tasks") or []):
@@ -694,7 +781,10 @@ def append_monitor_task(task, start_now=True):
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
-    except Exception:
+    except Exception as e:
+        # state.json 损坏时这里会退化成空状态，等于丢掉其它任务的运行状态，
+        # 至少要在日志里留痕，别让它悄悄发生。
+        log("[提醒] 读取 state.json 失败，将按空状态写入新任务条目：%s" % e)
         state = {}
     entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
     entry["status"] = "monitoring" if start_now else "paused"
@@ -810,19 +900,20 @@ def _merge_kind(code, kind):
     code = (code or "").upper()
     if len(code) != 3 or not kind:
         return False
-    kinds = load_station_kinds()
-    old = kinds.get(code)
-    if old == kind:
-        return False
-    if not old:
-        kinds[code] = kind
+    load_station_kinds()  # 确保已加载（内部自带锁）
+    with _kind_lock:  # 探测线程与主线程都会调这里：变更必须锁内做，
+        old = _station_kinds.get(code)  # 否则与 save_station_kinds 的拷贝撞并发修改
+        if old == kind:
+            return False
+        if not old:
+            _station_kinds[code] = kind
+            return True
+        parts = old.split("+")
+        if kind in parts:
+            return False
+        parts.append(kind)
+        _station_kinds[code] = "+".join(sorted(set(parts), key=lambda k: _KIND_ORDER.get(k, 9)))
         return True
-    parts = old.split("+")
-    if kind in parts:
-        return False
-    parts.append(kind)
-    kinds[code] = "+".join(sorted(set(parts), key=lambda k: _KIND_ORDER.get(k, 9)))
-    return True
 
 
 def learn_station_kinds(infos):
@@ -1474,6 +1565,7 @@ class LauncherApp(tk.Frame):
         self._standalone = master is None
         if self._standalone:
             master = tk.Tk()
+            install_tick_indicator(ttk.Style(master))
         self._top = master if self._standalone else master.winfo_toplevel()
         super().__init__(master)
         self._mp = self._top          # 弹窗父窗口：独立=窗口自身，嵌入=宿主主窗口
@@ -1525,21 +1617,29 @@ class LauncherApp(tk.Frame):
         self.after(2500, self._warm_station_kinds)
 
     def _warm_station_kinds(self):
-        """启动后预热常用车站的高铁/普速标注（历史站 + 当前出发/到达）。"""
-        try:
-            names = [self.from_ent.get(), self.to_ent.get()]
-            names.extend(self.from_ent.history[:6])
-            names.extend(self.to_ent.history[:6])
-            n2c, _c2n = tk_mod.load_station_map()
-            codes = []
-            for n in names:
-                c = n2c.get((n or "").strip())
-                if c and c not in codes:
-                    codes.append(c)
-            if codes and request_station_kinds(codes):
-                log("[车站] 正在后台识别常用车站类型（高铁 / 普速）")
-        except Exception as e:
-            log("[提醒] 常用车站类型预热失败：%s" % e)
+        """启动后预热常用车站的高铁/普速标注（历史站 + 当前出发/到达）。
+
+        放后台线程跑：车站代码表/索引缓存缺失时要联网下载（可达 20 秒），
+        在主线程会把界面整个冻住。Tk 变量读取先在主线程完成再进线程。"""
+        names = [self.from_ent.get(), self.to_ent.get()]
+        names.extend(self.from_ent.history[:6])
+        names.extend(self.to_ent.history[:6])
+
+        def worker():
+            try:
+                n2c, _c2n = tk_mod.load_station_map()
+                get_station_index()  # 一并预热车站拼音索引（首次要下载）
+                codes = []
+                for n in names:
+                    c = n2c.get((n or "").strip())
+                    if c and c not in codes:
+                        codes.append(c)
+                if codes and request_station_kinds(codes):
+                    log("[车站] 正在后台识别常用车站类型（高铁 / 普速）")
+            except Exception as e:
+                log("[提醒] 常用车站类型预热失败：%s" % e)
+
+        threading.Thread(target=worker, daemon=True, name="station-warm").start()
 
     # ---- 界面构建 ----
 
@@ -2075,6 +2175,12 @@ class LauncherApp(tk.Frame):
                 if ok:
                     self.auto_fired = True
                     self._set_status("ok", "抢票成功！")
+                    # 成功状态落盘：否则重启后任务库里显示"就绪"，已抢到的事被抹掉
+                    self.lc["status"] = "ok"
+                    try:
+                        self._save_cfg(self.lc)
+                    except Exception:
+                        pass
                     self._top.bell()
                 else:
                     self._set_status("idle", msg or "已停止")
@@ -2112,6 +2218,10 @@ class LauncherApp(tk.Frame):
                         elif self.armed and not self.auto_fired:
                             self.armed = False
                             self.countdown_lbl.configure(text="开抢时间已过，请手动开抢")
+                        elif diff > 0:
+                            # 还没到点（只是进入了预热窗口）：照常显示倒计时，
+                            # 别提前十分钟就喊"开抢时间已过"
+                            self.countdown_lbl.configure(text="距开抢 %s" % fmt_countdown(diff))
                         else:
                             self.countdown_lbl.configure(text="开抢时间已过")
                 else:
@@ -2177,6 +2287,9 @@ class LauncherApp(tk.Frame):
             if tag in line:
                 txt.tag_add(tag, "end-2l", "end-1l")
                 break
+        # 行数超限裁掉头部：长跑数天不能让日志区无限膨胀
+        if float(txt.index("end-1c")) > 2500.0:
+            txt.delete("1.0", "1000.0")
         txt.configure(state="disabled")
         txt.see("end")
 
@@ -2354,6 +2467,11 @@ class LauncherApp(tk.Frame):
     def _on_close(self):
         if self.grabber:
             self.grabber.stop()
+            # 等收尾（WarmSession 关浏览器、释放 profile 锁），避免留下孤儿浏览器
+            try:
+                self.grabber.join(timeout=15)
+            except Exception:
+                pass
         try:
             self._ui_to_lc()
         except Exception:
@@ -2590,16 +2708,21 @@ class PassengerDialog(tk.Toplevel):
         #   managed by pack"，整个弹窗直接崩掉）。
         g = ttk.Frame(f)
         g.pack(fill="both", expand=True)
+        self.id_entry = ttk.Entry(g, textvariable=self.id_var, width=26, show="*")
         grid = [
             ("姓名", ttk.Entry(g, textvariable=self.name_var, width=26)),
             ("证件类型", ttk.Combobox(g, textvariable=self.type_var, width=23,
                                       values=list(ID_TYPES.keys()), state="readonly")),
-            ("证件号", ttk.Entry(g, textvariable=self.id_var, width=26, show="*")),
+            ("证件号", self.id_entry),
             ("手机号", ttk.Entry(g, textvariable=self.mob_var, width=26)),
         ]
         for i, (lab, w) in enumerate(grid):
             ttk.Label(g, text=lab).grid(row=i + 1, column=0, sticky="e", pady=4)
             w.grid(row=i + 1, column=1, sticky="w", padx=6, pady=4)
+        # 小眼睛：证件号默认掩码，点一下切明文、再点还原
+        self._id_visible = False
+        self.eye_btn = ttk.Button(g, text="👁", width=3, command=self._toggle_id_show)
+        self.eye_btn.grid(row=3, column=2, sticky="w", padx=(0, 2))
         ttk.Checkbutton(g, text="成人票", variable=self.adult_var).grid(row=5, column=1, sticky="w", pady=2)
         ttk.Checkbutton(g, text="设为默认乘车人", variable=self.default_var).grid(row=6, column=1, sticky="w")
 
@@ -2611,6 +2734,11 @@ class PassengerDialog(tk.Toplevel):
         if self.plist:
             self.pick.current(0)
             self._load()
+
+    def _toggle_id_show(self):
+        self._id_visible = not self._id_visible
+        self.id_entry.configure(show="" if self._id_visible else "*")
+        self.eye_btn.configure(text="🙈" if self._id_visible else "👁")
 
     def _load(self, _event=None):
         name = self.pick.get().strip()
@@ -2749,7 +2877,15 @@ class GrabTaskWindow(tk.Toplevel):
         try:
             if self.app.grabber:
                 self.app.stop_grab()
-            self.app.lc["status"] = "idle"
+                # 等抢票线程收尾（关浏览器、写结果），最多 15 秒：
+                # 直接销毁窗口会把中途的订单/浏览器晾在后台
+                try:
+                    self.app.grabber.join(timeout=15)
+                except Exception:
+                    pass
+            # 抢到的任务保留"已抢到"状态，别在关窗时被抹成"就绪"
+            if self.app.lc.get("status") != "ok":
+                self.app.lc["status"] = "idle"
             self._save_task(self.app.lc)
         finally:
             self.manager._on_window_closed(self.task.get("id"))
@@ -2773,6 +2909,7 @@ class TaskManagerPanel(tk.Frame):
         self._standalone = master is None
         if self._standalone:
             master = tk.Tk()
+            install_tick_indicator(ttk.Style(master))
         self._top = master if self._standalone else master.winfo_toplevel()
         super().__init__(master)
         self._mp = self._top
@@ -2868,7 +3005,13 @@ class TaskManagerPanel(tk.Frame):
         return None
 
     def _new_task(self):
-        task = new_grab_task(len(self.tasks) + 1)
+        # 名字序号取现存最大号 +1：删除任务后新建不再出现重名（两个"任务 2"）
+        seqs = []
+        for t in self.tasks:
+            m = re.match(r"任务\s*(\d+)$", (t.get("name") or "").strip())
+            if m:
+                seqs.append(int(m.group(1)))
+        task = new_grab_task((max(seqs) if seqs else 0) + 1)
         self.tasks.append(task)
         save_grab_tasks(self.tasks)
         self._refresh_list()
@@ -2979,6 +3122,9 @@ class TaskManagerPanel(tk.Frame):
             if tag in line:
                 txt.tag_add(tag, "end-2l", "end-1l")
                 break
+        # 行数超限裁掉头部：长跑数天不能让日志区无限膨胀
+        if float(txt.index("end-1c")) > 2500.0:
+            txt.delete("1.0", "1000.0")
         txt.configure(state="disabled")
         txt.see("end")
 
@@ -2993,9 +3139,12 @@ class TaskManagerPanel(tk.Frame):
         self._put_log("[会话] 正在校验登录状态…")
 
     def _on_close(self):
+        # 必须走各窗口自己的 _on_close（停抢票线程 -> join -> 保存 -> 销毁）；
+        # 直接 destroy 会绕过收尾，浏览器/下单中途被硬杀
         for w in list(self._windows.values()):
             try:
-                w.destroy()
+                if w.winfo_exists():
+                    w._on_close()
             except Exception:
                 pass
         self._top.destroy()

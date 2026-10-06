@@ -29,6 +29,7 @@ import sys
 import re
 import json
 import time
+import threading
 
 import requests
 
@@ -79,27 +80,35 @@ def order_seat_code(seat_name, seat_code=None):
     return code, None
 
 _SESSION = None
+_SESSION_LOCK = threading.Lock()  # GUI 多线程会同时首次建会话，防重复初始化
 
 
 def get_session():
     """构建并复用基础请求会话（先拿 JSESSIONID）。"""
     global _SESSION
     if _SESSION is None:
-        s = requests.Session()
-        s.headers.update(BASE_HEADERS)
-        s.get("https://kyfw.12306.cn/otn/leftTicket/init", timeout=15)
-        _SESSION = s
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                s = requests.Session()
+                s.headers.update(BASE_HEADERS)
+                s.get("https://kyfw.12306.cn/otn/leftTicket/init", timeout=15)
+                _SESSION = s
     return _SESSION
 
 
 def load_station_map(cache_path="station_name.json"):
-    """下载并解析车站代码表，返回 {名称: 代码} 与 {代码: 名称} 两个字典。"""
+    """下载并解析车站代码表，返回 {名称: 代码} 与 {代码: 名称} 两个字典。
+    本地缓存损坏时自动重新下载（与 load_station_index 行为一致）。"""
     import os
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_path)
     if os.path.exists(here):
-        with open(here, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("name2code", {}), data.get("code2name", {})
+        try:
+            with open(here, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("name2code") and data.get("code2name"):
+                return data["name2code"], data["code2name"]
+        except Exception:
+            pass  # 缓存损坏/空：走重新下载
 
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Referer": "https://kyfw.12306.cn/otn/leftTicket/init"})
@@ -156,6 +165,16 @@ def load_station_index(cache_path="station_index.json"):
     return stations
 
 
+# 查询端点按序回退：12306 会不定期切换/下线 queryG（ symptoms 是接口突然 404 或
+# 返回非 JSON），queryZ/queryA/query 是历史上轮换出现过的同名族端点
+QUERY_URLS = (
+    "https://kyfw.12306.cn/otn/leftTicket/queryG",
+    "https://kyfw.12306.cn/otn/leftTicket/queryZ",
+    "https://kyfw.12306.cn/otn/leftTicket/queryA",
+    "https://kyfw.12306.cn/otn/leftTicket/query",
+)
+
+
 def query_tickets(from_code, to_code, date, purpose="ADULT"):
     """查询某天某区间余票，返回按车次分组的字典。免登录。
     purpose: ADULT=成人票, 0X00=学生票"""
@@ -166,12 +185,22 @@ def query_tickets(from_code, to_code, date, purpose="ADULT"):
         "leftTicketDTO.to_station": to_code,
         "purpose_codes": purpose,
     }
-    r = s.get("https://kyfw.12306.cn/otn/leftTicket/queryG", params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("httpstatus") != 200 or not data.get("data"):
-        raise RuntimeError("查询接口返回异常：{0}".format(data))
-    return data["data"]["result"]
+    last = None
+    for url in QUERY_URLS:
+        try:
+            r = s.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            last = e
+            continue  # 端点 404/超时/返回非 JSON：换下一个端点
+        if data.get("httpstatus") != 200:
+            last = RuntimeError("查询接口返回异常：{0}".format(data))
+            continue
+        return (data.get("data") or {}).get("result") or []
+    if last is None:
+        last = RuntimeError("查询接口无可用端点")
+    raise last
 
 
 def parse_row(row, code2name, query_date=None):
