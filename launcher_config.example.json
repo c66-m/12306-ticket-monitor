@@ -1,4 +1,5 @@
 {
+  "_说明": "本文件为模板。复制为 launcher_config.json 后按需修改。grab_tasks.json 的任务条目在本结构之外还有 id/name/status 三个字段;seat_priority 支持「车次=席别」专属规则,如 K225=硬座/无座, K1969=硬卧。",
   "version": 1,
   "passenger_names": [],
   "from": "",
@@ -16,5 +17,7 @@
   "station_history": [],
   "purpose_code": "ADULT",
   "query_history": [],
-  "synced_trains": []
+  "synced_trains": [],
+  "pax_purpose": {},
+  "seat_priority": ""
 }

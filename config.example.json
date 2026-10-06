@@ -35,5 +35,7 @@
       ]
     }
   },
-  "tasks": []
+  "tasks": [],
+  "order_mode": "browser",
+  "browser_headless": false
 }

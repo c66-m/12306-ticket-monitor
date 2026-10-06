@@ -22,6 +22,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -749,6 +750,43 @@ class TestAppCommon(TempDirCase):
                                side_effect=OSError("busy forever")):
             appcommon.replace_with_retry(src, dst2, fallback_direct=True)
         self.assertEqual(open(dst2, encoding="utf-8").read(), "data")
+
+
+class TestConfigKeys(TempDirCase):
+    """配置键防漂移：代码读取的键必须都在 example 模板里文档化。"""
+
+    def _scan(self, pattern):
+        keys = set()
+        for f in ["launcher.py", "gui.py", "engine.py", "order.py",
+                  "browser_order.py", "monitor.py"]:
+            for m in re.finditer(pattern, open(f, encoding="utf-8").read()):
+                keys.add(m.group(1))
+        return keys
+
+    def test_config_example_covers_code_reads(self):
+        import config_keys
+        live = json.load(open(os.path.join(HERE, "config.example.json"),
+                              encoding="utf-8"))
+        code_keys = (self._scan(r"(?<![\w.])config\.get\(\s*['\"](\w+)[\"']")
+                     | self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']"))
+        self.assertTrue(code_keys <= config_keys.CONFIG_KEYS,
+                        sorted(code_keys - config_keys.CONFIG_KEYS))
+        self.assertTrue(config_keys.CONFIG_KEYS <= set(live),
+                        sorted(config_keys.CONFIG_KEYS - set(live)))
+        email = live.get("notify", {}).get("email", {})
+        self.assertTrue(config_keys.NOTIFY_EMAIL_KEYS <= set(email))
+
+    def test_launcher_example_covers_code_reads(self):
+        import config_keys
+        live = json.load(open(os.path.join(HERE, "launcher_config.example.json"),
+                              encoding="utf-8"))
+        code_keys = (self._scan(r"(?<![\w.])lc\.get\(\s*['\"](\w+)[\"']")
+                     | self._scan(r"(?<![\w.])self\.lc\.get\(\s*['\"](\w+)[\"']"))
+        allowed = config_keys.LAUNCHER_CONFIG_KEYS | config_keys.LAUNCHER_TASK_EXTRA_KEYS
+        self.assertTrue(code_keys <= allowed,
+                        sorted(code_keys - allowed))
+        self.assertTrue(config_keys.LAUNCHER_CONFIG_KEYS <= set(live),
+                        sorted(config_keys.LAUNCHER_CONFIG_KEYS - set(live)))
 
 
 # ----------------------------- 辅助 -----------------------------
