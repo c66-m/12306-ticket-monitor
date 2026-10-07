@@ -1970,6 +1970,8 @@ class TestQuarantineToctou(TempDirCase):
     def test_load_orders_toctou_end_to_end(self):
         # 端到端：经 load_orders 真实调用链复现竞态 —— 损坏读失败后、
         # quarantine 执行前"另一进程"写入健康文件，健康文件不得被挪走。
+        # （round 2 更新：放弃隔离后 load_orders 重读一次返回新鲜数据，
+        # 不再返回空库——旧断言 db == {} 已过时。）
         import appcommon
         p = os.path.join(self.tmp, "orders.json")
         self._write(p, "CORRUPT{{{")
@@ -1983,10 +1985,116 @@ class TestQuarantineToctou(TempDirCase):
 
         with mock.patch.object(appcommon, "quarantine_corrupt", sneaky):
             db = appcommon.load_orders(p)
-        self.assertEqual(db, {"orders": {}})
+        self.assertEqual(db, healthy, "放弃隔离后应重读返回新鲜数据")
         with open(p, encoding="utf-8") as f:
             self.assertEqual(json.load(f), healthy, "健康文件不得被隔离挪走")
         self.assertEqual(self._bad_files(p), [], "不得产生隔离文件")
+
+
+class TestQuarantineAbandonReread(TempDirCase):
+    """Task 33 round 2: quarantine 因"文件自读失败后被改写"而放弃隔离后，
+    调用方必须重读一次用新鲜数据继续，绝不能用过期空读数覆盖健康文件。"""
+
+    def _write(self, path, data):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+
+    def _bad_files(self, path):
+        d = os.path.dirname(path)
+        base = os.path.basename(path)
+        return [f for f in os.listdir(d) if f.startswith(base + ".bad-")]
+
+    def _sneaky_rewrite(self, path, new_content):
+        """包装 quarantine_corrupt：在其执行前用新内容改写文件，模拟竞态窗口。"""
+        import appcommon
+        orig = appcommon.quarantine_corrupt
+
+        def sneaky(p, fp=None):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            return orig(p, fp)
+
+        return mock.patch.object(appcommon, "quarantine_corrupt", sneaky)
+
+    def test_append_history_abandon_rereads_instead_of_overwriting(self):
+        import appcommon
+        p = os.path.join(self.tmp, "order_history.json")
+        self._write(p, "{CORRUPT")
+        healthy = [{"train": "G1"}]
+        rec = {"train": "G2"}
+        with self._sneaky_rewrite(p, json.dumps(healthy)):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                appcommon.append_history(p, rec)
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data, healthy + [rec],
+                         "放弃隔离后必须重读新鲜数据再追加，不能用空列表覆盖健康文件")
+        self.assertEqual(self._bad_files(p), [], "放弃隔离不得产生隔离文件")
+        out = "\n".join(logs.output)
+        self.assertIn("放弃隔离", out)
+        self.assertNotIn("已隔离留证：None", out, "日志不得再出现误导性的已隔离留证：None")
+
+    def test_load_orders_abandon_upsert_preserves_healthy(self):
+        import appcommon
+        p = os.path.join(self.tmp, "orders.json")
+        self._write(p, "{CORRUPT")
+        healthy = {"orders": {"G123|2026-10-09": {"order_no": "E123"}}}
+        with self._sneaky_rewrite(p, json.dumps(healthy)):
+            appcommon.upsert_order(p, "G456|2026-10-10", {"order_no": "E456"})
+        with open(p, encoding="utf-8") as f:
+            db = json.load(f)
+        self.assertIn("G123|2026-10-09", db["orders"], "健康旧记录不得被空库覆盖丢失")
+        self.assertIn("G456|2026-10-10", db["orders"], "新记录必须登记")
+        self.assertEqual(self._bad_files(p), [], "放弃隔离不得产生隔离文件")
+
+    def test_append_history_shape_invalid_abandon_rereads(self):
+        import appcommon
+        p = os.path.join(self.tmp, "order_history.json")
+        self._write(p, '{"not": "a list"}')
+        healthy = [{"train": "G7"}]
+        rec = {"train": "G8"}
+        with self._sneaky_rewrite(p, json.dumps(healthy)):
+            appcommon.append_history(p, rec)
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), healthy + [rec])
+        self.assertEqual(self._bad_files(p), [])
+
+    def test_abandon_reread_failure_falls_back_safely(self):
+        # 放弃隔离后重读仍失败（文件被删）：不崩、不循环，回退空数据继续
+        import appcommon
+        orig = appcommon.quarantine_corrupt
+
+        def sneaky_delete(path, fp=None):
+            os.remove(path)
+            return orig(path, fp)
+
+        p = os.path.join(self.tmp, "order_history.json")
+        self._write(p, "{CORRUPT")
+        with mock.patch.object(appcommon, "quarantine_corrupt", sneaky_delete):
+            appcommon.append_history(p, {"train": "G9"})
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [{"train": "G9"}])
+        p2 = os.path.join(self.tmp, "orders.json")
+        self._write(p2, "{CORRUPT")
+        with mock.patch.object(appcommon, "quarantine_corrupt", sneaky_delete):
+            self.assertEqual(appcommon.load_orders(p2), {"orders": {}})
+
+    def test_move_failure_log_distinguishes_from_abandon(self):
+        # 挪移失败（非放弃）：日志必须说"挪移失败"而非"放弃隔离"，证据保留原地
+        import appcommon
+        import appcommon as ac
+        p = os.path.join(self.tmp, "orders.json")
+        self._write(p, "{CORRUPT")
+        with mock.patch.object(ac.os, "replace", side_effect=OSError("busy")):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                self.assertEqual(ac.load_orders(p), {"orders": {}})
+        out = "\n".join(logs.output)
+        self.assertIn("挪移失败", out)
+        self.assertNotIn("放弃隔离", out)
+        self.assertNotIn("已隔离留证：None", out)
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{CORRUPT",
+                             "挪移失败时证据保留原地")
 
 
 if __name__ == "__main__":

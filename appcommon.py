@@ -152,6 +152,43 @@ def quarantine_corrupt(path, expected_fingerprint=None):
     return bad
 
 
+def _quarantine_decision(path, fp):
+    """quarantine_corrupt 的三分决策：("quarantined", bad) / ("abandoned", None)
+    / ("move_failed", None)。
+
+    quarantine_corrupt 本体对"放弃隔离"和"挪移失败"都返回 None；这里用指纹
+    二次比对区分：指纹变了 = 自读失败后文件被改写 = 放弃隔离；没变 = 挪移失败。
+    误判方向是安全的：把挪移失败误判为放弃，最多多一次重读。"""
+    bad = quarantine_corrupt(path, fp)
+    if bad is not None:
+        return "quarantined", bad
+    if stat_fingerprint(path) != fp:
+        return "abandoned", None
+    return "move_failed", None
+
+
+def _read_history_list(path):
+    """重读一次历史文件；失败/形状非法返回 []（不抛异常、不循环）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _read_orders_db(path):
+    """重读一次 orders.json；失败/形状非法返回空库（不抛异常、不循环）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            db = json.load(f)
+    except Exception:
+        return {"orders": {}}
+    if isinstance(db, dict) and isinstance(db.get("orders"), dict):
+        return db
+    return {"orders": {}}
+
+
 def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
     """原子写 state.json（见 atomic_write_json）。"""
     atomic_write_json(path, state, tmp_kind=tmp_kind,
@@ -164,7 +201,9 @@ _HIST_LOCK = threading.Lock()
 def append_history(path, record, keep=500):
     """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。
     文件损坏/形状非法时时间戳挪档留证（quarantine_corrupt）+ LOG.error，
-    再追加新记录——不再静默清空整份历史。"""
+    再追加新记录——不再静默清空整份历史。
+    若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据继续，
+    绝不用过期空读数覆盖健康文件。"""
     with _HIST_LOCK:
         history = []
         if os.path.exists(path):
@@ -172,16 +211,33 @@ def append_history(path, record, keep=500):
                 with open(path, encoding="utf-8") as f:
                     history = json.load(f)
             except Exception as e:
-                bad = quarantine_corrupt(path, stat_fingerprint(path))
-                LOG.error("[数据] order_history.json 损坏，已隔离留证：%s（%s）；新记录继续追加",
-                          bad, e)
-                history = []
+                decision, bad = _quarantine_decision(path,
+                                                     stat_fingerprint(path))
+                if decision == "quarantined":
+                    LOG.error("[数据] order_history.json 损坏，已隔离留证：%s（%s）；新记录继续追加",
+                              bad, e)
+                    history = []
+                elif decision == "abandoned":
+                    LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
+                    history = _read_history_list(path)
+                else:
+                    LOG.error("[数据] order_history.json 损坏，隔离挪移失败，证据保留原地（%s）；新记录继续追加",
+                              e)
+                    history = []
             else:
                 if not isinstance(history, list):
-                    bad = quarantine_corrupt(path, stat_fingerprint(path))
-                    LOG.error("[数据] order_history.json 结构非法，已隔离留证：%s；新记录继续追加",
-                              bad)
-                    history = []
+                    decision, bad = _quarantine_decision(path,
+                                                         stat_fingerprint(path))
+                    if decision == "quarantined":
+                        LOG.error("[数据] order_history.json 结构非法，已隔离留证：%s；新记录继续追加",
+                                  bad)
+                        history = []
+                    elif decision == "abandoned":
+                        LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
+                        history = _read_history_list(path)
+                    else:
+                        LOG.error("[数据] order_history.json 结构非法，隔离挪移失败，证据保留原地；新记录继续追加")
+                        history = []
         history.append(record)
         atomic_write_json(path, history[-keep:])
 
@@ -191,20 +247,34 @@ _ORDERS_LOCK = threading.Lock()
 
 def load_orders(path):
     """orders.json → {"orders": {key: rec}}；缺失返回空库；损坏/形状非法则
-    时间戳挪档留证（quarantine_corrupt）+ LOG.error，再返回空库——不再静默。"""
+    时间戳挪档留证（quarantine_corrupt）+ LOG.error，再返回空库——不再静默。
+    若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据返回，
+    绝不用过期空库覆盖健康文件（upsert_order 随后会落盘）。"""
     if not os.path.exists(path):
         return {"orders": {}}
     try:
         with open(path, encoding="utf-8") as f:
             db = json.load(f)
     except Exception as e:
-        bad = quarantine_corrupt(path, stat_fingerprint(path))
-        LOG.error("[数据] orders.json 损坏，已隔离留证：%s（%s）；返回空库", bad, e)
+        decision, bad = _quarantine_decision(path, stat_fingerprint(path))
+        if decision == "quarantined":
+            LOG.error("[数据] orders.json 损坏，已隔离留证：%s（%s）；返回空库", bad, e)
+            return {"orders": {}}
+        if decision == "abandoned":
+            LOG.warning("[数据] orders.json 自读取后已被改写，放弃隔离；重读最新内容继续")
+            return _read_orders_db(path)
+        LOG.error("[数据] orders.json 损坏，隔离挪移失败，证据保留原地（%s）；返回空库", e)
         return {"orders": {}}
     if isinstance(db, dict) and isinstance(db.get("orders"), dict):
         return db
-    bad = quarantine_corrupt(path, stat_fingerprint(path))
-    LOG.error("[数据] orders.json 结构非法，已隔离留证：%s；返回空库", bad)
+    decision, bad = _quarantine_decision(path, stat_fingerprint(path))
+    if decision == "quarantined":
+        LOG.error("[数据] orders.json 结构非法，已隔离留证：%s；返回空库", bad)
+        return {"orders": {}}
+    if decision == "abandoned":
+        LOG.warning("[数据] orders.json 自读取后已被改写，放弃隔离；重读最新内容继续")
+        return _read_orders_db(path)
+    LOG.error("[数据] orders.json 结构非法，隔离挪移失败，证据保留原地；返回空库")
     return {"orders": {}}
 
 
