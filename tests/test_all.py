@@ -1164,6 +1164,15 @@ class TestEngineFlow(TempDirCase):
             self._run((False, "已有订单", {"reason": "dup"}),
                       expect_status="success", expect_dedup="SUBMITTED")
 
+    def test_dup_paid_keeps_monitoring_when_not_stop_after(self):
+        # stop_after_order=False：dup→官方回读 paid（已支付旧单）
+        # → 任务保持 monitoring，继续抢其它日期（Task 48，旧代码误置 success 漏单）
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("paid", "E9", "已支付", None)):
+            self._run((False, "已有订单", {"reason": "dup"}),
+                      expect_status="monitoring", expect_dedup="SUBMITTED",
+                      stop_after_order=False)
+
     def test_seat_unavailable_permanent_skip(self):
         self._run((False, "网页端不提供席别 硬座", {"reason": "seat_unavailable"}),
                   expect_status="monitoring", expect_dedup="SEAT_UNAVAILABLE")

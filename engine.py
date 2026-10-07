@@ -645,9 +645,14 @@ class MonitorEngine(object):
                         if cls == "paid":
                             self.state["dedup"][key] = "SUBMITTED"
                             self._save_state()
-                            self.set_task_status(task, "success",
-                                                 "官方确认已支付,订单 %s" % (ono or "未知"))
-                            return True, False
+                            if stop_after:
+                                self.set_task_status(task, "success",
+                                                     "官方确认已支付,订单 %s" % (ono or "未知"))
+                                return True, False
+                            if self.task_status(task) == "retrying":
+                                self.set_task_status(task, "monitoring",
+                                    "官方确认已支付（订单 %s），继续监控其它日期" % (ono or "未知"))
+                            return True, False  # 本轮不再继续（避免同轮重复下单）；任务保持 monitoring
                         if cls == "unpaid":
                             if recent:
                                 # 下单时间落在本次提交窗口内 → 本次已提交成功
