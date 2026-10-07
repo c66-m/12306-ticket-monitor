@@ -1,0 +1,8 @@
+# 必需：HTTP 查询与下单接口
+requests
+
+# 浏览器下单（browser_order / capture_session）：Playwright + 本机 Edge/Chrome
+playwright
+
+# 可选：非 Windows 平台的加密兜底（Windows 用系统 DPAPI，无需此包）
+cryptography
