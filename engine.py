@@ -114,7 +114,11 @@ def expand_dates(task):
             LOG.warning("[配置] 任务「%s」的 dates 含非法条目已跳过：%r",
                         task.get("name"), d)
     dr = task.get("date_range")
-    if dr and len(dr) == 2:
+    if not dr:
+        # 未配置（或空）date_range：正常情况，静默跳过（保持旧行为）
+        pass
+    elif (isinstance(dr, (list, tuple)) and len(dr) == 2
+            and isinstance(dr[0], str) and isinstance(dr[1], str)):
         try:
             d0 = datetime.date.fromisoformat(dr[0])
             d1 = datetime.date.fromisoformat(dr[1])
@@ -128,6 +132,11 @@ def expand_dates(task):
                 while d <= d1:
                     result.append(d.isoformat())
                     d += datetime.timedelta(days=1)
+    else:
+        # 病态形状（dict、单元素、嵌套、非字符串元素、整数等）：
+        # 记警告后跳过，绝不让单个任务的手误崩掉整个引擎进程
+        LOG.warning("[配置] 任务「%s」的 date_range 形状非法，已跳过：%r",
+                    task.get("name"), dr)
     seen, uniq = set(), []
     for x in result:
         if x not in seen:

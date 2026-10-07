@@ -406,6 +406,59 @@ class TestEngineDatesSanitization(TempDirCase):
         self.assertGreaterEqual(e.task_interval(t), 300)
 
 
+class TestEngineDateRangeShape(TempDirCase):
+    """Task 25 (P1): date_range 形状病态（dict/单元素/嵌套/非 str 元素）不得崩引擎进程。"""
+
+    def test_dict_date_range_does_not_raise(self):
+        # 手误把 date_range 写成 {"start":..., "end":...}：旧代码 dr[0] 抛 KeyError 崩进程
+        t = {"name": "t25",
+             "date_range": {"start": "2026-10-01", "end": "2026-10-02"}}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_single_element_list_skipped(self):
+        t = {"name": "t25", "date_range": ["2026-10-01"]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_three_element_list_skipped(self):
+        t = {"name": "t25",
+             "date_range": ["2026-10-01", "2026-10-02", "2026-10-03"]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_int_date_range_skipped(self):
+        # 旧代码 len(5) 直接 TypeError 崩进程
+        t = {"name": "t25", "date_range": 5}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_non_str_elements_skipped(self):
+        t = {"name": "t25", "date_range": [20261001, 20261002]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_nested_list_skipped(self):
+        t = {"name": "t25", "date_range": [["2026-10-01"], ["2026-10-02"]]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_none_date_range_silent(self):
+        # 未配置 date_range 是正常情况：静默视为空，不崩
+        t = {"name": "t25", "date_range": None}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_valid_tuple_still_works(self):
+        # 回归 pin：合法 2 元组仍展开
+        t = {"name": "t25",
+             "date_range": ("2026-10-01", "2026-10-02")}
+        self.assertEqual(engine_mod.expand_dates(t),
+                         ["2026-10-01", "2026-10-02"])
+
+    def test_task_interval_dict_date_range_no_crash(self):
+        # 真实崩溃路径：task_interval 经 _soonest_date 调 expand_dates
+        e = make_engine(self.tmp)
+        e.config = {"adaptive": {"enabled": True, "peak_hours": [0, 24],
+                                 "peak_multiplier": 1.0, "rush_within_hours": 24}}
+        t = task_of("t25", dates=[],
+                    date_range={"start": "2026-10-01", "end": "2026-10-02"})
+        self.assertGreaterEqual(e.task_interval(t), 300)
+
+
 class TestEnginePriorityValidation(TempDirCase):
     """Task 2 (P1): 非数字 priority 不得崩调度排序。"""
 
