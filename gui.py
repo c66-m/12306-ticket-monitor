@@ -139,6 +139,35 @@ def save_state(state):
         appcommon.write_state(path, state, tmp_kind="guisave")
 
 
+def update_config_locked(mutator):
+    """config.json 读-改-写原子接口：整包在 file_lock 内，与 launcher/monitor 互斥。
+
+    mutator(config) 就地修改读到的 dict；返回其返回值。
+    替代「load_config() → 改 → save_config()」的锁外读模式（双端并发改任务丢数据）。
+    """
+    with filelock.file_lock(CONFIG_PATH + ".lock"):
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            config = json.load(f)
+        result = mutator(config)
+        appcommon.atomic_write_json(CONFIG_PATH, config)
+        return result
+
+
+def update_state_locked(mutator):
+    """state.json 读-改-写原子接口：整包在 file_lock 内，与引擎/launcher 互斥。
+
+    mutator(state) 就地修改读到的 dict；返回其返回值。
+    路径解析沿用 save_state 的口径（config 的 state_file，默认 state.json）。
+    """
+    config = load_config()
+    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    with filelock.file_lock(path + ".lock"):
+        state = engine_mod.load_state_file(path)
+        result = mutator(state)
+        appcommon.write_state(path, state, tmp_kind="guisave")
+        return result
+
+
 def mark_task_created(app, task, start_now):
     """新建任务后立刻写状态：勾选了立即启动 = 监控中；否则 = 已暂停（未启动）。
     引擎运行时通过共享实例写入，引擎未运行时直接原子写文件。"""
@@ -148,13 +177,15 @@ def mark_task_created(app, task, start_now):
         app.get_ops_engine().set_task_status(task, target, msg, force=True)
     else:
         name = task.get("name") or ""
-        state = load_state()
-        entry = state.setdefault("tasks", {}).setdefault(name, {})
-        entry["status"] = target
-        entry.setdefault("fail_streak", 0)
-        entry.setdefault("last_poll", 0)
-        entry["message"] = msg
-        save_state(state)
+
+        def _mark(state):
+            entry = state.setdefault("tasks", {}).setdefault(name, {})
+            entry["status"] = target
+            entry.setdefault("fail_streak", 0)
+            entry.setdefault("last_poll", 0)
+            entry["message"] = msg
+
+        update_state_locked(_mark)
 
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
@@ -1278,9 +1309,7 @@ class TaskWizard(tk.Toplevel):
             "purpose_code": self.purpose_var.get(),
             "notify_channels": ["email"] if self.notify_var.get() else [],
         }
-        config = load_config()
-        config.setdefault("tasks", []).append(task)
-        save_config(config)
+        update_config_locked(lambda config: config.setdefault("tasks", []).append(task))
         mark_task_created(self.app, task, start_now)
         if self.on_created:
             self.on_created()
@@ -1457,9 +1486,7 @@ class QuickMonitorDialog(tk.Toplevel):
             "purpose_code": self.purpose_var.get(),
             "notify_channels": ["email"],
         }
-        config = load_config()
-        config.setdefault("tasks", []).append(task)
-        save_config(config)
+        update_config_locked(lambda config: config.setdefault("tasks", []).append(task))
         mark_task_created(self.app, task, start_now)
         if self.on_created:
             self.on_created()
@@ -1722,9 +1749,10 @@ class NotifyFormMixin:
         except ValueError as e:
             messagebox.showwarning("无法保存", str(e), parent=self)
             return
-        cfg = load_config()
-        cfg.setdefault("notify", {})["email"] = email
-        save_config(cfg)
+        def _save_email(c):
+            c.setdefault("notify", {})["email"] = email
+
+        update_config_locked(_save_email)
         messagebox.showinfo("完成", "通知设置已保存", parent=self)
 
     def test(self):
@@ -2411,9 +2439,8 @@ class TaskPage(ttk.Frame):
                     eng.set_task_status(task, "monitoring", "右键菜单重置", force=True)
             elif action == "delete":
                 if messagebox.askyesno("确认", "确定从配置中删除任务「%s」？" % name, parent=self):
-                    config = load_config()
-                    remove_task_from_config(config, task)
-                    save_config(config)
+                    update_config_locked(
+                        lambda config: remove_task_from_config(config, task))
         finally:
             self.app.refresh_tasks()
         # 先刷新列表再弹窗，减小阻塞期间被旧状态覆盖的窗口
@@ -2585,18 +2612,16 @@ class TaskEditDialog(tk.Toplevel):
             "notify_channels": self.task.get("notify_channels") or ["email"],
             "seats_by_date": {},  # 编辑为全局席别模式（按日席别需在向导重建）
         }
-        config = load_config()
-        replaced = False
-        uid = self.task.get("uid")
-        for i, t in enumerate(config.get("tasks") or []):
-            if (uid and t.get("uid") == uid) or \
-                    (not uid and t.get("name") == self.task.get("name")):
-                config["tasks"][i] = new_task
-                replaced = True
-                break
-        if not replaced:
+        def _replace_task(config):
+            uid = self.task.get("uid")
+            for i, t in enumerate(config.get("tasks") or []):
+                if (uid and t.get("uid") == uid) or \
+                        (not uid and t.get("name") == self.task.get("name")):
+                    config["tasks"][i] = new_task
+                    return
             config.setdefault("tasks", []).append(new_task)
-        save_config(config)
+
+        update_config_locked(_replace_task)
         if self.on_saved:
             self.on_saved()
         self.destroy()

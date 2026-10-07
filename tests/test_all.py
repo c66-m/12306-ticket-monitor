@@ -1668,6 +1668,13 @@ def _mk_logger(name, handler):
     return lg, handler
 
 
+def _capture_mut(mutator):
+    """把 update_config_locked 的 mutator 作用到空 dict 并返回，用于测试捕获。"""
+    cfg = {}
+    mutator(cfg)
+    return cfg
+
+
 class TestMonitorInterrupt(TempDirCase):
     """Task 28 (P1): monitor 交互输入 Ctrl+C/EOF 时 read 返回 None，
     ask_yes_no / ask_priority 不得抛 AttributeError，应抛 KeyboardInterrupt
@@ -1877,8 +1884,9 @@ class TestMonitorInterruptRound4(TempDirCase):
              mock.patch.object(monitor_mod, "read",
                                side_effect=["", "1", "5", "n", "n", "", "n"]), \
              mock.patch.object(monitor_mod, "load_config", return_value={}), \
-             mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved_cfg.update(c)):
+             mock.patch.object(monitor_mod, "update_config_locked",
+                               side_effect=lambda mut: saved_cfg.update(
+                                   _capture_mut(mut))):
             mock_ticket.load_station_map.return_value = (
                 {"北京": "BJP", "上海": "SHH"}, {"BJP": "北京", "SHH": "上海"})
             mock_ticket.query_tickets.side_effect = Exception("offline")
@@ -1915,8 +1923,9 @@ class TestMonitorInterruptRound5(TempDirCase):
              mock.patch.object(monitor_mod, "pick_multi", return_value=["二等座"]), \
              mock.patch.object(monitor_mod, "read", side_effect=list(reads)), \
              mock.patch.object(monitor_mod, "load_config", return_value={}), \
-             mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved_cfg.update(c)), \
+             mock.patch.object(monitor_mod, "update_config_locked",
+                               side_effect=lambda mut: saved_cfg.update(
+                                   _capture_mut(mut))), \
              mock.patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(map(str, a)))):
             mock_ticket.load_station_map.return_value = (
                 {"北京": "BJP", "上海": "SHH"}, {"BJP": "北京", "SHH": "上海"})
@@ -2597,8 +2606,9 @@ class TestTrainCodeCase(TempDirCase):
              mock.patch.object(monitor_mod.passengers_mod, "load_passengers",
                                return_value=[]), \
              mock.patch.object(monitor_mod, "load_config", return_value={}), \
-             mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda cfg: captured.update(cfg)):
+             mock.patch.object(monitor_mod, "update_config_locked",
+                               side_effect=lambda mut: captured.update(
+                                   _capture_mut(mut))):
             monitor_mod.menu_create_task()
         # 旧代码：task["trains"] == ["k225"]，断言失败
         self.assertEqual(captured["tasks"][-1]["trains"], ["K225"])
@@ -3286,6 +3296,121 @@ class TestProbeStep7(unittest.TestCase):
             self.assertEqual(json.load(f),
                              {"JSESSIONID": "diag-value",
                               "RAIL_DEVICEID": "diag-device"})
+
+
+class TestLockedRMW(TempDirCase):
+    """Task 46 (P2): gui/monitor/launcher 读-改-写统一经 file_lock 原子接口。
+
+    改前：gui 读在锁外、写才加锁；monitor 全程无锁——双端同时改任务丢数据。
+    改后：三入口经 update_config_locked / update_state_locked，整包在锁内。
+    """
+
+    def _patch_gui_paths(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [], "state_file": "state.json"}, f)
+        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+            p = mock.patch.object(gui, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        return cfg
+
+    def test_gui_update_config_locked_concurrent_no_lost_update(self):
+        # RED on old code: gui 根本没有 update_config_locked（AttributeError）
+        cfg = self._patch_gui_paths()
+        n = 16
+
+        def worker(i):
+            gui.update_config_locked(
+                lambda c: c.setdefault("tasks", []).append({"name": "t%d" % i}))
+
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        with open(cfg, encoding="utf-8") as f:
+            tasks = json.load(f)["tasks"]
+        self.assertEqual(len(tasks), n)
+        self.assertEqual(sorted(t["name"] for t in tasks),
+                         sorted("t%d" % i for i in range(n)))
+
+    def test_gui_update_state_locked_concurrent_no_lost_update(self):
+        # RED on old code: gui 根本没有 update_state_locked（AttributeError）
+        self._patch_gui_paths()
+        n = 16
+
+        def worker(i):
+            gui.update_state_locked(
+                lambda s: s.setdefault("tasks", {}).setdefault(
+                    "t%d" % i, {}) .__setitem__("status", "monitoring"))
+
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        with open(os.path.join(self.tmp, "state.json"), encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(len(state["tasks"]), n)
+        for i in range(n):
+            self.assertEqual(state["tasks"]["t%d" % i]["status"], "monitoring")
+
+    def test_gui_save_config_still_writes_standalone(self):
+        # 回归 pin：旧的 load_config/save_config 独立读写行为不变
+        cfg = self._patch_gui_paths()
+        config = gui.load_config()
+        config["order_mode"] = "browser"
+        gui.save_config(config)
+        with open(cfg, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["order_mode"], "browser")
+
+    def test_monitor_save_config_holds_file_lock(self):
+        # RED on old code: monitor.save_config 只原子写、不加锁
+        import monitor as monitor_mod
+        import filelock
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": []}, f)
+        p = mock.patch.object(monitor_mod, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
+        real = filelock.file_lock
+        seen = []
+
+        def spy(path, *a, **k):
+            seen.append(path)
+            return real(path, *a, **k)
+
+        with mock.patch.object(filelock, "file_lock", side_effect=spy):
+            monitor_mod.save_config({"tasks": [{"name": "t"}]})
+        self.assertIn(cfg + ".lock", seen)
+        with open(cfg, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["tasks"], [{"name": "t"}])
+
+    def test_monitor_update_config_locked_concurrent_no_lost_update(self):
+        # RED on old code: monitor 根本没有 update_config_locked（AttributeError）
+        import monitor as monitor_mod
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": []}, f)
+        p = mock.patch.object(monitor_mod, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
+        n = 16
+
+        def worker(i):
+            monitor_mod.update_config_locked(
+                lambda c: c.setdefault("tasks", []).append({"name": "m%d" % i}))
+
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        with open(cfg, encoding="utf-8") as f:
+            tasks = json.load(f)["tasks"]
+        self.assertEqual(len(tasks), n)
 
 
 if __name__ == "__main__":

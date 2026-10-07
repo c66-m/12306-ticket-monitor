@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 import appcommon
 import engine as engine_mod
+import filelock
 import notify as notify_mod
 import order as order_mod
 import passengers as passengers_mod
@@ -61,8 +62,23 @@ def load_config():
 
 
 def save_config(config):
-    # 原子写：写一半被杀不留截断文件
-    appcommon.atomic_write_json(CONFIG_PATH, config)
+    # 原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）
+    with filelock.file_lock(CONFIG_PATH + ".lock"):
+        appcommon.atomic_write_json(CONFIG_PATH, config)
+
+
+def update_config_locked(mutator):
+    """config.json 读-改-写原子接口：整包在 file_lock 内，与 launcher/gui 互斥。
+
+    mutator(config) 就地修改读到的 dict；返回其返回值。
+    注意：不要在 mutator 里做交互式输入——锁内长时间占用会堵住 launcher
+    的下单写路径；交互式菜单仍用 load_config/save_config（写侧已加锁）。
+    """
+    with filelock.file_lock(CONFIG_PATH + ".lock"):
+        config = load_config()
+        result = mutator(config)
+        appcommon.atomic_write_json(CONFIG_PATH, config)
+        return result
 
 
 def pause():
@@ -299,9 +315,7 @@ def menu_create_task():
         "notify_channels": ["email"],
     }
 
-    config = load_config()
-    config.setdefault("tasks", []).append(task)
-    save_config(config)
+    update_config_locked(lambda config: config.setdefault("tasks", []).append(task))
     print("\n  [完成] 任务「{0}」已创建：{1}->{2} 日期 {3} 席别 {4} 乘车人 {5}".format(
         task_name, from_name, to_name,
         dates[0] if dates else "~".join(date_range),
