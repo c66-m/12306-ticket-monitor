@@ -2550,6 +2550,47 @@ class LauncherApp(tk.Frame):
 
     # ---- 定时器 ----
 
+    def _notify_nonmodal(self, title, msg):
+        """非模态提醒窗：Toplevel，不 grab、不 wait_window，不阻塞 _tick 的 after 链。
+
+        无人值守时自动开抢必须能继续；用户回来点"知道了"关掉即可。
+        重复提醒不堆窗口：新窗出现前先关掉旧窗。
+        """
+        try:
+            old = getattr(self, "_remind_win", None)
+            if old is not None:
+                try:
+                    if old.winfo_exists():
+                        old.destroy()
+                except tk.TclError:
+                    pass
+        except Exception:
+            pass
+        try:
+            top = tk.Toplevel(self._mp)
+        except tk.TclError:
+            return
+        try:
+            top.title(title)
+            top.resizable(False, False)
+            # 依附主窗口（任务栏不单独占位）+ 置顶，保证提醒可见
+            top.transient(self._mp)
+            top.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        ttk.Label(top, text=msg, justify="left", wraplength=380).pack(padx=18, pady=(14, 8))
+        ttk.Button(top, text="知道了", command=top.destroy).pack(pady=(0, 14))
+        try:
+            # 居中到主窗口
+            top.update_idletasks()
+            x = self._mp.winfo_x() + (self._mp.winfo_width() - top.winfo_reqwidth()) // 2
+            y = self._mp.winfo_y() + (self._mp.winfo_height() - top.winfo_reqheight()) // 2
+            top.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+        except tk.TclError:
+            pass
+        # 注意：绝不能在这里 grab_set()/wait_window()——那会重新变成模态，冻住 _tick。
+        self._remind_win = top
+
     def _tick(self):
         try:
             self._sync_monitor()
@@ -2591,8 +2632,10 @@ class LauncherApp(tk.Frame):
                             self.reminded = True
                             self._put_log("[提醒] 距离开抢不到 %d 分钟！" % remind)
                             self._top.bell()
-                            messagebox.showinfo("开抢提醒", "距离开抢不到 %d 分钟！\n开抢时间：%s" % (
-                                remind, st.strftime("%Y-%m-%d %H:%M:%S")), parent=self._mp)
+                            # 非模态提醒：模态弹窗会冻住 _tick 的 after 链，
+                            # 无人值守时自动开抢永远到不了
+                            self._notify_nonmodal("开抢提醒", "距离开抢不到 %d 分钟！\n开抢时间：%s" % (
+                                remind, st.strftime("%Y-%m-%d %H:%M:%S")))
                     else:
                         if self.armed and not self.auto_fired and (now - st).total_seconds() <= max(90, lead):
                             self.auto_fired = True

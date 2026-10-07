@@ -959,6 +959,134 @@ class TestValidateAutoNoModal(TempDirCase):
         mw.assert_not_called()
 
 
+class _FakeTkWidget:
+    """Task 45: 记录方法调用的 Tk 构件替身（无真实显示）。
+
+    winfo_* 返回 0 让居中算术可跑；方法按名缓存，保证 top.destroy
+    每次取到的是同一个可调用对象，便于断言按钮 command 身份。
+    """
+
+    def __init__(self, master=None, **kw):
+        self.master = master
+        self.kw = kw
+        self.calls = []          # [(name, args, kwargs)]
+        self.destroyed = False
+        self._methods = {}
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        if name not in self._methods:
+            def _rec(*a, **k):
+                self.calls.append((name, a, k))
+                if name == "destroy":
+                    self.destroyed = True
+                if name == "winfo_exists":
+                    return 0 if self.destroyed else 1
+                return 0 if name.startswith("winfo_") else None
+            self._methods[name] = _rec
+        return self._methods[name]
+
+    def called(self, name):
+        return any(c[0] == name for c in self.calls)
+
+
+class _FakeParent(_FakeTkWidget):
+    pass
+
+
+class TestRemindNonmodal(TempDirCase):
+    """Task 45: launcher 开抢提醒改非模态。
+
+    改前 _tick 里 messagebox.showinfo 是模态的：冻住 Tk 主线程的 after 链，
+    无人值守时自动开抢永远到不了——提醒功能杀死核心功能。
+    改后：bell + 日志 + 非模态 Toplevel（不 grab、不 wait_window），不阻塞 _tick。
+    """
+
+    def _make_app(self):
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app._mp = _FakeParent()
+        app._top = mock.Mock()
+        return app
+
+    def _patched_tk(self):
+        tops, labels, buttons = [], [], []
+
+        def _toplevel(master=None, **kw):
+            w = _FakeTkWidget(master, **kw)
+            tops.append(w)
+            return w
+
+        def _label(master=None, **kw):
+            w = _FakeTkWidget(master, **kw)
+            labels.append(w)
+            return w
+
+        def _button(master=None, **kw):
+            w = _FakeTkWidget(master, **kw)
+            buttons.append(w)
+            return w
+
+        p1 = mock.patch.object(launcher.tk, "Toplevel", _toplevel)
+        p2 = mock.patch.object(launcher.ttk, "Label", _label)
+        p3 = mock.patch.object(launcher.ttk, "Button", _button)
+        return p1, p2, p3, tops, labels, buttons
+
+    def test_notify_nonmodal_creates_toplevel(self):
+        app = self._make_app()
+        p1, p2, p3, tops, labels, buttons = self._patched_tk()
+        with p1, p2, p3:
+            app._notify_nonmodal("开抢提醒", "距离开抢不到 5 分钟！")
+        self.assertEqual(len(tops), 1)
+        top = tops[0]
+        self.assertIs(top.master, app._mp)
+        self.assertIn(("title", ("开抢提醒",), {}), top.calls)
+        self.assertTrue(any("距离开抢不到 5 分钟" in str(l.kw.get("text", ""))
+                            for l in labels))
+
+    def test_notify_nonmodal_never_blocks(self):
+        # 非模态的核心证据：绝不调用 grab_set / wait_window
+        app = self._make_app()
+        p1, p2, p3, tops, labels, buttons = self._patched_tk()
+        with p1, p2, p3:
+            app._notify_nonmodal("开抢提醒", "msg")
+        top = tops[0]
+        self.assertFalse(top.called("grab_set"))
+        self.assertFalse(top.called("wait_window"))
+        self.assertFalse(top.called("focus_force"))
+        # 提醒窗不自动消失：等用户点"知道了"
+        self.assertFalse(top.destroyed)
+        # "知道了"按钮确实能关掉窗口
+        self.assertEqual(len(buttons), 1)
+        cmd = buttons[0].kw.get("command")
+        self.assertIs(cmd, top.destroy)
+        cmd()
+        self.assertTrue(top.destroyed)
+
+    def test_notify_nonmodal_replaces_old_window(self):
+        # 重复提醒不堆窗口：新窗出现前旧窗先关掉
+        app = self._make_app()
+        p1, p2, p3, tops, labels, buttons = self._patched_tk()
+        with p1, p2, p3:
+            app._notify_nonmodal("开抢提醒", "第一次")
+            app._notify_nonmodal("开抢提醒", "第二次")
+        self.assertEqual(len(tops), 2)
+        self.assertTrue(tops[0].destroyed)
+        self.assertFalse(tops[1].destroyed)
+
+    def test_tick_has_no_blocking_dialog(self):
+        # 回归 pin：_tick 里绝不能再出现模态弹窗（任何模态都会冻住 after 链）
+        import inspect
+        src = inspect.getsource(launcher.LauncherApp._tick)
+        self.assertNotIn("showinfo", src)
+        self.assertNotIn("showwarning", src)
+        self.assertNotIn("showerror", src)
+        self.assertNotIn("askyesno", src)
+        self.assertNotIn("grab_set", src)
+        self.assertNotIn("wait_window", src)
+        self.assertIn("_notify_nonmodal", src)
+
+
 class TestGuiUnit(TempDirCase):
     def test_normalize_email(self):
         email = gui.normalize_email_settings({
