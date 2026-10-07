@@ -42,6 +42,10 @@ import passengers as pax_mod         # noqa: E402
 import launcher                      # noqa: E402
 import gui                           # noqa: E402
 import browser_order                 # noqa: E402
+import appcommon                     # noqa: E402
+import filelock                      # noqa: E402
+import time                          # noqa: E402
+import contextlib                    # noqa: E402
 
 
 def synthetic_row(train="K225", hard_seat="5", from_c="VNP", to_c="ZAF"):
@@ -2095,6 +2099,105 @@ class TestQuarantineAbandonReread(TempDirCase):
         with open(p, encoding="utf-8") as f:
             self.assertEqual(f.read(), "{CORRUPT",
                              "挪移失败时证据保留原地")
+
+
+class TestLoadStateReadLock(unittest.TestCase):
+    """Task 34: _load_state 读 state.json 时必须持有与写侧相同的 file_lock。
+
+    背景：_save_state 用 fallback_direct=True，os.replace 重试耗尽后退化为
+    非原子直写（open "w" 截断后再写）。读侧不持锁可能撞上写一半的撕裂文件
+    → json 误判损坏 → 健康 state.json 被隔离。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="t34_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_config(self, state_obj):
+        sp = os.path.join(self.tmp, "state.json")
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump(state_obj, f, ensure_ascii=False)
+        cfg = {"tasks": [],
+               "state_file": sp,
+               "history_file": os.path.join(self.tmp, "order_history.json")}
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return p
+
+    def _make_engine(self, state_obj):
+        cfg_path = self._write_config(state_obj)
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            return engine_mod.MonitorEngine(config_path=cfg_path,
+                                            setup_logging=False)
+
+    def test_load_state_reads_under_state_lock(self):
+        # 读瞬间必须处于 file_lock(state.json.lock) 上下文内（与 _save_state 同一把）
+        cfg_path = self._write_config({"dedup": {"k": 1},
+                                       "tasks": {}, "retry": {}})
+        state_path = os.path.join(self.tmp, "state.json")
+        lock_path = state_path + ".lock"
+        in_lock_during_read = []
+        flag = {"in_lock": False}
+        real_file_lock = filelock.file_lock
+        real_read = appcommon.read_state_or_none
+
+        @contextlib.contextmanager
+        def spy_lock(path, timeout=10.0):
+            if path == lock_path:
+                flag["in_lock"] = True
+            try:
+                with real_file_lock(path, timeout=timeout):
+                    yield
+            finally:
+                if path == lock_path:
+                    flag["in_lock"] = False
+
+        def spy_read(path):
+            in_lock_during_read.append(flag["in_lock"])
+            return real_read(path)
+
+        with mock.patch.object(filelock, "file_lock", spy_lock), \
+             mock.patch.object(appcommon, "read_state_or_none", spy_read), \
+             mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            engine_mod.MonitorEngine(config_path=cfg_path,
+                                     setup_logging=False)
+
+        self.assertTrue(in_lock_during_read, "read_state_or_none 没有被调用到")
+        self.assertTrue(
+            all(in_lock_during_read),
+            "Task34: _load_state 读 state.json 时未持有写侧同把 file_lock")
+
+    def test_load_state_waits_for_writer_lock(self):
+        # 写侧持锁慢写时，读侧必须阻塞等待，不能直接读半截文件
+        e = self._make_engine({"dedup": {}, "tasks": {}, "retry": {}})
+        lock_path = e.state_path + ".lock"
+        entered = threading.Event()
+
+        def slow_writer():
+            with filelock.file_lock(lock_path):
+                entered.set()
+                time.sleep(1.0)  # 模拟 fallback_direct 慢速直写
+
+        t = threading.Thread(target=slow_writer)
+        t.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5), "写线程未能拿到锁")
+            # 屏蔽 _save_state：只测"读"是否等待写锁（否则旧代码也会因
+            # _save_state 持锁而被动等待，测不出读侧问题）
+            with mock.patch.object(e, "_save_state"):
+                start = time.monotonic()
+                e._load_state()
+                elapsed = time.monotonic() - start
+        finally:
+            t.join(timeout=5)
+        self.assertGreaterEqual(
+            elapsed, 0.8,
+            "读未等待写锁（%.2fs），可能读到撕裂文件" % elapsed)
 
 
 if __name__ == "__main__":

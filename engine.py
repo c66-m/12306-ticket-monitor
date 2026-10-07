@@ -228,7 +228,12 @@ class MonitorEngine(object):
     # ----------------------------- 状态持久化 -----------------------------
 
     def _load_state(self):
-        state, err = appcommon.read_state_or_none(self.state_path)
+        # 读与写侧持同一把 file_lock：_save_state 的 fallback_direct 直写是
+        # 非原子的（open "w" 截断后再写），不持锁读可能撞上写一半的撕裂文件
+        # → json 误判损坏 → 健康 state.json 被隔离。只包住读本身，
+        # quarantine / _save_state 留在锁外（顺序持锁，不嵌套）。
+        with filelock.file_lock(self.state_path + ".lock"):
+            state, err = appcommon.read_state_or_none(self.state_path)
         state_ok = err is None
         if err is not None:
             LOG.warning("state.json 读取失败: %s", err)
