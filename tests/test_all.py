@@ -4502,6 +4502,82 @@ class TestFileLockTimeout(TempDirCase):
             monitor_mod.main_menu()  # 不应抛异常：回到菜单继续
 
 
+class TestSaveStateInLockRMW(TempDirCase):
+    """Task 57: _save_state 读-改-写全程持锁。
+
+    旧代码：snapshot 在拿 file_lock 之前已从内存 deepcopy → 写回时覆盖
+    launcher/gui 在竞态窗口内并发写入 state.json 的变更 → 丢任务/状态。
+    新行为：锁内重读文件 → 合并内存变更 → 写回。
+    合并规则：tasks 取并集（冲突时内存赢；墓碑名剔除）；dedup/retry 内存为准。
+    """
+
+    def test_launcher_concurrent_task_not_lost(self):
+        # 核心回归：launcher 在引擎 _sync_state 之后、_save_state 落盘之前
+        # 并发写入的新任务，不得被引擎的写回覆盖。
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {}, "tasks": {"A": {"status": "monitoring"}},
+                   "retry": {}}
+        e._save_state()
+        # 模拟 launcher.py:969 的并发 RMW：同锁内读→加任务 B→写回
+        with filelock.file_lock(e.state_path + ".lock"):
+            with open(e.state_path, encoding="utf-8") as f:
+                disk = json.load(f)
+            disk.setdefault("tasks", {})["B"] = {"status": "paused"}
+            appcommon.atomic_write_json(e.state_path, disk,
+                                        fallback_direct=True)
+        # 引擎内存仍只知 A（_sync_state 尚未跑——这就是竞态窗口）
+        self.assertNotIn("B", e.state["tasks"])
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            final = json.load(f)
+        self.assertIn("A", final["tasks"])
+        self.assertIn("B", final["tasks"])  # 旧代码：B 丢失
+
+    def test_tombstoned_task_not_resurrected_by_merge(self):
+        # 合并不得复活墓碑任务（Task 53）：内存已删 + 墓碑，磁盘残留 A
+        # 在并发窗口内出现 → 写回不得带回 A。
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {}, "tasks": {"A": {"status": "monitoring"}},
+                   "retry": {}}
+        e._save_state()
+        e.state["tasks"].pop("A")
+        e._deleted_names = {"A"}
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            final = json.load(f)
+        self.assertNotIn("A", final.get("tasks", {}))
+
+    def test_empty_dedup_not_resurrected(self):
+        # dedup/retry 内存为准：显式清空不得被磁盘旧值复活。
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {"K1|K2|2026-01-01|G1|硬座|p": "SUBMITTED"},
+                   "tasks": {}, "retry": {}}
+        e._save_state()
+        e.empty_task_dedup({"from": "K1", "to": "K2"})
+        # empty_task_dedup 内部已 _save_state；再显式 save 一次也应保持
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            final = json.load(f)
+        self.assertEqual(final.get("dedup"), {})
+
+    def test_memory_wins_task_conflict(self):
+        # 同一任务两边不一致 → 内存（引擎最新一轮结果）获胜。
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {}, "tasks": {"A": {"status": "monitoring"}},
+                   "retry": {}}
+        e._save_state()
+        with filelock.file_lock(e.state_path + ".lock"):
+            with open(e.state_path, encoding="utf-8") as f:
+                disk = json.load(f)
+            disk["tasks"]["A"]["status"] = "paused"  # 过时的并发写
+            appcommon.atomic_write_json(e.state_path, disk,
+                                        fallback_direct=True)
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            final = json.load(f)
+        self.assertEqual(final["tasks"]["A"]["status"], "monitoring")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

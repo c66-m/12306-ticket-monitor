@@ -301,21 +301,33 @@ class MonitorEngine(object):
         if lock is None:  # 兼容未初始化锁的旧实例
             lock = self._save_lock = threading.Lock()
         with lock:  # 同一实例内跨线程（GUI/引擎）串行化写入
-            # 用副本序列化：避免跨线程（GUI 操作与引擎线程）修改同一字典导致异常
-            snapshot = None
-            for _ in range(3):
-                try:
-                    snapshot = copy.deepcopy(state)
-                    break
-                except RuntimeError:  # 字典并发修改导致的迭代异常
-                    time.sleep(0.02)
-            if snapshot is None:
-                snapshot = copy.deepcopy(dict(state))
-            # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
-            # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
-            # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
+            # Task 57：读-改-写全程持 file_lock。旧代码在拿锁前已从内存
+            # deepcopy 出快照 → 写回时覆盖 launcher/gui 并发写入的变更
+            # （丢任务/状态）。现锁内重读文件 → 合并内存变更 → 写回。
             try:
                 with filelock.file_lock(self.state_path + ".lock"):
+                    # 锁内重读：读到的一定是其它持锁写方已落盘的最新内容
+                    disk_state = load_state_file(self.state_path)
+                    snapshot = None
+                    for _ in range(3):
+                        try:
+                            # 用副本序列化：避免跨线程（GUI 操作与引擎线程）
+                            # 修改同一字典导致异常；tombstoned 的 set() 拷贝
+                            # 同样可能撞上 note_task_deleted 的并发 add，
+                            # 一并放在重试循环内
+                            tombstoned = set(
+                                getattr(self, "_deleted_names", None) or ())
+                            snapshot = copy.deepcopy(
+                                _merge_state_for_save(
+                                    disk_state, state, tombstoned))
+                            break
+                        except RuntimeError:  # 字典/集合并发修改导致的迭代异常
+                            time.sleep(0.02)
+                    if snapshot is None:
+                        snapshot = copy.deepcopy(dict(state))
+                    # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
+                    # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
+                    # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
                     appcommon.atomic_write_json(self.state_path, snapshot,
                                                 fallback_direct=True)
             except TimeoutError as e:
@@ -1133,6 +1145,44 @@ def load_state_file(path):
         except Exception:
             return {}
     return {}
+
+
+def _merge_state_for_save(disk_state, mem_state, tombstoned):
+    """Task 57 锁内合并：磁盘为底、内存覆盖、墓碑剔除。返回新 dict。
+
+    背景：_save_state 旧代码在拿 file_lock 之前已从内存 deepcopy 出快照，
+    写回时覆盖其它进程（launcher/gui）在竞态窗口内并发写入的变更 →
+    丢任务/状态。改为锁内重读文件后按本规则合并再写回。
+
+    - tasks：并发写方只增删任务条目 → 取并集；同一任务两边不一致时
+      内存（引擎最新一轮的调度结果）获胜；tombstoned 中的名字一律剔除
+      （内存已删，磁盘残留不得复活——Task 53 墓碑语义）。
+    - dedup/retry：只有引擎写这两节 → 内存为准（empty_task_dedup 的
+      显式清空必须被尊重，不能用磁盘旧值复活）。
+
+    返回的是新 dict，但 tasks 条目值仍引用 mem/disk 的 live 对象——
+    调用方必须 deepcopy 后再序列化（见 _save_state 的重试循环）。
+    """
+    disk_state = disk_state if isinstance(disk_state, dict) else {}
+    mem_state = mem_state if isinstance(mem_state, dict) else {}
+    tombstoned = tombstoned or ()
+    disk_tasks = disk_state.get("tasks")
+    if not isinstance(disk_tasks, dict):
+        disk_tasks = {}
+    mem_tasks = mem_state.get("tasks")
+    if not isinstance(mem_tasks, dict):
+        mem_tasks = {}
+    merged_tasks = dict(disk_tasks)
+    merged_tasks.update(mem_tasks)
+    for name in tombstoned:
+        merged_tasks.pop(name, None)
+    mem_dedup = mem_state.get("dedup")
+    mem_retry = mem_state.get("retry")
+    return {
+        "dedup": dict(mem_dedup) if isinstance(mem_dedup, dict) else {},
+        "retry": dict(mem_retry) if isinstance(mem_retry, dict) else {},
+        "tasks": merged_tasks,
+    }
 
 
 if __name__ == "__main__":
