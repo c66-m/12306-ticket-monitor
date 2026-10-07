@@ -1875,6 +1875,57 @@ class TestLoadOrdersQuarantine(TempDirCase):
         self.assertEqual(self._bad_files(p), [])
 
 
+class TestAppendHistoryQuarantine(TempDirCase):
+    """Task 32: history.json 损坏不再静默清空——挪档留证 + LOG.error，新记录仍能追加。"""
+
+    def _hist_path(self):
+        return os.path.join(self.tmp, "order_history.json")
+
+    def _bad_files(self, path):
+        import glob
+        return glob.glob(path + ".bad-*")
+
+    def test_corrupt_history_quarantined_new_record_appended(self):
+        import appcommon
+        p = self._hist_path()
+        garbage = b"\x00\x01 not json \xff\xfe"
+        with open(p, "wb") as f:
+            f.write(garbage)
+        rec = {"ts": "2026-10-08 10:00:00", "event": "order_ok"}
+        with self.assertLogs("monitor", level="ERROR"):
+            appcommon.append_history(p, rec)
+        bad = self._bad_files(p)
+        self.assertEqual(len(bad), 1, "损坏文件应被挪档留证")
+        with open(bad[0], "rb") as f:
+            self.assertEqual(f.read(), garbage)
+        with open(p, encoding="utf-8") as f:
+            history = json.load(f)
+        self.assertEqual(history, [rec], "新记录应写入全新历史文件")
+
+    def test_wrong_shape_history_quarantined(self):
+        # 合法 JSON 但形状非法（dict），旧代码 .append 直接抛 AttributeError
+        import appcommon
+        p = self._hist_path()
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"not": "a list"}')
+        rec = {"ts": "2026-10-08 10:00:00", "event": "order_ok"}
+        appcommon.append_history(p, rec)
+        self.assertEqual(len(self._bad_files(p)), 1, "形状非法同样挪档留证")
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [rec])
+
+    def test_healthy_history_append_works(self):
+        # 回归 pin：健康文件行为不变，追加+截断 keep，不挪档
+        import appcommon
+        p = self._hist_path()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump([{"event": "a"}, {"event": "b"}], f)
+        appcommon.append_history(p, {"event": "c"}, keep=2)
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [{"event": "b"}, {"event": "c"}])
+        self.assertEqual(self._bad_files(p), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

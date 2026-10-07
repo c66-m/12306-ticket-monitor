@@ -144,15 +144,26 @@ _HIST_LOCK = threading.Lock()
 
 
 def append_history(path, record, keep=500):
-    """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。"""
+    """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。
+    文件损坏/形状非法时时间戳挪档留证（quarantine_corrupt）+ LOG.error，
+    再追加新记录——不再静默清空整份历史。"""
     with _HIST_LOCK:
         history = []
         if os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
                     history = json.load(f)
-            except Exception:
+            except Exception as e:
+                bad = quarantine_corrupt(path)
+                LOG.error("[数据] order_history.json 损坏，已隔离留证：%s（%s）；新记录继续追加",
+                          bad, e)
                 history = []
+            else:
+                if not isinstance(history, list):
+                    bad = quarantine_corrupt(path)
+                    LOG.error("[数据] order_history.json 结构非法，已隔离留证：%s；新记录继续追加",
+                              bad)
+                    history = []
         history.append(record)
         atomic_write_json(path, history[-keep:])
 
