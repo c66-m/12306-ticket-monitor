@@ -8,6 +8,7 @@
 """
 
 import datetime
+import filelock
 import json
 import logging
 import os
@@ -197,16 +198,15 @@ def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
                       fallback_direct=fallback_direct)
 
 
-_HIST_LOCK = threading.Lock()
-
-
 def append_history(path, record, keep=500):
     """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。
+    整个读-改-写包在 filelock.file_lock(path) 内：同一把锁串行化所有写方
+    （Windows 下是跨进程字节锁；Linux 下是按路径共享的进程内 RLock）。
     文件损坏/形状非法时时间戳挪档留证（quarantine_corrupt）+ LOG.error，
     再追加新记录——不再静默清空整份历史。
     若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据继续，
     绝不用过期空读数覆盖健康文件。"""
-    with _HIST_LOCK:
+    with filelock.file_lock(path):
         history = []
         if os.path.exists(path):
             try:

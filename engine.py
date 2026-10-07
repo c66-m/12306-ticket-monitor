@@ -476,23 +476,6 @@ class MonitorEngine(object):
                     LOG.error("[通知失败] %s", msg)
         return results
 
-    def _append_history(self, record):
-        # 加锁串行化 + 原子写：与 _save_state 同一范式，防止并发追加丢记录、
-        # 写一半崩溃截断 order_history.json
-        lock = getattr(self, "_history_lock", None)
-        if lock is None:  # 兼容未初始化锁的旧实例
-            lock = self._history_lock = threading.Lock()
-        with lock:
-            history = []
-            if os.path.exists(self.history_path):
-                try:
-                    with open(self.history_path, encoding="utf-8") as f:
-                        history = json.load(f)
-                except Exception:
-                    history = []
-            history.append(record)
-            appcommon.atomic_write_json(self.history_path, history[-500:])
-
     # ----------------------------- 单任务扫描 -----------------------------
 
     def _run_task(self, task):
@@ -591,7 +574,7 @@ class MonitorEngine(object):
                         notify_txt = "; ".join("{0}:{1}".format(k, "成功" if nok else msg)
                                                for k, (nok, msg) in notify_results.items()) or "无通知渠道"
                         LOG.info("[有票] 任务「%s」%s 有余票，已通知：%s", name, seat_name, notify_txt)
-                        self._append_history({
+                        appcommon.append_history(self.history_path, {
                             "time": self._now(), "task": name, "result": "hit_no_order",
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
@@ -650,7 +633,7 @@ class MonitorEngine(object):
                              "seat": seat_name, "passengers": p_names,
                              "official_status": raw, "classify": cls,
                              "decision": decision, "source": "engine"})
-                        self._append_history({
+                        appcommon.append_history(self.history_path, {
                             "time": self._now(), "task": name, "result": "dup",
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
@@ -729,7 +712,7 @@ class MonitorEngine(object):
                                 "有单就支付/取消，确认无单后再恢复本任务")
                             LOG.error("[警告] 任务「%s」%s %s 提交后结果未知，已停止自动重试",
                                       name, date, train_code)
-                            self._append_history({
+                            appcommon.append_history(self.history_path, {
                                 "time": self._now(), "task": name, "result": "ambiguous",
                                 "train": train_code, "date": date, "from": info["from_name"],
                                 "to": info["to_name"], "seat": seat_name,
@@ -742,7 +725,7 @@ class MonitorEngine(object):
                             # 换时间点重试也不会有：记入 dedup 永久跳过，别无限重试刷日志
                             self.state["dedup"][key] = "SEAT_UNAVAILABLE"
                             self._save_state()
-                            self._append_history({
+                            appcommon.append_history(self.history_path, {
                                 "time": self._now(), "task": name, "result": "seat_unavailable",
                                 "train": train_code, "date": date, "from": info["from_name"],
                                 "to": info["to_name"], "seat": seat_name,
@@ -791,7 +774,7 @@ class MonitorEngine(object):
                                 % (entry["busy_count"], cooldown))
                             continue
                         LOG.error("[错误] 任务「%s」抢票失败：%s", name, msg)
-                        self._append_history({
+                        appcommon.append_history(self.history_path, {
                             "time": self._now(), "task": name, "result": "failed",
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
@@ -850,7 +833,7 @@ class MonitorEngine(object):
             notify_results = {}
         notify_txt = "; ".join("{0}:{1}".format(k, "成功" if ok else msg)
                                for k, (ok, msg) in notify_results.items()) or "无通知渠道"
-        self._append_history({
+        appcommon.append_history(self.history_path, {
             "time": self._now(), "task": name, "result": "success",
             "train": info["train_code"], "date": date, "from": info["from_name"],
             "to": info["to_name"], "seat": seat_name,

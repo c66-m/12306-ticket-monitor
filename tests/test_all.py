@@ -304,10 +304,14 @@ class TestEngineUnit(TempDirCase):
         self.assertEqual(e.state["tasks"][t["name"]]["status"], "monitoring")
 
     def test_append_history_cap_and_atomic(self):
+        # Task 41 后 engine._append_history 已删除，统一走 appcommon.append_history
+        import appcommon
         e = make_engine(self.tmp)
         for i in range(510):
-            e._append_history({"time": "t", "task": "x%d" % i, "result": "success"})
-        data = json.load(open(e.history_path, encoding="utf-8"))
+            appcommon.append_history(e.history_path,
+                                     {"time": "t", "task": "x%d" % i, "result": "success"})
+        with open(e.history_path, encoding="utf-8") as f:
+            data = json.load(f)
         self.assertEqual(len(data), 500)
         self.assertFalse([f for f in os.listdir(self.tmp) if ".tmp" in f])
 
@@ -2580,6 +2584,89 @@ class TestLoadStateErrorSplit(TempDirCase):
             got = e._load_state()
         m_q.assert_called_once()
         self.assertEqual(got["dedup"], {})
+
+
+class TestHistoryAppendConcurrency(TempDirCase):
+    """Task 41: engine 自家 _append_history（进程内锁 A）与
+    appcommon.append_history（进程内锁 B）写同一 order_history.json →
+    读-改-写竞态丢记录。修复：删 engine 版、统一调 appcommon 版，
+    后者用 filelock.file_lock(path) 包住整个读-改-写。"""
+
+    def _engine_writer(self, fake_self, path):
+        # engine 侧追加入口：旧代码是 MonitorEngine._append_history（独立锁），
+        # Task 41 后已统一为 appcommon.append_history；取当前实现的入口。
+        import appcommon
+        eng_append = getattr(engine_mod.MonitorEngine, "_append_history", None)
+        if eng_append is not None:
+            return lambda rec: eng_append(fake_self, rec)
+        return lambda rec: appcommon.append_history(path, rec)
+
+    def test_two_writers_no_records_lost(self):
+        import appcommon, time
+        p = os.path.join(self.tmp, "order_history.json")
+        orig_write = appcommon.atomic_write_json
+
+        def slow_write(path, obj, **kw):
+            time.sleep(0.02)  # 拉大读-改-写窗口，让交错必然发生
+            return orig_write(path, obj, **kw)
+
+        class FakeEngine:
+            pass
+        fake = FakeEngine()
+        fake.history_path = p
+        fake._history_lock = threading.Lock()
+        engine_writer = self._engine_writer(fake, p)
+
+        errs = []
+
+        def run_writer(writer, tag):
+            try:
+                for n in range(50):
+                    writer({"w": tag, "n": n})
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+
+        import appcommon as ac
+        with mock.patch.object(ac, "atomic_write_json", slow_write):
+            ta = threading.Thread(target=run_writer, args=(engine_writer, "engine"))
+            tb = threading.Thread(target=run_writer,
+                                  args=(lambda rec: ac.append_history(p, rec), "launcher"))
+            ta.start()
+            tb.start()
+            ta.join()
+            tb.join()
+
+        self.assertEqual(errs, [])
+        with open(p, encoding="utf-8") as f:
+            got = json.load(f)
+        self.assertEqual(len(got), 100, "双写方并发追加不应丢记录，实得 %d 条" % len(got))
+        self.assertEqual(
+            sorted((r["w"], r["n"]) for r in got),
+            sorted([("engine", n) for n in range(50)]
+                   + [("launcher", n) for n in range(50)]))
+
+    def test_engine_append_unified(self):
+        # engine 不再保留独立的 _append_history（已统一调 appcommon.append_history）
+        self.assertFalse(hasattr(engine_mod.MonitorEngine, "_append_history"))
+
+    def test_append_history_holds_file_lock(self):
+        # 整个读-改-写包在 filelock.file_lock(path) 内：持锁时另一线程追加必须等待
+        import appcommon, filelock, time
+        p = os.path.join(self.tmp, "order_history.json")
+        appcommon.append_history(p, {"n": 0})
+        acquired = []
+        with filelock.file_lock(p):
+            t = threading.Thread(
+                target=lambda: (appcommon.append_history(p, {"n": 1}),
+                                acquired.append(True)))
+            t.start()
+            time.sleep(0.3)
+            self.assertEqual(acquired, [], "持锁期间另一线程的追加应被阻塞")
+        t.join(timeout=15)
+        self.assertEqual(acquired, [True])
+        with open(p, encoding="utf-8") as f:
+            got = json.load(f)
+        self.assertEqual(len(got), 2)
 
 
 if __name__ == "__main__":
