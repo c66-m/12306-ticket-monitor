@@ -3616,6 +3616,183 @@ class TestTask50MonitorSecretsAndEmptyDates(TempDirCase):
         self.assertNotIn("未配置日期", printed)
 
 
+class TestOrderQueryFixes(TempDirCase):
+    """Task 51 (P2): order 查询三件套。
+
+    (a) start_date 回退必须做 YYYYMMDD → YYYY-MM-DD 转换；
+    (b) fetch_unpaid_order_no 必须按 not_before 归因本次新建，不取历史旧单；
+    (c) 订单查询失败必须向上传播（记 warning），调用方保守不下单。
+    """
+
+    # ---------- (a) train_date 格式 ----------
+
+    def test_dash_date_converts_yyyymmdd(self):
+        # 旧代码：ticket["start_date"]（YYYYMMDD）原样发给 submitOrderRequest，
+        # train_date 非法且 find_duplicate 在该路径静默失效。
+        self.assertEqual(order_mod._dash_date("20261010"), "2026-10-10")
+
+    def test_dash_date_passthrough(self):
+        # 已是横线格式 / 病态串原样返回（不在此处崩，下游接口报错）。
+        self.assertEqual(order_mod._dash_date("2026-10-10"), "2026-10-10")
+        self.assertEqual(order_mod._dash_date("2026101"), "2026101")
+        self.assertEqual(order_mod._dash_date(""), "")
+
+    def test_order_ticket_uses_converted_date_for_submit(self):
+        # ticket 无 query_date 时，submit 收到的 train_date 必须是 YYYY-MM-DD。
+        ticket = {"query_date": None, "start_date": "20261010",
+                  "train_code": "G101", "from_name": "北京", "to_name": "上海",
+                  "start_time": "08:00", "arrive_time": "12:00",
+                  "train_location": "P3", "secret_str": "x"}
+        task = {"passenger_names": ["张三"]}
+        config = {}
+        seen = {}
+
+        def fake_submit(sess, ticket_, seat_code, date, tries, delay,
+                        purpose="ADULT"):
+            seen["date"] = date
+            return True, ""
+
+        with mock.patch.object(order_mod, "load_session",
+                               return_value=object()), \
+             mock.patch.object(order_mod, "check_login",
+                               return_value=(True, "u")), \
+             mock.patch.object(order_mod, "order_seat_code",
+                               return_value=("O", "二等座")), \
+             mock.patch.object(order_mod, "submit_with_busy_retry",
+                               side_effect=fake_submit), \
+             mock.patch.object(order_mod, "get_init_dc",
+                               return_value=("tok", "left", "key", "")), \
+             mock.patch.object(order_mod, "get_passengers",
+                               return_value=[{"name": "张三", "is_adult": True,
+                                              "id_no": "x", "mobile": ""}]), \
+             mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=[]), \
+             mock.patch.object(order_mod, "check_order_info",
+                               return_value=(True, "")), \
+             mock.patch.object(order_mod, "confirm_with_busy_retry",
+                               return_value=(True, "ok")), \
+             mock.patch.object(order_mod, "fetch_unpaid_order_no",
+                               return_value="E1"):
+            order_mod.order_ticket(config, task, ticket, "二等座")
+        # 旧代码此处是 "20261010"（submitOrderRequest 只认 YYYY-MM-DD）。
+        self.assertEqual(seen.get("date"), "2026-10-10")
+
+    # ---------- (b) 订单号归属 ----------
+
+    @staticmethod
+    def _bj_str(ts):
+        return datetime.datetime.fromtimestamp(
+            ts, datetime.timezone(datetime.timedelta(hours=8))
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _nocomplete_session(self, items):
+        class _FakeResp:
+            def __init__(self, payload):
+                self._p = payload
+
+            def json(self):
+                return self._p
+
+        class _FakeSession:
+            headers = {}
+
+            def post(self, url, data=None, timeout=None):
+                if "queryMyOrderNoComplete" in url:
+                    return _FakeResp({"data": {"orderDBList": items}})
+                return _FakeResp({"data": {}})
+
+        return _FakeSession()
+
+    def _unpaid_item(self, seq, order_ts):
+        return {"sequence_no": seq, "order_status_name_cn": "未完成",
+                "order_date": self._bj_str(order_ts),
+                "train_code_page": "G101",
+                "start_train_date_page": "2026-10-08",
+                "from_station_name_page": "北京", "to_station_name_page": "上海",
+                "array_passser_name_page": ["张三"]}
+
+    def test_fetch_unpaid_order_no_attributes_to_this_submit(self):
+        # 历史未支付旧单在前、本次新建在后：必须返回本次新建的单号。
+        now = time.time()
+        items = [self._unpaid_item("E_OLD", now - 86400),
+                 self._unpaid_item("E_NEW", now - 30)]
+        sess = self._nocomplete_session(items)
+        got = order_mod.fetch_unpaid_order_no(
+            sess, date="2026-10-08", train_code="G101",
+            passenger_names=["张三"], not_before_ts=now - 120)
+        # 旧代码取第一笔（任意行程）→ 返回 E_OLD（过期单号）。
+        self.assertEqual(got, "E_NEW")
+
+    def test_fetch_unpaid_order_no_returns_none_when_no_recent(self):
+        # 只有历史旧单（不在本次提交窗口内）：宁可缺省，不张冠李戴。
+        now = time.time()
+        sess = self._nocomplete_session([self._unpaid_item("E_OLD", now - 86400)])
+        got = order_mod.fetch_unpaid_order_no(
+            sess, date="2026-10-08", train_code="G101",
+            passenger_names=["张三"], not_before_ts=now - 120)
+        self.assertIsNone(got)
+
+    def test_fetch_unpaid_order_no_failure_does_not_break_flow(self):
+        # 回归 pin：查询异常 → None（失败不影响主流程，旧代码即如此）。
+        class _BadSession:
+            headers = {}
+
+            def post(self, url, data=None, timeout=None):
+                raise RuntimeError("net down")
+
+        self.assertIsNone(order_mod.fetch_unpaid_order_no(_BadSession()))
+
+    # ---------- (c) 查询失败不吞 ----------
+
+    def test_check_existing_orders_propagates_query_failure(self):
+        # 未完成订单接口瞬时失败：必须向上传播 + 记 warning，不再吞成空列表。
+        class _BadSession:
+            headers = {}
+
+            def post(self, url, data=None, timeout=None):
+                raise RuntimeError("transient 500")
+
+        with self.assertLogs(level="WARNING") as logs:
+            with self.assertRaises(Exception):
+                order_mod.check_existing_orders(_BadSession(), "2026-10-08")
+        self.assertTrue(any("WARNING" in r for r in
+                            [rec.levelname for rec in logs.records]),
+                        "查询失败应记 warning")
+
+    def test_order_ticket_refuses_when_query_fails(self):
+        # 防重守卫被架空时：未知 → 保守不下单（旧代码吞成 [] 继续下单）。
+        ticket = {"query_date": "2026-10-08", "start_date": "20261008",
+                  "train_code": "G101", "from_name": "北京", "to_name": "上海",
+                  "start_time": "08:00", "arrive_time": "12:00",
+                  "train_location": "P3", "secret_str": "x"}
+        task = {"passenger_names": ["张三"]}
+        with mock.patch.object(order_mod, "load_session",
+                               return_value=object()), \
+             mock.patch.object(order_mod, "check_login",
+                               return_value=(True, "u")), \
+             mock.patch.object(order_mod, "order_seat_code",
+                               return_value=("O", "二等座")), \
+             mock.patch.object(order_mod, "submit_with_busy_retry",
+                               return_value=(True, "")), \
+             mock.patch.object(order_mod, "get_init_dc",
+                               return_value=("tok", "left", "key", "")), \
+             mock.patch.object(order_mod, "get_passengers",
+                               return_value=[{"name": "张三", "is_adult": True,
+                                              "id_no": "x", "mobile": ""}]), \
+             mock.patch.object(order_mod, "check_existing_orders",
+                               side_effect=RuntimeError("transient 500")), \
+             mock.patch.object(order_mod, "check_order_info",
+                               return_value=(True, "")) as m_check, \
+             mock.patch.object(order_mod, "confirm_with_busy_retry",
+                               return_value=(True, "ok")) as m_confirm:
+            ok, msg, extra = order_mod.order_ticket({}, task, ticket, "二等座")
+        self.assertFalse(ok)
+        self.assertIn("保守", msg)
+        self.assertIsNone(extra)
+        m_check.assert_not_called()     # 未走到下单链
+        m_confirm.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

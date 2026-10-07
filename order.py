@@ -19,6 +19,7 @@
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -28,6 +29,8 @@ from urllib.parse import unquote, urlencode
 
 import appcommon
 import requests
+
+LOG = logging.getLogger(__name__)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -506,7 +509,11 @@ def check_existing_orders(session, target_date):
     """查询账号订单（未完成 + 未出行 + 历史），返回统一订单列表（尽力解析）。
 
     target_date 是乘车日期。三个列表都必须查：已支付的未来票在「未出行」（G），
-    已出行/已退票的在「历史」（H），未支付的独立接口（NoComplete）。"""
+    已出行/已退票的在「历史」（H），未支付的独立接口（NoComplete）。
+
+    任一查询失败记 warning 后向上传播（不再吞成空列表）：调用方按"未知"
+    保守处理（如下单入口直接中止本轮），不拿空列表当"无重复"继续下单。
+    """
     orders = []
     today = time.strftime("%Y-%m-%d")
     t = time.time()
@@ -521,16 +528,18 @@ def check_existing_orders(session, target_date):
             it = _normalize_order_item(item, "未完成/未支付")
             it["_no_complete"] = True
             orders.append(it)
-    except Exception:
-        pass
+    except Exception as e:
+        LOG.warning("查询未完成订单失败: %s", e)
+        raise RuntimeError("未完成订单查询失败: {0}".format(e))
     # 未出行（已支付、乘车日期在今天之后）：G 的窗口按下单日期过滤
     # （实测：G 窗口 10-07~12-06 查不到 9-28 下单的 K225，9-28~9-28 可以），
     # 故窗口取 [60 天前, 今天]；列表含退票残留，状态看票级字段。
     try:
         for item in _query_my_order(session, "G", back60, today):
             orders.append(_normalize_order_item(item, "已支付(未出行)"))
-    except Exception:
-        pass
+    except Exception as e:
+        LOG.warning("查询未出行订单失败: %s", e)
+        raise RuntimeError("未出行订单查询失败: {0}".format(e))
     # 历史（乘车日期已过，含已出站/已退票）：H 窗口 EndDate 必须 <= 昨天，
     # 含今天会整体返回空 body；目标日期在过去时只查当天即可
     try:
@@ -538,8 +547,9 @@ def check_existing_orders(session, target_date):
         h_start = target_date if target_date <= yesterday else back60
         for item in _query_my_order(session, "H", h_start, h_end):
             orders.append(_normalize_order_item(item, "历史订单"))
-    except Exception:
-        pass
+    except Exception as e:
+        LOG.warning("查询历史订单失败: %s", e)
+        raise RuntimeError("历史订单查询失败: {0}".format(e))
     return orders
 
 
@@ -664,19 +674,41 @@ def confirm_with_busy_retry(session, token, left_ticket_str, key_check, train_lo
     return False, msg or "confirmSingleForQueue 连续 {0} 次系统忙，稍后自动重试".format(tries)
 
 
-def fetch_unpaid_order_no(session):
-    """尽力获取最近一笔未完成订单号（失败不影响主流程）。"""
+def fetch_unpaid_order_no(session, date=None, train_code=None, passenger_names=None,
+                          not_before_ts=None):
+    """尽力获取「本次提交生成」的未完成订单号（失败不影响主流程）。
+
+    按 not_before_ts 做下单时间归因：只返回 order_ts 落在本次提交窗口内、且
+    行程（车次 + 日期 + 乘车人交集）匹配的订单。有历史未支付单时不再张冠李戴。
+    未传归因参数时退化为旧行为（取第一笔未完成订单）；归因无匹配时返回 None
+    （宁可缺省，不给过期单号）。
+    """
     try:
-        url = "https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete"
-        session.headers["Referer"] = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
-        r = session.post(url, data={"_json_att": ""}, timeout=15)
-        data = r.json().get("data") or {}
-        for item in data.get("orderDBList") or []:
-            if item.get("order_status_name_cn") in ("未完成", ""):
-                return item.get("sequence_no") or item.get("order_no")
+        orders = check_existing_orders(session, date or time.strftime("%Y-%m-%d"))
     except Exception:
-        pass
-    return None
+        return None
+    inc = [o for o in orders
+           if o.get("_no_complete") and (o.get("order_no") or "")]
+    if not inc:
+        return None
+    if date and train_code and not_before_ts is not None:
+        recent = find_recent_order(inc, date, train_code, passenger_names,
+                                   not_before_ts)
+        return recent.get("order_no") if recent else None
+    return inc[0].get("order_no") or None
+
+
+def _dash_date(s):
+    """YYYYMMDD → YYYY-MM-DD。
+
+    ticket["start_date"] 是列车始发日期（p13），格式无横线；submitOrderRequest
+    的 train_date 只认 YYYY-MM-DD。非 8 位数字串原样返回（下游接口会报错，
+    不在此处引入新崩溃）。
+    """
+    s = (s or "").strip()
+    if len(s) == 8 and s.isdigit():
+        return "{0}-{1}-{2}".format(s[:4], s[4:6], s[6:8])
+    return s
 
 
 def order_ticket(config, task, ticket, seat_name):
@@ -709,7 +741,7 @@ def order_ticket(config, task, ticket, seat_name):
 
     # 必须用查询时的乘车日期：start_date 是列车始发日期（跨夜车会差一天），
     # 且格式为 YYYYMMDD，而 submitOrderRequest 只接受 YYYY-MM-DD。
-    date = ticket.get("query_date") or ticket["start_date"]
+    date = ticket.get("query_date") or _dash_date(ticket["start_date"])
     purpose = task.get("purpose_code") or "ADULT"
     # 按人票种：勾选乘车人全是学生票时才用学生余票口径，否则按成人票请求
     purpose_map = task.get("pax_purpose") or {}
@@ -759,8 +791,11 @@ def order_ticket(config, task, ticket, seat_name):
     # 防重复下单：检查账号中是否已有同日期 + 同车次 + 同乘车人的订单
     try:
         existing = check_existing_orders(sess, date)
-    except Exception:
-        existing = []
+    except Exception as e:
+        # 查询失败 = 未知：按防重复保守规则中止本次下单，不拿空列表当"无重复"。
+        # 瞬时失败下一轮重试即可；重复提交的代价（重复占座/挡单）远大于少抢一轮。
+        return False, ("官方订单查询失败（{0}），按防重复保守规则中止本次下单，"
+                       "避免重复提交".format(e)), None
     dup = None
     try:
         dup = find_duplicate(existing, date, ticket["train_code"],
@@ -783,13 +818,19 @@ def order_ticket(config, task, ticket, seat_name):
     except Exception as e:
         return False, "checkOrderInfo 异常: {0}".format(e), None
 
+    # 本次提交动作的开始时刻：用于把官方未完成订单归因到"本次新建"，
+    # 有历史未支付单时不再张冠李戴（成功消息里的单号必须是我们刚建的）。
+    not_before_ts = time.time()
     ok3, msg3 = confirm_with_busy_retry(sess, token, left_str, key_check,
                                         ticket["train_location"], p_ticket_str,
                                         old_str, tries, delay, purpose)
     if not ok3:
         return False, msg3, None
 
-    order_no = fetch_unpaid_order_no(sess)
+    order_no = fetch_unpaid_order_no(
+        sess, date=date, train_code=ticket["train_code"],
+        passenger_names=[p["name"] for p in picked],
+        not_before_ts=not_before_ts)
     passenger_names = "、".join(p["name"] for p in picked)
     extra = {"order_no": order_no, "passengers": passenger_names, "date": date,
              "train": ticket["train_code"], "seat": seat_name,
