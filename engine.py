@@ -509,7 +509,7 @@ class MonitorEngine(object):
             self.set_task_status(task, "failed", "监控日期已全部过期，任务自动停止")
             return False, False
 
-        trains = [t.strip() for t in (task.get("trains") or []) if t.strip()]
+        trains = [t.strip().upper() for t in (task.get("trains") or []) if t.strip()]
         seats_want_all = [s for s in (task.get("seat_types") or [])]
         seats_by_date = task.get("seats_by_date") or {}
         auto_order = bool(task.get("auto_order", True))

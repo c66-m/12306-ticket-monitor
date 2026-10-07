@@ -234,7 +234,7 @@ def menu_create_task():
         print("  " + "-" * 86)
         trains_choice = read("  选择监控车次（多个用逗号分隔，回车=全部车次）：", "")
 
-    trains = [t.strip() for t in trains_choice.replace("，", ",").split(",")
+    trains = [t.strip().upper() for t in trains_choice.replace("，", ",").split(",")
               if t.strip()] if trains_choice else []
     for t in trains:
         if shown and t not in shown:

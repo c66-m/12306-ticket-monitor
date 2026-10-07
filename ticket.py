@@ -545,7 +545,7 @@ def main():
         print(__doc__)
         return
     from_name, to_name, date = sys.argv[1], sys.argv[2], sys.argv[3]
-    train_filter = set(x.strip() for x in sys.argv[4].split(",")) if len(sys.argv) > 4 else None
+    train_filter = set(x.strip().upper() for x in sys.argv[4].split(",")) if len(sys.argv) > 4 else None
 
     name2code, code2name = load_station_map()
     if from_name not in name2code or to_name not in name2code:

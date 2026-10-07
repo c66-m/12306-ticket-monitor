@@ -2426,6 +2426,66 @@ class TestOrderTimestamp(TempDirCase):
         self.assertEqual(got["order_no"], "E100")
 
 
+class TestTrainCodeCase(TempDirCase):
+    """Task 38 (P2): 车次大小写三处统一 —— 小写配置必须命中大写的 train_code，
+    否则 12306（恒大写）返回的车次被静默漏掉。"""
+
+    def test_engine_lowercase_trains_match_uppercase_code(self):
+        # engine.py:512 只 strip 不 upper → 小写 k225 配大写 K225 静默漏单
+        e = make_engine(self.tmp)
+        t = task_of(trains=["k225"])
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123",
+                                              "passengers": "张三"})) as m_order, \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            e._run_task(t)
+        # 旧代码：车次被跳过，order_ticket 一次都没调 → 漏单
+        self.assertEqual(m_order.call_count, 1)
+
+    def test_monitor_menu_create_task_uppercases_trains(self):
+        # monitor.py:237 同上 —— 菜单里输小写 k225，落盘任务应为大写
+        import monitor as monitor_mod
+        reads = iter(["长葛", "确山", "2026-12-01", "k225", "1",
+                      "5", "y", "y", "", "n"])
+        captured = {}
+        with mock.patch.object(monitor_mod, "read",
+                               side_effect=lambda *a, **k: next(reads)), \
+             mock.patch.object(monitor_mod.ticket, "load_station_map",
+                               return_value=({"长葛": "VNP", "确山": "ZAF"},
+                                             {"VNP": "长葛", "ZAF": "确山"})), \
+             mock.patch.object(monitor_mod.ticket, "query_tickets",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(monitor_mod.passengers_mod, "load_passengers",
+                               return_value=[]), \
+             mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda cfg: captured.update(cfg)):
+            monitor_mod.menu_create_task()
+        # 旧代码：task["trains"] == ["k225"]，断言失败
+        self.assertEqual(captured["tasks"][-1]["trains"], ["K225"])
+
+    def test_ticket_main_lowercase_filter_matches(self):
+        # ticket.py:548 CLI —— 小写过滤器应命中大写 train_code
+        import io
+        argv = ["ticket.py", "长葛", "确山", "2026-10-10", "k225"]
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({"长葛": "VNP", "确山": "ZAF"},
+                                             {"VNP": "长葛", "ZAF": "确山"})), \
+             mock.patch.object(ticket, "query_tickets",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(sys, "argv", argv), \
+             contextlib.redirect_stdout(io.StringIO()) as buf:
+            ticket.main()
+        out = buf.getvalue()
+        # 旧代码：K225 被过滤器跳过，输出里没有 K225 行
+        self.assertIn("K225", out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
