@@ -112,6 +112,29 @@ def save_session(session, cookie_path=None):
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 
 
+def session_from_browser_state(state_path=None):
+    """从 browser_order 的 .browser_state.json Cookie 构造 requests 会话。
+
+    浏览器下单模式下登录态在 .browser_profile 里，session_cookies.json 是
+    capture_session 时代的旧载体；读只读接口（乘车人列表等）时用浏览器
+    Cookie 组会话即可，不必再开浏览器。"""
+    path = state_path or os.path.join(HERE, ".browser_state.json")
+    if not os.path.exists(path):
+        raise RuntimeError("未找到 %s（请先用浏览器方式登录一次）"
+                           % os.path.basename(path))
+    with open(path, encoding="utf-8") as f:
+        saved = json.load(f)
+    cookie_list = saved.get("cookies") if isinstance(saved, dict) else saved
+    s = requests.Session()
+    s.headers.update(BASE_HEADERS)
+    for c in cookie_list or []:
+        if "12306.cn" in (c.get("domain") or "") and c.get("name"):
+            s.cookies.set(c["name"], c.get("value", ""),
+                          domain=c.get("domain") or ".12306.cn",
+                          path=c.get("path") or "/")
+    return s
+
+
 def verify_session(session):
     """校验会话是否有效。返回 (ok, who, permanent)：
     - ok=True：会话有效

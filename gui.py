@@ -1079,7 +1079,11 @@ class TaskWizard(tk.Toplevel):
         def do_load():
             account = []
             try:
-                sess = order_mod.load_session(load_config().get("session_cookies_file"))
+                if (load_config().get("order_mode") or "http") == "browser":
+                    sess = order_mod.session_from_browser_state()
+                else:
+                    sess = order_mod.load_session(
+                        load_config().get("session_cookies_file"))
                 ok, _who = order_mod.check_login(sess)
                 if ok:
                     account = order_mod.get_passengers(sess)
@@ -1800,10 +1804,10 @@ class SessionDialog(tk.Toplevel):
                 ok, who = browser_order.check_session(timeout=6)
                 passengers = []
                 if ok:
-                    # 乘车人列表仍需登录态接口，走 HTTP 会话取（取不到就留空）
+                    # 乘车人列表用浏览器 Cookie 组会话取（浏览器模式的登录态
+                    # 在 .browser_profile，session_cookies.json 是过期的旧载体）
                     try:
-                        sess = order_mod.load_session(
-                            load_config().get("session_cookies_file"))
+                        sess = order_mod.session_from_browser_state()
                         passengers = order_mod.get_passengers(sess)
                     except Exception:
                         passengers = []
