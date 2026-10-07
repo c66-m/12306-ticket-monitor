@@ -1357,17 +1357,26 @@ class TestSeatRules(TempDirCase):
 
     def test_candidates_nothing_restricted_uses_avail(self):
         avail = {"硬座": "5", "高级动卧": "有", "硬卧": "有"}
-        # Task 47: 不限席别只收可下单席别（按 avail 顺序，展示类席别名被过滤）
+        # Task 47: 不限席别只收可下单席别（展示类席别名被过滤）；
+        # Task 54: 按 SEAT_SHOW_ORDER 稳定排序（硬卧 < 硬座），不跟随 avail 插入序
         self.assertEqual(ticket.seat_candidates_for("K225", [], "", avail),
-                         ["硬座", "硬卧"])
+                         ["硬卧", "硬座"])
 
     def test_candidates_unrestricted_filters_display_only(self):
         # Task 47: 「不限席别」分支必须过滤掉不可下单的展示类席别名，
         # 否则 launcher 按名索引 SEAT_NAME_TO_CODE 会潜伏 KeyError。
         avail = {"硬座": "5", "高级动卧": "有", "其他": "有",
                  "一等卧": "有", "二等卧": "有", "硬卧": "有"}
+        # Task 54: 按 SEAT_SHOW_ORDER 稳定排序（硬卧 < 硬座）
         self.assertEqual(ticket.seat_candidates_for("K225", [], "", avail),
-                         ["硬座", "硬卧"])
+                         ["硬卧", "硬座"])
+
+    def test_candidates_unrestricted_stable_show_order(self):
+        # Task 54: 「不限席别」候选不再跟随 avail 插入序，而是按 SEAT_SHOW_ORDER
+        # 稳定排序（贵的在前，无座垫底）——避免展示名抢先、误报「有票」。
+        avail = {"硬卧": "有", "硬座": "5", "软卧": "有"}  # 插入序：硬卧, 硬座, 软卧
+        self.assertEqual(ticket.seat_candidates_for("K225", [], "", avail),
+                         ["软卧", "硬卧", "硬座"])  # SEAT_SHOW_ORDER 序
 
     def test_candidates_avail_filter_and_lowercase(self):
         avail = {"硬座": "5"}

@@ -253,7 +253,12 @@ def seat_candidates_for(train_code, checked, priority, avail=None):
             if s not in cand:
                 cand.append(s)
         if not cand and avail is not None:
-            cand = [s for s in avail if s in SEAT_NAME_TO_CODE]  # 不限席别：过滤不可下单的展示类席别名（Task 47）
+            # 不限席别：过滤不可下单的展示类席别名（Task 47），并按 SEAT_SHOW_ORDER
+            # 稳定排序（贵的在前，无座垫底），不跟随 avail 插入序——避免展示名
+            # 抢先/误报「有票」（Task 54）。
+            show_order = {n: i for i, n in enumerate(SEAT_SHOW_ORDER)}
+            cand = sorted((s for s in avail if s in SEAT_NAME_TO_CODE),
+                          key=lambda x: show_order.get(x, 99))
     if avail is not None:
         cand = [s for s in cand if s in avail]
     return cand
