@@ -187,7 +187,13 @@ class MonitorEngine(object):
         except OSError:
             self._state_mtime = None
 
-        self.name2code, self.code2name = ticket.load_station_map()
+        try:
+            self.name2code, self.code2name = ticket.load_station_map()
+        except Exception as e:
+            # 离线首跑：车站表下载失败不得崩监控，空表降级运行；
+            # 联网后下次启动自动恢复
+            LOG.error("[网络] 车站数据加载失败，将以空表降级运行：%s", e)
+            self.name2code, self.code2name = {}, {}
         self.tasks = self.config.get("tasks") or []
 
         self.base_interval = int(self.config.get("poll_interval_seconds", 45))

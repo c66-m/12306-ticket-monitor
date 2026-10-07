@@ -161,7 +161,12 @@ def ask_yes_no(prompt, default="y"):
 
 def menu_create_task():
     print("\n===== 创建监控任务 =====")
-    name2code, code2name = ticket.load_station_map()
+    try:
+        name2code, code2name = ticket.load_station_map()
+    except Exception as e:
+        # 离线：车站表加载失败不得崩菜单，空表降级（选站会提示无匹配）
+        print("  [网络] 车站数据加载失败，将以空表降级运行：%s" % e)
+        name2code, code2name = {}, {}
 
     from_name = pick_station("  出发站：", name2code)
     if not from_name:
@@ -544,7 +549,12 @@ def menu_session():
 
 def menu_quick_check():
     print("\n===== 余票速查（免登录） =====")
-    name2code, code2name = ticket.load_station_map()
+    try:
+        name2code, code2name = ticket.load_station_map()
+    except Exception as e:
+        # 离线：车站表加载失败不得崩菜单，空表降级
+        print("  [网络] 车站数据加载失败，将以空表降级运行：%s" % e)
+        name2code, code2name = {}, {}
     from_name = pick_station("  出发站：", name2code)
     if not from_name:
         return

@@ -406,6 +406,59 @@ class TestEngineDatesSanitization(TempDirCase):
         self.assertGreaterEqual(e.task_interval(t), 300)
 
 
+from urllib.error import URLError  # noqa: E402
+
+
+class TestStationMapDegraded(TempDirCase):
+    """Task 26 (P1): 离线首跑 load_station_map 抛异常不得崩进程，应空表降级。"""
+
+    def _write_config(self):
+        cfg = {"tasks": [],
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "history_file": os.path.join(self.tmp, "order_history.json")}
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return p
+
+    def test_engine_init_survives_station_map_failure(self):
+        # 离线首跑：load_station_map 抛 URLError → __init__ 不抛，空表降级继续
+        cfg_path = self._write_config()
+        with mock.patch.object(ticket, "load_station_map",
+                               side_effect=URLError("offline")):
+            e = engine_mod.MonitorEngine(config_path=cfg_path,
+                                         setup_logging=False)
+        self.assertEqual(e.name2code, {})
+        self.assertEqual(e.code2name, {})
+
+    def test_engine_init_logs_degraded_error(self):
+        # 降级原因必须被清楚记录（ERROR 级）
+        cfg_path = self._write_config()
+        with mock.patch.object(ticket, "load_station_map",
+                               side_effect=URLError("offline")):
+            with self.assertLogs("monitor", level="ERROR") as cm:
+                engine_mod.MonitorEngine(config_path=cfg_path,
+                                         setup_logging=False)
+        self.assertTrue(any("车站数据加载失败" in m for m in cm.output),
+                        "未记录车站数据加载失败: %s" % cm.output)
+
+    def test_monitor_menu_create_task_survives(self):
+        # CLI 创建任务菜单：车站表加载失败 → 不崩，应可取消退出
+        import monitor as monitor_mod
+        with mock.patch.object(ticket, "load_station_map",
+                               side_effect=URLError("offline")), \
+             mock.patch.object(monitor_mod, "read", return_value=None):
+            monitor_mod.menu_create_task()  # 不抛异常（pick_station 返回 None → 取消）
+
+    def test_monitor_menu_quick_check_survives(self):
+        # CLI 余票速查菜单：同上
+        import monitor as monitor_mod
+        with mock.patch.object(ticket, "load_station_map",
+                               side_effect=URLError("offline")), \
+             mock.patch.object(monitor_mod, "read", return_value=None):
+            monitor_mod.menu_quick_check()  # 不抛异常
+
+
 class TestEngineDateRangeShape(TempDirCase):
     """Task 25 (P1): date_range 形状病态（dict/单元素/嵌套/非 str 元素）不得崩引擎进程。"""
 
