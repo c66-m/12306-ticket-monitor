@@ -139,7 +139,12 @@ def input_dates():
             print("  提示：开始日期已是过去日期（监控时会自动跳过过期日期）。")
         elif dates and datetime.date.fromisoformat(dates[0]) < today:
             print("  提示：该日期已过期，请确认是否仍要创建任务。")
-            if read("  仍要创建？(y/n)：", "n").lower() != "y":
+            confirm = read("  仍要创建？(y/n)：", "n")
+            if confirm is None:
+                # Ctrl+C/EOF：沿用本函数首个输入的取消约定，调用方 menu_create_task
+                # 已有 `if dates is None: 已取消创建` 处理
+                return None, None
+            if confirm.lower() != "y":
                 continue
         return dates, date_range
 
@@ -498,11 +503,17 @@ def menu_notify():
     email["smtp_host"] = read("  SMTP 服务器（回车=%s）：" % email.get("smtp_host", "smtp.qq.com")) \
         or email.get("smtp_host", "smtp.qq.com")
     port = read("  端口（回车=%s）：" % email.get("smtp_port", 465), str(email.get("smtp_port", 465)))
+    if port is None:
+        # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+        raise KeyboardInterrupt
     email["smtp_port"] = int(port) if port.isdigit() else 465
     email["username"] = read("  发件邮箱：", email.get("username"))
     email["password"] = read("  邮箱授权码（非登录密码）：", email.get("password"))
     email["from"] = read("  发件人地址（回车=发件邮箱）：", "") or email.get("username")
     to_raw = read("  收件人（多个用逗号分隔）：", ",".join(email.get("to") or []))
+    if to_raw is None:
+        # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+        raise KeyboardInterrupt
     email["to"] = [x.strip() for x in to_raw.replace("，", ",").split(",") if x.strip()]
     save_config(config)
     print("  已保存。")

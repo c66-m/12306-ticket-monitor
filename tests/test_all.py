@@ -1454,6 +1454,61 @@ class TestMonitorInterrupt(TempDirCase):
             self.assertEqual(monitor_mod.ask_priority(), 5)
 
 
+class TestMonitorInterruptRound2(TempDirCase):
+    """Task 28 round 2 (P1): monitor.py 同文件同 pattern 漏网三处——
+    input_dates 确认提示、menu_notify 端口/收件人输入在 Ctrl+C/EOF（read 返回 None）
+    时抛 AttributeError 打 traceback。"""
+
+    def test_input_dates_confirm_none_returns_none_none(self):
+        # Ctrl+C/EOF 发生在"仍要创建？"确认时：旧代码 None.lower() 抛 AttributeError；
+        # 应沿用本函数首个 read 的取消约定返回 (None, None)（调用方 menu_create_task
+        # 已有 `if dates is None: 已取消创建` 处理）。
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "read", side_effect=["2020-01-01", None]):
+            self.assertEqual(monitor_mod.input_dates(), (None, None))
+
+    def test_input_dates_normal_unchanged(self):
+        # 回归 pin：正常输入行为不变（旧代码即通过）
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "read", side_effect=["2099-01-01"]):
+            dates, date_range = monitor_mod.input_dates()
+            self.assertEqual(dates, ["2099-01-01"])
+
+    def test_menu_notify_port_none_raises_keyboard_interrupt(self):
+        # Ctrl+C/EOF 发生在端口输入时：旧代码 None.isdigit() 抛 AttributeError；
+        # 应抛 KeyboardInterrupt，由 main_menu 接住（"已中断，返回主菜单。"）。
+        # menu_notify 经 main_menu 分发，全部调用点在保护之下（round 1 已核验）。
+        # load_config 被 mock：隔离被测单元（config.json 缺失是 Task 29 的范围）。
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "read", side_effect=["", None]):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor_mod.menu_notify()
+
+    def test_menu_notify_to_none_raises_keyboard_interrupt(self):
+        # 同上：收件人输入时 Ctrl+C/EOF，旧代码 None.replace() 抛 AttributeError。
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "465", "", "", "", None]):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor_mod.menu_notify()
+
+    def test_menu_notify_normal_port_unchanged(self):
+        # 回归 pin：正常输入行为不变（旧代码即通过）；save_config 被 mock，
+        # 不写真实 config.json，ask_yes_no 走第 7 个 read 返回 "n"，不发测试邮件。
+        import monitor as monitor_mod
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "read", side_effect=[
+                 "", "587", "u@x.com", "pw", "", "a@x.com", "n"]), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved.update(c)):
+            monitor_mod.menu_notify()
+        self.assertEqual(saved["notify"]["email"]["smtp_port"], 587)
+        self.assertEqual(saved["notify"]["email"]["to"], ["a@x.com"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
