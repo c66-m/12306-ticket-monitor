@@ -49,8 +49,15 @@ def fresh_engine():
 
 
 def load_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        # 首跑无配置文件：不打 traceback，给友好引导后返回空配置。
+        # 全部 6 处调用方均已按空配置降级（.get/.setdefault），菜单[1]仍可创建
+        # 首个任务并落盘——此处若 sys.exit 会把首个任务创建流程一并杀死，故不退出。
+        print("  未找到 config.json，请先在菜单 [1] 创建任务。")
+        return {}
 
 
 def save_config(config):

@@ -1734,6 +1734,40 @@ class TestMonitorInterruptRound6(TempDirCase):
         self.assertFalse(any("[警告]" in p for p in printed))
 
 
+class TestMonitorLoadConfigMissing(TempDirCase):
+    """Task 29 (P1): 无 config.json 首跑，load_config 不得抛 FileNotFoundError 打 traceback；
+    应打印友好引导并返回空配置（全部 6 处调用方均已按空配置降级；菜单[1]仍可创建首个任务并落盘，
+    故不采用 sys.exit——退出会把首个任务创建流程一并杀死）。"""
+
+    def test_missing_config_no_raise_returns_empty(self):
+        # 旧代码：open 直接抛 FileNotFoundError，首跑即 traceback
+        import monitor as monitor_mod
+        missing = os.path.join(self.tmp, "config.json")
+        with mock.patch.object(monitor_mod, "CONFIG_PATH", missing):
+            cfg = monitor_mod.load_config()
+        self.assertEqual(cfg, {})
+
+    def test_missing_config_prints_friendly_hint(self):
+        import monitor as monitor_mod
+        missing = os.path.join(self.tmp, "config.json")
+        with mock.patch.object(monitor_mod, "CONFIG_PATH", missing), \
+             mock.patch("builtins.print") as p:
+            monitor_mod.load_config()
+        out = "\n".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        self.assertIn("未找到 config.json", out)
+        self.assertIn("菜单 [1]", out)
+
+    def test_existing_config_loads_unchanged(self):
+        # 回归 pin：有文件时行为与旧代码一致
+        import monitor as monitor_mod
+        cfg_path = os.path.join(self.tmp, "config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": "t"}]}, f)
+        with mock.patch.object(monitor_mod, "CONFIG_PATH", cfg_path):
+            cfg = monitor_mod.load_config()
+        self.assertEqual(cfg["tasks"][0]["name"], "t")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
