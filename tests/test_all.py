@@ -490,9 +490,9 @@ class TestEngineFlow(TempDirCase):
     """端到端（mock）：查询命中 → 下单 → 状态/防重/历史 的完整状态机。"""
 
     def _run(self, order_ret, expect_status, expect_dedup=None, notify_calls=None,
-             expect_history=True):
+             expect_history=True, **task_over):
         e = make_engine(self.tmp)
-        t = task_of()
+        t = task_of(**task_over)
         e.tasks = [t]
         e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
         with mock.patch.object(e, "_query_with_retry",
@@ -516,9 +516,15 @@ class TestEngineFlow(TempDirCase):
         self._run((True, "ok 订单号: E123", {"order_no": "E123", "passengers": "张三"}),
                   expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
 
-    def test_dup_marks_dedup(self):
+    def test_dup_marks_dedup_and_stops(self):
+        # 防重命中 + stop_after_order(默认开) → 按「已购得」停止任务
         self._run((False, "已有订单", {"reason": "dup", "order_no": "E9"}),
-                  expect_status="monitoring", expect_dedup="ACCOUNT_DUP")
+                  expect_status="success", expect_dedup="ACCOUNT_DUP")
+
+    def test_dup_keeps_monitoring_without_stop(self):
+        self._run((False, "已有订单", {"reason": "dup"}),
+                  expect_status="monitoring", expect_dedup="ACCOUNT_DUP",
+                  stop_after_order=False)
 
     def test_seat_unavailable_permanent_skip(self):
         self._run((False, "网页端不提供席别 硬座", {"reason": "seat_unavailable"}),
