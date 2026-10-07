@@ -98,7 +98,14 @@ def _safe_priority(task):
 def expand_dates(task):
     """把 dates + date_range 展开成日期列表（去重保序）。"""
     result = []
-    for d in task.get("dates") or []:
+    dates = task.get("dates") or []
+    if not isinstance(dates, list):
+        # 整字段非列表（如漏写方括号的 "dates": 20261009）：记警告后视为空，
+        # 绝不让单个任务的手误崩掉整个引擎进程
+        LOG.warning("[配置] 任务「%s」的 dates 字段非列表，已忽略：%r",
+                    task.get("name"), dates)
+        dates = []
+    for d in dates:
         if isinstance(d, str):
             result.append(d)
         else:

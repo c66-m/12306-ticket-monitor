@@ -387,6 +387,24 @@ class TestEngineDatesSanitization(TempDirCase):
         iv = e.task_interval(t)
         self.assertLess(iv, 300)
 
+    def test_expand_dates_non_list_int_field_ignored(self):
+        # Round 2：整字段是整数（漏写方括号的手误）→ 记警告后视为空，不抛异常
+        t = {"name": "t24", "dates": 20261009}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_expand_dates_non_list_str_field_ignored(self):
+        # Round 2：整字段是裸字符串同样非列表 → 忽略，不逐字符展开
+        t = {"name": "t24", "dates": "2026-10-09"}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_task_interval_non_list_dates_field_no_crash(self):
+        # Round 2：整字段非列表时 task_interval 走兜底长间隔而非崩进程
+        e = make_engine(self.tmp)
+        e.config = {"adaptive": {"enabled": True, "peak_hours": [0, 24],
+                                 "peak_multiplier": 1.0, "rush_within_hours": 24}}
+        t = task_of("t24", dates=20261009, date_range=[])
+        self.assertGreaterEqual(e.task_interval(t), 300)
+
 
 class TestEnginePriorityValidation(TempDirCase):
     """Task 2 (P1): 非数字 priority 不得崩调度排序。"""
