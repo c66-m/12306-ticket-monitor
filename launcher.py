@@ -549,6 +549,19 @@ class Grabber(threading.Thread):
         bad = set()          # {(车次, 席别)}：网页端下单页不下发的组合，永久跳过
         ambiguous_retries = 0  # 提交后结果未知且官方查无订单的安全重试计数
         MAX_ORDER_FAILS = 5  # 同一目标连续失败这么多次就停，不再无限重复
+        exc_key, exc_streak = None, 0  # 同一异常连续计数（Task 55a：防吞异常无限活锁）
+        MAX_SAME_EXC = 3     # 同一异常连续这么多次 → 计入失败走正常停止逻辑
+
+        def note_exc(e):
+            """同一异常（类名+消息）连续计数；达到 MAX_SAME_EXC 返回 True（应停止）。"""
+            nonlocal exc_key, exc_streak
+            key = (type(e).__name__, str(e))
+            if key == exc_key:
+                exc_streak += 1
+            else:
+                exc_key, exc_streak = key, 1
+            return exc_streak >= MAX_SAME_EXC
+
         try:
             while not self.stop_event.is_set():
                 n += 1
@@ -600,15 +613,26 @@ class Grabber(threading.Thread):
                             purpose=purpose_of(lc), purpose_map=purpose_map_of(lc),
                             warm=warm, alias_name=_alias)
                     except RuntimeError as e:
+                        if note_exc(e):
+                            self.result = (False, "下单异常连续 %d 次（%s: %s），已自动停止"
+                                           % (MAX_SAME_EXC, type(e).__name__, e))
+                            log("[错误] %s" % self.result[1])
+                            return
                         log("[错误] %s（5 秒后重试）" % e)
                         if self.stop_event.wait(5):
                             break
                         continue
                     except Exception as e:
+                        if note_exc(e):
+                            self.result = (False, "下单异常连续 %d 次（%s: %s），已自动停止"
+                                           % (MAX_SAME_EXC, type(e).__name__, e))
+                            log("[错误] %s" % self.result[1])
+                            return
                         log("[错误] 下单异常：%s: %s（5 秒后重试）" % (type(e).__name__, e))
                         if self.stop_event.wait(5):
                             break
                         continue
+                    exc_key, exc_streak = None, 0  # 本次下单尝试正常返回：异常 streak 断开
                     if ok:
                         self.result = (True, msg)
                         log("[抢到] %s" % msg)
@@ -766,6 +790,7 @@ class Grabber(threading.Thread):
                     continue
     
                 busy_n = 0  # 本轮无下单繁忙：复位退避，恢复正常轮询节奏
+                exc_key, exc_streak = None, 0  # 完整空轮询一轮：异常 streak 断开
                 if n % 4 == 1 or n == 1:
                     log("[运行] 第 %d 轮无票（%s %s %s），%s 秒后再查" % (
                         n, date, "/".join(trains) or "全部车次", from_ + "→" + to_, int(poll)))
@@ -1815,6 +1840,7 @@ class LauncherApp(tk.Frame):
         self.grabber = None
         self.armed = False
         self.auto_fired = False
+        self._auto_vfail_warned = False
         self.reminded = False
         self.pax_vars = {}
         self.pax_purpose_vars = {}
@@ -2112,6 +2138,7 @@ class LauncherApp(tk.Frame):
         st = parse_dt(self.lc.get("start_time") or "")
         self.armed = bool(st and st > datetime.now())
         self.auto_fired = False
+        self._auto_vfail_warned = False
         self.reminded = False
 
     def _ui_to_lc(self):
@@ -2638,7 +2665,6 @@ class LauncherApp(tk.Frame):
                                 remind, st.strftime("%Y-%m-%d %H:%M:%S")))
                     else:
                         if self.armed and not self.auto_fired and (now - st).total_seconds() <= max(90, lead):
-                            self.auto_fired = True
                             self.countdown_lbl.configure(text="已到点，自动开抢！")
                             if lead > 0:
                                 self._put_log("[自动] 进入预热窗口（开抢前 %d 分钟）：先登录并保持浏览器，到点立即下单" % int(lead / 60))
@@ -2751,7 +2777,11 @@ class LauncherApp(tk.Frame):
     def _validate_fail(self, title, msg, auto):
         """校验失败提示：手动弹模态框；自动只 bell+日志（无人值守弹模态会冻住主线程）。"""
         if auto:
-            self._top.bell()
+            # Task 55b 配套：校验失败允许下个 _tick 重试；bell 每个 armed 会话只响一次
+            #（否则 500ms 一次蜂鸣刷屏），日志每次都记以便盯着看重试仍在失败。
+            if not getattr(self, "_auto_vfail_warned", False):
+                self._top.bell()
+                self._auto_vfail_warned = True
             self._put_log("[自动开抢] 校验失败：%s" % msg)
             return False
         messagebox.showwarning(title, msg, parent=self._mp)
@@ -2765,19 +2795,31 @@ class LauncherApp(tk.Frame):
 
     def start_grab(self, auto=False):
         if self.grabber and self.grabber.is_alive():
-            return
-        if auto:
-            self.auto_fired = True
+            return True  # 已在运行：视为已触发，避免 _tick 反复调用
         self._ui_to_lc()
         if not self._validate(auto=auto):
-            return
-        self.grabber = Grabber(dict(self.lc), logq=self.logq)
-        self.grabber.start()
+            return False
+        if auto:
+            # Task 55b：_validate() 通过之后才置位；失败时保持 False，
+            # 下个 _tick 会重试（之前提前置位会缴械整点自动开抢且无重试）。
+            self.auto_fired = True
+            self._auto_vfail_warned = False
+        try:
+            self.grabber = Grabber(dict(self.lc), logq=self.logq)
+            self.grabber.start()
+        except Exception as e:
+            # 线程启动失败（极罕见）：回滚置位，允许下个 _tick 重试
+            self.grabber = None
+            if auto:
+                self.auto_fired = False
+            self._put_log("[启动] 抢票线程启动失败：%s" % e)
+            return False
         self._set_status("running", "抢票中…（后台运行，无窗口）")
         self.go_btn.configure(text="停 止", bg="#57606a")
         self._put_log("[启动] 开始抢票：%s → %s %s，车次 %s" % (
             self.lc.get("from"), self.lc.get("to"), self.lc.get("date"),
             "、".join(self.lc.get("trains") or []) or "全部"))
+        return True
 
     def stop_grab(self):
         if self.grabber:
@@ -2905,6 +2947,7 @@ class LauncherApp(tk.Frame):
         st = parse_dt(self.start_var.get())
         self.armed = bool(st and st > datetime.now())
         self.auto_fired = False
+        self._auto_vfail_warned = False
         self.reminded = False
 
     def _on_close(self):

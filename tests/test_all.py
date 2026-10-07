@@ -4241,6 +4241,157 @@ class TestReloginScriptResult(TempDirCase):
             self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
 
 
+class TestTask55ExcStreakStop(TempDirCase):
+    """Task 55(a): 下单异常被 except 吞掉 + 5 秒重试 → 无限活锁。
+
+    同一异常连续 3 次 → 计入失败走正常停止逻辑，不再无声自旋。
+    """
+
+    def _make_grabber(self, max_waits=10):
+        import queue
+        lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+              "trains": ["G101"], "seat_types": ["二等座"],
+              "seat_priority": "", "passenger_names": ["张三"]}
+        g = launcher.Grabber(lc, logq=queue.Queue())
+        g._log = g.logq.put  # 不写真实日志文件
+        waits = []
+        g.stop_event = mock.Mock()
+        g.stop_event.is_set.return_value = False
+
+        def fake_wait(s):
+            waits.append(s)
+            return len(waits) >= max_waits  # 旧代码：兜底停转，防测试无限循环
+        g.stop_event.wait.side_effect = fake_wait
+        return g, waits
+
+    def _patch_loop(self, order_side_effect):
+        train = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                 "start_time": "08:00", "available_seats": {"二等座": "有"}}
+        return (
+            mock.patch.object(ticket, "load_station_map",
+                              return_value=({"北京": "BJP", "上海": "SHH"},
+                                            {"BJP": "北京", "SHH": "上海"})),
+            mock.patch.object(launcher.browser_order, "busy", return_value=False),
+            mock.patch.object(launcher.browser_order, "check_session",
+                              return_value=(True, "user")),
+            mock.patch.object(ticket, "query_tickets", return_value=[{"row": 1}]),
+            mock.patch.object(ticket, "parse_row", return_value=train),
+            mock.patch.object(ticket, "seat_candidates_for",
+                              return_value=["二等座"]),
+            mock.patch.object(launcher.browser_order, "order_via_browser",
+                              side_effect=order_side_effect),
+        )
+
+    def test_same_keyerror_3_times_triggers_stop(self):
+        # 旧代码：KeyError 被吞 → 5 秒重试无限活锁，result 永不置位
+        g, waits = self._make_grabber()
+        patches = self._patch_loop(KeyError("boom"))
+        with patches[0], patches[1], patches[2], patches[3], \
+                patches[4], patches[5], patches[6]:
+            g._run()
+        self.assertIsNotNone(g.result, "同一 KeyError 连续 3 次仍无声自旋，未走停止逻辑")
+        ok, msg = g.result
+        self.assertFalse(ok)
+        self.assertIn("连续", msg)
+        self.assertIn("自动停止", msg)
+        # 第 3 次直接停止，不再有第 3 个 5 秒等待
+        self.assertEqual(waits, [5, 5])
+
+    def test_different_exceptions_reset_streak(self):
+        # pin：异常类型/消息变化 → 计数重置，不误触发停止
+        g, waits = self._make_grabber(max_waits=8)
+        seq = [KeyError("a"), ValueError("b")]
+
+        def boom(*a, **k):
+            e = seq.pop(0)
+            seq.append(e)
+            raise e
+
+        patches = self._patch_loop(boom)
+        with patches[0], patches[1], patches[2], patches[3], \
+                patches[4], patches[5], patches[6]:
+            g._run()
+        self.assertIsNone(g.result, "交替出现的异常不应触发连续停止：%r" % (g.result,))
+        self.assertEqual(len(waits), 8)
+
+
+class TestTask55AutoFired(TempDirCase):
+    """Task 55(b): auto_fired 在 _validate() 之前置位 → 校验失败即缴械整点自动开抢。
+
+    改后：_validate() 通过之后才置位；失败时保持 False，允许下个 _tick 重试。
+    """
+
+    def _make_app(self, lc):
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.lc = lc
+        app.grabber = None
+        app.auto_fired = False
+        app._auto_vfail_warned = False
+        app._mp = None
+        app._top = mock.Mock()
+        logs = []
+        app._put_log = logs.append
+        app._ui_to_lc = lambda: None
+        app._set_status = mock.Mock()
+        app.go_btn = mock.Mock()
+        import queue
+        app.logq = queue.Queue()
+        return app, logs
+
+    def _invalid_lc(self):
+        return {"from": "", "to": "上海", "date": "2026-10-10",
+                "seat_types": ["二等座"], "passenger_names": ["张三"]}
+
+    def _valid_lc(self):
+        return {"from": "北京", "to": "上海", "date": "2026-10-10",
+                "seat_types": ["二等座"], "passenger_names": ["张三"]}
+
+    def test_auto_validate_fail_keeps_auto_fired_false(self):
+        # 旧代码：auto_fired=True 先置位 → 校验失败也永久 True，本整点被缴械
+        app, logs = self._make_app(self._invalid_lc())
+        app.start_grab(auto=True)
+        self.assertFalse(app.auto_fired, "_validate 失败后 auto_fired 必须保持 False")
+        self.assertIsNone(app.grabber)
+
+    def test_auto_validate_ok_sets_auto_fired_and_starts(self):
+        # 回归 pin：校验通过 → 置位 + 正常启动
+        app, logs = self._make_app(self._valid_lc())
+        with mock.patch.object(launcher, "Grabber") as MG:
+            ret = app.start_grab(auto=True)
+        self.assertTrue(ret)
+        self.assertTrue(app.auto_fired)
+        MG.assert_called_once()
+        self.assertIsNotNone(app.grabber)
+
+    def test_manual_start_grab_does_not_touch_auto_fired(self):
+        # 回归 pin：手动路径不碰 auto_fired
+        app, logs = self._make_app(self._valid_lc())
+        with mock.patch.object(launcher, "Grabber"):
+            app.start_grab(auto=False)
+        self.assertFalse(app.auto_fired)
+
+    def test_auto_grabber_start_failure_rolls_back_auto_fired(self):
+        # _validate 通过但线程启动失败 → 回滚置位，允许下个 _tick 重试
+        app, logs = self._make_app(self._valid_lc())
+        with mock.patch.object(launcher, "Grabber",
+                               side_effect=RuntimeError("no threads")):
+            ret = app.start_grab(auto=True)
+        self.assertFalse(ret)
+        self.assertFalse(app.auto_fired)
+        self.assertIsNone(app.grabber)
+        self.assertTrue(any("启动失败" in l for l in logs))
+
+    def test_auto_validate_fail_bells_once(self):
+        # 配套：允许下个 _tick 重试，但 bell 只响一次（防 500ms 一次蜂鸣刷屏）
+        app, logs = self._make_app(self._invalid_lc())
+        app.start_grab(auto=True)
+        app._top.bell.reset_mock()
+        app._auto_vfail_warned = False  # 模拟新一轮 armed 会话
+        app._validate(auto=True)
+        app._validate(auto=True)
+        app._top.bell.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
