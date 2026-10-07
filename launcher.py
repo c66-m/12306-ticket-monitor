@@ -900,16 +900,27 @@ def get_station_index():
     return _STATION_INDEX
 
 
+_FW_TRANS = {0x3000: 0x20}
+_FW_TRANS.update({0xFF01 + i: 0x21 + i for i in range(0x5E)})   # ａｂｃ１２３→abc123
+
+
+def _norm_query(text):
+    """中文输入容错：全角→半角、剔除全部空白、转小写（长 葛→长葛,ｃｑ→cq）。"""
+    t = (text or "").translate(_FW_TRANS)
+    return "".join(t.split()).lower()
+
+
 def search_stations(text, limit=12):
     """本地模糊搜索车站，按匹配度降序：精确站名 > 站名前缀 > 简拼/全拼/
     电报码前缀 > 站名包含。同档按站名长度短者优先（长葛排在长葛北前）。
 
     旧实现汉字查询只走"站名包含"档且按索引序截断，长葛这类普速小站常被
     挤出结果。返回 [{"name","code","py","spy"}, ...]，纯本地计算。"""
-    q = (text or "").strip()
+    q = _norm_query(text)
     if not q:
         return []
-    ql = q.lower()
+    ql = q
+    capped = limit is not None
     name2code_rev = {}
     scored = []
     for idx, st in enumerate(get_station_index()):
@@ -941,7 +952,8 @@ def search_stations(text, limit=12):
         kind_rank = 0 if "普速" in kind else (1 if kind else 2)
         scored.append((score, kind_rank, len(name), idx, st))
     scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-    return [x[4] for x in scored[:limit]]
+    out = [x[4] for x in scored]
+    return out if limit is None else out[:limit]
 
 
 # --------------------------- 车站类型（高铁/普速） ---------------------------
@@ -1166,10 +1178,8 @@ class StationEntry(ttk.Frame):
         self._items = list(items)
         for i, it in enumerate(self._items):
             if isinstance(it, dict):
-                kind = station_kind(it.get("code"))
-                text = "%s  %s" % (it["name"], it["code"])
-                if kind:
-                    text += " · " + kind
+                kind = station_kind(it.get("code")) or "车站"
+                text = "%s  %s · %s" % (it["name"], it["code"], kind)
                 lb.insert("end", text)
                 color = _KIND_COLOR.get((kind or "").split("+")[0])
                 if color:
@@ -1212,7 +1222,7 @@ class StationEntry(ttk.Frame):
         if not text:
             self.show(self.history[:8])
             return
-        items = search_stations(text)
+        items = search_stations(text, limit=None)   # 全量命中站,下拉可滚
         if not items:
             items = [{"name": h} for h in self.history if text in h][:8]
         self.show(items)

@@ -891,6 +891,23 @@ class TestSearchStations(TempDirCase):
         self.assertIn("长葛", r)
         # 同档(2字"长"字站约10个)按索引序,长葛位次不保证,但在结果内即可达
 
+    def test_fault_tolerance_fullwidth_and_spaces(self):
+        self.assertEqual(launcher.search_stations("ｃｑ")[0]["name"], "重庆")   # 全角
+        r = [x["name"] for x in launcher.search_stations("长　葛")]
+        self.assertEqual(r[0], "长葛")                                        # 全角空格+忽略空白
+        r2 = launcher.search_stations("chong qing")
+        self.assertEqual(r2[0]["name"], "重庆")                               # 空格剔除
+
+    def test_covers_all_matches_within_2s(self):
+        import time as _time
+        t0 = _time.perf_counter()
+        r = launcher.search_stations("长", limit=None)      # 全量命中
+        dt = _time.perf_counter() - t0
+        names = [x["name"] for x in r]
+        self.assertGreater(len(r), 12)                      # 旧实现 12 个封顶,现全量
+        self.assertIn("长葛", names)
+        self.assertLess(dt, 2.0)                            # 响应 ≤2 秒
+
     def test_ascii_ranking_unchanged(self):
         self.assertEqual(launcher.search_stations("cq")[0]["name"], "重庆")
         self.assertEqual(launcher.search_stations("chang")[0]["name"], "长春")
