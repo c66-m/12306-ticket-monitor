@@ -308,30 +308,60 @@ def login(timeout_sec=300, stop_event=None):
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         _log("请在打开的浏览器里完成登录（扫码或账号密码+滑块），最多等 %d 秒。" % timeout_sec)
         page.goto(LOGIN_URL)
+        probe = ctx.new_page()   # 复用同一支探针页校验，不再反复开/关标签页
+        probe.goto("about:blank")
         deadline = time.time() + timeout_sec
-        next_probe = 0.0
+        next_fast = 0.0   # 有登录信号时的校验节拍（2 秒）
+        next_slow = 0.0   # 无信号时的兜底节拍（15 秒）
         ok, who = False, ""
         while time.time() < deadline:
-            if stop_event is not None and stop_event.wait(2):
+            if stop_event is not None and stop_event.wait(1):
                 ctx.close()
                 _log("[停止] 登录已被手动停止。")
                 return False
             now = time.time()
-            landed = False
+            # 快信号：Cookie 出现 tk = 登录成功（capture_session.py 同款判据，
+            # 读 Cookie 无需导航，识别延迟从最坏 30 秒降到 1~2 秒）。登录后
+            # 12306 的 uam 中转跳转不在旧 URL 白名单里，之前只能等 30 秒兜底
+            # ——那就是"登录后识别太慢"的主因。URL 落点降为辅助信号。
+            signal = False
             try:
-                for pg in ctx.pages:
-                    u = pg.url or ""
-                    if "initMy12306" in u or "/otn/view/" in u or "/otn/index" in u:
-                        landed = True
-                        break
+                signal = any(str(c.get("name", "")).startswith("tk")
+                             for c in ctx.cookies())
             except Exception:
                 pass
-            # 绝对不能每 2 秒调一次 session_ok：它是"开新标签页 -> 导航 -> 关闭"，
-            # 一秒钟就闪一次，用户看到的就是"网页一直开启关闭"。改成先看 URL，
-            # 命中才做一次真实校验，再配 30 秒兜底。
-            if landed or now >= next_probe:
-                next_probe = now + 30
-                ok, who = session_ok(ctx)
+            if not signal:
+                try:
+                    for pg in ctx.pages:
+                        u = pg.url or ""
+                        if "initMy12306" in u or "/otn/view/" in u or "/otn/index" in u:
+                            signal = True
+                            break
+                except Exception:
+                    pass
+            # 有信号：每 2 秒做一次真实校验（uam 中转没走完时会暂时失败，
+            # 短间隔重试直到通过）；无信号：15 秒兜底探测。
+            if signal and now >= next_fast:
+                next_fast = now + 2
+                next_slow = now + 15
+                try:
+                    ok, who = session_ok(ctx, page=probe)
+                except Exception:
+                    ok, who = False, ""
+                    try:
+                        if probe.is_closed():
+                            probe = ctx.new_page()
+                            probe.goto("about:blank")
+                    except Exception:
+                        pass
+                if ok:
+                    break
+            elif not signal and now >= next_slow:
+                next_slow = now + 15
+                try:
+                    ok, who = session_ok(ctx, page=probe)
+                except Exception:
+                    ok, who = False, ""
                 if ok:
                     break
         if ok:
