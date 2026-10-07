@@ -428,6 +428,9 @@ def menu_passengers():
             print("  已添加并加密保存。")
         elif op == "2":
             raw = read("  编辑第几位：", "")
+            if raw is None:
+                # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+                raise KeyboardInterrupt
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 p = passengers[int(raw) - 1]
                 name = read("  姓名（%s）：" % p.get("name"), p.get("name"))
@@ -442,6 +445,9 @@ def menu_passengers():
                 print("  已更新并加密保存。")
         elif op == "3":
             raw = read("  删除第几位：", "")
+            if raw is None:
+                # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+                raise KeyboardInterrupt
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 if ask_yes_no("  确认删除该乘车人？", "n"):
                     del passengers[int(raw) - 1]
@@ -449,6 +455,9 @@ def menu_passengers():
                     print("  已删除。")
         elif op == "4":
             raw = read("  设为默认的第几位：", "")
+            if raw is None:
+                # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+                raise KeyboardInterrupt
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 for p in passengers:
                     p["is_default"] = False

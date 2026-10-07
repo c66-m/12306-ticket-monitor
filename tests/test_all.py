@@ -1509,6 +1509,47 @@ class TestMonitorInterruptRound2(TempDirCase):
         self.assertEqual(saved["notify"]["email"]["to"], ["a@x.com"])
 
 
+class TestMonitorInterruptRound3(TempDirCase):
+    """Task 28 round 3 (P1): menu_passengers 编辑/删除/设默认的序号输入
+    在 Ctrl+C/EOF（read 返回 None）时 None.isdigit() 抛 AttributeError
+    打 traceback。应抛 KeyboardInterrupt，由 main_menu 接住。"""
+
+    SAMPLE = [{"name": "张三", "id_type_code": "1", "id_no": "110101199001011234",
+               "mobile": "13800138000", "is_default": False, "is_adult": True}]
+
+    def _run_menu(self, reads):
+        import monitor as monitor_mod
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = [dict(self.SAMPLE[0])]
+        pm.ID_TYPE_NAMES = {"1": "二代身份证"}
+        with mock.patch.object(monitor_mod, "passengers_mod", pm), \
+             mock.patch.object(monitor_mod, "read", side_effect=list(reads)):
+            monitor_mod.menu_passengers()
+
+    def test_edit_index_none_raises_keyboard_interrupt(self):
+        # "2" 进编辑分支，"编辑第几位"时 Ctrl+C：旧代码 None.isdigit() 抛 AttributeError
+        with self.assertRaises(KeyboardInterrupt):
+            self._run_menu(["2", None])
+
+    def test_delete_index_none_raises_keyboard_interrupt(self):
+        # "3" 进删除分支：旧代码同上
+        with self.assertRaises(KeyboardInterrupt):
+            self._run_menu(["3", None])
+
+    def test_setdefault_index_none_raises_keyboard_interrupt(self):
+        # "4" 进设默认分支：旧代码同上
+        with self.assertRaises(KeyboardInterrupt):
+            self._run_menu(["4", None])
+
+    def test_menu_passengers_quit_unchanged(self):
+        # 回归 pin：正常退出路径不变（旧代码即通过）
+        self._run_menu(["0"])
+
+    def test_edit_invalid_index_unchanged(self):
+        # 回归 pin：非法序号走原逻辑（忽略并继续循环），随后 "0" 退出（旧代码即通过）
+        self._run_menu(["2", "9", "0"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
