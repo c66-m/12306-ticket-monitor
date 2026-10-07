@@ -592,10 +592,15 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 page.wait_for_url("**/confirmPassenger/initDc**",
                                   wait_until="commit", timeout=30000)
             except Exception:
-                try:
-                    body = page.evaluate("() => document.body ? document.body.innerText : ''")
-                except Exception:
-                    body = ""
+                body = ""
+                for _ in range(3):   # 弹窗渲染可能晚于超时瞬间:复核 3 次
+                    try:
+                        body = page.evaluate("() => document.body ? document.body.innerText : ''")
+                    except Exception:
+                        body = ""
+                    if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
+                        break
+                    page.wait_for_timeout(500)
                 if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
                     i = max(0, body.find("订单") - 30)
                     mark("result")

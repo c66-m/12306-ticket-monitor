@@ -553,6 +553,7 @@ class MonitorEngine(object):
                                     "paid": "已支付:判定为已购得,任务停止",
                                     "cancelled": "已取消:清除本地防重记录,允许重新下单",
                                     "none": "官方无此订单:清除本地记录,允许重新下单",
+                                    "blocked": "存在其它行程未支付订单挡路:请到 12306「未完成订单」支付或取消后恢复任务",
                                     "unknown": "官方状态不明确:保留本地记录,下轮再核",
                                     "error": "官方查询失败:保留本地记录,下轮再核"}[cls]
                         appcommon.upsert_order(
@@ -589,6 +590,9 @@ class MonitorEngine(object):
                             self.state["dedup"].pop(key, None)
                             self._save_state()
                             continue
+                        if cls == "blocked":
+                            self.set_task_status(task, "failed", "%s——处理后恢复本任务" % raw)
+                            return True, False
                         continue  # unknown/error:保留本地记录,下轮再核
                     else:
                         msg = (extra or {}).get("msg", "")

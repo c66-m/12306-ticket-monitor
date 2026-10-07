@@ -127,18 +127,31 @@ def classify_order_status(date, train, passenger_names, session=None):
     except Exception as e:
         return "error", "", "官方订单查询异常: %s" % e
     want = set(passenger_names or [])
-    for o in orders:
-        if (o.get("train") or "") != (train or "") or (o.get("date") or "")[:10] != (date or "")[:10]:
+
+    def _pax_hit(x):
+        pax = set(x.get("passengers") or [])
+        return not (passenger_names and pax) or bool(pax & want)
+
+    # 12306 规则:存在任何未完成订单就挡住新下单(不分日期车次)。
+    # 先分清挡路的是不是本行程:本行程=unpaid;其它行程=blocked。
+    inc = [x for x in orders if x.get("_no_complete")]
+    for x in inc:
+        if ((x.get("train") or "") == (train or "")
+                and (x.get("date") or "")[:10] == (date or "")[:10] and _pax_hit(x)):
+            return "unpaid", x.get("order_no", ""), x.get("status") or "未完成/未支付"
+    if inc:
+        x = inc[0]
+        return ("blocked", x.get("order_no", ""),
+                "存在其它行程未支付订单(%s %s)挡路" % (x.get("train"), x.get("date")))
+    for x in orders:
+        if (x.get("train") or "") != (train or "") or (x.get("date") or "")[:10] != (date or "")[:10]:
             continue
-        pax = set(o.get("passengers") or [])
-        if passenger_names and pax and not (pax & want):
+        if not _pax_hit(x):
             continue
-        st = o.get("status") or ""
-        ono = o.get("order_no", "")
+        st = x.get("status") or ""
+        ono = x.get("order_no", "")
         if "取消" in st:
             return "cancelled", ono, st
-        if o.get("_no_complete") or "未支付" in st or "未完成" in st:
-            return "unpaid", ono, st
         if "支付" in st:
             return "paid", ono, st
         return "unknown", ono, st
