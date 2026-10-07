@@ -2360,14 +2360,16 @@ class TestOrderTimestamp(TempDirCase):
         super().setUp()
         self._old_tz = os.environ.get("TZ")
         os.environ["TZ"] = "UTC"   # 模拟 UTC 机器：旧代码 time.mktime 会偏 8 小时
-        time.tzset()
+        if hasattr(time, "tzset"):  # Unix-only；Windows 无 tzset（CRT 本就忽略 TZ）
+            time.tzset()
 
     def tearDown(self):
         if self._old_tz is None:
             os.environ.pop("TZ", None)
         else:
             os.environ["TZ"] = self._old_tz
-        time.tzset()
+        if hasattr(time, "tzset"):  # Unix-only；Windows 无 tzset
+            time.tzset()
         super().tearDown()
 
     @staticmethod
