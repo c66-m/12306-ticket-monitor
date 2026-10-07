@@ -23,14 +23,20 @@ import contextlib
 import functools
 import json
 import os
+import re
 import sys
 import threading
 import time
 
 try:
     import msvcrt  # Windows 文件字节锁：跨进程互斥靠它
-except ImportError:  # 非 Windows 平台没有 msvcrt，跨进程锁退化为空操作
+except ImportError:  # 非 Windows 平台没有 msvcrt，改用 fcntl
     msvcrt = None
+
+try:
+    import fcntl  # POSIX 跨进程文件锁（Linux/macOS）；Windows 下没有这个模块
+except ImportError:
+    fcntl = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, ".browser_profile")
@@ -59,7 +65,9 @@ _LOCK_PATH = os.path.join(HERE, ".browser_profile.lock")
 
 
 class _ProfileLock:
-    """对锁文件首字节加 Windows 独占锁（msvcrt.locking）实现跨进程互斥。
+    """跨进程互斥：Windows 用 msvcrt.locking 对锁文件首字节加独占锁，
+    POSIX（Linux/macOS）用 fcntl.flock；两者都没有才退化为空操作
+    （跨进程这一层让位，仅保留进程内 RLock）。
 
     用文件字节锁而不是"锁文件存在即占用"：进程被强杀或崩溃时操作系统会自动
     释放，不会留下删不掉、又没人认领的死锁。"""
@@ -69,8 +77,8 @@ class _ProfileLock:
         self._fd = None
 
     def acquire(self, timeout=0):
-        if msvcrt is None:
-            return True  # 非 Windows：跨进程这一层让位，仅保留进程内锁
+        if msvcrt is None and fcntl is None:
+            return True  # 无跨进程后端：跨进程这一层让位，仅保留进程内锁
         try:
             fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
         except OSError:
@@ -79,7 +87,11 @@ class _ProfileLock:
         while True:
             try:
                 os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                if msvcrt is not None:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    # LOCK_NB 抢不到时抛 BlockingIOError（OSError 子类）
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 if time.time() >= deadline:
                     os.close(fd)
@@ -94,8 +106,11 @@ class _ProfileLock:
         if fd is None:
             return
         try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            if msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
         try:
@@ -111,13 +126,91 @@ _LOCK_LOCAL = threading.local()
 # 上一个候选启动失败会在 profile 目录留下 Singleton* 锁，必须先清掉再试下一个。
 _BROWSER_CHANNELS = ("msedge", "chrome", "chromium", None)
 
+_SINGLETON_NAMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
-def _clear_profile_locks():
-    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+
+def _snapshot_profile_locks():
+    """launch() 每次启动尝试前对 Singleton* 做快照。
+
+    只删"自己创建"的锁：快照之后新出现 / 被改动的文件才可能是本次尝试留下
+    的；尝试前已存在且未被改动的，是别人的（或对端浏览器的），不动。
+    用 lstat 而不用 exists/stat：Chromium 的 SingletonLock 是悬空软链接，
+    os.path.exists 会跟随链接返回 False，根本看不见它。"""
+    snap = {}
+    for name in _SINGLETON_NAMES:
         path = os.path.join(PROFILE_DIR, name)
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            snap[path] = os.lstat(path)
+        except OSError:
+            snap[path] = None
+    return snap
+
+
+def _same_stat(a, b):
+    return (a.st_ino, a.st_mtime_ns, a.st_size) == \
+        (b.st_ino, b.st_mtime_ns, b.st_size)
+
+
+def _singleton_lock_owner_alive(path):
+    """判断 SingletonLock 的持有者是否还活着。
+
+    Chromium 在 POSIX 下把 SingletonLock 做成指向 "<hostname>-<pid>" 的
+    软链接；目标 pid 存活 ⇒ 某个浏览器实例（可能是对端正在下单 / 体检的）
+    还活着。返回 True（活着）/ False（已死）/ None（无法判定，
+    如 Windows 下是普通文件、或无权限探查该 pid）。
+    """
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    m = re.search(r"-(\d+)\s*$", os.path.basename(target))
+    if not m:
+        return None
+    try:
+        os.kill(int(m.group(1)), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None  # 无权限等：保守起见视为未知
+    return True
+
+
+def _clear_profile_locks(baseline=None):
+    """清理 profile 锁，但只删"确定是自己留下的、或持有者已死"的。
+
+    旧行为：launch() 某通道启动失败就无条件删 SingletonLock/Socket/Cookie。
+    危险在于删掉对端（引擎体检 / 下单中）浏览器还活着的锁——等于把对方正在
+    下单的浏览器掐死。
+
+    规则：
+      1. SingletonLock 的持有者 pid 还活着 ⇒ 对端浏览器还在跑，
+         三个文件一个都不动，直接返回；
+      2. baseline 给出时：尝试前已存在且未被改动的文件不是自己创建的，不动；
+      3. 其余（本次尝试新产生的文件、持有者已死的僵尸锁、baseline 未给出
+         时归属未知的文件）按旧行为删除。
+    baseline 为空表示"不知道哪些是自己创建的"（兼容旧调用），此时只做
+    规则 1 的存活校验，其余按旧行为处理。
+    """
+    baseline = baseline or {}
+    lock_path = os.path.join(PROFILE_DIR, "SingletonLock")
+    try:
+        os.lstat(lock_path)
+    except OSError:
+        pass
+    else:
+        if _singleton_lock_owner_alive(lock_path):
+            return  # 对端浏览器还活着：一个都不动
+    for name in _SINGLETON_NAMES:
+        path = os.path.join(PROFILE_DIR, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue  # 不存在
+        base = baseline.get(path)
+        if base is not None and _same_stat(st, base):
+            continue  # 尝试前已存在且未被改动 ⇒ 不是自己创建的，不动
+        try:
+            os.remove(path)
         except OSError:
             pass
 
@@ -219,12 +312,14 @@ def launch(p, headless=False, restore=True):
         )
         if ch:
             kwargs["channel"] = ch
+        # 快照：失败时只删本次尝试自己留下的锁，不动对端的
+        baseline = _snapshot_profile_locks()
         try:
             ctx = p.chromium.launch_persistent_context(PROFILE_DIR, **kwargs)
             break
         except Exception as e:
             errs.append("%s: %s" % (ch or "chromium", type(e).__name__))
-            _clear_profile_locks()
+            _clear_profile_locks(baseline)
             time.sleep(0.5)
     else:
         raise RuntimeError("浏览器启动失败（已尝试 %s）：%s" % (

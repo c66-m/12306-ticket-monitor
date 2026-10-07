@@ -2918,6 +2918,193 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         self.assertIn("已提交订单", msg)
 
 
+# ============================ Task 43 ============================
+
+def _t43_filelock_holder(lock_path, ready_evt, hold_sec):
+    """子进程入口：拿 filelock.FileLock 并持有 hold_sec 秒。"""
+    import time as _time
+    import filelock as _fl
+    lk = _fl.FileLock(lock_path, timeout=10)
+    lk.acquire()
+    ready_evt.set()
+    _time.sleep(hold_sec)
+    lk.release()
+
+
+def _t43_profilelock_holder(lock_path, ready_evt, hold_sec):
+    """子进程入口：拿 browser_order._ProfileLock 并持有 hold_sec 秒。"""
+    import time as _time
+    import browser_order as _bo
+    lk = _bo._ProfileLock(lock_path)
+    if lk.acquire(timeout=10):
+        ready_evt.set()
+        _time.sleep(hold_sec)
+        lk.release()
+
+
+def _t43_join_child(testcase, proc):
+    proc.join(timeout=20)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=5)
+    testcase.assertFalse(proc.is_alive(), "子进程未能退出")
+
+
+class TestTask43FileLockCrossProcess(TempDirCase):
+    """Task 43a: filelock.FileLock 在 Linux/macOS 上必须真正跨进程互斥。
+
+    旧代码：msvcrt 不可用时 acquire() 直接 return True（假锁），两个进程
+    同时"拿到锁"，launcher 与 gui/engine 的读-改-写并发把任务吃掉。
+    """
+
+    @unittest.skipIf(filelock.msvcrt is not None,
+                     "Windows 走 msvcrt 路径，本测试只验 POSIX fcntl 后端")
+    def test_two_processes_mutual_exclusion(self):
+        import multiprocessing
+        path = os.path.join(self.tmp, "x.lock")
+        ready = multiprocessing.Event()
+        p = multiprocessing.Process(
+            target=_t43_filelock_holder, args=(path, ready, 2.0))
+        p.start()
+        try:
+            self.assertTrue(ready.wait(timeout=15), "子进程 15 秒内没拿到锁")
+            t0 = time.time()
+            with self.assertRaises(TimeoutError):
+                filelock.FileLock(path, timeout=1.0).acquire()
+            self.assertGreaterEqual(
+                time.time() - t0, 0.9, "应该等满超时而不是立刻返回（假锁）")
+        finally:
+            _t43_join_child(self, p)
+
+    @unittest.skipIf(filelock.msvcrt is not None,
+                     "Windows 走 msvcrt 路径，本测试只验 POSIX fcntl 后端")
+    def test_lock_released_after_holder_exits(self):
+        # 持有者释放后，另一进程能立刻拿到锁（无死锁残留）
+        import multiprocessing
+        path = os.path.join(self.tmp, "y.lock")
+        ready = multiprocessing.Event()
+        p = multiprocessing.Process(
+            target=_t43_filelock_holder, args=(path, ready, 0.5))
+        p.start()
+        try:
+            self.assertTrue(ready.wait(timeout=15), "子进程 15 秒内没拿到锁")
+        finally:
+            _t43_join_child(self, p)
+        with filelock.file_lock(path, timeout=5):
+            pass  # 能进来即证明锁已释放
+
+
+class TestTask43ProfileLockCrossProcess(TempDirCase):
+    """Task 43a: browser_order._ProfileLock 在 Linux/macOS 上必须跨进程互斥。
+
+    旧代码：非 Windows 直接 return True。两个进程同时认为自己独占 profile，
+    Playwright 互相挤掉，对方浏览器 exitCode=21 启动即退。
+    """
+
+    @unittest.skipIf(browser_order.msvcrt is not None,
+                     "Windows 走 msvcrt 路径，本测试只验 POSIX fcntl 后端")
+    def test_two_processes_mutual_exclusion(self):
+        import multiprocessing
+        path = os.path.join(self.tmp, "profile.lock")
+        ready = multiprocessing.Event()
+        p = multiprocessing.Process(
+            target=_t43_profilelock_holder, args=(path, ready, 2.0))
+        p.start()
+        try:
+            self.assertTrue(ready.wait(timeout=15), "子进程 15 秒内没拿到锁")
+            lk = browser_order._ProfileLock(path)
+            t0 = time.time()
+            got = lk.acquire(timeout=1.0)
+            self.assertFalse(got, "子进程持有锁时，父进程 acquire 必须返回 False")
+            self.assertGreaterEqual(
+                time.time() - t0, 0.9, "应该等满超时而不是立刻返回（假锁）")
+        finally:
+            _t43_join_child(self, p)
+
+    @unittest.skipIf(browser_order.msvcrt is not None,
+                     "Windows 走 msvcrt 路径，本测试只验 POSIX fcntl 后端")
+    def test_acquire_release_cycle(self):
+        # 本进程内拿锁→释放→再拿，不应自锁死
+        path = os.path.join(self.tmp, "profile2.lock")
+        lk = browser_order._ProfileLock(path)
+        self.assertTrue(lk.acquire(timeout=5))
+        lk.release()
+        self.assertTrue(lk.acquire(timeout=5))
+        lk.release()
+
+
+class TestTask43ClearProfileLocksOwnership(TempDirCase):
+    """Task 43b: launch() 失败只删自己创建的锁，绝不删对端活着的 SingletonLock。
+
+    旧代码：某通道启动失败就无条件删 SingletonLock/Socket/Cookie。
+    若删掉的是对端（引擎体检 / 下单中）浏览器还活着的 SingletonLock，
+    会把对方正在下单的浏览器掐死。
+    Chromium 在 POSIX 下把 SingletonLock 做成指向 "<hostname>-<pid>" 的软链接，
+    目标 pid 存活 ⇒ 某个浏览器实例还活着。
+    """
+
+    def _profile_dir(self):
+        prof = os.path.join(self.tmp, ".browser_profile")
+        os.makedirs(prof, exist_ok=True)
+        return prof
+
+    def test_live_peer_singleton_lock_not_deleted(self):
+        prof = self._profile_dir()
+        link = os.path.join(prof, "SingletonLock")
+        os.symlink("fakehost-%d" % os.getpid(), link)  # 指向本进程：存活
+        sock = os.path.join(prof, "SingletonSocket")
+        with open(sock, "w") as f:
+            f.write("x")
+        with mock.patch.object(browser_order, "PROFILE_DIR", prof):
+            browser_order._clear_profile_locks()
+        self.assertTrue(os.path.islink(link), "活着的对端 SingletonLock 被删了")
+        self.assertTrue(os.path.exists(sock), "对端活着时，其 Socket 也不该动")
+
+    def test_stale_singleton_lock_deleted(self):
+        prof = self._profile_dir()
+        link = os.path.join(prof, "SingletonLock")
+        os.symlink("fakehost-999999999", link)  # 不可能存在的 pid：持有者已死
+        with mock.patch.object(browser_order, "PROFILE_DIR", prof):
+            browser_order._clear_profile_locks()
+        self.assertFalse(os.path.lexists(link), "持有者已死的僵尸锁应该被清理")
+
+    def test_only_own_new_locks_deleted(self):
+        prof = self._profile_dir()
+        old_sock = os.path.join(prof, "SingletonSocket")
+        with open(old_sock, "w") as f:
+            f.write("old")
+        with mock.patch.object(browser_order, "PROFILE_DIR", prof):
+            baseline = browser_order._snapshot_profile_locks()
+            # 本次启动尝试新产生的僵尸锁（上一个 channel 失败留下）
+            new_link = os.path.join(prof, "SingletonLock")
+            os.symlink("fakehost-999999999", new_link)
+            browser_order._clear_profile_locks(baseline)
+        self.assertFalse(os.path.lexists(new_link), "自己尝试留下的僵尸锁应被清理")
+        self.assertTrue(os.path.exists(old_sock),
+                        "尝试前已存在且未被改动的文件不是自己创建的，不该删")
+
+    def test_launch_failure_keeps_live_peer_lock(self):
+        # launch() 所有通道都失败时，对端活着浏览器的锁文件必须一个都不少
+        prof = self._profile_dir()
+        link = os.path.join(prof, "SingletonLock")
+        os.symlink("fakehost-%d" % os.getpid(), link)  # 对端浏览器：存活
+        sock = os.path.join(prof, "SingletonSocket")
+        with open(sock, "w") as f:
+            f.write("x")
+        cookie = os.path.join(prof, "SingletonCookie")
+        with open(cookie, "w") as f:
+            f.write("y")
+        fake_p = mock.Mock()
+        fake_p.chromium.launch_persistent_context.side_effect = \
+            RuntimeError("no browser here")
+        with mock.patch.object(browser_order, "PROFILE_DIR", prof):
+            with self.assertRaises(RuntimeError):
+                browser_order.launch(fake_p, restore=False)
+        self.assertTrue(os.path.islink(link), "launch 失败把对端活着的 SingletonLock 删了")
+        self.assertTrue(os.path.exists(sock), "launch 失败把对端活着浏览器的 Socket 删了")
+        self.assertTrue(os.path.exists(cookie), "launch 失败把对端活着浏览器的 Cookie 删了")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
