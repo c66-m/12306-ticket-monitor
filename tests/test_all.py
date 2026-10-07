@@ -596,6 +596,51 @@ class TestNotify(TempDirCase):
         self.assertEqual(notify_mod.secret_of("legacy"), "legacy")
 
 
+class TestNotifyPortValidation(TempDirCase):
+    """Task 30: 非数字 smtp_port 不得杀死监控线程。"""
+
+    def _email_cfg(self, **over):
+        cfg = {"enabled": True, "smtp_host": "smtp.example.com",
+               "smtp_port": 465, "username": "u", "password": "p",
+               "from": "u@example.com", "to": ["u@example.com"]}
+        cfg.update(over)
+        return cfg
+
+    def test_non_numeric_port_falls_back_to_465(self):
+        # "abc" 不得抛 ValueError；应回退 465 发起连接
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(self._email_cfg(smtp_port="abc"), "s", "b")
+        self.assertTrue(ok, msg)
+        m_ssl.assert_called_once()
+        self.assertEqual(m_ssl.call_args[0][1], 465)
+
+    def test_numeric_string_port_accepted(self):
+        # 回归 pin：数字字符串本就可用
+        with mock.patch("notify.smtplib.SMTP") as m_smtp:
+            ok, msg = notify_mod.send_email(self._email_cfg(smtp_port="587"), "s", "b")
+        self.assertTrue(ok, msg)
+        self.assertEqual(m_smtp.call_args[0][1], 587)
+
+    def test_safe_port_values(self):
+        self.assertEqual(notify_mod._safe_port({"smtp_port": "abc"}), 465)
+        self.assertEqual(notify_mod._safe_port({"smtp_port": None}), 465)
+        self.assertEqual(notify_mod._safe_port({}), 465)
+        self.assertEqual(notify_mod._safe_port({"smtp_port": 587}), 587)
+
+    def test_notify_exception_does_not_kill_monitoring(self):
+        # 有票命中 + 未开自动下单 → 走 _notify 调用点；send_email 抛异常也不得向上传播
+        e = make_engine(self.tmp)
+        t = task_of(auto_order=False)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               side_effect=RuntimeError("boom")):
+            broke, _rec = e._run_task(t)  # 不得抛异常
+        self.assertFalse(broke)
+
+
 class TestLogutil(TempDirCase):
     def test_day_rotation(self):
         h = logutil.DayFileHandler(self.tmp, "test")

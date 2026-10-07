@@ -563,7 +563,11 @@ class MonitorEngine(object):
                                  _to=info["to_name"], start=info["start_time"],
                                  arrive=info["arrive_time"], seat=seat_name,
                                  num=avail.get(seat_name, ""))
-                        notify_results = self._notify(task, subject, body)
+                        try:
+                            notify_results = self._notify(task, subject, body)
+                        except Exception as e:
+                            LOG.error("[通知异常] 发送通知时发生未捕获异常，已忽略：%s", e)
+                            notify_results = {}
                         notify_txt = "; ".join("{0}:{1}".format(k, "成功" if nok else msg)
                                                for k, (nok, msg) in notify_results.items()) or "无通知渠道"
                         LOG.info("[有票] 任务「%s」%s 有余票，已通知：%s", name, seat_name, notify_txt)
@@ -815,7 +819,11 @@ class MonitorEngine(object):
         if order_no:
             body += "订单号：{0}\n".format(order_no)
         body += "\n（本条由监控系统自动发送）"
-        notify_results = self._notify(task, subject, body)
+        try:
+            notify_results = self._notify(task, subject, body)
+        except Exception as e:
+            LOG.error("[通知异常] 发送通知时发生未捕获异常，已忽略：%s", e)
+            notify_results = {}
         notify_txt = "; ".join("{0}:{1}".format(k, "成功" if ok else msg)
                                for k, (ok, msg) in notify_results.items()) or "无通知渠道"
         self._append_history({

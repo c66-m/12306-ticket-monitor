@@ -8,9 +8,12 @@ SMTP 参数在 config.json 的 notify.email 中配置。
 
 import smtplib
 import sys
+import logging
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
+
+LOG = logging.getLogger("monitor")
 
 _DPAPI_PREFIX = "dpapi1:"
 
@@ -44,6 +47,16 @@ def secret_of(text):
     return text or ""
 
 
+def _safe_port(cfg):
+    """取 SMTP 端口：非法值记警告后回退 465，绝不抛异常。"""
+    raw = cfg.get("smtp_port", 465)
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        LOG.warning("[配置] smtp_port 非法，已回退 465：%r", raw)
+        return 465
+
+
 def send_email(cfg, subject, body):
     """
     cfg: config.json 中的 notify.email 字典
@@ -53,7 +66,7 @@ def send_email(cfg, subject, body):
         return True, "邮件未启用"
     try:
         host = cfg["smtp_host"]
-        port = int(cfg.get("smtp_port", 465))
+        port = _safe_port(cfg)
         user = cfg["username"]
         pwd = secret_of(cfg["password"])  # 兼容明文与 DPAPI 密文两种存储
         from_addr = cfg["from"]
