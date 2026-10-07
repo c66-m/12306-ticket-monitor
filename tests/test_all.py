@@ -308,6 +308,46 @@ class TestEngineUnit(TempDirCase):
         self.assertFalse([f for f in os.listdir(self.tmp) if ".tmp" in f])
 
 
+class TestEngineDateValidation(TempDirCase):
+    """Task 1 (P1): 非法 date_range 不得崩引擎进程。"""
+
+    def test_expand_dates_skips_invalid_range(self):
+        # 非法月份：跳过该区间，不抛异常
+        t = {"name": "t1", "date_range": ["2026-13-01", "2026-10-02"]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_expand_dates_skips_garbage_strings(self):
+        t = {"name": "t1", "date_range": ["not-a-date", "2026-10-02"]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_expand_dates_skips_nonstring_values(self):
+        t = {"name": "t1", "date_range": [None, "2026-10-02"]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_expand_dates_keeps_valid_dates_when_range_invalid(self):
+        # 合法的 dates 不受非法 date_range 牵连
+        t = {"name": "t1", "dates": ["2026-10-08"],
+             "date_range": ["2026-13-01", "2026-10-02"]}
+        self.assertEqual(engine_mod.expand_dates(t), ["2026-10-08"])
+
+    def test_expand_dates_reversed_range_still_ignored(self):
+        # 起止倒置：保持原有行为（忽略该区间），不抛异常
+        t = {"name": "t1", "date_range": ["2026-10-05", "2026-10-02"]}
+        self.assertEqual(engine_mod.expand_dates(t), [])
+
+    def test_soonest_date_none_for_invalid_task(self):
+        t = {"name": "t1", "date_range": ["2026-13-01", "2026-13-05"]}
+        self.assertIsNone(engine_mod.MonitorEngine._soonest_date(t))
+
+    def test_task_interval_long_fallback_for_dateless_task(self):
+        # 无有效监控日期：不抛异常，走兜底长间隔（>=300s）而非高频空转
+        e = make_engine(self.tmp)
+        e.config = {"adaptive": {"enabled": True, "peak_hours": [0, 24],
+                                 "peak_multiplier": 1.0, "rush_within_hours": 24}}
+        t = task_of("t1", dates=[], date_range=["2026-13-01", "2026-13-05"])
+        self.assertGreaterEqual(e.task_interval(t), 300)
+
+
 class TestOrder(TempDirCase):
     def test_build_ticket_strs(self):
         # 官方格式：seat,0,ticket_type,姓名,1,证件号,手机号,N,0_

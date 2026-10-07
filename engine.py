@@ -48,6 +48,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 轮询间隔硬底线：低于该值会被提升，避免配置成 0 时无间隔空转打爆请求
 MIN_INTERVAL_FLOOR = 1
 
+# 无有效监控日期时的兜底轮询间隔（秒）：任务的 dates/date_range 非法或为空时，
+# 用长间隔并告警，避免无效高频轮询（_run_task 会把该任务标为失败并停止）
+NO_DATES_FALLBACK_INTERVAL = 300
+
 STATUS_LABELS = {
     "monitoring": "监控中",
     "retrying": "等待重试",
@@ -77,13 +81,19 @@ def expand_dates(task):
     result = list(task.get("dates") or [])
     dr = task.get("date_range")
     if dr and len(dr) == 2:
-        d0 = datetime.date.fromisoformat(dr[0])
-        d1 = datetime.date.fromisoformat(dr[1])
-        if d1 >= d0:
-            d = d0
-            while d <= d1:
-                result.append(d.isoformat())
-                d += datetime.timedelta(days=1)
+        try:
+            d0 = datetime.date.fromisoformat(dr[0])
+            d1 = datetime.date.fromisoformat(dr[1])
+        except (ValueError, TypeError):
+            # 非法日期区间：记警告后跳过，绝不让单个任务的手误崩掉整个引擎进程
+            LOG.warning("[配置] 任务「%s」的 date_range 非法，已跳过：%r",
+                        task.get("name"), dr)
+        else:
+            if d1 >= d0:
+                d = d0
+                while d <= d1:
+                    result.append(d.isoformat())
+                    d += datetime.timedelta(days=1)
     seen, uniq = set(), []
     for x in result:
         if x not in seen:
@@ -357,21 +367,26 @@ class MonitorEngine(object):
         ad = self.config.get("adaptive") or {}
         iv = float(self.base_interval)
         if ad.get("enabled", True):
+            soon = self._soonest_date(task)
+            if soon is None:
+                # 无有效监控日期：日期配置非法或为空，用兜底长间隔并告警，
+                # 避免无效高频轮询（_run_task 会把该任务标为失败并停止）
+                LOG.warning("[配置] 任务「%s」没有有效监控日期（date_range/dates 非法或为空），"
+                            "使用兜底间隔 %ss", task.get("name"), NO_DATES_FALLBACK_INTERVAL)
+                return max(self.base_interval, NO_DATES_FALLBACK_INTERVAL)
             hour = datetime.datetime.now().hour
             peak = ad.get("peak_hours") or [6, 23]
             mult = ad.get("peak_multiplier", 1.0) if peak[0] <= hour < peak[1] \
                 else ad.get("offpeak_multiplier", 1.6)
             rush_hours = ad.get("rush_within_hours", 24)
             if rush_hours:
-                soon = self._soonest_date(task)
-                if soon:
-                    try:
-                        delta_h = (datetime.datetime.fromisoformat(soon)
-                                   - datetime.datetime.now()).total_seconds() / 3600.0
-                        if 0 <= delta_h <= rush_hours:
-                            mult = min(mult, ad.get("rush_multiplier", 0.75))
-                    except ValueError:
-                        pass
+                try:
+                    delta_h = (datetime.datetime.fromisoformat(soon)
+                               - datetime.datetime.now()).total_seconds() / 3600.0
+                    if 0 <= delta_h <= rush_hours:
+                        mult = min(mult, ad.get("rush_multiplier", 0.75))
+                except ValueError:
+                    pass
             try:
                 prio = int(task.get("priority") or 5)
             except (TypeError, ValueError):
