@@ -56,7 +56,7 @@ def parse_date_range(raw_from, raw_to=None, max_span_days=MAX_DATE_SPAN_DAYS):
 
 # ----------------------------- 原子文件 IO -----------------------------
 
-def replace_with_retry(src, dst, tries=3, delay=0.05, fallback_direct=False):
+def replace_with_retry(src, dst, tries=5, delay=0.1, fallback_direct=False):
     """os.replace 带 Windows 占用重试：目标/源被并发读写句柄占用的瞬间会
     PermissionError（杀毒扫描、对方 json.load 持有读句柄），短暂退避重试。
 
@@ -79,8 +79,8 @@ def replace_with_retry(src, dst, tries=3, delay=0.05, fallback_direct=False):
             time.sleep(delay)
 
 
-def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=3,
-                      replace_delay=0.05, fallback_direct=False):
+def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
+                      replace_delay=0.1, fallback_direct=False):
     """原子写 JSON：临时名带 pid+线程标识（同进程多线程/多窗口互不踩），
     写完 replace 并对 Windows 占用做退避重试。
 

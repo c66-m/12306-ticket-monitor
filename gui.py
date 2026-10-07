@@ -797,7 +797,7 @@ class TaskWizard(tk.Toplevel):
         except ValueError as e:
             messagebox.showwarning("提示", str(e), parent=self)
             return
-        self.monitor_dates = [d.isoformat() for d in dates]
+        self.monitor_dates = list(dates)   # appcommon 返回的已是 ISO 字符串
         self.query_date = self.monitor_dates[0]
         self.query_hint.config(text="正在查询 %d 天车次  %s → %s ..."
                                % (len(self.monitor_dates), from_name, to_name))
@@ -2548,16 +2548,7 @@ class TaskEditDialog(tk.Toplevel):
         raw = self.date_var.get().strip()
         dates, date_range = [], []
         try:
-            if "~" in raw:
-                a, b = [x.strip() for x in raw.split("~", 1)]
-                d0, d1 = datetime.date.fromisoformat(a), datetime.date.fromisoformat(b)
-                if d1 < d0:
-                    raise ValueError("结束日期不能早于开始日期")
-                if (d1 - d0).days > 5:
-                    raise ValueError("日期跨度最多相差 5 天")
-                date_range = [d0.isoformat(), d1.isoformat()]
-            else:
-                dates = [datetime.date.fromisoformat(raw).isoformat()]
+            dates, date_range = appcommon.parse_date_range(raw)
         except ValueError as e:
             messagebox.showwarning("提示", "日期格式错误：%s" % e, parent=self)
             return
