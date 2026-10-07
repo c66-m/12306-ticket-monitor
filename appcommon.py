@@ -107,14 +107,14 @@ def read_state_or_none(path):
         return {}, None
     # 读句柄持有可能与写方的 os.replace 撞车（Windows 对正被打开的目标执行
     # replace 报拒绝访问），短暂退避重试——只影响撞上的那一瞬
-    for i in range(3):
+    for i in range(5):
         try:
             with open(path, encoding="utf-8") as f:
                 return json.load(f), None
         except PermissionError:
-            if i == 2:
+            if i == 4:
                 return None, PermissionError("读 %s 被占用（重试后仍失败）" % path)
-            time.sleep(0.05)
+            time.sleep(0.1)
         except Exception as e:
             return None, e
     return None, RuntimeError("unreachable")

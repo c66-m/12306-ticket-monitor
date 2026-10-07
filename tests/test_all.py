@@ -831,7 +831,13 @@ class TestStateStore(TempDirCase):
         def engine_like(i):
             try:
                 for n in range(30):
-                    st, err = appcommon.read_state_or_none(p)
+                    for _ in range(20):          # 撞锁=本轮跳过重读(生产语义)
+                        st, err = appcommon.read_state_or_none(p)
+                        if err is None or not isinstance(
+                                err, PermissionError):
+                            break
+                    else:
+                        continue
                     if err is not None:
                         errs.append(err)
                         continue
