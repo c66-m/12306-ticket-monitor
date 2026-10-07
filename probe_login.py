@@ -12,7 +12,8 @@
     3. 申请登录二维码，保存成图片，供你用 12306 App 扫描
     4. 轮询二维码状态
     5. 登录成功后，调用一个"需要登录"的接口来验证会话是否真的有效
-    6. 把会话 Cookie 存到本地，用于验证持久化
+    6. 把会话 Cookie 存到本地独立的 probe_cookies.json，用于验证持久化
+       （不碰生产 session_cookies.json）
 
 它不做什么
     - 不处理账号密码登录的滑块验证（那属于绕过安全验证，不做）
@@ -63,7 +64,10 @@ BASE_HEADERS = {
 }
 
 QR_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "login_qr.png")
-COOKIE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_cookies.json")
+# Task 44: 诊断脚本不得写生产 session_cookies.json。拍平的 {name: value}
+# 会丢 domain/path（增大风控特征风险），还会覆盖生产会话。
+# 诊断 Cookie 一律落到独立的 probe_cookies.json，生产文件永不触碰。
+PROBE_COOKIE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_cookies.json")
 POLL_TIMEOUT_SEC = 180          # 扫码轮询最长等待时间
 POLL_INTERVAL_SEC = 2
 
@@ -322,9 +326,10 @@ def step7_save_cookies():
     banner("STEP 7  保存会话 Cookie（验证持久化）")
     cookies = {c.name: c.value for c in SESSION.cookies}
     try:
-        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+        with open(PROBE_COOKIE_PATH, "w", encoding="utf-8") as f:
             json.dump(cookies, f, ensure_ascii=False, indent=2)
-        print("  已保存 {0} 个 Cookie 到：{1}".format(len(cookies), COOKIE_PATH))
+        print("  已保存 {0} 个 Cookie 到诊断文件：{1}".format(len(cookies), PROBE_COOKIE_PATH))
+        print("  （生产 session_cookies.json 未被触碰）")
         print("  Cookie 列表：" + ", ".join(cookies.keys()))
         print("\n  下一步可以验证：重开一个进程，用这些 Cookie 直接请求 STEP 6 的接口，")
         print("  如果仍然返回登录态数据，说明会话可持久化，多账号方案在地基上是成立的。")

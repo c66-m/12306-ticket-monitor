@@ -3,6 +3,8 @@
 config.json
 # 登录会话 Cookie
 session_cookies.json
+# probe 诊断脚本的独立 Cookie 文件（含会话，不上传）
+probe_cookies.json
 # Playwright 持久化浏览器 profile（含登录态与设备指纹）
 .browser_profile/
 .browser_state.json

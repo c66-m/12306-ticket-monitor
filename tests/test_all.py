@@ -44,6 +44,7 @@ import gui                           # noqa: E402
 import browser_order                 # noqa: E402
 import appcommon                     # noqa: E402
 import filelock                      # noqa: E402
+import probe_login                   # noqa: E402
 import time                          # noqa: E402
 import contextlib                    # noqa: E402
 
@@ -3103,6 +3104,60 @@ class TestTask43ClearProfileLocksOwnership(TempDirCase):
         self.assertTrue(os.path.islink(link), "launch 失败把对端活着的 SingletonLock 删了")
         self.assertTrue(os.path.exists(sock), "launch 失败把对端活着浏览器的 Socket 删了")
         self.assertTrue(os.path.exists(cookie), "launch 失败把对端活着浏览器的 Cookie 删了")
+
+
+class TestProbeStep7(unittest.TestCase):
+    """Task 44: probe 诊断脚本不得写生产 session_cookies.json。
+
+    改前：step7_save_cookies() 把拍平 {name: value} 的诊断 Cookie 写进生产
+    session_cookies.json（丢 domain/path，增大风控特征风险，还会覆盖生产会话）。
+    改后：诊断 Cookie 落到独立 probe_cookies.json，生产文件 mtime/内容不动。
+    """
+
+    def setUp(self):
+        self.repo_dir = os.path.dirname(os.path.abspath(probe_login.__file__))
+        self.prod_path = os.path.join(self.repo_dir, "session_cookies.json")
+        self.probe_path = os.path.join(self.repo_dir, "probe_cookies.json")
+        self.had_prod = os.path.exists(self.prod_path)
+        self.prod_backup = None
+        if self.had_prod:
+            with open(self.prod_path, "r", encoding="utf-8") as f:
+                self.prod_backup = f.read()
+        # 种子生产会话文件并记录 mtime（纳秒精度，避免同秒 flaky）
+        with open(self.prod_path, "w", encoding="utf-8") as f:
+            json.dump({"JSESSIONID": "production-value"}, f)
+        self.prod_mtime_ns = os.stat(self.prod_path).st_mtime_ns
+        # 注入诊断会话 Cookie（不走网络）
+        probe_login.SESSION.cookies.set("JSESSIONID", "diag-value")
+        probe_login.SESSION.cookies.set("RAIL_DEVICEID", "diag-device")
+
+    def tearDown(self):
+        probe_login.SESSION.cookies.clear()
+        if os.path.exists(self.probe_path):
+            os.remove(self.probe_path)
+        if self.had_prod:
+            with open(self.prod_path, "w", encoding="utf-8") as f:
+                f.write(self.prod_backup)
+        elif os.path.exists(self.prod_path):
+            os.remove(self.prod_path)
+
+    def test_step7_does_not_touch_production_session_file(self):
+        probe_login.step7_save_cookies()
+        self.assertEqual(
+            os.stat(self.prod_path).st_mtime_ns, self.prod_mtime_ns,
+            "probe 诊断写了生产 session_cookies.json（mtime 变了）")
+        with open(self.prod_path, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"JSESSIONID": "production-value"},
+                             "probe 诊断覆盖了生产 session_cookies.json 内容")
+
+    def test_step7_writes_diagnosis_cookies_to_probe_file(self):
+        probe_login.step7_save_cookies()
+        self.assertTrue(os.path.exists(self.probe_path),
+                        "诊断 Cookie 未落到独立 probe_cookies.json")
+        with open(self.probe_path, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f),
+                             {"JSESSIONID": "diag-value",
+                              "RAIL_DEVICEID": "diag-device"})
 
 
 if __name__ == "__main__":
