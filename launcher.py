@@ -405,6 +405,14 @@ class Grabber(threading.Thread):
     def _run(self):
         log = self._log
         lc = self.lc
+        # 历史文件路径与监控系统同源(config.history_file),别写错文件
+        try:
+            _cfg = json.load(open(os.path.join(HERE, "config.json"),
+                                  encoding="utf-8"))
+            hist_path = os.path.join(HERE, _cfg.get("history_file",
+                                                    "order_history.json"))
+        except Exception:
+            hist_path = os.path.join(HERE, "order_history.json")
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
         trains = [t.strip().upper() for t in (lc.get("trains") or []) if t and t.strip()]
@@ -596,7 +604,7 @@ class Grabber(threading.Thread):
                         try:
                             order_no = (extra or {}).get("order_no") or ""
                             appcommon.append_history(
-                                os.path.join(HERE, "order_history.json"),
+                                hist_path,
                                 {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
                                  "task": lc.get("name") or "启动器抢票",
                                  "result": "success", "train": info["train_code"],
@@ -619,7 +627,7 @@ class Grabber(threading.Thread):
                     if extra.get("reason") == "dup":
                         try:
                             appcommon.append_history(
-                                os.path.join(HERE, "order_history.json"),
+                                hist_path,
                                 {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
                                  "task": lc.get("name") or "启动器抢票",
                                  "result": "dup", "train": info["train_code"],
