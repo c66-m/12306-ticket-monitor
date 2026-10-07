@@ -700,13 +700,17 @@ class MonitorEngine(object):
                                 self._record_success(
                                     task, info, date, seat_name,
                                     {"passengers": "、".join(p_names), "order_no": ono})
-                                self.set_task_status(
-                                    task, "success",
-                                    "本次已提交订单（未支付），下单时间 %s" % (
-                                        recent.get("order_time") or "未知"))
                                 LOG.info("[结果回读] 任务「%s」%s 官方已生成订单 %s（下单时间 %s），判定本次成功",
                                          name, date, ono, recent.get("order_time") or "未知")
-                                return True, False
+                                if stop_after:
+                                    self.set_task_status(
+                                        task, "success",
+                                        "本次已提交订单（未支付），下单时间 %s" % (
+                                            recent.get("order_time") or "未知"))
+                                    return True, False
+                                if self.task_status(task) == "retrying":
+                                    self.set_task_status(task, "monitoring", "下单成功，恢复正常监控")
+                                return True, False  # 本轮不再继续（避免同轮重复下单）
                             if cls in ("none", "cancelled"):
                                 LOG.info("[结果回读] 任务「%s」%s 官方确认无此订单（%s），安全重试",
                                          name, date, cls)

@@ -1060,6 +1060,18 @@ class TestEngineFlow(TempDirCase):
         hist = json.load(open(e.history_path, encoding="utf-8"))
         self.assertEqual(hist[-1]["result"], "success")
 
+    def test_ambiguous_recent_unpaid_keeps_monitoring_when_not_stop_after(self):
+        # stop_after_order=False：ambiguous→官方回读成功（未支付+本次）
+        # → 任务保持 monitoring，继续抢其它日期（Task 37，旧代码误置 success）
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付",
+                                             {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
+            e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
+                          expect_status="monitoring", expect_dedup="SUBMITTED",
+                          notify_calls=1, stop_after_order=False)
+        hist = json.load(open(e.history_path, encoding="utf-8"))
+        self.assertEqual(hist[-1]["result"], "success")
+
     def test_ambiguous_none_keeps_monitoring(self):
         # 结果未知但官方确认无此订单 → 安全重试，任务继续监控、不写历史
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
