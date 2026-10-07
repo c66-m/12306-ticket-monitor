@@ -256,6 +256,13 @@ def menu_create_task():
                     passenger_names.append(local_passengers[int(part) - 1]["name"])
         else:
             passenger_names = passengers_mod.default_names()
+        # 防御历史脏数据：旧版本 Ctrl+C 可能把 name=None 的记录存盘，
+        # join 会抛 TypeError；过滤掉并警告，让用户去主菜单 [4] 清理 (Task 28 round 5)
+        dropped = sum(1 for n in passenger_names if not n)
+        if dropped:
+            print("  [警告] 乘车人库中有 {0} 条姓名为空的记录，已跳过（建议到主菜单 [4] 清理）。".format(dropped))
+            passenger_names = [n for n in passenger_names if n]
+        if not sel:
             print("  已选择默认乘车人：{0}".format("、".join(passenger_names) or "（无）"))
     else:
         print("\n  本地乘车人库为空。可不选：下单时将自动使用 12306 账号内已保存的常用乘车人。")

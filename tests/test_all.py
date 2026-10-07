@@ -1607,15 +1607,15 @@ class TestMonitorInterruptRound4(TempDirCase):
         self.assertEqual(email["password"], "oldsecret")
 
     def test_corrupt_name_none_crashes_task_join(self):
-        # 危害演示（诚实声明：新旧代码行为一致，非红绿测试）——pre-fix 的
-        # menu_passengers 会把 name=None 存盘；带着这条脏记录进 menu_create_task
-        # 并选中该乘车人，末尾 "、".join(passenger_names) 抛 TypeError。
-        # 本测试证明旧代码存 None 的危害真实；上面的修后测试证明新代码不再产生脏记录。
+        # 危害演示（round 4 时：旧代码在末尾 join 抛 TypeError）。
+        # Round 5 已在 join 前过滤 falsy 姓名并警告：不再抛 TypeError，
+        # 脏记录被跳过，任务照常创建。本测试现锁定修复后行为。
         import monitor as monitor_mod
         corrupt = [dict(self.SAMPLE[0])]
         corrupt[0]["name"] = None  # pre-fix 的 menu_passengers 会存下这种脏记录
         pm = mock.MagicMock()
         pm.load_passengers.return_value = corrupt
+        saved_cfg = {}
         with mock.patch.object(monitor_mod, "passengers_mod", pm), \
              mock.patch.object(monitor_mod, "pick_station", side_effect=["北京", "上海"]), \
              mock.patch.object(monitor_mod, "input_dates",
@@ -1623,14 +1623,73 @@ class TestMonitorInterruptRound4(TempDirCase):
              mock.patch.object(monitor_mod, "ticket") as mock_ticket, \
              mock.patch.object(monitor_mod, "pick_multi", return_value=["二等座"]), \
              mock.patch.object(monitor_mod, "read",
-                               side_effect=["", "1", "5", "n", "n", ""]), \
+                               side_effect=["", "1", "5", "n", "n", "", "n"]), \
              mock.patch.object(monitor_mod, "load_config", return_value={}), \
-             mock.patch.object(monitor_mod, "save_config"):
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved_cfg.update(c)):
             mock_ticket.load_station_map.return_value = (
                 {"北京": "BJP", "上海": "SHH"}, {"BJP": "北京", "SHH": "上海"})
             mock_ticket.query_tickets.side_effect = Exception("offline")
-            with self.assertRaises(TypeError):
-                monitor_mod.menu_create_task()
+            monitor_mod.menu_create_task()  # 不再抛 TypeError
+        tasks = saved_cfg.get("tasks", [])
+        self.assertTrue(tasks)
+        self.assertNotIn(None, tasks[0]["passenger_names"])
+
+
+class TestMonitorInterruptRound5(TempDirCase):
+    """Task 28 round 5 (P1): 历史脏数据——pre-fix 版本可能把 name=None 的乘车人
+    记录存盘；建任务选中该记录后 `"、".join(passenger_names)` 抛 TypeError
+    （崩溃点实测在 menu_create_task 末尾的 join）。修法：在 join 前过滤掉
+    falsy 姓名并打一条 [警告]（让用户去主菜单 [4] 清理记录），不静默吞。"""
+
+    DIRTY = {"name": None, "id_type_code": "1", "id_no": "110101199001011234",
+             "mobile": "13800138000", "is_default": False, "is_adult": True}
+    GOOD = {"name": "张三", "id_type_code": "1", "id_no": "110101199001011234",
+            "mobile": "13800138000", "is_default": False, "is_adult": True}
+
+    def _run_create_task(self, passengers, reads):
+        import monitor as monitor_mod
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = [dict(p) for p in passengers]
+        saved_cfg = {}
+        printed = []
+        # reads: 车次选择 / 乘车人选择 / 优先级 / 自动下单 / 下单后停止 /
+        #        任务名 / 是否立即启动
+        with mock.patch.object(monitor_mod, "passengers_mod", pm), \
+             mock.patch.object(monitor_mod, "pick_station", side_effect=["北京", "上海"]), \
+             mock.patch.object(monitor_mod, "input_dates",
+                               return_value=(["2026-10-09"], [])), \
+             mock.patch.object(monitor_mod, "ticket") as mock_ticket, \
+             mock.patch.object(monitor_mod, "pick_multi", return_value=["二等座"]), \
+             mock.patch.object(monitor_mod, "read", side_effect=list(reads)), \
+             mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved_cfg.update(c)), \
+             mock.patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(map(str, a)))):
+            mock_ticket.load_station_map.return_value = (
+                {"北京": "BJP", "上海": "SHH"}, {"BJP": "北京", "SHH": "上海"})
+            mock_ticket.query_tickets.side_effect = Exception("offline")
+            monitor_mod.menu_create_task()
+        tasks = saved_cfg.get("tasks", [])
+        return tasks[0] if tasks else None, printed
+
+    def test_dirty_name_selected_no_crash(self):
+        # 选中 name=None 的脏记录：旧代码在末尾 join 抛 TypeError；
+        # 新代码不过崩，存盘的 passenger_names 不含 None，并打警告
+        task, printed = self._run_create_task(
+            [self.DIRTY], ["", "1", "5", "n", "n", "", "n"])
+        self.assertIsNotNone(task)
+        self.assertNotIn(None, task["passenger_names"])
+        self.assertTrue(any("[警告]" in p and "姓名为空" in p for p in printed),
+                        "应提示用户清理姓名为空的乘车人记录")
+
+    def test_mixed_names_keep_good_drop_dirty(self):
+        # 一好一脏：保留好姓名，只丢掉 None
+        task, printed = self._run_create_task(
+            [self.GOOD, self.DIRTY], ["", "1,2", "5", "n", "n", "", "n"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["passenger_names"], ["张三"])
+        self.assertTrue(any("1 条" in p for p in printed))
 
 
 if __name__ == "__main__":
