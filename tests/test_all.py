@@ -3316,6 +3316,105 @@ class TestProbeStep7(unittest.TestCase):
                               "RAIL_DEVICEID": "diag-device"})
 
 
+class _FakeElapsed:
+    def total_seconds(self):
+        return 0.0
+
+
+class _FakeResp:
+    """step6 测试用假响应：满足 show() 的属性需求。"""
+    def __init__(self, text, status_code=200):
+        self.text = text
+        self.status_code = status_code
+        self.content = text.encode("utf-8")
+        self.headers = {"Content-Type": "application/json"}
+        self.elapsed = _FakeElapsed()
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class TestProbeFailurePath(unittest.TestCase):
+    """Task 49(a): 二维码失败路径不得写盘（成功才保存）。
+
+    改前：main() 的 `if not uamtk:` 分支仍调 step7_save_cookies()，
+    用登录前无用 Cookie（仅 JSESSIONID）污染 probe_cookies.json。
+    改后：失败路径不写盘；成功路径仍保存。
+    """
+
+    def _run_main(self, poll_result):
+        for p in (
+            mock.patch.object(probe_login, "step1_connectivity"),
+            mock.patch.object(probe_login, "step2_bootstrap_cookies"),
+            mock.patch.object(probe_login, "step3_create_qr", return_value="fake-uuid"),
+            mock.patch.object(probe_login, "step4_poll_qr", return_value=poll_result),
+            mock.patch.object(probe_login, "step7_save_cookies"),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        probe_login.main()
+        return probe_login.step7_save_cookies
+
+    def test_qr_timeout_does_not_write_cookies(self):
+        # RED on old code: 失败路径仍调 step7_save_cookies（写盘）
+        save = self._run_main(None)
+        save.assert_not_called()
+
+    def test_success_path_still_saves_cookies(self):
+        # 成功路径仍保存：pin（新旧代码都通过）
+        for p in (
+            mock.patch.object(probe_login, "step5_finish_login", return_value=True),
+            mock.patch.object(probe_login, "step6_verify_session", return_value=True),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        save = self._run_main("fake-uamtk")
+        save.assert_called_once()
+
+
+class TestProbeSessionHeuristic(unittest.TestCase):
+    """Task 49(b): 会话有效性启发收紧 —— 错误包 JSON 不得判有效。
+
+    实际接口（initMy12306Api / passengers/query）返回
+    {"status": true/false, "data": {...}}；未登录时 status=false 且 data={}。
+    旧启发 `'"data"' in r.text` 命中任意含 "data" 键的 JSON（含错误包）。
+    """
+
+    def _run_step6(self, get_text, post_text=None, status=200):
+        fake = mock.Mock()
+        fake.get.return_value = _FakeResp(get_text, status)
+        fake.post.return_value = _FakeResp(
+            post_text if post_text is not None else get_text, status)
+        with mock.patch.object(probe_login, "SESSION", fake):
+            return probe_login.step6_verify_session()
+
+    def test_error_json_not_valid(self):
+        # RED on old code: 错误包被判有效（'"data"' in r.text 恒成立）
+        err = ('{"validateMessagesShowId":"_validatorMessage","status":false,'
+               '"httpstatus":200,"data":{},"messages":[],"validateMessages":{}}')
+        self.assertFalse(self._run_step6(err))
+
+    def test_valid_session_detected(self):
+        # pin：有效会话仍判有效（新旧代码都通过）
+        ok_get = ('{"validateMessagesShowId":"_validatorMessage","status":true,'
+                  '"httpstatus":200,"data":{"user_name":"张*","name":"张三"},'
+                  '"messages":[],"validateMessages":{}}')
+        ok_post = ('{"validateMessagesShowId":"_validatorMessage","status":true,'
+                   '"httpstatus":200,"data":{"flag":true,"pageSize":10,'
+                   '"datas":[{"passenger_name":"张三"}]},"messages":[],'
+                   '"validateMessages":{}}')
+        self.assertTrue(self._run_step6(ok_get, ok_post))
+
+    def test_non_json_not_valid(self):
+        # pin：HTML 登录页不判有效（新旧代码都通过）
+        self.assertFalse(self._run_step6("<html><title>登录</title></html>"))
+
+    def test_non_200_not_valid(self):
+        # pin：非 200 不判有效（新旧代码都通过）
+        self.assertFalse(self._run_step6('{"status":true,"data":{"user_name":"x"}}',
+                                         status=500))
+
+
 class TestLockedRMW(TempDirCase):
     """Task 46 (P2): gui/monitor/launcher 读-改-写统一经 file_lock 原子接口。
 

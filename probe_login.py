@@ -296,6 +296,26 @@ def step5_finish_login(uamtk):
 
 # ----------------------------- STEP 6：验证会话有效性 -----------------------------
 
+def _session_looks_valid(r):
+    """STEP 6 会话有效性判定（收紧版）。
+
+    实际接口（initMy12306Api / passengers/query）返回
+    {"status": true/false, "data": {...}, ...}；未登录时 status=false 且 data={}。
+    旧启发 `'"data"' in r.text` 会把未认证/错误包也判成有效（每个 JSON 都有 "data" 键）。
+    口径与 browser_order.session_ok 的 `data.get("status")` 一致，另要求 data 非空。
+    """
+    if r.status_code != 200:
+        return False
+    try:
+        j = r.json()
+    except Exception:
+        return False
+    if not isinstance(j, dict):
+        return False
+    data = j.get("data")
+    return bool(j.get("status")) and isinstance(data, dict) and bool(data)
+
+
 def step6_verify_session():
     banner("STEP 6  验证会话是否真的有效（调用需登录接口）")
     checks = [
@@ -312,8 +332,7 @@ def step6_verify_session():
             else:
                 r = SESSION.post(url, data=payload, timeout=10)
             show(r)
-            if r.status_code == 200 and ("passengers" in r.text or "user_name" in r.text
-                                         or '"data"' in r.text):
+            if _session_looks_valid(r):
                 ok = True
         except Exception as e:
             print("    [异常] {0}: {1}".format(type(e).__name__, e))
@@ -356,7 +375,9 @@ def main():
     if not uamtk:
         banner("结论")
         print("  未完成登录。若是超时，说明只是没扫码；若是过期/报错，请把输出发出来。")
-        step7_save_cookies()  # 仍保存当前 Cookie，便于排查
+        # Task 49: 失败路径不写盘 —— 登录前的 Cookie（仅 JSESSIONID）无诊断价值，
+        # 且写盘会污染 probe_cookies.json。排查信息打控制台即可。
+        print("  当前 Cookie（仅展示，不落盘）：" + ", ".join(c.name for c in SESSION.cookies))
         return
 
     logged_in = step5_finish_login(uamtk)
