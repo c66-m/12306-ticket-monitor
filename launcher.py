@@ -910,10 +910,14 @@ def search_stations(text, limit=12):
     if not q:
         return []
     ql = q.lower()
+    name2code_rev = {}
     scored = []
     for idx, st in enumerate(get_station_index()):
         name, spy, py = st["name"], st["spy"], st["py"]
         code = st["code"].lower()
+        if name not in name2code_rev:
+            name2code_rev[name] = code
+        name2code_rev[name] = code
         if q == name:
             score = 0                       # 精确站名：唯一首选项
         elif name.startswith(q):
@@ -932,9 +936,12 @@ def search_stations(text, limit=12):
             score = 7
         else:
             continue
-        scored.append((score, len(name), idx, st))
-    scored.sort(key=lambda x: (x[0], x[1], x[2]))
-    return [x[3] for x in scored[:limit]]
+        # 同分内普速站优先于高铁/动车站，再按站名长度（用户口径：普通车站靠前）
+        kind = load_station_kinds().get(name2code_rev.get(name, ""), "")
+        kind_rank = 0 if "普速" in kind else (1 if kind else 2)
+        scored.append((score, kind_rank, len(name), idx, st))
+    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    return [x[4] for x in scored[:limit]]
 
 
 # --------------------------- 车站类型（高铁/普速） ---------------------------
