@@ -2689,21 +2689,30 @@ class LauncherApp(tk.Frame):
 
     # ---- 抢票控制 ----
 
-    def _validate(self):
+    def _validate(self, auto=False):
         lc = self.lc
         if not lc.get("from") or not lc.get("to"):
-            messagebox.showwarning("参数不完整", "请填写出发站和到达站", parent=self._mp)
-            return False
+            return self._validate_fail("参数不完整", "请填写出发站和到达站", auto)
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", lc.get("date") or ""):
-            messagebox.showwarning("参数不完整", "日期格式应为 YYYY-MM-DD", parent=self._mp)
-            return False
+            return self._validate_fail("参数不完整", "日期格式应为 YYYY-MM-DD", auto)
         if not lc.get("seat_types"):
-            messagebox.showwarning("参数不完整", "请至少勾选一种席别", parent=self._mp)
-            return False
+            return self._validate_fail("参数不完整", "请至少勾选一种席别", auto)
         if not lc.get("passenger_names"):
+            if auto:
+                # 无人值守无法确认"使用默认乘车人"，fail closed：跳过本次开抢
+                return self._validate_fail("未选乘车人", "未勾选乘车人，自动开抢已跳过", auto)
             if not messagebox.askyesno("未选乘车人", "未勾选乘车人，将使用账号默认乘车人，继续？", parent=self._mp):
                 return False
         return True
+
+    def _validate_fail(self, title, msg, auto):
+        """校验失败提示：手动弹模态框；自动只 bell+日志（无人值守弹模态会冻住主线程）。"""
+        if auto:
+            self._top.bell()
+            self._put_log("[自动开抢] 校验失败：%s" % msg)
+            return False
+        messagebox.showwarning(title, msg, parent=self._mp)
+        return False
 
     def toggle_grab(self):
         if self.grabber and self.grabber.is_alive():
@@ -2717,7 +2726,7 @@ class LauncherApp(tk.Frame):
         if auto:
             self.auto_fired = True
         self._ui_to_lc()
-        if not self._validate():
+        if not self._validate(auto=auto):
             return
         self.grabber = Grabber(dict(self.lc), logq=self.logq)
         self.grabber.start()

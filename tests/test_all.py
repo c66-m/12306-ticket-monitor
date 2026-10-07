@@ -756,6 +756,97 @@ class TestLauncherUnit(TempDirCase):
         self.assertEqual(launcher._station_kinds["VNP"], "高铁+动车+普速")
 
 
+class TestValidateAutoNoModal(TempDirCase):
+    """Task 27: _validate(auto=True) 不得弹任何模态框。
+
+    无人值守自动开抢时，模态 messagebox 会冻住 Tk 主线程导致定时开抢被杀。
+    auto=True 时校验失败只 bell + 记日志 + 返回 False；手动路径行为不变。
+    """
+
+    def _make_app(self, lc):
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.lc = lc
+        app._mp = None
+        app._top = mock.Mock()
+        logs = []
+        app._put_log = logs.append
+        return app, logs
+
+    def _ok_lc(self, **over):
+        lc = {"from": "北京", "to": "上海", "date": "2026-10-09",
+              "seat_types": ["二等座"], "passenger_names": ["张三"]}
+        lc.update(over)
+        return lc
+
+    def _patched(self):
+        p1 = mock.patch.object(launcher.messagebox, "showwarning")
+        p2 = mock.patch.object(launcher.messagebox, "askyesno", return_value=True)
+        return p1, p2
+
+    def test_auto_missing_station_no_modal(self):
+        app, logs = self._make_app(self._ok_lc(**{"from": ""}))
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertFalse(app._validate(auto=True))
+        mw.assert_not_called()
+        my.assert_not_called()
+        app._top.bell.assert_called_once()
+        self.assertTrue(any("校验失败" in l for l in logs))
+
+    def test_auto_bad_date_no_modal(self):
+        app, logs = self._make_app(self._ok_lc(date="2026/10/09"))
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertFalse(app._validate(auto=True))
+        mw.assert_not_called()
+        my.assert_not_called()
+
+    def test_auto_no_seat_no_modal(self):
+        app, logs = self._make_app(self._ok_lc(seat_types=[]))
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertFalse(app._validate(auto=True))
+        mw.assert_not_called()
+        my.assert_not_called()
+
+    def test_auto_no_passenger_fail_closed_no_modal(self):
+        # 无人值守无法回答"使用默认乘车人"，fail closed：跳过本次开抢
+        app, logs = self._make_app(self._ok_lc(passenger_names=[]))
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertFalse(app._validate(auto=True))
+        mw.assert_not_called()
+        my.assert_not_called()
+        app._top.bell.assert_called_once()
+
+    def test_auto_all_valid(self):
+        app, logs = self._make_app(self._ok_lc())
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertTrue(app._validate(auto=True))
+        mw.assert_not_called()
+        my.assert_not_called()
+        app._top.bell.assert_not_called()
+
+    def test_manual_missing_station_still_modal(self):
+        # 回归 pin：手动路径行为不变，仍弹模态框
+        app, logs = self._make_app(self._ok_lc(**{"from": ""}))
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertFalse(app._validate(auto=False))
+        mw.assert_called_once()
+        my.assert_not_called()
+
+    def test_manual_no_passenger_askyesno_yes_continues(self):
+        # 回归 pin：手动 askyesno 点"是"则继续
+        app, logs = self._make_app(self._ok_lc(passenger_names=[]))
+        p1, p2 = self._patched()
+        with p1 as mw, p2 as my:
+            self.assertTrue(app._validate(auto=False))
+        my.assert_called_once()
+        mw.assert_not_called()
+
+
 class TestGuiUnit(TempDirCase):
     def test_normalize_email(self):
         email = gui.normalize_email_settings({
