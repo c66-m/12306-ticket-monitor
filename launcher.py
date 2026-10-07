@@ -1170,6 +1170,18 @@ class StationEntry(ttk.Frame):
     def _on_key(self, event):
         if event.keysym in ("Down", "Up", "Return", "Escape", "Tab", "Shift_L", "Shift_R"):
             return
+        # 防抖 150ms：连打时只搜最后一次（本地索引搜索本身 ~1ms,防抖只为省重绘）
+        if getattr(self, "_search_job", None):
+            try:
+                self.after_cancel(self._search_job)
+            except Exception:
+                pass
+        self._search_job = self.after(150, self._do_search)
+
+    def _do_search(self):
+        self._search_job = None
+        if not self.winfo_exists():
+            return
         text = self.var.get().strip()
         if not text:
             self.show(self.history[:8])

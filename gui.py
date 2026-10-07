@@ -677,13 +677,15 @@ class TaskWizard(tk.Toplevel):
 
         row = tk.Frame(f, bg=CARD)
         row.pack(fill="x", padx=28)
-        self.from_field = StationField(row, "出发站", big=True)
-        self.from_field.pack(side="left")
+        ttk.Label(row, text="出发站", bg=CARD, fg=GRAY, font=(FONT, 10)).pack(side="left")
+        self.from_field = launcher.StationEntry(row, width=14)
+        self.from_field.pack(side="left", padx=(4, 6))
         tk.Button(row, text="⇄", command=self.swap_stations, bg=BLUE, fg="white",
                   activebackground=BLUE_DARK, activeforeground="white",
                   font=(FONT, 12, "bold"), relief="flat", width=3,
                   cursor="hand2").pack(side="left", padx=10, ipady=6)
-        self.to_field = StationField(row, "到达站", big=True)
+        ttk.Label(row, text="到达站", bg=CARD, fg=GRAY, font=(FONT, 10)).pack(side="left")
+        self.to_field = launcher.StationEntry(row, width=14)
         self.to_field.pack(side="left")
 
         date_row = tk.Frame(f, bg=CARD)
@@ -773,18 +775,14 @@ class TaskWizard(tk.Toplevel):
                       padx=10, pady=4, cursor="hand2").pack(side="left", padx=3, pady=2)
 
     def fill_stations(self, fr, to):
-        self.from_field.entry.delete(0, "end")
-        self.from_field.entry.insert(0, fr)
-        self.to_field.entry.delete(0, "end")
-        self.to_field.entry.insert(0, to)
+        self.from_field.set(fr)
+        self.to_field.set(to)
 
     def swap_stations(self):
         a = self.from_field.get()
         b = self.to_field.get()
-        self.from_field.entry.delete(0, "end")
-        self.from_field.entry.insert(0, b)
-        self.to_field.entry.delete(0, "end")
-        self.to_field.entry.insert(0, a)
+        self.from_field.set(b)
+        self.to_field.set(a)
 
     def do_query(self):
         from_name, to_name = self.from_field.get(), self.to_field.get()
