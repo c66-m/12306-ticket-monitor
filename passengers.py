@@ -29,6 +29,7 @@
 
 import base64
 import json
+import logging
 
 import appcommon
 import os
@@ -38,6 +39,8 @@ try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+LOG = logging.getLogger("monitor")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PATH = os.path.join(HERE, "passengers.json")
@@ -201,14 +204,43 @@ def load_passengers(path=None):
         return []
 
 
-def save_passengers(passengers, path=None):
-    """加密保存乘车人列表。"""
+def _is_undecryptable_box(path):
+    """磁盘盒子在本环境是否不可解密（拒写守卫用）。
+
+    文件存在、非空，但解密失败（dpapi 盒子拷到别的机器/用户、
+    fernet 密钥丢失等）→ True。文件不存在/为空/可解密 → False。
+    注意：盒子信封 JSON 本身损坏也判 True——同样无法证明可恢复，
+    宁可拒写（可用 force=True 显式覆盖）。
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            box = json.load(f)
+        _decrypt(box.get("enc", "none"), box.get("data", "[]"))
+        return False
+    except Exception:
+        return True
+
+
+def save_passengers(passengers, path=None, force=False):
+    """加密保存乘车人列表。成功返回 True。
+
+    若磁盘上已有文件且在本环境不可解密（dpapi 盒子拷到 Linux /
+    换了 Windows 用户），默认拒绝覆写——否则源机器可恢复的密文会被
+    永久销毁。确需放弃旧数据时传 force=True（对应 --force）。
+    """
     path = path or DEFAULT_PATH
+    if not force and _is_undecryptable_box(path):
+        LOG.error("[安全] 拒绝覆盖不可解密的 passengers 数据（%s），"
+                  "请在原机器解密后迁移；如确认放弃请用 --force", path)
+        return False
     payload = json.dumps({"passengers": list(passengers)}, ensure_ascii=False, indent=2)
     enc_name, data_text = _encrypt(payload)
     box = {"version": 1, "enc": enc_name, "data": data_text}
     # 原子写：写一半被杀不留半截密文（密文损坏 = 乘车人数据全丢）
     appcommon.atomic_write_json(path, box)
+    return True
 
 
 # ----------------------------- 业务辅助 -----------------------------

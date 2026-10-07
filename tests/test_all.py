@@ -748,6 +748,64 @@ class TestDpapiBlobLifetime(unittest.TestCase):
                 self.assertEqual(ctypes.string_at(st.pbData, len(payload)), payload)
 
 
+class TestPassengersUndecryptableGuard(TempDirCase):
+    """save_passengers 不得覆写在本环境不可解密的盒子（P1 数据销毁类）。
+
+    背景：dpapi 盒子拷到 Linux / 换 Windows 用户后，load_passengers 解密失败
+    静默返回 []；随后任意 save 会覆写盒子，把源机器可恢复的密文永久销毁。
+    修复：save 前检测到"文件存在、非空、但本环境解不开"时拒绝覆写并记 error，
+    只有 force=True 才允许覆盖。
+    """
+
+    def _write_dpapi_box(self, path):
+        """写一个本 Linux 环境解不开的 dpapi 盒子（模拟从 Windows 拷来的文件）。
+
+        _decrypt("dpapi", ...) 在 Linux 上因 ctypes.windll 不存在而抛异常，
+        与"换了机器/用户解不开"是同一条失败路径。
+        """
+        import base64
+        box = {"version": 1, "enc": "dpapi",
+               "data": base64.b64encode(b"not-a-real-dpapi-blob").decode("ascii")}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(box, f)
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_refuse_overwrite_undecryptable_box(self):
+        p = os.path.join(self.tmp, "passengers.json")
+        before = self._write_dpapi_box(p)
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            ok = pax_mod.save_passengers([{"name": "张三"}], p)
+        self.assertFalse(ok)
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), before)  # 文件内容必须原样保留
+        self.assertTrue(any("[安全]" in m for m in cm.output))
+
+    def test_force_allows_overwrite(self):
+        p = os.path.join(self.tmp, "passengers.json")
+        self._write_dpapi_box(p)
+        ok = pax_mod.save_passengers([{"name": "张三"}], p, force=True)
+        self.assertTrue(ok)
+        back = pax_mod.load_passengers(p)
+        self.assertEqual([x["name"] for x in back], ["张三"])
+
+    def test_healthy_box_can_be_overwritten(self):
+        # 回归 pin：本环境可解密的健康盒子，正常覆写不受影响
+        p = os.path.join(self.tmp, "passengers.json")
+        pax_mod.save_passengers([{"name": "张三"}], p)
+        ok = pax_mod.save_passengers([{"name": "李四"}], p)
+        self.assertTrue(ok)
+        back = pax_mod.load_passengers(p)
+        self.assertEqual([x["name"] for x in back], ["李四"])
+
+    def test_missing_file_saves_normally(self):
+        # 回归 pin：首跑无文件时正常创建
+        p = os.path.join(self.tmp, "new.json")
+        ok = pax_mod.save_passengers([{"name": "王五"}], p)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(p))
+
+
 class TestLauncherUnit(TempDirCase):
     def test_parse_dt_formats(self):
         r = launcher.LauncherApp._resolve_dates({"date": "2026-10-07", "date_to": "2026-10-12"})
