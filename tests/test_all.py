@@ -878,6 +878,25 @@ class TestStateStore(TempDirCase):
         self.assertFalse([f for f in os.listdir(self.tmp) if ".tmp" in f])
 
 
+class TestSearchStations(TempDirCase):
+    """车站搜索匹配度排序：精确优先、普速小站不被挤出（长葛问题）。"""
+
+    def test_hanzi_exact_first_and_prefix_after(self):
+        r = launcher.search_stations("长葛")
+        self.assertEqual(r[0]["name"], "长葛")
+        self.assertIn("长葛北", [x["name"] for x in r])
+
+    def test_hanzi_single_char_includes_pusu(self):
+        r = [x["name"] for x in launcher.search_stations("长", limit=12)]
+        self.assertIn("长葛", r)
+        # 同档(2字"长"字站约10个)按索引序,长葛位次不保证,但在结果内即可达
+
+    def test_ascii_ranking_unchanged(self):
+        self.assertEqual(launcher.search_stations("cq")[0]["name"], "重庆")
+        self.assertEqual(launcher.search_stations("chang")[0]["name"], "长春")
+        self.assertEqual(launcher.search_stations("bjd")[0]["name"], "北京东")
+
+
 # ----------------------------- 辅助 -----------------------------
 
 import logging  # noqa: E402

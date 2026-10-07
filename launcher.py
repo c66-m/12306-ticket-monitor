@@ -901,21 +901,40 @@ def get_station_index():
 
 
 def search_stations(text, limit=12):
-    """本地模糊搜索车站：简拼/全拼/代码前缀优先，站名包含其次。
+    """本地模糊搜索车站，按匹配度降序：精确站名 > 站名前缀 > 简拼/全拼/
+    电报码前缀 > 站名包含。同档按站名长度短者优先（长葛排在长葛北前）。
 
-    返回 [{"name","code","py","spy"}, ...]。纯本地计算，无需联网。"""
-    q = (text or "").strip().lower()
+    旧实现汉字查询只走"站名包含"档且按索引序截断，长葛这类普速小站常被
+    挤出结果。返回 [{"name","code","py","spy"}, ...]，纯本地计算。"""
+    q = (text or "").strip()
     if not q:
         return []
-    head, tail = [], []
-    for st in get_station_index():
-        if st["spy"].startswith(q) or st["py"].startswith(q) or st["code"].lower().startswith(q):
-            head.append(st)
-        elif q in st["name"] or q in st["py"]:
-            tail.append(st)
-        if len(head) >= limit:
-            break
-    return (head + tail)[:limit]
+    ql = q.lower()
+    scored = []
+    for idx, st in enumerate(get_station_index()):
+        name, spy, py = st["name"], st["spy"], st["py"]
+        code = st["code"].lower()
+        if q == name:
+            score = 0                       # 精确站名：唯一首选项
+        elif name.startswith(q):
+            score = 1
+        elif spy == ql or py == ql or code == ql:
+            score = 2
+        elif spy.startswith(ql):
+            score = 3
+        elif py.startswith(ql):
+            score = 4
+        elif code.startswith(ql):
+            score = 5
+        elif q in name:
+            score = 6
+        elif ql in py:
+            score = 7
+        else:
+            continue
+        scored.append((score, len(name), idx, st))
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [x[3] for x in scored[:limit]]
 
 
 # --------------------------- 车站类型（高铁/普速） ---------------------------
