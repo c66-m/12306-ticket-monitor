@@ -305,8 +305,12 @@ class MonitorEngine(object):
         state = {}
         if os.path.exists(self.state_path):
             try:
-                with open(self.state_path, encoding="utf-8") as f:
-                    state = json.load(f)
+                # 与 _load_state 同理：读与写侧持同一把 file_lock，
+                # 避免撞上 _save_state fallback_direct 直写的撕裂文件
+                # → json 误判损坏 → self.state = {} → 空状态被落盘丢防重。
+                with filelock.file_lock(self.state_path + ".lock"):
+                    with open(self.state_path, encoding="utf-8") as f:
+                        state = json.load(f)
             except Exception:
                 state = {}
         state.setdefault("dedup", {})

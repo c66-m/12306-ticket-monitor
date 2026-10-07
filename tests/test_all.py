@@ -2200,6 +2200,100 @@ class TestLoadStateReadLock(unittest.TestCase):
             "读未等待写锁（%.2fs），可能读到撕裂文件" % elapsed)
 
 
+class TestReloadStateReadLock(unittest.TestCase):
+    """Task 34 round 2: _reload_state（_sync_state 的热重载路径）读 state.json
+    时同样必须持有与写侧相同的 file_lock。
+
+    背景：round 1 只修了 _load_state。_reload_state 是裸 open + json.load，
+    撞上 _save_state fallback_direct 的撕裂写 → 异常被吞 → self.state = {}
+    → 后续某处无参 _save_state() 把空状态落盘 → 防重永久丢失 → 可能重复下单。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="t34r2_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_config(self, state_obj):
+        sp = os.path.join(self.tmp, "state.json")
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump(state_obj, f, ensure_ascii=False)
+        cfg = {"tasks": [],
+               "state_file": sp,
+               "history_file": os.path.join(self.tmp, "order_history.json")}
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return p
+
+    def _make_engine(self, state_obj):
+        cfg_path = self._write_config(state_obj)
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            return engine_mod.MonitorEngine(config_path=cfg_path,
+                                            setup_logging=False)
+
+    def test_reload_state_reads_under_state_lock(self):
+        # 读瞬间必须处于 file_lock(state.json.lock) 上下文内（与 _save_state 同一把）
+        e = self._make_engine({"dedup": {"k": 1},
+                               "tasks": {}, "retry": {}})
+        lock_path = e.state_path + ".lock"
+        in_lock_during_read = []
+        flag = {"in_lock": False}
+        real_file_lock = filelock.file_lock
+        real_json_load = json.load
+
+        @contextlib.contextmanager
+        def spy_lock(path, timeout=10.0):
+            if path == lock_path:
+                flag["in_lock"] = True
+            try:
+                with real_file_lock(path, timeout=timeout):
+                    yield
+            finally:
+                if path == lock_path:
+                    flag["in_lock"] = False
+
+        def spy_load(fp, *a, **k):
+            in_lock_during_read.append(flag["in_lock"])
+            return real_json_load(fp, *a, **k)
+
+        with mock.patch.object(filelock, "file_lock", spy_lock), \
+             mock.patch.object(engine_mod.json, "load", spy_load):
+            e._reload_state()
+
+        self.assertTrue(in_lock_during_read, "json.load 没有被调用到")
+        self.assertTrue(
+            all(in_lock_during_read),
+            "Task34r2: _reload_state 读 state.json 时未持有写侧同把 file_lock")
+
+    def test_reload_state_waits_for_writer_lock(self):
+        # 写侧持锁慢写时，读侧必须阻塞等待，不能直接读半截文件
+        e = self._make_engine({"dedup": {}, "tasks": {}, "retry": {}})
+        lock_path = e.state_path + ".lock"
+        entered = threading.Event()
+
+        def slow_writer():
+            with filelock.file_lock(lock_path):
+                entered.set()
+                time.sleep(1.0)  # 模拟 fallback_direct 慢速直写
+
+        t = threading.Thread(target=slow_writer)
+        t.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5), "写线程未能拿到锁")
+            start = time.monotonic()
+            e._reload_state()
+            elapsed = time.monotonic() - start
+        finally:
+            t.join(timeout=5)
+        self.assertGreaterEqual(
+            elapsed, 0.8,
+            "读未等待写锁（%.2fs），可能读到撕裂文件" % elapsed)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
