@@ -1347,7 +1347,16 @@ class TestSeatRules(TempDirCase):
         self.assertEqual(cand, ["硬卧", "硬座"])                 # 首选可超出勾选（旧口径）
 
     def test_candidates_nothing_restricted_uses_avail(self):
-        avail = {"硬座": "5", "硬卧": "有"}
+        avail = {"硬座": "5", "高级动卧": "有", "硬卧": "有"}
+        # Task 47: 不限席别只收可下单席别（按 avail 顺序，展示类席别名被过滤）
+        self.assertEqual(ticket.seat_candidates_for("K225", [], "", avail),
+                         ["硬座", "硬卧"])
+
+    def test_candidates_unrestricted_filters_display_only(self):
+        # Task 47: 「不限席别」分支必须过滤掉不可下单的展示类席别名，
+        # 否则 launcher 按名索引 SEAT_NAME_TO_CODE 会潜伏 KeyError。
+        avail = {"硬座": "5", "高级动卧": "有", "其他": "有",
+                 "一等卧": "有", "二等卧": "有", "硬卧": "有"}
         self.assertEqual(ticket.seat_candidates_for("K225", [], "", avail),
                          ["硬座", "硬卧"])
 

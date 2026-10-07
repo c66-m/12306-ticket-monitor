@@ -253,7 +253,7 @@ def seat_candidates_for(train_code, checked, priority, avail=None):
             if s not in cand:
                 cand.append(s)
         if not cand and avail is not None:
-            cand = list(avail.keys())   # 无勾选无偏好 = 不限席别
+            cand = [s for s in avail if s in SEAT_NAME_TO_CODE]  # 不限席别：过滤不可下单的展示类席别名（Task 47）
     if avail is not None:
         cand = [s for s in cand if s in avail]
     return cand
