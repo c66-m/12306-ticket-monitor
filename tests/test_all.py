@@ -1926,6 +1926,69 @@ class TestAppendHistoryQuarantine(TempDirCase):
         self.assertEqual(self._bad_files(p), [])
 
 
+class TestQuarantineToctou(TempDirCase):
+    """Task 33: quarantine_corrupt TOCTOU —— 读失败后、挪档前若文件被另一进程
+    改写为健康内容，必须放弃隔离（不能误伤健康文件丢防重记录）。"""
+
+    def _write(self, path, data):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+
+    def _bad_files(self, path):
+        d = os.path.dirname(path)
+        base = os.path.basename(path)
+        return [f for f in os.listdir(d) if f.startswith(base + ".bad-")]
+
+    def test_quarantine_skips_when_rewritten_after_failed_read(self):
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        self._write(p, "CORRUPT{{{")                        # 损坏：10 字节
+        fp = appcommon.stat_fingerprint(p)                 # 读失败瞬间的指纹
+        healthy = '{"tasks": [], "dedup": {}}'              # 健康：24 字节
+        self._write(p, healthy)                             # 另一进程在竞态窗口写入
+        self.assertNotEqual(appcommon.stat_fingerprint(p), fp,
+                            "测试前置：指纹必须已变化")
+        bad = appcommon.quarantine_corrupt(p, fp)
+        self.assertIsNone(bad, "文件已被改写，应放弃隔离")
+        self.assertEqual(self._bad_files(p), [], "不得产生隔离文件")
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(f.read(), healthy, "健康文件必须原样保留")
+
+    def test_quarantine_proceeds_when_unchanged(self):
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        garbage = "CORRUPT{{{"
+        self._write(p, garbage)
+        fp = appcommon.stat_fingerprint(p)
+        bad = appcommon.quarantine_corrupt(p, fp)
+        self.assertIsNotNone(bad, "未被改写时应正常隔离")
+        self.assertFalse(os.path.exists(p))
+        self.assertEqual(len(self._bad_files(p)), 1)
+        with open(bad, encoding="utf-8") as f:
+            self.assertEqual(f.read(), garbage, "证据逐字节保留")
+
+    def test_load_orders_toctou_end_to_end(self):
+        # 端到端：经 load_orders 真实调用链复现竞态 —— 损坏读失败后、
+        # quarantine 执行前"另一进程"写入健康文件，健康文件不得被挪走。
+        import appcommon
+        p = os.path.join(self.tmp, "orders.json")
+        self._write(p, "CORRUPT{{{")
+        healthy = {"orders": {"G123|2026-10-09": {"order_no": "E123"}}}
+        orig = appcommon.quarantine_corrupt
+
+        def sneaky(path, fp=None):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(healthy, f)          # 竞态窗口：第二进程写入健康文件
+            return orig(path, fp)
+
+        with mock.patch.object(appcommon, "quarantine_corrupt", sneaky):
+            db = appcommon.load_orders(p)
+        self.assertEqual(db, {"orders": {}})
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), healthy, "健康文件不得被隔离挪走")
+        self.assertEqual(self._bad_files(p), [], "不得产生隔离文件")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

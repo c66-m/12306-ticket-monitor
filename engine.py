@@ -235,7 +235,10 @@ class MonitorEngine(object):
             # 读不出来 ≠ 空状态：挪档留证（时间戳名，见 appcommon.quarantine_corrupt），
             # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
             # 重复下单——必须醒目提示去核对在途行程。
-            bad = appcommon.quarantine_corrupt(self.state_path)
+            # 传入读失败瞬间的指纹：若另一进程在此期间已写入健康文件，
+            # quarantine 会放弃隔离，避免误伤（Task 33 TOCTOU 守卫）。
+            bad = appcommon.quarantine_corrupt(
+                self.state_path, appcommon.stat_fingerprint(self.state_path))
             if bad is None:
                 # 挪不动（如杀毒软件占用）：本次不落盘，免得下面的
                 # _save_state 把仅存的坏档覆盖掉

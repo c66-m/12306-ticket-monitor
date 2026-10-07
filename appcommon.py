@@ -123,9 +123,27 @@ def read_state_or_none(path):
     return None, RuntimeError("unreachable")
 
 
-def quarantine_corrupt(path):
+def stat_fingerprint(path):
+    """文件指纹 (st_mtime_ns, st_size)，供 quarantine_corrupt 做 TOCTOU 守卫。
+    在"读失败"瞬间抓取；文件已消失返回 None。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def quarantine_corrupt(path, expected_fingerprint=None):
     """坏档时间戳挪档（state.json → state.json.bad-YYYYmmdd-HHMMSS，反复损坏
-    不互相覆盖）。返回挪档后的路径；None = 挪移失败（文件被占用，证据保留原地）。"""
+    不互相覆盖）。返回挪档后的路径；None = 挪移失败或放弃隔离（文件被占用、
+    或自读失败后已被另一进程改写——证据保留原地，绝不误伤健康文件）。
+    expected_fingerprint: 读失败瞬间抓取的 stat_fingerprint；挪档前比对当前
+    指纹，不一致则记 warning 并放弃隔离。None = 不校验（兼容旧调用）。"""
+    if expected_fingerprint is not None:
+        if stat_fingerprint(path) != expected_fingerprint:
+            LOG.warning("[数据] %s 自读失败后已被改写，放弃隔离以免误伤健康文件",
+                        path)
+            return None
     bad = "{0}.bad-{1}".format(path, time.strftime("%Y%m%d-%H%M%S"))
     try:
         os.replace(path, bad)
@@ -154,13 +172,13 @@ def append_history(path, record, keep=500):
                 with open(path, encoding="utf-8") as f:
                     history = json.load(f)
             except Exception as e:
-                bad = quarantine_corrupt(path)
+                bad = quarantine_corrupt(path, stat_fingerprint(path))
                 LOG.error("[数据] order_history.json 损坏，已隔离留证：%s（%s）；新记录继续追加",
                           bad, e)
                 history = []
             else:
                 if not isinstance(history, list):
-                    bad = quarantine_corrupt(path)
+                    bad = quarantine_corrupt(path, stat_fingerprint(path))
                     LOG.error("[数据] order_history.json 结构非法，已隔离留证：%s；新记录继续追加",
                               bad)
                     history = []
@@ -180,12 +198,12 @@ def load_orders(path):
         with open(path, encoding="utf-8") as f:
             db = json.load(f)
     except Exception as e:
-        bad = quarantine_corrupt(path)
+        bad = quarantine_corrupt(path, stat_fingerprint(path))
         LOG.error("[数据] orders.json 损坏，已隔离留证：%s（%s）；返回空库", bad, e)
         return {"orders": {}}
     if isinstance(db, dict) and isinstance(db.get("orders"), dict):
         return db
-    bad = quarantine_corrupt(path)
+    bad = quarantine_corrupt(path, stat_fingerprint(path))
     LOG.error("[数据] orders.json 结构非法，已隔离留证：%s；返回空库", bad)
     return {"orders": {}}
 
