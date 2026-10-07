@@ -45,3 +45,4 @@ desktop.ini
 *.launcher
 *.lock
 state.json.bad*
+orders.json

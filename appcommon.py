@@ -152,3 +152,30 @@ def append_history(path, record, keep=500):
                 history = []
         history.append(record)
         atomic_write_json(path, history[-keep:])
+
+
+_ORDERS_LOCK = threading.Lock()
+
+
+def load_orders(path):
+    """orders.json → {"orders": {key: rec}};缺失/损坏返回空库。"""
+    if not os.path.exists(path):
+        return {"orders": {}}
+    try:
+        with open(path, encoding="utf-8") as f:
+            db = json.load(f)
+    except Exception:
+        return {"orders": {}}
+    return db if isinstance(db, dict) and isinstance(db.get("orders"), dict) else {"orders": {}}
+
+
+def upsert_order(path, key, rec):
+    """登记/更新一条订单记录(锁 + 原子写)。"""
+    with _ORDERS_LOCK:
+        db = load_orders(path)
+        rec = dict(rec)
+        rec.setdefault("first_seen", rec.get("last_check") or
+                       time.strftime("%Y-%m-%d %H:%M:%S"))
+        rec["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        db["orders"][key] = rec
+        atomic_write_json(path, db)

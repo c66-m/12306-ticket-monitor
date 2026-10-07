@@ -516,15 +516,27 @@ class TestEngineFlow(TempDirCase):
         self._run((True, "ok 订单号: E123", {"order_no": "E123", "passengers": "张三"}),
                   expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
 
-    def test_dup_marks_dedup_and_stops(self):
-        # 防重命中 + stop_after_order(默认开) → 按「已购得」停止任务
-        self._run((False, "已有订单", {"reason": "dup", "order_no": "E9"}),
-                  expect_status="success", expect_dedup="ACCOUNT_DUP")
+    def test_dup_unpaid_stops(self):
+        # 官方核验=待支付:记 ACCOUNT_DUP 并按 stop_after_order 停止
+        with mock.patch.object(engine_mod.order_mod, "classify_order_status",
+                               return_value=("unpaid", "E9", "未支付")) as mq:
+            e = self._run((False, "已有订单", {"reason": "dup"}),
+                          expect_status="success", expect_dedup="ACCOUNT_DUP")
+        self.assertEqual(mq.call_count, 1)
 
-    def test_dup_keeps_monitoring_without_stop(self):
-        self._run((False, "已有订单", {"reason": "dup"}),
-                  expect_status="monitoring", expect_dedup="ACCOUNT_DUP",
-                  stop_after_order=False)
+    def test_dup_cancelled_clears_and_keeps_monitoring(self):
+        # 官方核验=已取消:清除本地防重记录,允许重新下单,任务继续监控
+        with mock.patch.object(engine_mod.order_mod, "classify_order_status",
+                               return_value=("cancelled", "E9", "已取消")):
+            e = self._run((False, "已有订单", {"reason": "dup"}),
+                          expect_status="monitoring")
+        self.assertNotIn("ACCOUNT_DUP", set(e.state["dedup"].values()))
+
+    def test_dup_paid_stops_as_success(self):
+        with mock.patch.object(engine_mod.order_mod, "classify_order_status",
+                               return_value=("paid", "E9", "已支付")):
+            self._run((False, "已有订单", {"reason": "dup"}),
+                      expect_status="success", expect_dedup="SUBMITTED")
 
     def test_seat_unavailable_permanent_skip(self):
         self._run((False, "网页端不提供席别 硬座", {"reason": "seat_unavailable"}),

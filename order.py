@@ -112,6 +112,39 @@ def save_session(session, cookie_path=None):
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 
 
+def classify_order_status(date, train, passenger_names, session=None):
+    """12306 官方接口订单状态分类(唯一事实来源,只读接口)。
+
+    返回 (分类, 订单号, 原文状态):分类 ∈ paid(已支付)/unpaid(待支付)/
+    cancelled(已取消)/none(未找到)/error(查询失败)。按 车次+乘车日期+
+    乘车人交集 匹配订单。"""
+    try:
+        sess = session or session_from_browser_state()
+    except Exception as e:
+        return "error", "", "官方订单查询失败: %s" % e
+    try:
+        orders = check_existing_orders(sess, date)
+    except Exception as e:
+        return "error", "", "官方订单查询异常: %s" % e
+    want = set(passenger_names or [])
+    for o in orders:
+        if (o.get("train") or "") != (train or "") or (o.get("date") or "")[:10] != (date or "")[:10]:
+            continue
+        pax = set(o.get("passengers") or [])
+        if passenger_names and pax and not (pax & want):
+            continue
+        st = o.get("status") or ""
+        ono = o.get("order_no", "")
+        if "取消" in st:
+            return "cancelled", ono, st
+        if o.get("_no_complete") or "未支付" in st or "未完成" in st:
+            return "unpaid", ono, st
+        if "支付" in st:
+            return "paid", ono, st
+        return "unknown", ono, st
+    return "none", "", "官方订单列表(未完成+该日历史)中未找到 %s %s" % (train, date)
+
+
 def session_from_browser_state(state_path=None):
     """从 browser_order 的 .browser_state.json Cookie 构造 requests 会话。
 
@@ -343,7 +376,9 @@ def check_existing_orders(session, target_date):
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
                          data={"_json_att": ""}, timeout=15)
         for item in ((r.json().get("data") or {}).get("orderDBList") or []):
-            orders.append(_normalize_order_item(item, "未完成/未支付"))
+            it = _normalize_order_item(item, "未完成/未支付")
+            it["_no_complete"] = True
+            orders.append(it)
     except Exception:
         pass
     # 已完成（历史）订单：按目标日期窗口查询

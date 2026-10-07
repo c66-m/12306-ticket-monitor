@@ -542,24 +542,54 @@ class MonitorEngine(object):
                             self.set_task_status(task, "monitoring", "下单成功，恢复正常监控")
                         return True, False  # 本轮不再继续（避免同轮重复下单）
                     elif result_msg == "dup":
-                        self.state["dedup"][key] = "ACCOUNT_DUP"
-                        self._save_state()
+                        # 本地记录仅作线索:以 12306 官方接口的订单状态为准决策
+                        cls, ono, raw = order_mod.classify_order_status(
+                            date, train_code, task.get("passenger_names") or [])
+                        okey = "%s|%s" % (date, train_code)
+                        LOG.info("[防重核查] 任务「%s」%s %s 官方查询结果=%s %s",
+                                 name, date, train_code, cls,
+                                 ("订单号 %s,官方状态「%s」" % (ono, raw)) if ono else raw)
+                        decision = {"unpaid": "待支付:任务停止,请尽快支付",
+                                    "paid": "已支付:判定为已购得,任务停止",
+                                    "cancelled": "已取消:清除本地防重记录,允许重新下单",
+                                    "none": "官方无此订单:清除本地记录,允许重新下单",
+                                    "unknown": "官方状态不明确:保留本地记录,下轮再核",
+                                    "error": "官方查询失败:保留本地记录,下轮再核"}[cls]
+                        appcommon.upsert_order(
+                            os.path.join(HERE, "orders.json"), okey,
+                            {"order_no": ono, "train": train_code, "date": date,
+                             "from": info["from_name"], "to": info["to_name"],
+                             "seat": seat_name, "passengers": p_names,
+                             "official_status": raw, "classify": cls,
+                             "decision": decision, "source": "engine"})
                         self._append_history({
                             "time": self._now(), "task": name, "result": "dup",
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
-                            "passengers": p_names,
-                            "order_no": (extra or {}).get("order_no", ""),
-                            "message": "账号已有相同行程订单，防重复跳过", "notify": "未通知",
+                            "passengers": p_names, "order_no": ono,
+                            "message": "官方核验:%s(%s)。决策:%s" % (raw or cls, cls, decision),
+                            "notify": "未通知",
                         })
-                        LOG.info("[防重] 任务「%s」账号已有相同行程订单，跳过", name)
-                        if bool(task.get("stop_after_order", True)):
-                            # 票已到手(未支付订单在账):继续监控可能因其它席别
-                            # 命中而买第二张——按 stop_after_order 语义停止任务
+                        LOG.info("[防重决策] 任务「%s」%s", name, decision)
+                        if cls == "paid":
+                            self.state["dedup"][key] = "SUBMITTED"
+                            self._save_state()
                             self.set_task_status(task, "success",
-                                "账号已有相同行程订单（视为已购得），任务停止；请尽快支付")
+                                                 "官方确认已支付,订单 %s" % (ono or "未知"))
                             return True, False
-                        continue
+                        if cls == "unpaid":
+                            self.state["dedup"][key] = "ACCOUNT_DUP"
+                            self._save_state()
+                            if bool(task.get("stop_after_order", True)):
+                                self.set_task_status(task, "success",
+                                    "存在待支付订单 %s——请尽快支付" % (ono or "未知"))
+                                return True, False
+                            continue
+                        if cls in ("cancelled", "none"):
+                            self.state["dedup"].pop(key, None)
+                            self._save_state()
+                            continue
+                        continue  # unknown/error:保留本地记录,下轮再核
                     else:
                         msg = (extra or {}).get("msg", "")
                         if (extra or {}).get("reason") == "ambiguous":
@@ -794,6 +824,30 @@ class MonitorEngine(object):
         """主循环。stop_event: threading.Event，置位后本轮结束即优雅退出（GUI 内嵌用）。"""
         LOG.info("=" * 64)
         LOG.info("监控引擎启动")
+        # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核
+        try:
+            op = os.path.join(HERE, "orders.json")
+            odb = appcommon.load_orders(op)
+            for okey, rec in (odb.get("orders") or {}).items():
+                if rec.get("classify") != "unpaid":
+                    continue
+                LOG.info("[订单恢复] 待支付订单 %s %s %s(订单号 %s)——重新核验官方状态",
+                         rec.get("train"), rec.get("date"), rec.get("seat"), rec.get("order_no"))
+                cls, ono, raw = order_mod.classify_order_status(
+                    rec.get("date"), rec.get("train"), rec.get("passengers"))
+                rec.update({"classify": cls, "official_status": raw,
+                            "order_no": ono or rec.get("order_no"),
+                            "decision": "启动复核:%s" % cls})
+                appcommon.upsert_order(op, okey, rec)
+                LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
+                if cls == "cancelled":
+                    for dk in [k for k in self.state.get("dedup", {})
+                               if rec.get("date") in k and rec.get("train") in k]:
+                        self.state["dedup"].pop(dk, None)
+                    self._save_state()
+                    LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
+        except Exception as e:
+            LOG.warning("[订单恢复] 未完成订单上下文恢复失败(不影响监控): %s", e)
         active_tasks = [t for t in self.tasks
                         if self.task_status(t) in ACTIVE_STATUSES]
         for t in self.tasks:
