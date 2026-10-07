@@ -477,6 +477,38 @@ def _goto_and_query(page, info, date, want_hit=True, timeout=20000, wait_code=No
         return False
 
 
+def _slide_up(page):
+    """当前页面是否有可见的滑块验证框。返回非空列表表示有（取证用）。"""
+    try:
+        return page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                  '#slide_passcode, .nc-container, .yzm, #randCodeForm_id'))
+                  .filter(e => e.getBoundingClientRect().width > 0
+                            && getComputedStyle(e).display !== 'none')
+                  .map(e => e.id || e.className)""")
+    except Exception:
+        return []
+
+
+def _wait_slide_gone(page, sec):
+    """等用户在浏览器窗口手动完成滑块（脚本不绕过验证码）。
+
+    浏览器和锁都保持原状。成功返回实际等待的秒数（float），超时返回 False。
+    调用方必须用返回值补偿业务倒计时——滑块是用户手动完成的，这段时间
+    不应消耗「确认窗 15 秒」或「结果等待」倒计时（Task 42）：确认窗循环在
+    滑块消失后重置 t_confirm，结果等待循环 deadline += elapsed。
+    """
+    t_slide = time.time()
+    while time.time() - t_slide < sec:
+        page.wait_for_timeout(500)
+        try:
+            if not _slide_up(page):
+                return time.time() - t_slide
+        except Exception:
+            return time.time() - t_slide
+    return False
+
+
 def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 headless=False, verify_timeout=90, purpose="ADULT", warm=None, tm=None,
                 alias_name=None, purpose_map=None):
@@ -858,17 +890,6 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 except Exception:
                     return {"found": False, "cls": ""}
 
-            def _slide_up():
-                try:
-                    return page.evaluate(
-                        """() => Array.from(document.querySelectorAll(
-                              '#slide_passcode, .nc-container, .yzm, #randCodeForm_id'))
-                              .filter(e => e.getBoundingClientRect().width > 0
-                                        && getComputedStyle(e).display !== 'none')
-                              .map(e => e.id || e.className)""")
-                except Exception:
-                    return []
-
             def _visible_ok_btns():
                 try:
                     return page.eval_on_selector_all(
@@ -879,19 +900,6 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                                           txt: (e.innerText || '').trim().slice(0, 12)}))""")
                 except Exception:
                     return []
-
-            def _wait_slide_gone(sec):
-                """等用户在浏览器窗口手动完成滑块（脚本不绕过验证码）。
-                浏览器和锁都保持原状；返回 False 表示超时。"""
-                t_slide = time.time()
-                while time.time() - t_slide < sec:
-                    page.wait_for_timeout(500)
-                    try:
-                        if not _slide_up():
-                            return True
-                    except Exception:
-                        return True
-                return False
 
             clicked = False
             captcha_waited = False
@@ -950,14 +958,20 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         time.time() - t_confirm))
                     clicked = True
                     break
-                if _slide_up():
+                if _slide_up(page):
                     # 浏览器和锁都保持原状等用户完成滑块；此前直接返回，
                     # 毫秒级关窗让"请手动完成滑块"根本做不到
                     _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
-                    if not _wait_slide_gone(_SLIDE_WAIT_SEC):
+                    slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC)
+                    if slide_elapsed is False:
                         return (False, "滑块验证等待超时（%d 秒），本次下单中止" % _SLIDE_WAIT_SEC,
                                 {"need_captcha": True})
-                    _log("  [浏览器] 滑块已消失，继续等确认按钮…")
+                    # 滑块是用户手动完成的：等待期间不消耗确认窗倒计时，
+                    # 重置计时起点（Task 42；此前倒计时在滑块前定死，回来后
+                    # 按钮永远点不下去，却只记一条普通失败日志）
+                    t_confirm = time.time()
+                    _log("  [浏览器] 滑块已消失（人工等待 %.1fs，不计入确认倒计时），"
+                         "继续等确认按钮…" % slide_elapsed)
                 page.wait_for_timeout(200)
             if not clicked:
                 # 旧版页面回退：只点文本确认为「确定/确认/是/好的」的可见控件；
@@ -992,10 +1006,16 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         if not captcha_waited:
                             captcha_waited = True
                             _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
-                            if not _wait_slide_gone(_SLIDE_WAIT_SEC):
+                            slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC)
+                            if slide_elapsed is False:
                                 return (False, "滑块验证等待超时（%d 秒），请重试" % _SLIDE_WAIT_SEC,
                                         {"need_captcha": True})
-                            _log("  [浏览器] 滑块已消失，继续等出票结果…")
+                            # 滑块是用户手动完成的：等待期间不消耗结果等待倒计时，
+                            # 顺延 deadline（Task 42；此前倒计时在滑块前定死，
+                            # 回来后很快报超时）
+                            deadline += slide_elapsed
+                            _log("  [浏览器] 滑块已消失（人工等待 %.1fs，不计入结果倒计时），"
+                                 "继续等出票结果…" % slide_elapsed)
                         else:
                             return (False, "滑块验证再次出现，已中止（脚本不绕过验证码）",
                                     {"need_captcha": True})
@@ -1047,8 +1067,9 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 # 当普通失败盲目重试（重复下单窗口），标记 ambiguous 交人工核对
                 return (False,
                         "提交后 %d 秒未收到明确结果（当前页：%s）——结果未知，请先到 12306 核对未完成订单"
-                        % (verify_timeout, page.url), {"reason": "ambiguous"})
-            return False, "提交后 %d 秒未收到明确结果（当前页：%s）" % (verify_timeout, page.url), None
+                        % (int(time.time() - t_submit), page.url), {"reason": "ambiguous"})
+            return False, "提交后 %d 秒未收到明确结果（当前页：%s）" % (
+                int(time.time() - t_submit), page.url), None
         except Exception as e:
             mark("result")
             if clicked:

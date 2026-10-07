@@ -2669,6 +2669,255 @@ class TestHistoryAppendConcurrency(TempDirCase):
         self.assertEqual(len(got), 2)
 
 
+class TestSlideWaitDeadlineCompensation(TempDirCase):
+    """Task 42: 滑块等待不消耗业务倒计时。
+
+    旧代码：确认窗 15 秒循环与结果等待 deadline 都在滑块等待之前定死；
+    用户手动过滑块（最长 180 秒）回来后，确认按钮永远点不下去、
+    结果等待很快报超时——日志却是普通失败，误导排查。
+    新行为：_wait_slide_gone 返回实际等待秒数；确认窗循环在滑块消失后
+    重置 t_confirm，结果等待循环 deadline += elapsed。
+    无真实浏览器：用假页面 + 假时钟驱动 _order_impl 全流程。
+    """
+
+    # ---------- 测试替身 ----------
+    class _Clock:
+        """可手动拨动的假时钟，整体替换 browser_order.time。"""
+        def __init__(self):
+            self.now = 1_700_000_000.0
+
+        def time(self):
+            return self.now
+
+        def sleep(self, s):
+            self.now += s
+
+        def perf_counter(self):
+            return self.now
+
+        def strftime(self, fmt, t=None):
+            return time.strftime(
+                fmt, time.localtime(self.now if t is None else t))
+
+        def localtime(self, t=None):
+            return time.localtime(self.now if t is None else t)
+
+    class _Locator:
+        def __init__(self, count=0, visible=False, evaluate_result=None):
+            self._count = count
+            self._visible = visible
+            self._evaluate_result = evaluate_result
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return self._count
+
+        def is_visible(self):
+            return self._visible
+
+        def evaluate(self, js):
+            return self._evaluate_result
+
+    class _Page:
+        """按脚本走完「确认窗→结果等待」的假页面。"""
+        INIT_URL = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+        PAY_URL = "https://kyfw.12306.cn/otn/payOrder/init?sequence_no=E123"
+
+        def __init__(self, clock):
+            self._clock = clock
+            self.qr_submit_clicked = False
+            self.submit_order_clicked = False
+            # 确认窗第 1 轮：倒计时未结束(btn92)；滑块回来后：已启用(btn92s)
+            self._qr_states = [
+                {"found": True, "cls": "btn92", "shown": True},
+                {"found": True, "cls": "btn92s", "shown": True},
+            ]
+            self._slide_ups = [["nc-container"], []]  # 确认窗里滑块出现一次
+            self._result_slide_seen = False  # 结果等待里滑块也只出现一次
+            self._result_t0 = None  # 结果循环第一次读 url 时打点
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def wait_for_timeout(self, ms):
+            self._clock.now += ms / 1000.0
+
+        def wait_for_url(self, *a, **k):
+            pass
+
+        def wait_for_selector(self, *a, **k):
+            pass
+
+        def wait_for_function(self, *a, **k):
+            pass
+
+        def locator(self, sel):
+            if sel == "#slide_passcode":
+                if self._result_slide_seen:
+                    return TestSlideWaitDeadlineCompensation._Locator()
+                self._result_slide_seen = True
+                return TestSlideWaitDeadlineCompensation._Locator(
+                    count=1, visible=True)
+            if sel == "#seatType_1":
+                return TestSlideWaitDeadlineCompensation._Locator(
+                    count=1, visible=True,
+                    evaluate_result=[{"v": "WZ", "t": "无座"}])
+            return TestSlideWaitDeadlineCompensation._Locator()
+
+        def eval_on_selector_all(self, sel, js):
+            if sel.startswith("#normal_passenger_id"):
+                return [{"id": "p1", "text": "张三"}]
+            return []  # 旧确认控件回退：没有可点的
+
+        @property
+        def url(self):
+            if self._result_t0 is None:
+                self._result_t0 = self._clock.now
+                return self.INIT_URL
+            # 出票结果在结果等待滑块点之后 +80s 才出现：旧 deadline 在滑块后
+            # 只剩约 30s，等不到；延长后的 deadline（剩约 90s）才等得到
+            if self._clock.now - self._result_t0 >= 80:
+                return self.PAY_URL
+            return self.INIT_URL
+
+        def evaluate(self, js, arg=None):
+            if "dialog_xsertcj" in js:
+                return None  # 无学生票询问弹窗
+            if "checkticketinfo_id" in js:
+                return ""  # 核对窗原文为空：跳过席别对账分支
+            if "qr_submit_id" in js:
+                if "click" in js:
+                    self.qr_submit_clicked = True
+                    return None
+                if self._qr_states:
+                    return self._qr_states.pop(0)
+                return {"found": True, "cls": "btn92s", "shown": True}
+            if "queryLeftTable" in js:
+                return True  # 点中预订
+            if "slide_passcode" in js and "nc-container" in js:
+                if self._slide_ups:
+                    return self._slide_ups.pop(0)
+                return []
+            if "ticketType_" in js:
+                return {"before": ["1"], "after": ["1"], "map": {}}
+            if "seatType_1" in js:
+                return {}
+            if "tt: String" in js:
+                return [{"name": "张三", "tt": "1"}]
+            if "limit_tickets" in js:
+                return [{"name": "张三", "seat": "WZ", "ticket_type": "1"}]
+            if js.startswith("(id) =>"):
+                return None  # 勾选乘车人 click
+            if js.startswith("(ids) =>"):
+                return []  # 勾选回读：全部已勾上
+            if "document.body" in js:
+                return ""
+            if "#submitOrder_id" in js:
+                self.submit_order_clicked = True
+                return None
+            raise AssertionError("假页面遇到未预期的 evaluate: %r" % js[:80])
+
+    class _Warm:
+        def __init__(self, page):
+            self.p = object()
+            self.ctx = object()
+            self.page = page
+
+        def usable(self):
+            return True
+
+        def refresh(self, info):
+            pass
+
+    class _SlidePage:
+        """只测 _wait_slide_gone 合约的极简页面。"""
+        def __init__(self, clock, present):
+            self._clock = clock
+            self._present = present
+
+        def wait_for_timeout(self, ms):
+            self._clock.now += ms / 1000.0
+
+        def evaluate(self, js, arg=None):
+            return ["nc-container"] if self._present else []
+
+    # ---------- 准备 ----------
+    def _stub_playwright(self):
+        import sys
+        import types as _types
+        pw = _types.ModuleType("playwright")
+        pw_sync = _types.ModuleType("playwright.sync_api")
+
+        def _no_playwright():
+            raise AssertionError("预热路径不应启动 playwright")
+
+        pw_sync.sync_playwright = _no_playwright
+        pw.sync_api = pw_sync
+        self._pw_mods = {"playwright": pw, "playwright.sync_api": pw_sync}
+        for name, mod in self._pw_mods.items():
+            sys.modules[name] = mod
+        self.addCleanup(self._unstub_playwright)
+
+    def _unstub_playwright(self):
+        import sys
+        for name in self._pw_mods:
+            sys.modules.pop(name, None)
+
+    def _run_order(self):
+        """滑块耗时 60s 的一次完整下单（确认窗 + 结果等待各触发一次滑块）。"""
+        clock = self._Clock()
+        page = self._Page(clock)
+
+        def fake_wait_slide_gone(p, sec):
+            clock.now += 60.0  # 模拟用户手动过滑块花了 60 秒
+            return 60.0
+
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock), \
+             mock.patch.object(browser_order, "_wait_slide_gone",
+                               side_effect=fake_wait_slide_gone):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page))
+        return ok, msg, extra, page
+
+    # ---------- 断言 ----------
+    def test_wait_slide_gone_returns_elapsed(self):
+        # helper 合约：成功返回实际等待秒数（float），超时返回 False
+        clock = self._Clock()
+        with mock.patch.object(browser_order, "time", clock):
+            elapsed = browser_order._wait_slide_gone(
+                self._SlidePage(clock, present=False), 30)
+        self.assertIsInstance(elapsed, float)
+        self.assertAlmostEqual(elapsed, 0.5)
+
+    def test_wait_slide_gone_timeout_is_false(self):
+        clock = self._Clock()
+        with mock.patch.object(browser_order, "time", clock):
+            got = browser_order._wait_slide_gone(
+                self._SlidePage(clock, present=True), 1)
+        self.assertIs(got, False)
+
+    def test_confirm_button_still_clickable_after_slide(self):
+        # 滑块耗时 60s：旧代码确认窗 15s 倒计时被吃光，qr_submit 永远点不下去
+        ok, msg, extra, page = self._run_order()
+        self.assertTrue(
+            page.qr_submit_clicked,
+            "滑块等待 60s 后确认按钮仍应可点击（旧代码：确认窗倒计时被吃光）")
+
+    def test_result_deadline_extended_after_slide(self):
+        # 结果页在结果等待滑块点之后 +80s 才出现：旧 deadline 在滑块后只剩
+        # 约 30s 会超时，只有 deadline += 60s 延长后（剩约 90s）才能拿到结果
+        ok, msg, extra, page = self._run_order()
+        self.assertTrue(ok, "结果等待应被滑块耗时顺延，实际返回：%r" % (msg,))
+        self.assertIn("已提交订单", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
