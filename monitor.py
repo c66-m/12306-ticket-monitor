@@ -416,8 +416,8 @@ def menu_passengers():
             for code, label in passengers_mod.ID_TYPE_NAMES.items():
                 print("    {0}. {1}".format(code, label))
             id_type = read("  证件类型代码（回车=1 二代身份证）：", "1")
-            id_no = read("  证件号码：", "")
-            mobile = read("  手机号（可空）：", "")
+            id_no = read("  证件号码：", "") or ""
+            mobile = read("  手机号（可空）：", "") or ""
             is_default = ask_yes_no("  设为默认乘车人？", "n")
             is_adult = ask_yes_no("  是否成人？", "y")
             passengers.append({
@@ -433,9 +433,9 @@ def menu_passengers():
                 raise KeyboardInterrupt
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 p = passengers[int(raw) - 1]
-                name = read("  姓名（%s）：" % p.get("name"), p.get("name"))
+                name = read("  姓名（%s）：" % p.get("name"), p.get("name")) or p.get("name")
                 id_no = read("  证件号码（保持不填=不变）：", "") or p.get("id_no")
-                mobile = read("  手机号：", p.get("mobile"))
+                mobile = read("  手机号：", p.get("mobile")) or p.get("mobile")
                 is_default = ask_yes_no(
                     "  设为默认乘车人？(当前：%s)" % ("是" if p.get("is_default") else "否"),
                     "y" if p.get("is_default") else "n")
@@ -516,8 +516,8 @@ def menu_notify():
         # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
         raise KeyboardInterrupt
     email["smtp_port"] = int(port) if port.isdigit() else 465
-    email["username"] = read("  发件邮箱：", email.get("username"))
-    email["password"] = read("  邮箱授权码（非登录密码）：", email.get("password"))
+    email["username"] = read("  发件邮箱：", email.get("username")) or email.get("username")
+    email["password"] = read("  邮箱授权码（非登录密码）：", email.get("password")) or email.get("password")
     email["from"] = read("  发件人地址（回车=发件邮箱）：", "") or email.get("username")
     to_raw = read("  收件人（多个用逗号分隔）：", ",".join(email.get("to") or []))
     if to_raw is None:

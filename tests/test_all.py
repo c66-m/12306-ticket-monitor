@@ -1550,6 +1550,90 @@ class TestMonitorInterruptRound3(TempDirCase):
         self._run_menu(["2", "9", "0"])
 
 
+class TestMonitorInterruptRound4(TempDirCase):
+    """Task 28 round 4 (P1): read() 在 Ctrl+C/EOF 时返回 None（绕过 default），
+    6 处把 None 直接存入乘车人/通知数据。修法：`or <原值>` 兜底，
+    与本文件 :434（id_no）、:503（smtp_host）、:512（from）既有惯例一致。
+    read() 回车走 default、Ctrl+C/EOF 才返回 None——兜底只改变后者，正常路径零漂移。"""
+
+    SAMPLE = [{"name": "张三", "id_type_code": "1", "id_no": "110101199001011234",
+               "mobile": "13800138000", "is_default": False, "is_adult": True}]
+
+    def _run_passengers(self, reads):
+        import monitor as monitor_mod
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = [dict(self.SAMPLE[0])]
+        with mock.patch.object(monitor_mod, "passengers_mod", pm), \
+             mock.patch.object(monitor_mod, "read", side_effect=list(reads)):
+            monitor_mod.menu_passengers()
+        return pm
+
+    def test_edit_name_none_keeps_original(self):
+        # 编辑时在"姓名"处 Ctrl+C：旧代码存 name=None；新代码保留原名
+        pm = self._run_passengers(["2", "1", None, "", "13800138000", "y", "y", "0"])
+        saved = pm.save_passengers.call_args[0][0]
+        self.assertEqual(saved[0]["name"], "张三")
+
+    def test_edit_mobile_none_keeps_original(self):
+        # 编辑时在"手机号"处 Ctrl+C：旧代码存 mobile=None；新代码保留原号
+        pm = self._run_passengers(["2", "1", "张三", "", None, "y", "y", "0"])
+        saved = pm.save_passengers.call_args[0][0]
+        self.assertEqual(saved[0]["mobile"], "13800138000")
+
+    def test_add_idno_mobile_none_stored_empty(self):
+        # 添加时在证件号/手机号处 Ctrl+C：旧代码存 None；新代码按 default 存 ""
+        pm = self._run_passengers(["1", "李四", "1", None, None, "y", "y", "0"])
+        saved = pm.save_passengers.call_args[0][0]
+        new = saved[1]  # append 的新记录；saved[0] 是原有样本
+        self.assertEqual(new["name"], "李四")
+        self.assertEqual(new["id_no"], "")
+        self.assertEqual(new["mobile"], "")
+
+    def test_notify_username_password_none_keep_original(self):
+        # 通知设置在发件邮箱/授权码处 Ctrl+C：旧代码存 None；新代码保留原值
+        import monitor as monitor_mod
+        cfg = {"notify": {"email": {"enabled": True, "smtp_host": "smtp.qq.com",
+                "smtp_port": 465, "username": "old@x.com", "password": "oldsecret",
+                "from": "", "to": []}}}
+        saved_cfg = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value=cfg), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved_cfg.update(c)), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "465", None, None, "", "a@b.com", "n"]):
+            monitor_mod.menu_notify()
+        email = saved_cfg["notify"]["email"]
+        self.assertEqual(email["username"], "old@x.com")
+        self.assertEqual(email["password"], "oldsecret")
+
+    def test_corrupt_name_none_crashes_task_join(self):
+        # 危害演示（诚实声明：新旧代码行为一致，非红绿测试）——pre-fix 的
+        # menu_passengers 会把 name=None 存盘；带着这条脏记录进 menu_create_task
+        # 并选中该乘车人，末尾 "、".join(passenger_names) 抛 TypeError。
+        # 本测试证明旧代码存 None 的危害真实；上面的修后测试证明新代码不再产生脏记录。
+        import monitor as monitor_mod
+        corrupt = [dict(self.SAMPLE[0])]
+        corrupt[0]["name"] = None  # pre-fix 的 menu_passengers 会存下这种脏记录
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = corrupt
+        with mock.patch.object(monitor_mod, "passengers_mod", pm), \
+             mock.patch.object(monitor_mod, "pick_station", side_effect=["北京", "上海"]), \
+             mock.patch.object(monitor_mod, "input_dates",
+                               return_value=(["2026-10-09"], [])), \
+             mock.patch.object(monitor_mod, "ticket") as mock_ticket, \
+             mock.patch.object(monitor_mod, "pick_multi", return_value=["二等座"]), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "1", "5", "n", "n", ""]), \
+             mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "save_config"):
+            mock_ticket.load_station_map.return_value = (
+                {"北京": "BJP", "上海": "SHH"}, {"BJP": "北京", "SHH": "上海"})
+            mock_ticket.query_tickets.side_effect = Exception("offline")
+            with self.assertRaises(TypeError):
+                monitor_mod.menu_create_task()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
