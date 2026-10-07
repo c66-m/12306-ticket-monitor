@@ -135,3 +135,20 @@ def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
     """原子写 state.json（见 atomic_write_json）。"""
     atomic_write_json(path, state, tmp_kind=tmp_kind,
                       fallback_direct=fallback_direct)
+
+
+_HIST_LOCK = threading.Lock()
+
+
+def append_history(path, record, keep=500):
+    """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。"""
+    with _HIST_LOCK:
+        history = []
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+        history.append(record)
+        atomic_write_json(path, history[-keep:])

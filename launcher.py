@@ -593,6 +593,19 @@ class Grabber(threading.Thread):
                     if ok:
                         self.result = (True, msg)
                         log("[抢到] %s" % msg)
+                        try:
+                            order_no = (extra or {}).get("order_no") or ""
+                            appcommon.append_history(
+                                os.path.join(HERE, "order_history.json"),
+                                {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "task": lc.get("name") or "启动器抢票",
+                                 "result": "success", "train": info["train_code"],
+                                 "date": date, "from": info["from_name"],
+                                 "to": info["to_name"], "seat": seat,
+                                 "passengers": names, "order_no": order_no,
+                                 "message": msg, "notify": "已通知(启动器)"})
+                        except Exception as e:
+                            log("[提醒] 购票历史写入失败：%s" % e)
                         self._notify_success(info, seat, msg)
                         return
                     extra = extra or {}
@@ -604,6 +617,18 @@ class Grabber(threading.Thread):
                         log("[错误] %s（下单返回：%s）" % (self.result[1], msg))
                         return
                     if extra.get("reason") == "dup":
+                        try:
+                            appcommon.append_history(
+                                os.path.join(HERE, "order_history.json"),
+                                {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "task": lc.get("name") or "启动器抢票",
+                                 "result": "dup", "train": info["train_code"],
+                                 "date": date, "from": info["from_name"],
+                                 "to": info["to_name"], "seat": seat,
+                                 "passengers": names, "order_no": "",
+                                 "message": msg, "notify": ""})
+                        except Exception:
+                            pass
                         if extra.get("dup_kind") == "行程冲突":
                             # 行程冲突 ≠ 本行程已有订单：别报"票已到手"误导去支付
                             self.result = (False, "12306 提示行程冲突——可能是其它行程的未支付订单挡路，"

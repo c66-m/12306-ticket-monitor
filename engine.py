@@ -553,6 +553,12 @@ class MonitorEngine(object):
                             "message": "账号已有相同行程订单，防重复跳过", "notify": "未通知",
                         })
                         LOG.info("[防重] 任务「%s」账号已有相同行程订单，跳过", name)
+                        if bool(task.get("stop_after_order", True)):
+                            # 票已到手(未支付订单在账):继续监控可能因其它席别
+                            # 命中而买第二张——按 stop_after_order 语义停止任务
+                            self.set_task_status(task, "success",
+                                "账号已有相同行程订单（视为已购得），任务停止；请尽快支付")
+                            return True, False
                         continue
                     else:
                         msg = (extra or {}).get("msg", "")
