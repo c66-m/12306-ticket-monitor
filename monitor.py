@@ -147,14 +147,20 @@ def input_dates():
 def ask_priority():
     while True:
         raw = read("  任务优先级 1~10（数字越大越优先，默认 5）：", "5")
+        if raw is None:
+            # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+            raise KeyboardInterrupt
         if raw.isdigit() and 1 <= int(raw) <= 10:
             return int(raw)
         print("  请输入 1~10 的整数。")
 
 
 def ask_yes_no(prompt, default="y"):
-    v = read(prompt + " (y/n，回车=%s)：" % default, default).lower()
-    return v in ("y", "yes", "是")
+    v = read(prompt + " (y/n，回车=%s)：" % default, default)
+    if v is None:
+        # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
+        raise KeyboardInterrupt
+    return v.lower() in ("y", "yes", "是")
 
 
 # ----------------------------- 菜单 1：创建任务 -----------------------------

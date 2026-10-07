@@ -1416,5 +1416,44 @@ def _mk_logger(name, handler):
     return lg, handler
 
 
+class TestMonitorInterrupt(TempDirCase):
+    """Task 28 (P1): monitor 交互输入 Ctrl+C/EOF 时 read 返回 None，
+    ask_yes_no / ask_priority 不得抛 AttributeError，应抛 KeyboardInterrupt
+    让 main_menu 的已有处理接住（"已中断，返回主菜单。"），不打 traceback。"""
+
+    def test_ask_yes_no_none_raises_keyboard_interrupt(self):
+        # Ctrl+C/EOF：旧代码 read(...).lower() 抛 AttributeError 崩
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "read", return_value=None):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor_mod.ask_yes_no("  测试？")
+
+    def test_ask_priority_none_raises_keyboard_interrupt(self):
+        # 同上：旧代码 raw.isdigit() 抛 AttributeError 崩
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "read", return_value=None):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor_mod.ask_priority()
+
+    def test_ask_yes_no_normal_inputs_unchanged(self):
+        # 回归 pin：正常输入行为不变（旧代码即通过）
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "read", return_value="y"):
+            self.assertTrue(monitor_mod.ask_yes_no("  测试？"))
+        with mock.patch.object(monitor_mod, "read", return_value="n"):
+            self.assertFalse(monitor_mod.ask_yes_no("  测试？", "y"))
+        with mock.patch.object(monitor_mod, "read", return_value="是"):
+            self.assertTrue(monitor_mod.ask_yes_no("  测试？", "n"))
+
+    def test_ask_priority_normal_inputs_unchanged(self):
+        # 回归 pin：正常输入行为不变（旧代码即通过）
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "read", return_value="7"):
+            self.assertEqual(monitor_mod.ask_priority(), 7)
+        with mock.patch.object(monitor_mod, "read", return_value="5"):
+            self.assertEqual(monitor_mod.ask_priority(), 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
