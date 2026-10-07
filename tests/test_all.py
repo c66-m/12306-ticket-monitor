@@ -517,24 +517,24 @@ class TestEngineFlow(TempDirCase):
                   expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
 
     def test_dup_unpaid_stops(self):
-        # 官方核验=待支付:记 ACCOUNT_DUP 并按 stop_after_order 停止
-        with mock.patch.object(engine_mod.order_mod, "classify_order_status",
-                               return_value=("unpaid", "E9", "未支付")) as mq:
+        # 官方核验=待支付且非本次提交(更早旧单):记 ACCOUNT_DUP 并按 stop_after_order 停止
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付", None)) as mq:
             e = self._run((False, "已有订单", {"reason": "dup"}),
                           expect_status="success", expect_dedup="ACCOUNT_DUP")
         self.assertEqual(mq.call_count, 1)
 
     def test_dup_cancelled_clears_and_keeps_monitoring(self):
         # 官方核验=已取消:清除本地防重记录,允许重新下单,任务继续监控
-        with mock.patch.object(engine_mod.order_mod, "classify_order_status",
-                               return_value=("cancelled", "E9", "已取消")):
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("cancelled", "E9", "已取消", None)):
             e = self._run((False, "已有订单", {"reason": "dup"}),
                           expect_status="monitoring")
         self.assertNotIn("ACCOUNT_DUP", set(e.state["dedup"].values()))
 
     def test_dup_paid_stops_as_success(self):
-        with mock.patch.object(engine_mod.order_mod, "classify_order_status",
-                               return_value=("paid", "E9", "已支付")):
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("paid", "E9", "已支付", None)):
             self._run((False, "已有订单", {"reason": "dup"}),
                       expect_status="success", expect_dedup="SUBMITTED")
 
@@ -549,10 +549,38 @@ class TestEngineFlow(TempDirCase):
         self.assertTrue(e.state["retry"])
 
     def test_ambiguous_stops_task(self):
-        e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
-                      expect_status="failed")
+        # 结果未知且官方回读失败(查不到) → 保守停任务交人工
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("error", "", "官方订单查询失败", None)):
+            e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
+                          expect_status="failed")
         hist = json.load(open(e.history_path, encoding="utf-8"))
         self.assertEqual(hist[-1]["result"], "ambiguous")
+
+    def test_ambiguous_recent_unpaid_is_success(self):
+        # 结果未知，回读发现「未支付且下单时间=本次」→ 判定本次提交成功
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付",
+                                             {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
+            e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
+                          expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
+        hist = json.load(open(e.history_path, encoding="utf-8"))
+        self.assertEqual(hist[-1]["result"], "success")
+
+    def test_ambiguous_none_keeps_monitoring(self):
+        # 结果未知但官方确认无此订单 → 安全重试，任务继续监控、不写历史
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("none", "", "未找到", None)):
+            self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
+                      expect_status="monitoring", expect_history=False)
+
+    def test_dup_recent_unpaid_is_success(self):
+        # 防重复命中但回读发现「未支付且下单时间=本次」→ 本次已提交成功
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付",
+                                             {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
+            self._run((False, "已有订单", {"reason": "dup"}),
+                      expect_status="success", expect_dedup="SUBMITTED")
 
     def test_dedup_prevents_reorder(self):
         """防重第二层：已 SUBMITTED 的组合再次命中直接跳过，不再调下单。"""

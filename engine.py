@@ -526,7 +526,8 @@ class MonitorEngine(object):
                         retry_map.pop(key, None)
                         if self.task_status(task) == "retrying":
                             self.set_task_status(task, "monitoring", "冷却结束，恢复下单尝试")
-                    # 自动下单
+                    # 自动下单（记录本次发起时刻，供提交后结果未知/防重复时做时间戳归因）
+                    attempt_ts = time.time()
                     result_msg, extra = self._order_once(task, info, date, seat_name)
                     if result_msg == "ok":
                         retry_map.pop(key, None)
@@ -543,8 +544,9 @@ class MonitorEngine(object):
                         return True, False  # 本轮不再继续（避免同轮重复下单）
                     elif result_msg == "dup":
                         # 本地记录仅作线索:以 12306 官方接口的订单状态为准决策
-                        cls, ono, raw = order_mod.classify_order_status(
-                            date, train_code, task.get("passenger_names") or [])
+                        cls, ono, raw, recent = order_mod.classify_with_time(
+                            date, train_code, task.get("passenger_names") or [],
+                            not_before_ts=attempt_ts)
                         okey = "%s|%s" % (date, train_code)
                         LOG.info("[防重核查] 任务「%s」%s %s 官方查询结果=%s %s",
                                  name, date, train_code, cls,
@@ -579,12 +581,24 @@ class MonitorEngine(object):
                                                  "官方确认已支付,订单 %s" % (ono or "未知"))
                             return True, False
                         if cls == "unpaid":
-                            self.state["dedup"][key] = "ACCOUNT_DUP"
-                            self._save_state()
-                            if bool(task.get("stop_after_order", True)):
-                                self.set_task_status(task, "success",
-                                    "存在待支付订单 %s——请尽快支付" % (ono or "未知"))
-                                return True, False
+                            if recent:
+                                # 下单时间落在本次提交窗口内 → 本次已提交成功
+                                self.state["dedup"][key] = "SUBMITTED"
+                                self._save_state()
+                                if bool(task.get("stop_after_order", True)):
+                                    self.set_task_status(task, "success",
+                                        "本次已提交订单（未支付），下单时间 %s——请尽快支付"
+                                        % (recent.get("order_time") or "未知"))
+                                    return True, False
+                            else:
+                                # 有该行程未支付订单但下单时间更早 → 更早遗留订单
+                                self.state["dedup"][key] = "ACCOUNT_DUP"
+                                self._save_state()
+                                if bool(task.get("stop_after_order", True)):
+                                    self.set_task_status(task, "success",
+                                        "账号存在该行程更早的未支付订单 %s——请核对后尽快支付"
+                                        % (ono or "未知"))
+                                    return True, False
                             continue
                         if cls in ("cancelled", "none"):
                             self.state["dedup"].pop(key, None)
@@ -597,8 +611,30 @@ class MonitorEngine(object):
                     else:
                         msg = (extra or {}).get("msg", "")
                         if (extra or {}).get("reason") == "ambiguous":
-                            # 提交确认后结果未知：订单可能已在服务端生成，继续自动
-                            # 重试有重复下单风险——停任务交人工核对
+                            # 提交确认后结果未知：先回读官方订单接口做时间戳归因。
+                            # 订单已生成且下单时间对得上=本次成功；确认无订单=安全重试；
+                            # 其余（查不到/更早旧单/其它行程挡路）=保守停任务，防重复下单。
+                            cls, ono, raw, recent = order_mod.classify_with_time(
+                                date, train_code, task.get("passenger_names") or [],
+                                not_before_ts=attempt_ts)
+                            if cls == "unpaid" and recent:
+                                self.state["dedup"][key] = "SUBMITTED"
+                                self._save_state()
+                                self._record_success(
+                                    task, info, date, seat_name,
+                                    {"passengers": "、".join(p_names), "order_no": ono})
+                                self.set_task_status(
+                                    task, "success",
+                                    "本次已提交订单（未支付），下单时间 %s" % (
+                                        recent.get("order_time") or "未知"))
+                                LOG.info("[结果回读] 任务「%s」%s 官方已生成订单 %s（下单时间 %s），判定本次成功",
+                                         name, date, ono, recent.get("order_time") or "未知")
+                                return True, False
+                            if cls in ("none", "cancelled"):
+                                LOG.info("[结果回读] 任务「%s」%s 官方确认无此订单（%s），安全重试",
+                                         name, date, cls)
+                                continue
+                            # unpaid 但时间对不上 / blocked / error / unknown：保守停
                             self.set_task_status(task, "failed",
                                 "订单提交后结果未知——请先到 12306「未支付订单」核对："
                                 "有单就支付/取消，确认无单后再恢复本任务")
@@ -608,7 +644,7 @@ class MonitorEngine(object):
                                 "time": self._now(), "task": name, "result": "ambiguous",
                                 "train": train_code, "date": date, "from": info["from_name"],
                                 "to": info["to_name"], "seat": seat_name,
-                                "passengers": p_names, "order_no": "",
+                                "passengers": p_names, "order_no": ono,
                                 "message": msg, "notify": "",
                             })
                             return True, False

@@ -150,12 +150,58 @@ def classify_order_status(date, train, passenger_names, session=None):
             continue
         st = x.get("status") or ""
         ono = x.get("order_no", "")
-        if "取消" in st:
+        # 票级状态来自 tickets[].ticket_status_name：已退票（含业务流水号）/
+        # 已出站 / 已支付等。退票后可重新购票，故归 cancelled 允许重试。
+        if "退票" in st or "取消" in st:
             return "cancelled", ono, st
-        if "支付" in st:
+        if "出站" in st or "支付" in st or "未出行" in st:
             return "paid", ono, st
         return "unknown", ono, st
     return "none", "", "官方订单列表(未完成+该日历史)中未找到 %s %s" % (train, date)
+
+
+def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, window_sec=180):
+    """时间戳归因：在订单列表里找「本行程 + 下单时间落在本次提交窗口内」的订单。
+
+    not_before_ts 是软件本次发起下单动作的时刻（epoch 秒）。订单的 order_ts 若
+    大于 not_before_ts - window_sec（允许少量时钟/接口延迟），即可判定该订单是
+    本次提交生成的；更早的就是遗留旧订单。返回匹配的订单 dict 或 None。
+    """
+    lo = not_before_ts - window_sec
+    want = set(passenger_names or [])
+    best = None
+    for o in orders:
+        if ((o.get("train") or "") != (train_code or "")
+                or (o.get("date") or "")[:10] != (date or "")[:10]):
+            continue
+        pax = set(o.get("passengers") or [])
+        if want and pax and not (pax & want):
+            continue
+        ts = o.get("order_ts")
+        if ts is None or ts < lo:
+            continue
+        if best is None or ts > best.get("order_ts", 0):
+            best = o
+    return best
+
+
+def classify_with_time(date, train, passenger_names, not_before_ts=None, session=None):
+    """classify_order_status + 下单时间归因。
+
+    返回 (cls, order_no, raw, recent)：前三个与 classify_order_status 完全一致，
+    recent 是「下单时间落在本次提交窗口内」的订单 dict（cls 为 unpaid 时才可能有值，
+    其余情况为 None）。not_before_ts 传 None 时跳过归因，recent 恒为 None。
+    """
+    cls, ono, raw = classify_order_status(date, train, passenger_names, session=session)
+    recent = None
+    if cls == "unpaid" and not_before_ts is not None:
+        try:
+            sess = session or session_from_browser_state()
+            orders = check_existing_orders(sess, date)
+            recent = find_recent_order(orders, date, train, passenger_names, not_before_ts)
+        except Exception:
+            recent = None
+    return cls, ono, raw, recent
 
 
 def session_from_browser_state(state_path=None):
@@ -369,22 +415,75 @@ def _normalize_order_item(item, status):
         name = p.get("passenger_name")
         if name:
             passengers.append(name)
+    # 新接口里乘车人挂在 array_passser_name_page（字符串数组，官方拼写如此）
+    for name in item.get("array_passser_name_page") or []:
+        if name and name not in passengers:
+            passengers.append(name)
     start = item.get("start_train_date_page") or ""
+
+    def _f(v):
+        # 新接口里站名是数组（如 ["长葛"]），老接口是字符串，统一成字符串
+        if isinstance(v, (list, tuple)):
+            return "".join(str(x) for x in v)
+        return v or ""
+
+    # 票状态藏在 tickets[].ticket_status_name（"已出站" / "已退票(业务流水号:...)"），
+    # 比顶层 return_flag/resign_flag 可靠（实测这些 flag 对所有状态都一样）。
+    ticket_status = ""
+    for t in item.get("tickets") or []:
+        sn = (t.get("ticket_status_name") or "").strip()
+        if sn:
+            ticket_status = sn
+            break
+    # order_date 是下单时刻（"YYYY-MM-DD HH:MM:SS"），用于「这笔订单是不是本次
+    # 提交生成的」时间戳归因；解析失败则 order_ts=None，归因时走保守分支。
+    order_date_raw = (item.get("order_date") or "").strip()
+    order_ts = None
+    try:
+        order_ts = time.mktime(time.strptime(order_date_raw[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        order_ts = None
     return {
         "order_no": item.get("sequence_no") or item.get("order_no") or "",
         "train": (item.get("train_code_page") or "").replace(" ", ""),
-        "from": item.get("from_station_name_page") or "",
-        "to": item.get("to_station_name_page") or "",
-        "date": start[:10] if start else (item.get("order_date") or "").replace(" ", "")[:10],
-        "status": status or item.get("order_status_name_cn") or "",
+        "from": _f(item.get("from_station_name_page")),
+        "to": _f(item.get("to_station_name_page")),
+        "date": start[:10] if start else order_date_raw[:10],
+        "status": ticket_status or status or item.get("order_status_name_cn") or "",
         "passengers": passengers,
+        "order_time": order_date_raw[:19] if order_date_raw else "",
+        "order_ts": order_ts,
     }
 
 
+def _query_my_order(session, query_where, start, end, page_size=8):
+    """新版 queryMyOrder（2026-10 实测参数）。query_where: G=未出行, H=历史。
+
+    旧参数集（_json_att + 缺 pageIndex/pageSize/query_where/sequeue_train_name）
+    会拿到 200 空 body，静默失效；缺了新参数一个都不行。
+    注意：H（历史）不接受含今天及未来的日期窗口，会返回空 body；
+    乘车日期已过去的订单用 H 查，未出行的用 G 查。"""
+    data = {"come_from_flag": "my_order", "pageIndex": "0",
+            "pageSize": str(page_size), "query_where": query_where,
+            "queryStartDate": start, "queryEndDate": end,
+            "queryType": "1", "sequeue_train_name": ""}
+    r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrder",
+                     data=data, timeout=15)
+    return ((r.json().get("data") or {}).get("OrderDTODataList") or [])
+
+
 def check_existing_orders(session, target_date):
-    """查询账号中的未完成订单 + 目标日期已完成订单，返回统一订单列表（尽力解析）。"""
+    """查询账号订单（未完成 + 未出行 + 历史），返回统一订单列表（尽力解析）。
+
+    target_date 是乘车日期。三个列表都必须查：已支付的未来票在「未出行」（G），
+    已出行/已退票的在「历史」（H），未支付的独立接口（NoComplete）。"""
     orders = []
-    # 未完成订单（未支付 + 待支付等）
+    today = time.strftime("%Y-%m-%d")
+    t = time.time()
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(t - 86400))
+    back60 = time.strftime("%Y-%m-%d", time.localtime(t - 60 * 86400))
+    ahead60 = time.strftime("%Y-%m-%d", time.localtime(t + 60 * 86400))
+    # 未完成订单（未支付）：不分日期车次，12306 规则是任一未完成订单都会挡新单
     try:
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
                          data={"_json_att": ""}, timeout=15)
@@ -394,15 +493,21 @@ def check_existing_orders(session, target_date):
             orders.append(it)
     except Exception:
         pass
-    # 已完成（历史）订单：按目标日期窗口查询
+    # 未出行（已支付、乘车日期在今天之后）：G 的窗口按下单日期过滤
+    # （实测：G 窗口 10-07~12-06 查不到 9-28 下单的 K225，9-28~9-28 可以），
+    # 故窗口取 [60 天前, 今天]；列表含退票残留，状态看票级字段。
     try:
-        data = {"_json_att": "", "queryType": "1",
-                "queryStartDate": target_date, "queryEndDate": target_date,
-                "come_from_flag": "my_order"}
-        r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrder",
-                         data=data, timeout=15)
-        for item in ((r.json().get("data") or {}).get("orderDBList") or []):
-            orders.append(_normalize_order_item(item, item.get("order_status_name_cn") or "已完成/已支付"))
+        for item in _query_my_order(session, "G", back60, today):
+            orders.append(_normalize_order_item(item, "已支付(未出行)"))
+    except Exception:
+        pass
+    # 历史（乘车日期已过，含已出站/已退票）：H 窗口 EndDate 必须 <= 昨天，
+    # 含今天会整体返回空 body；目标日期在过去时只查当天即可
+    try:
+        h_end = target_date if target_date <= yesterday else yesterday
+        h_start = target_date if target_date <= yesterday else back60
+        for item in _query_my_order(session, "H", h_start, h_end):
+            orders.append(_normalize_order_item(item, "历史订单"))
     except Exception:
         pass
     return orders

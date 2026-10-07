@@ -22,6 +22,13 @@
 - `#submitOrder_id`（DOM click）→ `checkOrderInfo` → `getQueueCount` → 核对窗 `checkticketinfo_id` → `#qr_submit_id` 约 3 秒倒计时（class 从 `btn92` 变 `btn92s` 才可点）→ `confirmSingleForQueue` → `payOrder/init`。
 - 规则：200ms 轮询 `#qr_submit_id` 的 class 含 `btn92s` 再点；等不到就用可见确认控件兜底。`#slide_passcode` 一出现就返回 `need_captcha`，不绕验证码。
 - 取证：点核对窗前抄窗内原文（`#checkticketinfo_id / #lay-box_id / #orderResultInfo_id / #popup / #confirmDiv`）→ 日志 `[浏览器] 核对窗原文：…`；到支付页再扫席别 → `seat_on_page`/`seat_in_dialog` 一并回传。**以订单详情为准**。
+- **下单结果判定不回读页面文本/URL，只看官方订单接口**：`order.py` 的 `classify_order_status`（三元组）+ `classify_with_time`（四元组，多一个 `recent`=下单时间落在本次提交窗口内的订单）。engine 与 launcher 的 dup/ambiguous 分支统一走 `classify_with_time(..., not_before_ts=attempt_ts)`。
+- ambiguous（提交后结果未知，如关网页丢了成功信号）三态：①官方 unpaid 且 recent 非空 → **本次提交成功**（dedup=SUBMITTED，下单时间入账/通知）；②官方 none/cancelled → 确认无订单，**安全重试**（launcher 最多 3 次后停，engine 直接 continue 下轮）；③其余（error/unknown/blocked/更早旧单）→ 保守停任务交人工，防重复下单。
+- dup（页面判重）三态：先排除「行程冲突」（`dup_kind=="行程冲突"` 永不判成功）；其余回读 —— paid=已支付、unpaid+recent=本次提交成功、unpaid 无 recent=账号更早遗留订单（ACCOUNT_DUP，请核对支付）、none/cancelled=清除本地记录继续抢。
+- 归因窗口 `find_recent_order(..., window_sec=180)`：订单 `order_ts` ≥ 本次发起时刻 - 180 秒才算「本次生成」；`_normalize_order_item` 解析 `order_date`（下单时刻）出 `order_time`/`order_ts`，解析失败 `order_ts=None` 走保守分支（绝不判本次成功）。
+- `engine.py` 启动恢复复核 orders.json（约 840 行）仍用三元组 `classify_order_status`，不参与时间归因（别改成四元组）。
+- **queryMyOrder 新参数（2026-10-07 实测，旧参数静默失效）**：必须带 `pageIndex=0&pageSize=8&query_where=G|H&sequeue_train_name=`，数据在 `data.OrderDTODataList`（不是 orderDBList）。窗口语义：H（历史）按**乘车日期**过滤且 EndDate 必须 ≤ 昨天（含今天整体空 body）；G（未出行）按**下单日期**过滤（窗口 [60 天前, 今天] 才能捞到全部未出行票）。未支付单走独立接口 queryMyOrderNoComplete（data.orderDBList）。
+- 真实字段结构（order.py `_normalize_order_item` 已适配）：`order_date`="2026-09-28 19:06:16" 精确下单时刻；`from_station_name_page`/`to_station_name_page` 是数组；乘客在 `array_passser_name_page`（官方拼写，passengerDTOList=null）；票状态只看 `tickets[].ticket_status_name`（已出站/已退票(业务流水号:...)/已支付），顶层 return_flag/resign_flag/pay_flag 恒同不可用。退票订单仍留在 G 列表，classify 归 cancelled（可重购）。
 
 ## 四、会话与锁
 - `tk`/`uamtk`/`JSESSIONID` 是 session cookie，浏览器一关就没：只能经 `browser_order.launch()` 启动（内部 `ctx.add_cookies(.browser_state.json)`）。直接 `launch_persistent_context(.browser_profile)` 打开是未登录态，点「预订」不跳转。
@@ -33,7 +40,7 @@
 - 动 `launcher_config.json` 的测试先备份（`shutil.copy2` → `.pbak`），结束还原。
 - 改完提醒重启才生效：`Get-CimInstance Win32_Process | ? { $_.CommandLine -match "gui\.py|launcher\.py" } | % { Stop-Process -Id $_.ProcessId -Force }`
 - 下单优先级按界面点选顺序；开抢前按 `warm_minutes` 预热；耗时看 `logs/order_timing.jsonl`（`python browser_order.py timing`）。
-- 待办：K225 2026-10-09 长葛→确山 的未支付订单该去「未完成订单」确认或放弃。
+- 疑案已结（2026-10-07）：K225 长葛→确山「未支付订单」实为 EC74084650，乘车 2026-10-08（非 10-09）已退票（下单 2026-09-28 19:06:16），classify 归 cancelled 允许重购，无需人工处理。
 
 ## 七、结构重构门禁（2026-10-07 起，重构批次 649db10..0dd5c57 落地后的约定）
 - 单点口径清单，改这些语义必须同时核对三个调用方：`appcommon.parse_date_range`（日期区间，gui/monitor/launcher 五个入口）、`appcommon.atomic_write_json / replace_with_retry / write_state`（原子写，全库 11 处）、`appcommon.read_state_or_none / quarantine_corrupt`（state.json 三写方 engine/gui/launcher 共享 plumbing）、`config_keys.py`（配置键 ⊆ example 模板，tests 有防漂移回归）。

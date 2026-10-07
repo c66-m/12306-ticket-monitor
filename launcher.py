@@ -51,6 +51,7 @@ import browser_order
 import filelock
 import logutil
 import notify
+import order as order_mod
 import passengers as passengers_mod
 import ticket
 
@@ -538,6 +539,7 @@ class Grabber(threading.Thread):
         fail_streak = 0
         busy_n = 0           # 系统繁忙连续次数，用于冷却退避
         bad = set()          # {(车次, 席别)}：网页端下单页不下发的组合，永久跳过
+        ambiguous_retries = 0  # 提交后结果未知且官方查无订单的安全重试计数
         MAX_ORDER_FAILS = 5  # 同一目标连续失败这么多次就停，不再无限重复
         try:
             while not self.stop_event.is_set():
@@ -578,6 +580,7 @@ class Grabber(threading.Thread):
                         info["available_seats"].get(seat), info["start_time"],
                         "（候选 %d/%d）" % seat_rank if seat_rank else ""))
                     try:
+                        attempt_ts = time.time()
                         sc = ticket.SEAT_NAME_TO_CODE[seat]
                         # 网页端下单页不下发「无座」：按同价席别改判（动车组→二等座，
                         # 普速→硬座，见 ticket.ORDER_SEAT_ALIAS / EMU_SEAT_ALIAS）
@@ -618,34 +621,85 @@ class Grabber(threading.Thread):
                         return
                     extra = extra or {}
                     if extra.get("reason") == "ambiguous":
-                        # 提交确认后结果未知：订单可能已在服务端生成，盲目重试有
-                        # 重复下单风险——停下让用户先核对「未支付订单」
+                        # 提交确认后结果未知：先回读官方订单接口做时间戳归因。
+                        # 订单已生成且下单时间对得上=本次成功；确认无订单=安全重试；
+                        # 其余（查不到/更早旧单/其它行程挡路）=停下交人工，防重复下单。
+                        cls, ono, raw, recent = order_mod.classify_with_time(
+                            date, info["train_code"], names, not_before_ts=attempt_ts)
+                        if cls == "unpaid" and recent:
+                            order_no = ono or (recent.get("order_no") or "")
+                            self.result = (True,
+                                "订单已提交成功（未支付）：订单号 %s，下单时间 %s，请尽快去 12306 支付"
+                                % (order_no, recent.get("order_time") or "未知"))
+                            log("[抢到] %s" % self.result[1])
+                            try:
+                                appcommon.append_history(
+                                    hist_path,
+                                    {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                     "task": lc.get("name") or "启动器抢票",
+                                     "result": "success", "train": info["train_code"],
+                                     "date": date, "from": info["from_name"],
+                                     "to": info["to_name"], "seat": seat,
+                                     "passengers": names, "order_no": order_no,
+                                     "message": self.result[1], "notify": "已通知(启动器)"})
+                            except Exception as e:
+                                log("[提醒] 购票历史写入失败：%s" % e)
+                            self._notify_success(info, seat, self.result[1])
+                            return
+                        if cls in ("none", "cancelled"):
+                            ambiguous_retries += 1
+                            if ambiguous_retries >= 3:
+                                self.result = (False,
+                                    "连续多次提交后结果未知且官方查无订单，请人工核对后重新开抢")
+                                log("[错误] %s" % self.result[1])
+                                return
+                            log("[提醒] 提交结果未知但官方确认无此订单（第 %d 次），继续重试" % ambiguous_retries)
+                            if self.stop_event.wait(2):
+                                break
+                            continue
                         self.result = (False, "订单提交后结果未知——请先到 12306 查「未支付订单」："
                                               "有单就支付或取消，确认无单后再重新开抢")
-                        log("[错误] %s（下单返回：%s）" % (self.result[1], msg))
+                        log("[错误] %s（下单返回：%s；官方核验：%s）" % (self.result[1], msg, raw))
                         return
                     if extra.get("reason") == "dup":
-                        try:
-                            appcommon.append_history(
-                                hist_path,
-                                {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                 "task": lc.get("name") or "启动器抢票",
-                                 "result": "dup", "train": info["train_code"],
-                                 "date": date, "from": info["from_name"],
-                                 "to": info["to_name"], "seat": seat,
-                                 "passengers": names, "order_no": "",
-                                 "message": msg, "notify": ""})
-                        except Exception:
-                            pass
                         if extra.get("dup_kind") == "行程冲突":
                             # 行程冲突 ≠ 本行程已有订单：别报"票已到手"误导去支付
                             self.result = (False, "12306 提示行程冲突——可能是其它行程的未支付订单挡路，"
                                                   "请到「未完成订单」查证处理后重新开抢")
                             log("[提醒] 下单返回：%s" % msg)
                             return
-                        # 账号已有该行程订单（多为未支付）→ 票已到手，继续重试只会被拒
-                        self.result = (True, "检测到该行程已有订单（多为未支付），请尽快去 12306 完成支付")
+                        # 本行程已有订单：回读官方接口 + 下单时间归因，确认是不是本次提交的
+                        cls, ono, raw, recent = order_mod.classify_with_time(
+                            date, info["train_code"], names, not_before_ts=attempt_ts)
+                        result_kind = "dup"
+                        if cls == "paid":
+                            self.result = (True, "该行程订单已支付，请查收")
+                        elif cls == "unpaid" and recent:
+                            result_kind = "success"
+                            self.result = (True,
+                                "本次已提交成功（未支付）：订单号 %s，下单时间 %s，请尽快去 12306 支付"
+                                % (ono or (recent.get("order_no") or ""),
+                                   recent.get("order_time") or "未知"))
+                        elif cls == "unpaid":
+                            self.result = (True,
+                                "账号存在该行程更早的未支付订单（订单号 %s），非本次提交，请核对后尽快支付"
+                                % (ono or "未知"))
+                        else:
+                            self.result = (True, "检测到该行程已有订单，请尽快去 12306 完成支付（官方核验：%s）" % raw)
                         log("[提示] 下单返回：%s" % msg)
+                        try:
+                            appcommon.append_history(
+                                hist_path,
+                                {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "task": lc.get("name") or "启动器抢票",
+                                 "result": result_kind, "train": info["train_code"],
+                                 "date": date, "from": info["from_name"],
+                                 "to": info["to_name"], "seat": seat,
+                                 "passengers": names, "order_no": ono or "",
+                                 "message": self.result[1],
+                                 "notify": "已通知(启动器)" if result_kind == "success" else ""})
+                        except Exception:
+                            pass
                         self._notify_success(info, seat, self.result[1])
                         return
                     if extra.get("need_captcha"):
