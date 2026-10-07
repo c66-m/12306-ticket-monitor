@@ -118,10 +118,24 @@ def load_config():
         return json.load(f)
 
 
+def _lock_timeout_abort():
+    """file_lock 锁争用超时的统一出口：记日志、给用户明确提示，再上抛友好异常。
+
+    调用方多为 Tk 回调：弹窗已告知用户"文件被占用，稍后重试"，Tk 打印
+    traceback 但界面存活——不崩；用户稍后重试该操作即可。
+    """
+    LOG.warning("文件锁争用超时：另一进程正长时间持有，本次操作跳过")
+    messagebox.showwarning("文件被占用", "文件被占用，稍后重试")
+    raise TimeoutError("文件被占用，稍后重试")
+
+
 def save_config(config):
     # 原子写 + 跨进程锁：与 launcher 的读-改-写互斥（config.json.lock）
-    with filelock.file_lock(CONFIG_PATH + ".lock"):
-        appcommon.atomic_write_json(CONFIG_PATH, config)
+    try:
+        with filelock.file_lock(CONFIG_PATH + ".lock"):
+            appcommon.atomic_write_json(CONFIG_PATH, config)
+    except TimeoutError:
+        _lock_timeout_abort()
 
 
 def load_state():
@@ -135,8 +149,11 @@ def save_state(state):
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
     # 跨进程锁：与 launcher.append_monitor_task 的 state 段互斥（state.json.lock）
-    with filelock.file_lock(path + ".lock"):
-        appcommon.write_state(path, state, tmp_kind="guisave")
+    try:
+        with filelock.file_lock(path + ".lock"):
+            appcommon.write_state(path, state, tmp_kind="guisave")
+    except TimeoutError:
+        _lock_timeout_abort()
 
 
 def update_config_locked(mutator):
@@ -145,12 +162,15 @@ def update_config_locked(mutator):
     mutator(config) 就地修改读到的 dict；返回其返回值。
     替代「load_config() → 改 → save_config()」的锁外读模式（双端并发改任务丢数据）。
     """
-    with filelock.file_lock(CONFIG_PATH + ".lock"):
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            config = json.load(f)
-        result = mutator(config)
-        appcommon.atomic_write_json(CONFIG_PATH, config)
-        return result
+    try:
+        with filelock.file_lock(CONFIG_PATH + ".lock"):
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                config = json.load(f)
+            result = mutator(config)
+            appcommon.atomic_write_json(CONFIG_PATH, config)
+            return result
+    except TimeoutError:
+        _lock_timeout_abort()
 
 
 def update_state_locked(mutator):
@@ -161,11 +181,14 @@ def update_state_locked(mutator):
     """
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
-    with filelock.file_lock(path + ".lock"):
-        state = engine_mod.load_state_file(path)
-        result = mutator(state)
-        appcommon.write_state(path, state, tmp_kind="guisave")
-        return result
+    try:
+        with filelock.file_lock(path + ".lock"):
+            state = engine_mod.load_state_file(path)
+            result = mutator(state)
+            appcommon.write_state(path, state, tmp_kind="guisave")
+            return result
+    except TimeoutError:
+        _lock_timeout_abort()
 
 
 def mark_task_created(app, task, start_now):

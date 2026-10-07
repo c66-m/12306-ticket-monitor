@@ -236,9 +236,20 @@ class MonitorEngine(object):
         # 非原子的（open "w" 截断后再写），不持锁读可能撞上写一半的撕裂文件
         # → json 误判损坏 → 健康 state.json 被隔离。只包住读本身，
         # quarantine / _save_state 留在锁外（顺序持锁，不嵌套）。
-        with filelock.file_lock(self.state_path + ".lock"):
-            state, err = appcommon.read_state_or_none(self.state_path)
-        state_ok = err is None
+        lock_timeout = False
+        try:
+            with filelock.file_lock(self.state_path + ".lock"):
+                state, err = appcommon.read_state_or_none(self.state_path)
+        except TimeoutError as e:
+            # 锁争用超时（另一进程长时间持有写锁）：与瞬时占用（Task 40）同口径——
+            # 本次跳过加载，不挪档、不重建、不落盘；_sync_state 会在文件变化后重载。
+            # 绝不能把健康文件当坏档隔离（旧行为丢防重记录），也不能落盘空状态
+            # 覆盖对方正在写的文件。
+            LOG.warning("state.json 锁争用超时，本次跳过加载，稍后重试: %s", e)
+            lock_timeout = True
+            old = getattr(self, "state", None)
+            state, err = (old if isinstance(old, dict) else {}), None
+        state_ok = err is None and not lock_timeout
         if err is not None:
             if isinstance(err, OSError):
                 # 瞬时占用（另一进程正在写 state.json，读句柄撞车）：本次跳过
@@ -303,9 +314,16 @@ class MonitorEngine(object):
             # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
             # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
             # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
-            with filelock.file_lock(self.state_path + ".lock"):
-                appcommon.atomic_write_json(self.state_path, snapshot,
-                                            fallback_direct=True)
+            try:
+                with filelock.file_lock(self.state_path + ".lock"):
+                    appcommon.atomic_write_json(self.state_path, snapshot,
+                                                fallback_direct=True)
+            except TimeoutError as e:
+                # 锁争用超时：本次跳过落盘，内存态保留完好，下次 _save_state
+                # 重试。绝不能让异常杀死引擎监控线程（→ 漏单）。
+                LOG.warning("state.json 锁争用超时，本次跳过落盘，稍后重试: %s",
+                            e)
+                return self.state
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
         except OSError:
@@ -313,7 +331,10 @@ class MonitorEngine(object):
         return self.state
 
     def _reload_state(self):
-        """仅重新读取 state.json（供运行中的引擎同步外部修改，不触发写入）。"""
+        """仅重新读取 state.json（供运行中的引擎同步外部修改，不触发写入）。
+
+        锁争用超时返回 None：调用方保留旧状态、稍后重试；绝不能回退成 {}
+        覆盖内存里的防重记录。"""
         state = {}
         if os.path.exists(self.state_path):
             try:
@@ -323,6 +344,10 @@ class MonitorEngine(object):
                 with filelock.file_lock(self.state_path + ".lock"):
                     with open(self.state_path, encoding="utf-8") as f:
                         state = json.load(f)
+            except TimeoutError as e:
+                LOG.warning("state.json 锁争用超时，本次跳过重载，稍后重试: %s",
+                            e)
+                return None
             except Exception:
                 state = {}
         state.setdefault("dedup", {})
@@ -337,7 +362,11 @@ class MonitorEngine(object):
         except OSError:
             return
         if m != self._state_mtime:
-            self.state = self._reload_state()
+            new_state = self._reload_state()
+            if new_state is None:
+                # 锁争用超时：保留旧内存态且不推进 mtime，下轮继续尝试重载
+                return
+            self.state = new_state
             self._state_mtime = m
 
     def _sync_config(self):

@@ -4392,6 +4392,116 @@ class TestTask55AutoFired(TempDirCase):
         app._top.bell.assert_called_once()
 
 
+class TestFileLockTimeout(TempDirCase):
+    """Task 56: filelock 锁争用超时（TimeoutError）在各调用点必须被捕获，
+    不能杀死引擎监控线程、不能崩 GUI/CLI 保存。Linux 上用 mock 模拟超时
+    （真跨进程争用只在 Windows/msvcrt 或 fcntl 后端长时间持有时发生）。"""
+
+    def _timeout_lock(self):
+        return mock.patch("filelock.file_lock",
+                          side_effect=TimeoutError("等待文件锁超时：x.lock"))
+
+    def test_engine_load_state_timeout_skips_not_quarantine(self):
+        e = make_engine(self.tmp)
+        old_state = {"dedup": {"k": 1}, "tasks": {"t1": {}}, "retry": {}}
+        e.state = old_state
+        # 写一份健康的 state.json：超时绝不能把它当坏档隔离
+        with open(e.state_path, "w", encoding="utf-8") as f:
+            json.dump(old_state, f)
+        with self._timeout_lock(), \
+                mock.patch.object(appcommon, "quarantine_corrupt") as q:
+            got = e._load_state()
+        q.assert_not_called()
+        self.assertIs(got, old_state)
+        with open(e.state_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), old_state)
+
+    def test_engine_save_state_timeout_skips_write(self):
+        e = make_engine(self.tmp)
+        before = {"dedup": {}, "tasks": {"t1": {"status": "monitoring"}},
+                  "retry": {}}
+        with open(e.state_path, "w", encoding="utf-8") as f:
+            json.dump(before, f)
+        mtime_before = os.path.getmtime(e.state_path)
+        e.state = {"dedup": {}, "tasks": {"t1": {"status": "paused"}},
+                   "retry": {}}
+        with self._timeout_lock():
+            e._save_state()
+        # 内存态保留、磁盘未动：下次 _save_state 重试
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "paused")
+        self.assertEqual(os.path.getmtime(e.state_path), mtime_before)
+        with open(e.state_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), before)
+
+    def test_engine_sync_state_timeout_keeps_old_state(self):
+        e = make_engine(self.tmp)
+        old_state = {"dedup": {"k": 1}, "tasks": {}, "retry": {}}
+        e.state = old_state
+        with open(e.state_path, "w", encoding="utf-8") as f:
+            json.dump({"dedup": {}, "tasks": {"t9": {}}, "retry": {}}, f)
+        e._state_mtime = 0  # 强制 _sync_state 走重载路径
+        with self._timeout_lock():
+            e._sync_state()
+        # 超时 = 本次跳过：旧内存态保留，不能被 {} 或 None 覆盖
+        self.assertIs(e.state, old_state)
+
+    def test_append_history_timeout_skips_record(self):
+        path = os.path.join(self.tmp, "order_history.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"a": 1}], f)
+        with self._timeout_lock():
+            appcommon.append_history(path, {"b": 2})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [{"a": 1}])
+
+    def test_launcher_append_monitor_task_timeout_user_message(self):
+        task = {"name": "t-timeout", "from": "长葛", "to": "确山"}
+        with self._timeout_lock():
+            with self.assertRaises(TimeoutError) as cm:
+                launcher.append_monitor_task(task)
+        self.assertIn("文件被占用", str(cm.exception))
+
+    def test_gui_update_config_locked_timeout_warns_user(self):
+        with self._timeout_lock(), mock.patch.object(gui, "messagebox") as mb:
+            with self.assertRaises(TimeoutError) as cm:
+                gui.update_config_locked(lambda c: c)
+        self.assertIn("文件被占用，稍后重试", str(cm.exception))
+        mb.showwarning.assert_called_once()
+        args, _ = mb.showwarning.call_args
+        self.assertIn("文件被占用，稍后重试", args[1])
+
+    def test_gui_update_state_locked_timeout_warns_user(self):
+        with self._timeout_lock(), mock.patch.object(gui, "messagebox") as mb, \
+                mock.patch.object(gui, "load_config",
+                                  return_value={"state_file": "state.json"}):
+            with self.assertRaises(TimeoutError) as cm:
+                gui.update_state_locked(lambda s: s)
+        self.assertIn("文件被占用，稍后重试", str(cm.exception))
+        mb.showwarning.assert_called_once()
+
+    def test_monitor_save_config_timeout_no_crash(self):
+        import monitor as monitor_mod
+        with self._timeout_lock(), \
+                mock.patch.object(monitor_mod, "print") as mprint:
+            with self.assertRaises(TimeoutError) as cm:
+                monitor_mod.save_config({})
+        self.assertIn("文件被占用，稍后重试", str(cm.exception))
+        printed = " ".join(str(c[0][0]) for c in mprint.call_args_list)
+        self.assertIn("文件被占用", printed)
+
+    def test_monitor_main_menu_survives_lock_timeout(self):
+        import monitor as monitor_mod
+        def _boom():
+            raise TimeoutError("文件被占用，稍后重试")
+        with mock.patch.object(monitor_mod, "read",
+                               side_effect=["9", "0"]), \
+                mock.patch.object(monitor_mod, "MENU",
+                                  [("9", "测试", _boom)]), \
+                mock.patch.object(monitor_mod, "pause"), \
+                mock.patch.object(monitor_mod, "print"):
+            monitor_mod.main_menu()  # 不应抛异常：回到菜单继续
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

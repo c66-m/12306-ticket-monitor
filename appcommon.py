@@ -201,47 +201,53 @@ def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
 def append_history(path, record, keep=500):
     """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。
     整个读-改-写包在 filelock.file_lock(path) 内：同一把锁串行化所有写方
-    （Windows 下是跨进程字节锁；Linux 下是按路径共享的进程内 RLock）。
+    （Windows 用 msvcrt 字节锁；Linux/macOS 用 fcntl 跨进程锁）。
+    锁争用超时（TimeoutError）时本条记录跳过并记 warning，不抛异常。
     文件损坏/形状非法时时间戳挪档留证（quarantine_corrupt）+ LOG.error，
     再追加新记录——不再静默清空整份历史。
     若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据继续，
     绝不用过期空读数覆盖健康文件。"""
-    with filelock.file_lock(path):
-        history = []
-        if os.path.exists(path):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    history = json.load(f)
-            except Exception as e:
-                decision, bad = _quarantine_decision(path,
-                                                     stat_fingerprint(path))
-                if decision == "quarantined":
-                    LOG.error("[数据] order_history.json 损坏，已隔离留证：%s（%s）；新记录继续追加",
-                              bad, e)
-                    history = []
-                elif decision == "abandoned":
-                    LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
-                    history = _read_history_list(path)
-                else:
-                    LOG.error("[数据] order_history.json 损坏，隔离挪移失败，证据保留原地（%s）；新记录继续追加",
-                              e)
-                    history = []
-            else:
-                if not isinstance(history, list):
+    try:
+        with filelock.file_lock(path):
+            history = []
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        history = json.load(f)
+                except Exception as e:
                     decision, bad = _quarantine_decision(path,
                                                          stat_fingerprint(path))
                     if decision == "quarantined":
-                        LOG.error("[数据] order_history.json 结构非法，已隔离留证：%s；新记录继续追加",
-                                  bad)
+                        LOG.error("[数据] order_history.json 损坏，已隔离留证：%s（%s）；新记录继续追加",
+                                  bad, e)
                         history = []
                     elif decision == "abandoned":
                         LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
                         history = _read_history_list(path)
                     else:
-                        LOG.error("[数据] order_history.json 结构非法，隔离挪移失败，证据保留原地；新记录继续追加")
+                        LOG.error("[数据] order_history.json 损坏，隔离挪移失败，证据保留原地（%s）；新记录继续追加",
+                                  e)
                         history = []
-        history.append(record)
-        atomic_write_json(path, history[-keep:])
+                else:
+                    if not isinstance(history, list):
+                        decision, bad = _quarantine_decision(path,
+                                                             stat_fingerprint(path))
+                        if decision == "quarantined":
+                            LOG.error("[数据] order_history.json 结构非法，已隔离留证：%s；新记录继续追加",
+                                      bad)
+                            history = []
+                        elif decision == "abandoned":
+                            LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
+                            history = _read_history_list(path)
+                        else:
+                            LOG.error("[数据] order_history.json 结构非法，隔离挪移失败，证据保留原地；新记录继续追加")
+                            history = []
+            history.append(record)
+            atomic_write_json(path, history[-keep:])
+    except TimeoutError as e:
+        LOG.warning("[数据] order_history.json 锁争用超时，"
+                    "本条历史记录跳过: %s", e)
+        return
 
 
 _ORDERS_LOCK = threading.Lock()

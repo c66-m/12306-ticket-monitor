@@ -62,10 +62,22 @@ def load_config():
         return {}
 
 
+def _lock_timeout_abort():
+    """file_lock 锁争用超时的统一出口：打印明确提示、记日志，再上抛友好异常。
+
+    CLI 菜单的 main_menu 会接住它并返回主菜单（不崩）；用户稍后重试该操作。
+    """
+    print("  文件被占用，稍后重试。")
+    raise TimeoutError("文件被占用，稍后重试")
+
+
 def save_config(config):
     # 原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）
-    with filelock.file_lock(CONFIG_PATH + ".lock"):
-        appcommon.atomic_write_json(CONFIG_PATH, config)
+    try:
+        with filelock.file_lock(CONFIG_PATH + ".lock"):
+            appcommon.atomic_write_json(CONFIG_PATH, config)
+    except TimeoutError:
+        _lock_timeout_abort()
 
 
 def update_config_locked(mutator):
@@ -75,11 +87,14 @@ def update_config_locked(mutator):
     注意：不要在 mutator 里做交互式输入——锁内长时间占用会堵住 launcher
     的下单写路径；交互式菜单仍用 load_config/save_config（写侧已加锁）。
     """
-    with filelock.file_lock(CONFIG_PATH + ".lock"):
-        config = load_config()
-        result = mutator(config)
-        appcommon.atomic_write_json(CONFIG_PATH, config)
-        return result
+    try:
+        with filelock.file_lock(CONFIG_PATH + ".lock"):
+            config = load_config()
+            result = mutator(config)
+            appcommon.atomic_write_json(CONFIG_PATH, config)
+            return result
+    except TimeoutError:
+        _lock_timeout_abort()
 
 
 def pause():
@@ -685,6 +700,10 @@ def main_menu():
                     func()
                 except KeyboardInterrupt:
                     print("\n  已中断，返回主菜单。")
+                except TimeoutError:
+                    # 文件锁争用超时：helper 已打印"文件被占用，稍后重试"，
+                    # 这里只负责不崩、返回主菜单。
+                    pass
                 break
         else:
             print("  无效选项。")

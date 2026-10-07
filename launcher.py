@@ -936,61 +936,74 @@ def append_monitor_task(task, start_now=True):
         # 只比 mtime 是 TOCTOU——实测 3 个线程并发追加任务，最后只剩 1 条。
         # 锁文件用 filelock（进程被强杀时由系统释放）；mtime 比对留作第二道，
         # 能发现「锁外」的改动（手工编辑、其它工具）。
-        with filelock.file_lock(cfg_path + ".lock"):
-            for _ in range(3):
-                try:
-                    before = os.path.getmtime(cfg_path)
-                except OSError:
-                    before = None
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                cfg.setdefault("tasks", []).append(task)
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, ensure_ascii=False, indent=2)
-                try:
-                    after = os.path.getmtime(cfg_path)
-                except OSError:
-                    after = None
-                if after == before:
-                    _atomic_replace(tmp, cfg_path)
-                    break
-                # 撞车：本轮作废，带着对方的新内容重来
-            else:
-                _atomic_replace(tmp, cfg_path)  # 三次都撞车：以本方落盘收场（低概率，双方都是追加型写）
+        try:
+            with filelock.file_lock(cfg_path + ".lock"):
+                for _ in range(3):
+                    try:
+                        before = os.path.getmtime(cfg_path)
+                    except OSError:
+                        before = None
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    cfg.setdefault("tasks", []).append(task)
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    try:
+                        after = os.path.getmtime(cfg_path)
+                    except OSError:
+                        after = None
+                    if after == before:
+                        _atomic_replace(tmp, cfg_path)
+                        break
+                    # 撞车：本轮作废，带着对方的新内容重来
+                else:
+                    _atomic_replace(tmp, cfg_path)  # 三次都撞车：以本方落盘收场（低概率，双方都是追加型写）
+        except TimeoutError as e:
+            # 锁争用超时：给用户明确提示，异常继续上抛给调用方的
+            # messagebox.showerror（不崩）。任务未落盘，用户稍后重试。
+            log("[错误] 文件被占用，稍后重试：%s" % cfg_path)
+            raise TimeoutError("文件被占用，稍后重试") from e
         # state.json 条目（与 gui.mark_task_created 的无 app 分支保持一致）
         state_path = os.path.join(HERE, cfg.get("state_file", "state.json"))
-        with filelock.file_lock(state_path + ".lock"):
-            if os.path.exists(state_path):
-                try:
-                    with open(state_path, "r", encoding="utf-8") as f:
-                        state = json.load(f)
-                except Exception as e:
-                    # state.json 损坏：挪档留证（带时间戳，反复损坏不互相覆盖），再按
-                    # 只含本任务的新状态重建——保住「立即启动」语义，不让它静默降级成
-                    # 未启动。其它任务的状态/防重记录在坏档里，引擎会按未启动重建。
-                    bad = "%s.bad-%s" % (state_path, time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            with filelock.file_lock(state_path + ".lock"):
+                if os.path.exists(state_path):
                     try:
-                        os.replace(state_path, bad)
-                    except OSError:
-                        # 挪不动（如杀毒软件占用）：保住坏档要紧，跳过状态写入，
-                        # 任务将以「未启动」落库——这点必须让用户知道
-                        log("[错误] 读取 state.json 失败且挪档失败（文件被占用？）：%s；"
-                            "本次只写任务不写状态，任务「%s」将按未启动落库，"
-                            "请人工处理坏档后再启动它" % (e, task["name"]))
-                        return task["name"]
-                    log("[错误] state.json 损坏（%s），已挪档为 %s 并按空状态重建。"
-                        "其它任务的运行状态与防重记录都在坏档里——请尽快到 12306"
-                        "「未支付订单」核对在途行程，避免重复下单" % (e, bad))
-                    state = {}
-            else:
-                state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
-            entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
-            entry["status"] = "monitoring" if start_now else "paused"
-            entry.setdefault("fail_streak", 0)
-            entry.setdefault("last_poll", 0)
-            entry["message"] = ("启动器创建，立即启动" if start_now
-                                else "启动器创建，未启动")
-            appcommon.write_state(state_path, state, tmp_kind="launcher")
+                        with open(state_path, "r", encoding="utf-8") as f:
+                            state = json.load(f)
+                    except Exception as e:
+                        # state.json 损坏：挪档留证（带时间戳，反复损坏不互相覆盖），再按
+                        # 只含本任务的新状态重建——保住「立即启动」语义，不让它静默降级成
+                        # 未启动。其它任务的状态/防重记录在坏档里，引擎会按未启动重建。
+                        bad = "%s.bad-%s" % (state_path, time.strftime("%Y%m%d-%H%M%S"))
+                        try:
+                            os.replace(state_path, bad)
+                        except OSError:
+                            # 挪不动（如杀毒软件占用）：保住坏档要紧，跳过状态写入，
+                            # 任务将以「未启动」落库——这点必须让用户知道
+                            log("[错误] 读取 state.json 失败且挪档失败（文件被占用？）：%s；"
+                                "本次只写任务不写状态，任务「%s」将按未启动落库，"
+                                "请人工处理坏档后再启动它" % (e, task["name"]))
+                            return task["name"]
+                        log("[错误] state.json 损坏（%s），已挪档为 %s 并按空状态重建。"
+                            "其它任务的运行状态与防重记录都在坏档里——请尽快到 12306"
+                            "「未支付订单」核对在途行程，避免重复下单" % (e, bad))
+                        state = {}
+                else:
+                    state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
+                entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
+                entry["status"] = "monitoring" if start_now else "paused"
+                entry.setdefault("fail_streak", 0)
+                entry.setdefault("last_poll", 0)
+                entry["message"] = ("启动器创建，立即启动" if start_now
+                                    else "启动器创建，未启动")
+                appcommon.write_state(state_path, state, tmp_kind="launcher")
+        except TimeoutError as e:
+            # 锁争用超时：config 段已写、state 段未写。给用户明确提示，
+            # 异常继续上抛给调用方的 messagebox.showerror（不崩）。
+            # 引擎 _sync_config 下次会为该任务补建缺省状态条目。
+            log("[错误] 文件被占用，稍后重试：%s" % state_path)
+            raise TimeoutError("文件被占用，稍后重试") from e
         return task["name"]
 
 
