@@ -4178,6 +4178,26 @@ class TestDeleteTaskClearsState(TempDirCase):
         e._note_failure({"name": "t1", "from": "A", "to": "B"}, "查询异常")
         self.assertIn("t1", e.state["tasks"])
 
+    def test_inflight_set_task_status_does_not_resurrect_deleted_task(self):
+        # 返工（reviewer Important）：set_task_status 内部的 setdefault 会把
+        # 已删除任务的 state 条目复活——在途轮询的后续状态写入不得复活
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        e.note_task_deleted("t1")
+        e.set_task_status({"name": "t1"}, "failed", "在途轮询写回")
+        self.assertNotIn("t1", e.state["tasks"])
+        self.assertNotIn("t1", self._read(st)["tasks"])
+
+    def test_set_task_status_force_resurrects_after_recreate(self):
+        # 墓碑不误拦合法任务：force=True（GUI 显式恢复/重置/新建）可放行
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        e.note_task_deleted("t1")
+        e.set_task_status({"name": "t1"}, "monitoring", "GUI 恢复",
+                          force=True)
+        self.assertIn("t1", e.state["tasks"])
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "monitoring")
+
 
 class TestReloginScriptResult(TempDirCase):
     """Task 53(b): capture_session.py 重登链按退出码判定成败。

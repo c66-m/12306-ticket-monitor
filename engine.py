@@ -408,6 +408,13 @@ class MonitorEngine(object):
 
     def set_task_status(self, task, status, message="", force=False):
         name = task["name"]
+        # 墓碑守卫（Task 53 返工）：已删除任务的在途轮询写回不得复活 state
+        # 条目——setdefault 会无声复活；GUI 显式动作（恢复/重置/新建）经
+        # force=True 放行（删→同名重建流程不受影响）。
+        if not force and name in getattr(self, "_deleted_names", ()):
+            LOG.info("[状态] 任务 %s 已删除，忽略状态写入 %s %s",
+                     name, STATUS_LABELS.get(status, status), message)
+            return
         entry = self.state["tasks"].setdefault(name, {})
         cur = entry.get("status", "monitoring")
         # 用户主动暂停/取消的状态不允许被引擎例行写入覆盖：
@@ -442,9 +449,9 @@ class MonitorEngine(object):
         被后续 _save_state 写回文件、复活成孤儿 state。同名重建任务也不会再
         继承陈旧状态。
 
-        另记墓碑：删任务若恰撞上该任务的在途轮询，_note_failure 与轮询后的
-        setdefault 会把条目复活——墓碑拦住这两次写回（_sync_config 见到同名
-        重建即清墓碑）。
+        另记墓碑：删任务若恰撞上该任务的在途轮询，_note_failure、轮询后的
+        setdefault 与 set_task_status 都会把条目复活——墓碑拦住这三处写回
+        （_sync_config 见到同名重建即清墓碑）。
         """
         tasks = self.state.get("tasks")
         if isinstance(tasks, dict):
