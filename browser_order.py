@@ -1103,8 +1103,14 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
                             slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC)
                             if slide_elapsed is False:
+                                extra = {"need_captcha": True}
+                                if clicked:
+                                    # 确认已点出去：订单可能已在服务端生成。
+                                    # 滑块超时≠没提交，标记 ambiguous 走官方回读
+                                    # 确认（Task 52；此前漏标，上层盲重试可能重复下单）
+                                    extra["reason"] = "ambiguous"
                                 return (False, "滑块验证等待超时（%d 秒），请重试" % _SLIDE_WAIT_SEC,
-                                        {"need_captcha": True})
+                                        extra)
                             # 滑块是用户手动完成的：等待期间不消耗结果等待倒计时，
                             # 顺延 deadline（Task 42；此前倒计时在滑块前定死，
                             # 回来后很快报超时）
@@ -1112,8 +1118,13 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             _log("  [浏览器] 滑块已消失（人工等待 %.1fs，不计入结果倒计时），"
                                  "继续等出票结果…" % slide_elapsed)
                         else:
+                            extra = {"need_captcha": True}
+                            if clicked:
+                                # 同上：确认已点出时滑块重现，结果同样未知，
+                                # 标 ambiguous 走官方回读而非盲重试
+                                extra["reason"] = "ambiguous"
                             return (False, "滑块验证再次出现，已中止（脚本不绕过验证码）",
-                                    {"need_captcha": True})
+                                    extra)
                 url = page.url
                 if any(k in url for k in ("payOrder", "MyOrderNoComplete", "order/init")):
                     _log("  [浏览器] 结果页用时 %.1fs（%d 轮）" % (time.time() - t_submit, tick))

@@ -3793,6 +3793,281 @@ class TestOrderQueryFixes(TempDirCase):
         m_confirm.assert_not_called()
 
 
+# ============================ Task 52 ============================
+
+def _t52_busy_holder(lock_path, ready_evt, hold_sec):
+    """子进程入口：拿 browser_order._ProfileLock 并持有 hold_sec 秒。"""
+    import time as _time
+    import browser_order as _bo
+    lk = _bo._ProfileLock(lock_path)
+    if lk.acquire(timeout=10):
+        ready_evt.set()
+        _time.sleep(hold_sec)
+        lk.release()
+
+
+class TestTask52SliderAmbiguous(TempDirCase):
+    """Task 52a: 结果等待期滑块超时/重现必须标 reason=ambiguous（clicked=True 时）。
+
+    旧代码：只回 {"need_captcha": True}，漏标 ambiguous → 上层（engine/launcher）
+    当普通失败盲重试（重复下单）或误判没抢到。
+    新行为：clicked=True（确认已点出，订单可能已提交）时同样标 ambiguous，
+    走官方回读确认；clicked=False（确实没提交）时保持原样。
+    无真实浏览器：用假页面 + 假时钟驱动 _order_impl 全流程。
+    """
+
+    class _Clock:
+        """可手动拨动的假时钟，整体替换 browser_order.time。"""
+        def __init__(self):
+            self.now = 1_700_000_000.0
+
+        def time(self):
+            return self.now
+
+        def sleep(self, s):
+            self.now += s
+
+        def perf_counter(self):
+            return self.now
+
+        def strftime(self, fmt, t=None):
+            return time.strftime(
+                fmt, time.localtime(self.now if t is None else t))
+
+        def localtime(self, t=None):
+            return time.localtime(self.now if t is None else t)
+
+    class _Locator:
+        def __init__(self, count=0, visible=False, evaluate_result=None):
+            self._count = count
+            self._visible = visible
+            self._evaluate_result = evaluate_result
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return self._count
+
+        def is_visible(self):
+            return self._visible
+
+        def evaluate(self, js):
+            return self._evaluate_result
+
+    class _Page:
+        """按脚本走完「确认窗→结果等待」的假页面，可配置滑块行为。"""
+        INIT_URL = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+
+        def __init__(self, clock, qr_enable=True, result_slides=1):
+            self._clock = clock
+            self.qr_submit_clicked = False
+            self._qr_enable = qr_enable
+            self._qr_calls = 0
+            # 结果等待里滑块出现 result_slides 次
+            self._result_slides_left = result_slides
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def wait_for_timeout(self, ms):
+            self._clock.now += ms / 1000.0
+
+        def wait_for_url(self, *a, **k):
+            pass
+
+        def wait_for_selector(self, *a, **k):
+            pass
+
+        def wait_for_function(self, *a, **k):
+            pass
+
+        def locator(self, sel):
+            if sel == "#slide_passcode":
+                if self._result_slides_left > 0:
+                    self._result_slides_left -= 1
+                    return TestTask52SliderAmbiguous._Locator(
+                        count=1, visible=True)
+                return TestTask52SliderAmbiguous._Locator()
+            if sel == "#seatType_1":
+                return TestTask52SliderAmbiguous._Locator(
+                    count=1, visible=True,
+                    evaluate_result=[{"v": "WZ", "t": "无座"}])
+            return TestTask52SliderAmbiguous._Locator()
+
+        def eval_on_selector_all(self, sel, js):
+            if sel.startswith("#normal_passenger_id"):
+                return [{"id": "p1", "text": "张三"}]
+            return []  # 旧确认控件回退：没有可点的
+
+        @property
+        def url(self):
+            return self.INIT_URL  # 结果页永远不出现：逼出滑块/超时路径
+
+        def evaluate(self, js, arg=None):
+            if "dialog_xsertcj" in js:
+                return None  # 无学生票询问弹窗
+            if "checkticketinfo_id" in js:
+                return ""  # 核对窗原文为空：跳过席别对账分支
+            if "qr_submit_id" in js:
+                if "click" in js:
+                    self.qr_submit_clicked = True
+                    return None
+                self._qr_calls += 1
+                if self._qr_enable and self._qr_calls >= 2:
+                    return {"found": True, "cls": "btn92s", "shown": True}
+                return {"found": True, "cls": "btn92", "shown": True}
+            if "queryLeftTable" in js:
+                return True  # 点中预订
+            if "slide_passcode" in js and "nc-container" in js:
+                return []  # 确认窗里无滑块
+            if "ticketType_" in js:
+                return {"before": ["1"], "after": ["1"], "map": {}}
+            if "seatType_1" in js:
+                return {}
+            if "tt: String" in js:
+                return [{"name": "张三", "tt": "1"}]
+            if "limit_tickets" in js:
+                return [{"name": "张三", "seat": "WZ", "ticket_type": "1"}]
+            if js.startswith("(id) =>"):
+                return None  # 勾选乘车人 click
+            if js.startswith("(ids) =>"):
+                return []  # 勾选回读：全部已勾上
+            if "document.body" in js:
+                return ""
+            if "#submitOrder_id" in js:
+                return None
+            raise AssertionError("假页面遇到未预期的 evaluate: %r" % js[:80])
+
+    class _Warm:
+        def __init__(self, page):
+            self.p = object()
+            self.ctx = object()
+            self.page = page
+
+        def usable(self):
+            return True
+
+        def refresh(self, info):
+            pass
+
+    def _stub_playwright(self):
+        import sys
+        import types as _types
+        pw = _types.ModuleType("playwright")
+        pw_sync = _types.ModuleType("playwright.sync_api")
+
+        def _no_playwright():
+            raise AssertionError("预热路径不应启动 playwright")
+
+        pw_sync.sync_playwright = _no_playwright
+        pw.sync_api = pw_sync
+        self._pw_mods = {"playwright": pw, "playwright.sync_api": pw_sync}
+        for name, mod in self._pw_mods.items():
+            sys.modules[name] = mod
+        self.addCleanup(self._unstub_playwright)
+
+    def _unstub_playwright(self):
+        import sys
+        for name in self._pw_mods:
+            sys.modules.pop(name, None)
+
+    def _run(self, qr_enable=True, result_slides=1, slide_result=False):
+        """驱动一次完整下单到结果等待滑块路径。slide_result 传给 _wait_slide_gone。"""
+        clock = self._Clock()
+        page = self._Page(clock, qr_enable=qr_enable,
+                          result_slides=result_slides)
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock), \
+             mock.patch.object(browser_order, "_wait_slide_gone",
+                               return_value=slide_result):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page))
+        return ok, msg, extra, page
+
+    def test_result_slide_timeout_marks_ambiguous_when_clicked(self):
+        # 确认已点出（clicked=True）后结果等待滑块超时：旧代码只回 need_captcha，
+        # 漏标 ambiguous → 上层盲重试可能重复下单
+        ok, msg, extra, page = self._run(qr_enable=True, result_slides=1,
+                                         slide_result=False)
+        self.assertTrue(page.qr_submit_clicked, "前置条件：确认按钮应已点击")
+        self.assertFalse(ok)
+        self.assertTrue((extra or {}).get("need_captcha"),
+                        "need_captcha 信号应保留")
+        self.assertEqual((extra or {}).get("reason"), "ambiguous",
+                         "clicked=True 时滑块超时必须标 ambiguous，走官方回读")
+
+    def test_result_slide_reappears_marks_ambiguous_when_clicked(self):
+        # 滑块第二次出现（captcha_waited 已 True）→ "再次出现"路径，同样标 ambiguous
+        ok, msg, extra, page = self._run(qr_enable=True, result_slides=2,
+                                         slide_result=60.0)
+        self.assertTrue(page.qr_submit_clicked, "前置条件：确认按钮应已点击")
+        self.assertFalse(ok)
+        self.assertIn("再次出现", msg)
+        self.assertEqual((extra or {}).get("reason"), "ambiguous",
+                         "clicked=True 时滑块重现必须标 ambiguous")
+
+    def test_result_slide_timeout_no_ambiguous_when_not_clicked(self):
+        # 确认按钮从未点出（clicked=False）：确实没提交，不标 ambiguous，
+        # 保持旧的 need_captcha 语义
+        ok, msg, extra, page = self._run(qr_enable=False, result_slides=1,
+                                         slide_result=False)
+        self.assertFalse(page.qr_submit_clicked, "前置条件：确认按钮不应被点击")
+        self.assertFalse(ok)
+        self.assertTrue((extra or {}).get("need_captcha"))
+        self.assertNotEqual((extra or {}).get("reason"), "ambiguous",
+                            "clicked=False 时不应标 ambiguous（无提交，无需回读）")
+
+
+class TestTask52BusyProbe(TempDirCase):
+    """Task 52b: busy() 必须是真实跨进程探测。
+
+    旧代码（Task 43 前）：_ProfileLock.acquire 非 Windows 恒 True → busy() 恒 False
+    → GUI/引擎在对端下单中途另起浏览器抢同一 profile → 对端被挤掉（exitCode=21）。
+    Task 43 已加 fcntl 后端；本测试锁定 busy() 的真实探测语义不退化。
+    """
+
+    @unittest.skipIf(browser_order.msvcrt is not None,
+                     "Windows 走 msvcrt 路径，本测试只验 POSIX fcntl 后端")
+    def test_busy_true_when_peer_holds_lock(self):
+        import multiprocessing
+        lock_path = os.path.join(self.tmp, "busy_probe.lock")
+        # busy() 探的是模块级 _PROFILE_LOCK（固定路径）；测试时临时替换隔离
+        orig = browser_order._PROFILE_LOCK
+        browser_order._PROFILE_LOCK = browser_order._ProfileLock(lock_path)
+        try:
+            ready = multiprocessing.Event()
+            p = multiprocessing.Process(
+                target=_t52_busy_holder, args=(lock_path, ready, 3.0))
+            p.start()
+            try:
+                self.assertTrue(ready.wait(timeout=15), "子进程 15 秒内没拿到锁")
+                self.assertTrue(
+                    browser_order.busy(),
+                    "对端进程持有 profile 锁时 busy() 必须报 True（旧代码恒 False）")
+            finally:
+                _t43_join_child(self, p)
+            self.assertFalse(browser_order.busy(), "锁释放后 busy() 应报 False")
+        finally:
+            browser_order._PROFILE_LOCK = orig
+
+    def test_busy_false_when_free(self):
+        # 无人持有（且本进程未持锁）时 busy() 报 False：无误报，不会永久挡住
+        # 用户自己的浏览器启动
+        orig = browser_order._PROFILE_LOCK
+        lock_path = os.path.join(self.tmp, "busy_free.lock")
+        browser_order._PROFILE_LOCK = browser_order._ProfileLock(lock_path)
+        try:
+            self.assertFalse(browser_order.busy())
+        finally:
+            browser_order._PROFILE_LOCK = orig
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
