@@ -1255,6 +1255,59 @@ class TestSearchStations(TempDirCase):
         self.assertEqual(launcher.search_stations("bjd")[0]["name"], "北京东")
 
 
+class TestGrabberStationMapDegraded(TempDirCase):
+    """Task 26 round 2 (P1): 下单 worker 线程 _run 内 load_station_map 抛异常
+    不得逃出 _run；应记警告后以明确的失败收尾（result 置位）。"""
+
+    def _make_grabber(self):
+        import queue
+        lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+              "trains": ["G101"], "seat_types": ["二等座"],
+              "seat_priority": "", "passenger_names": []}
+        g = launcher.Grabber(lc, logq=queue.Queue())
+        g._log = g.logq.put  # 不写真实日志文件
+        return g
+
+    def test_run_offline_station_map_failure_sets_clear_result(self):
+        # 离线首跑：load_station_map 抛 URLError → _run 不抛异常，
+        # result 置为明确的"车站数据加载失败"，而不是把 URLError 丢给外层
+        g = self._make_grabber()
+        with mock.patch.object(ticket, "load_station_map",
+                               side_effect=URLError("offline")):
+            g._run()  # 旧代码：URLError 从这里直接逃出
+        self.assertIsNotNone(g.result, "result 未置位")
+        ok, msg = g.result
+        self.assertFalse(ok)
+        self.assertIn("车站数据加载失败", msg)
+
+    def test_run_offline_logs_network_warning(self):
+        # 降级原因必须被清楚记录
+        g = self._make_grabber()
+        logged = []
+        g._log = logged.append
+        with mock.patch.object(ticket, "load_station_map",
+                               side_effect=URLError("offline")):
+            g._run()
+        self.assertTrue(any("车站数据加载失败" in m for m in logged),
+                        "未记录车站数据加载失败: %s" % logged)
+
+    def test_run_online_station_map_still_passes_through(self):
+        # 回归 pin：加载成功时守卫不拦截，原流程继续（走到会话校验）
+        g = self._make_grabber()
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({"北京": "BJP", "上海": "SHH"},
+                                             {"BJP": "北京", "SHH": "上海"})), \
+             mock.patch.object(launcher.browser_order, "check_session",
+                               return_value=(False, "未登录")), \
+             mock.patch.object(launcher.browser_order, "login",
+                               side_effect=Exception("no browser")):
+            g._run()
+        ok, msg = g.result
+        self.assertFalse(ok)
+        # 能走到"登录失败"，证明已越过车站表加载阶段
+        self.assertIn("登录失败", msg)
+
+
 # ----------------------------- 辅助 -----------------------------
 
 import logging  # noqa: E402

@@ -450,7 +450,15 @@ class Grabber(threading.Thread):
         if not names:
             log("[提醒] 未选择乘车人，将尝试使用账号默认乘车人（可能失败）")
 
-        name2code, code2name = ticket.load_station_map()
+        try:
+            name2code, code2name = ticket.load_station_map()
+        except Exception as e:
+            # 离线首跑：车站表下载失败。下单 worker 后续每一步都要联网，
+            # 空表继续只会误报"车站无法识别"，故直接以明确失败收尾
+            #（Task 26 round 2；引擎/监控侧走空表降级继续）。
+            log("[网络] 车站数据加载失败：%s" % e)
+            self.result = (False, "车站数据加载失败（网络异常），请联网后重试")
+            return
         fc, tc = name2code.get(from_), name2code.get(to_)
         if not fc or not tc:
             self.result = (False, "车站无法识别：%s → %s" % (from_, to_))
