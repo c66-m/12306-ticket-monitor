@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import datetime
 from urllib.parse import unquote, urlencode
 
 import appcommon
@@ -160,14 +161,45 @@ def classify_order_status(date, train, passenger_names, session=None):
     return "none", "", "官方订单列表(未完成+该日历史)中未找到 %s %s" % (train, date)
 
 
+def _beijing_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Asia/Shanghai")
+    except Exception:
+        # Windows 未装 tzdata 包时 ZoneInfo 不可用；北京无夏令时，固定 +8
+        # 恒等于 Asia/Shanghai，退化为此时区偏移同样正确。
+        return datetime.timezone(datetime.timedelta(hours=8), name="Asia/Shanghai")
+
+
+_BJ_TZ = _beijing_tz()
+
+
+def parse_bj_wall(s):
+    """把 12306 的北京时间墙钟串（"YYYY-MM-DD HH:MM:SS"）解析为 epoch 秒。
+
+    显式按北京时间解析，不依赖机器本地时区（UTC 机器上 time.mktime 会偏 8 小时）。
+    解析失败返回 None。后续架构 Task 20 会收敛为全仓库统一入口。
+    """
+    try:
+        dt = datetime.datetime.strptime((s or "")[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+    return dt.replace(tzinfo=_BJ_TZ).timestamp()
+
+
 def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, window_sec=180):
     """时间戳归因：在订单列表里找「本行程 + 下单时间落在本次提交窗口内」的订单。
 
     not_before_ts 是软件本次发起下单动作的时刻（epoch 秒）。订单的 order_ts 若
     大于 not_before_ts - window_sec（允许少量时钟/接口延迟），即可判定该订单是
-    本次提交生成的；更早的就是遗留旧订单。返回匹配的订单 dict 或 None。
+    本次提交生成的；更早的就是遗留旧订单。
+
+    上界：order_ts 大于 not_before_ts + 600 的订单一律跳过——"未来"的订单不
+    可能是本次提交生成的（时区解析偏斜的旧单、他会话事后建的单），否则会被误判
+    为"本次提交成功"（假成功）。返回匹配的订单 dict 或 None。
     """
     lo = not_before_ts - window_sec
+    hi = not_before_ts + 600
     want = set(passenger_names or [])
     best = None
     for o in orders:
@@ -178,7 +210,7 @@ def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, 
         if want and pax and not (pax & want):
             continue
         ts = o.get("order_ts")
-        if ts is None or ts < lo:
+        if ts is None or ts < lo or ts > hi:
             continue
         if best is None or ts > best.get("order_ts", 0):
             best = o
@@ -435,14 +467,12 @@ def _normalize_order_item(item, status):
         if sn:
             ticket_status = sn
             break
-    # order_date 是下单时刻（"YYYY-MM-DD HH:MM:SS"），用于「这笔订单是不是本次
-    # 提交生成的」时间戳归因；解析失败则 order_ts=None，归因时走保守分支。
+    # order_date 是下单时刻（"YYYY-MM-DD HH:MM:SS"，北京时间），用于「这笔订单是不是
+    # 本次提交生成的」时间戳归因；解析失败则 order_ts=None，归因时走保守分支。
+    # 注意：必须用 parse_bj_wall 显式按北京时间解析——time.mktime 按机器本地时区
+    # 解析，在 UTC 机器上会偏大 8 小时，导致旧单被误判为"本次提交"（假成功）。
     order_date_raw = (item.get("order_date") or "").strip()
-    order_ts = None
-    try:
-        order_ts = time.mktime(time.strptime(order_date_raw[:19], "%Y-%m-%d %H:%M:%S"))
-    except Exception:
-        order_ts = None
+    order_ts = parse_bj_wall(order_date_raw)
     return {
         "order_no": item.get("sequence_no") or item.get("order_no") or "",
         "train": (item.get("train_code_page") or "").replace(" ", ""),

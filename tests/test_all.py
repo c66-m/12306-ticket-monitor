@@ -2352,6 +2352,67 @@ class TestReloadStateReadLock(unittest.TestCase):
 
 
 
+class TestOrderTimestamp(TempDirCase):
+    """Task 36: 订单时间戳必须按北京时间解析（与机器时区无关），
+    find_recent_order 必须有上界（未来订单不归因）。"""
+
+    def setUp(self):
+        super().setUp()
+        self._old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"   # 模拟 UTC 机器：旧代码 time.mktime 会偏 8 小时
+        time.tzset()
+
+    def tearDown(self):
+        if self._old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self._old_tz
+        time.tzset()
+        super().tearDown()
+
+    @staticmethod
+    def _true_epoch():
+        # "2026-10-08 10:00:00" 北京时间的真实 epoch
+        return datetime.datetime(
+            2026, 10, 8, 10, 0, 0,
+            tzinfo=datetime.timezone(datetime.timedelta(hours=8))).timestamp()
+
+    def test_parse_bj_wall_utc_machine(self):
+        ts = order_mod.parse_bj_wall("2026-10-08 10:00:00")
+        self.assertIsNotNone(ts)
+        self.assertLess(abs(ts - self._true_epoch()), 60,
+                        "UTC 机器上解析偏差 %s 秒，应 < 60 秒" % abs(ts - self._true_epoch()))
+
+    def test_normalize_order_item_ts_independent_of_machine_tz(self):
+        item = {"order_date": "2026-10-08 10:00:00", "sequence_no": "E123",
+                "train_code_page": "G101", "start_train_date_page": "2026-10-08",
+                "passengerDTOList": []}
+        norm = order_mod._normalize_order_item(item, "")
+        self.assertIsNotNone(norm["order_ts"])
+        self.assertLess(abs(norm["order_ts"] - self._true_epoch()), 60,
+                        "UTC 机器上 order_ts 偏差 %s 秒，应 < 60 秒"
+                        % abs(norm["order_ts"] - self._true_epoch()))
+
+    def test_find_recent_order_rejects_far_future(self):
+        # 未来 8 小时的"旧单"（旧代码在 UTC 机器上把北京时间串偏成未来 8h）
+        # 绝不能被归因为"本次提交生成"
+        now = time.time()
+        orders = [{"train": "G101", "date": "2026-10-08", "passengers": ["张三"],
+                   "order_no": "E999", "order_ts": now + 8 * 3600}]
+        self.assertIsNone(order_mod.find_recent_order(
+            orders, "2026-10-08", "G101", ["张三"], now))
+
+    def test_find_recent_order_normal_window_still_matches(self):
+        # 回归 pin：窗口内的正常订单仍被归因（旧代码本就通过）
+        now = time.time()
+        orders = [{"train": "G101", "date": "2026-10-08", "passengers": ["张三"],
+                   "order_no": "E100", "order_ts": now + 60}]
+        got = order_mod.find_recent_order(orders, "2026-10-08", "G101", ["张三"], now)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["order_no"], "E100")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
