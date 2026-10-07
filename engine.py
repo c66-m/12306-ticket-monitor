@@ -75,6 +75,25 @@ DEDUPE_VALUES = {
 
 LOG = logging.getLogger("monitor")
 
+_WARNED_PRIORITIES = set()
+
+
+def _safe_priority(task):
+    """priority 安全取值：非法值记一次警告并回默认值 5。
+
+    供 task_interval 与调度排序共用，避免两处各写一套转换逻辑。
+    """
+    raw = task.get("priority") or 5
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        key = repr(raw)
+        if key not in _WARNED_PRIORITIES:
+            _WARNED_PRIORITIES.add(key)
+            LOG.warning("任务 %s 的 priority=%r 非法，已按默认值 5 处理",
+                        task.get("name"), raw)
+        return 5
+
 
 def expand_dates(task):
     """把 dates + date_range 展开成日期列表（去重保序）。"""
@@ -387,10 +406,7 @@ class MonitorEngine(object):
                         mult = min(mult, ad.get("rush_multiplier", 0.75))
                 except ValueError:
                     pass
-            try:
-                prio = int(task.get("priority") or 5)
-            except (TypeError, ValueError):
-                prio = 5
+            prio = _safe_priority(task)
             prio = min(max(prio, 1), 10)
             prio_factor = 1.15 - 0.03 * prio  # 优先级越高因子越小 => 轮询越勤
             iv = iv * mult * prio_factor
@@ -941,7 +957,7 @@ class MonitorEngine(object):
                 due = [(i, self.tasks[i]) for i in next_due
                        if self.task_status(self.tasks[i]) in ACTIVE_STATUSES
                        and now >= next_due[i]]
-                due.sort(key=lambda x: -int(x[1].get("priority") or 5))
+                due.sort(key=lambda x: -_safe_priority(x[1]))
                 for i, task in due:
                     if stop_event is not None and stop_event.is_set():
                         break

@@ -348,6 +348,39 @@ class TestEngineDateValidation(TempDirCase):
         self.assertGreaterEqual(e.task_interval(t), 300)
 
 
+class TestEnginePriorityValidation(TempDirCase):
+    """Task 2 (P1): 非数字 priority 不得崩调度排序。"""
+
+    def test_safe_priority_valid_values(self):
+        self.assertEqual(engine_mod._safe_priority({"priority": 8}), 8)
+        self.assertEqual(engine_mod._safe_priority({"priority": "7"}), 7)
+        self.assertEqual(engine_mod._safe_priority({"priority": 7.9}), 7)
+
+    def test_safe_priority_invalid_falls_back_to_5(self):
+        self.assertEqual(engine_mod._safe_priority({"priority": "high"}), 5)
+        self.assertEqual(engine_mod._safe_priority({"priority": None}), 5)
+        self.assertEqual(engine_mod._safe_priority({}), 5)
+        self.assertEqual(engine_mod._safe_priority({"priority": ["high"]}), 5)
+
+    def test_sort_with_mixed_priorities_does_not_raise(self):
+        # 复现原 bug：due.sort(key=lambda x: -int(x[1].get("priority") or 5))
+        # 遇到 "high" 直接 ValueError 崩进程；非法值按 5 参与排序
+        tasks = [{"name": "hi", "priority": 10},
+                 {"name": "bad", "priority": "high"},
+                 {"name": "lo", "priority": 3}]
+        ordered = sorted(tasks, key=lambda t: -engine_mod._safe_priority(t))
+        self.assertEqual([t["name"] for t in ordered], ["hi", "bad", "lo"])
+
+    def test_task_interval_tolerates_bad_priority(self):
+        e = make_engine(self.tmp)
+        e.base_interval, e.min_interval = 30, 15
+        e.config = {"adaptive": {"enabled": True, "peak_hours": [0, 24],
+                                 "peak_multiplier": 1.0, "rush_within_hours": 0}}
+        t = task_of("t1")
+        t["priority"] = "high"
+        self.assertGreaterEqual(e.task_interval(t), 15)  # 不抛异常，走默认 5
+
+
 class TestOrder(TempDirCase):
     def test_build_ticket_strs(self):
         # 官方格式：seat,0,ticket_type,姓名,1,证件号,手机号,N,0_
