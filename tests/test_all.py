@@ -477,6 +477,64 @@ class TestPassengers(TempDirCase):
         self.assertEqual(pax_mod.load_passengers(p), [])
 
 
+class TestDpapiBlobLifetime(unittest.TestCase):
+    """DPAPI _blob() 必须把 backing buffer 锚定在返回的 struct 上。
+
+    背景（passengers.py）：DATA_BLOB 的 pbData 只存裸地址，不持有 buffer
+    对象。若 _blob 返回后 buffer 被释放，后续 CryptProtectData /
+    CryptUnprotectData 就是 use-after-free（未定义行为；Windows 上通常
+    “碰巧能用”，但可能加密出垃圾导致 passengers.json 永久无法解密）。
+
+    本测试在 Linux 也可运行：它取出 _blob 的真实源码（AST 提取后 exec），
+    断言返回的 struct 锚定了 buffer。旧代码（直接 return DATA_BLOB(...)）
+    无此锚定，测试必红；新代码必绿。注意：这是机制守卫，不能替代
+    Windows 真机上的加解密往返测试。
+    """
+
+    _BLOB_OWNERS = ("_dpapi_protect", "_dpapi_unprotect")
+
+    @staticmethod
+    def _load_blob_func(owner_name):
+        """从 passengers.py 源码提取 owner_name 内嵌的 _blob，返回可调用对象。"""
+        import ast
+        import ctypes
+        from ctypes import wintypes
+
+        with open(os.path.join(HERE, "passengers.py"), encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        outer = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == owner_name)
+        blob_node = next(n for n in ast.walk(outer)
+                         if isinstance(n, ast.FunctionDef) and n.name == "_blob")
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        ns = {"ctypes": ctypes, "DATA_BLOB": DATA_BLOB}
+        exec(compile(ast.Module(body=[blob_node], type_ignores=[]),
+                     "<_blob:%s>" % owner_name, "exec"), ns)
+        return ns["_blob"]
+
+    def test_blob_anchors_backing_buffer(self):
+        import ctypes
+        for owner in self._BLOB_OWNERS:
+            with self.subTest(owner=owner):
+                blob_fn = self._load_blob_func(owner)
+                payload = b"dpapi-lifetime-probe-123"
+                st = blob_fn(payload)
+                anchor = getattr(st, "_buf", None)
+                self.assertIsNotNone(
+                    anchor,
+                    "%s() 内嵌 _blob 返回的 DATA_BLOB 没有锚定 backing buffer；"
+                    "_blob 返回后 pbData 即悬垂 (use-after-free)" % owner)
+                # 锚定的 buffer 内容与输入一致，且 struct 指针确实指向该内存
+                self.assertEqual(anchor.value, payload)
+                self.assertEqual(st.cbData, len(payload))
+                self.assertEqual(ctypes.string_at(st.pbData, len(payload)), payload)
+
+
 class TestLauncherUnit(TempDirCase):
     def test_parse_dt_formats(self):
         r = launcher.LauncherApp._resolve_dates({"date": "2026-10-07", "date_to": "2026-10-12"})

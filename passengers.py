@@ -76,7 +76,13 @@ def _dpapi_protect(data):
 
     def _blob(raw):
         buf = ctypes.create_string_buffer(raw)
-        return DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        st = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        # DATA_BLOB 只存 pbData 的裸地址，不持有 buffer 对象；若此处不锚定，
+        # _blob 返回后 buf 引用计数归零被释放，pbData 即成悬垂指针，
+        # 后续 CryptProtectData 将从已释放内存读取（use-after-free，未定义行为）。
+        # 把 buffer 挂在 struct 上，生命周期随 data_in 延至 API 调用结束之后。
+        st._buf = buf
+        return st
 
     data_in = _blob(data)
     data_out = DATA_BLOB()
@@ -106,7 +112,11 @@ def _dpapi_unprotect(blob):
 
     def _blob(raw):
         buf = ctypes.create_string_buffer(raw)
-        return DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        st = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        # 同 _dpapi_protect：锚定 backing buffer，防止 pbData 悬垂
+        # （use-after-free，未定义行为）。
+        st._buf = buf
+        return st
 
     data_in = _blob(blob)
     data_out = DATA_BLOB()
