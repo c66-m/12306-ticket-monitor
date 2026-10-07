@@ -236,24 +236,32 @@ class MonitorEngine(object):
             state, err = appcommon.read_state_or_none(self.state_path)
         state_ok = err is None
         if err is not None:
-            LOG.warning("state.json 读取失败: %s", err)
-            # 读不出来 ≠ 空状态：挪档留证（时间戳名，见 appcommon.quarantine_corrupt），
-            # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
-            # 重复下单——必须醒目提示去核对在途行程。
-            # 传入读失败瞬间的指纹：若另一进程在此期间已写入健康文件，
-            # quarantine 会放弃隔离，避免误伤（Task 33 TOCTOU 守卫）。
-            bad = appcommon.quarantine_corrupt(
-                self.state_path, appcommon.stat_fingerprint(self.state_path))
-            if bad is None:
-                # 挪不动（如杀毒软件占用）：本次不落盘，免得下面的
-                # _save_state 把仅存的坏档覆盖掉
-                LOG.warning("坏档挪移失败（文件被占用？），本次不落盘以保留证据")
+            if isinstance(err, OSError):
+                # 瞬时占用（另一进程正在写 state.json，读句柄撞车）：本次跳过
+                # 加载，不挪档、不重建、不落盘；_sync_state 会在文件变化后重载。
+                # 绝不能把健康文件当坏档隔离（旧行为丢防重记录）。
+                LOG.warning("state.json 被占用，本次跳过加载，稍后重试: %s", err)
+                old = getattr(self, "state", None)
+                state = old if isinstance(old, dict) else {}
             else:
-                LOG.warning(
-                    "坏档已挪为 %s，从空状态重建。其它任务的运行状态与"
-                    "防重记录都在坏档里——请尽快到 12306「未支付订单」"
-                    "核对在途行程，避免重复下单", bad)
-            state = {}
+                LOG.warning("state.json 读取失败: %s", err)
+                # 读不出来 ≠ 空状态：挪档留证（时间戳名，见 appcommon.quarantine_corrupt），
+                # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
+                # 重复下单——必须醒目提示去核对在途行程。
+                # 传入读失败瞬间的指纹：若另一进程在此期间已写入健康文件，
+                # quarantine 会放弃隔离，避免误伤（Task 33 TOCTOU 守卫）。
+                bad = appcommon.quarantine_corrupt(
+                    self.state_path, appcommon.stat_fingerprint(self.state_path))
+                if bad is None:
+                    # 挪不动（如杀毒软件占用）：本次不落盘，免得下面的
+                    # _save_state 把仅存的坏档覆盖掉
+                    LOG.warning("坏档挪移失败（文件被占用？），本次不落盘以保留证据")
+                else:
+                    LOG.warning(
+                        "坏档已挪为 %s，从空状态重建。其它任务的运行状态与"
+                        "防重记录都在坏档里——请尽快到 12306「未支付订单」"
+                        "核对在途行程，避免重复下单", bad)
+                state = {}
         # 兼容旧版：把平铺的 "区间|日期|车次|席别" 键迁到 dedup 下
         if "dedup" not in state:
             dedup, tasks = {}, {}

@@ -105,7 +105,9 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
 
 def read_state_or_none(path):
     """读 state.json。返回 (state, error)：
-    (dict, None) = 正常；(None, Exception) = 损坏/读失败；（{}, None) = 不存在。"""
+    (dict, None) = 正常；(None, OSError) = 瞬时占用/读失败（文件本身大概率健康，
+    调用方不得隔离，应跳过本次加载、稍后重试）；(None, 其他 Exception) = 内容损坏
+    （如 JSON 解析失败，调用方可隔离留证）；({}, None) = 不存在。"""
     if not os.path.exists(path):
         return {}, None
     # 读句柄持有可能与写方的 os.replace 撞车（Windows 对正被打开的目标执行

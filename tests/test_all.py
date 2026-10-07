@@ -2523,6 +2523,65 @@ class TestSessionCheckTransient(TempDirCase):
         self.assertEqual(e.task_status(t), "failed")
 
 
+class TestLoadStateErrorSplit(TempDirCase):
+    """Task 40: _load_state 区分"真坏档"与"瞬时占用"。
+
+    旧代码：PermissionError（重试耗尽）与 JSON 损坏共用 (None, err) 返回，
+    _load_state 不区分直接隔离完好的 state.json 并重建空状态 → 丢防重记录。
+    新行为：仅 JSON 解析失败才 quarantine_corrupt；OSError/PermissionError
+    走"本次不加载、稍后重试"，不挪档、不重建、不落盘。
+    """
+
+    def _engine_with_state(self, state_obj):
+        e = make_engine(self.tmp)
+        sp = e.state_path
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump(state_obj, f, ensure_ascii=False)
+        e.state = dict(state_obj)
+        return e, sp
+
+    def test_permission_error_no_quarantine_keeps_old_state(self):
+        # 旧代码：PermissionError 也被当坏档隔离 → 健康文件被挪走、防重丢失
+        import appcommon
+        old = {"dedup": {"k": 1}, "tasks": {}, "retry": {}}
+        e, sp = self._engine_with_state(old)
+        with mock.patch.object(appcommon, "read_state_or_none",
+                               return_value=(None, PermissionError("被占用"))), \
+             mock.patch.object(appcommon, "quarantine_corrupt") as m_q:
+            got = e._load_state()
+        m_q.assert_not_called()
+        self.assertEqual(got, old)
+        # 磁盘文件原样未动（未被隔离、未被空状态覆盖）
+        with open(sp, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), old)
+
+    def test_generic_oserror_no_quarantine(self):
+        # 非 PermissionError 的 OSError（如文件竞态消失）同样不得隔离
+        import appcommon
+        old = {"dedup": {"k": 2}, "tasks": {}, "retry": {}}
+        e, sp = self._engine_with_state(old)
+        with mock.patch.object(appcommon, "read_state_or_none",
+                               return_value=(None, OSError("I/O error"))), \
+             mock.patch.object(appcommon, "quarantine_corrupt") as m_q:
+            got = e._load_state()
+        m_q.assert_not_called()
+        self.assertEqual(got, old)
+
+    def test_json_decode_error_still_quarantines(self):
+        # 真坏档（JSON 解析失败）仍走隔离留证（回归 pin，旧代码即如此）
+        import appcommon
+        old = {"dedup": {"k": 3}, "tasks": {}, "retry": {}}
+        e, sp = self._engine_with_state(old)
+        err = json.JSONDecodeError("Expecting value", "{corrupt", 0)
+        with mock.patch.object(appcommon, "read_state_or_none",
+                               return_value=(None, err)), \
+             mock.patch.object(appcommon, "quarantine_corrupt",
+                               return_value=sp + ".bad-1") as m_q:
+            got = e._load_state()
+        m_q.assert_called_once()
+        self.assertEqual(got["dedup"], {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
