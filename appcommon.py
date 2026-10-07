@@ -9,10 +9,13 @@
 
 import datetime
 import json
+import logging
 import os
 import re
 import threading
 import time
+
+LOG = logging.getLogger("monitor")
 
 MAX_DATE_SPAN_DAYS = 5   # 乘车日期区间最多相差天数（= 6 个日期）
 
@@ -158,15 +161,22 @@ _ORDERS_LOCK = threading.Lock()
 
 
 def load_orders(path):
-    """orders.json → {"orders": {key: rec}};缺失/损坏返回空库。"""
+    """orders.json → {"orders": {key: rec}}；缺失返回空库；损坏/形状非法则
+    时间戳挪档留证（quarantine_corrupt）+ LOG.error，再返回空库——不再静默。"""
     if not os.path.exists(path):
         return {"orders": {}}
     try:
         with open(path, encoding="utf-8") as f:
             db = json.load(f)
-    except Exception:
+    except Exception as e:
+        bad = quarantine_corrupt(path)
+        LOG.error("[数据] orders.json 损坏，已隔离留证：%s（%s）；返回空库", bad, e)
         return {"orders": {}}
-    return db if isinstance(db, dict) and isinstance(db.get("orders"), dict) else {"orders": {}}
+    if isinstance(db, dict) and isinstance(db.get("orders"), dict):
+        return db
+    bad = quarantine_corrupt(path)
+    LOG.error("[数据] orders.json 结构非法，已隔离留证：%s；返回空库", bad)
+    return {"orders": {}}
 
 
 def upsert_order(path, key, rec):

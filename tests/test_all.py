@@ -1813,6 +1813,68 @@ class TestMonitorLoadConfigMissing(TempDirCase):
         self.assertEqual(cfg["tasks"][0]["name"], "t")
 
 
+class TestLoadOrdersQuarantine(TempDirCase):
+    """Task 31: orders.json 损坏不再静默清库——挪档留证 + LOG.error，再返回空库。"""
+
+    def _orders_path(self):
+        import appcommon
+        return os.path.join(self.tmp, "orders.json")
+
+    def _bad_files(self, path):
+        import glob
+        return glob.glob(path + ".bad-*")
+
+    def test_corrupt_orders_quarantined_not_silent(self):
+        import appcommon
+        p = self._orders_path()
+        garbage = b"\x00\x01 not json \xff\xfe"
+        with open(p, "wb") as f:
+            f.write(garbage)
+        with self.assertLogs("monitor", level="ERROR"):
+            db = appcommon.load_orders(p)
+        self.assertEqual(db, {"orders": {}})
+        bad = self._bad_files(p)
+        self.assertEqual(len(bad), 1, "损坏文件应被挪档留证")
+        with open(bad[0], "rb") as f:
+            self.assertEqual(f.read(), garbage)
+        self.assertFalse(os.path.exists(p), "原损坏文件应已被挪走")
+
+    def test_corrupt_orders_upsert_preserves_evidence(self):
+        # 真实破坏链：损坏 → upsert 覆写 → 证据永久丢失
+        import appcommon
+        p = self._orders_path()
+        garbage = b"{broken json"
+        with open(p, "wb") as f:
+            f.write(garbage)
+        appcommon.upsert_order(p, "k1", {"order_no": "E123"})
+        bad = self._bad_files(p)
+        self.assertEqual(len(bad), 1, "upsert 前损坏证据必须留存")
+        with open(bad[0], "rb") as f:
+            self.assertEqual(f.read(), garbage)
+        db = appcommon.load_orders(p)
+        self.assertEqual(db["orders"]["k1"]["order_no"], "E123")
+
+    def test_wrong_shape_orders_quarantined(self):
+        # 合法 JSON 但形状非法（数组），同样不能静默覆写
+        import appcommon
+        p = self._orders_path()
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        db = appcommon.load_orders(p)
+        self.assertEqual(db, {"orders": {}})
+        self.assertEqual(len(self._bad_files(p)), 1)
+
+    def test_healthy_orders_untouched(self):
+        # 回归 pin：健康文件行为不变，不挪档
+        import appcommon
+        p = self._orders_path()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"orders": {"k": {"order_no": "E1"}}}, f)
+        db = appcommon.load_orders(p)
+        self.assertEqual(db["orders"]["k"]["order_no"], "E1")
+        self.assertEqual(self._bad_files(p), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
