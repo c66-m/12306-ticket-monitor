@@ -10,6 +10,8 @@ session_cookies.json
 state.json
 order_history.json
 passengers.json
+# Fernet 对称密钥文件（非 Windows 下 passengers.py 写入，明文，0o600）
+.passengers_key
 # launcher 的本地配置（含乘车人、常用路线等个人数据）
 launcher_config.json
 # 抢票任务数据（含乘车人、行程等个人数据）
