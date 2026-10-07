@@ -677,14 +677,16 @@ class TaskWizard(tk.Toplevel):
 
         row = tk.Frame(f, bg=CARD)
         row.pack(fill="x", padx=28)
-        ttk.Label(row, text="出发站", bg=CARD, fg=GRAY, font=(FONT, 10)).pack(side="left")
+        tk.Label(row, text="出发站", bg=CARD, fg=GRAY, font=(FONT, 10),
+                 width=6, anchor="w").pack(side="left")
         self.from_field = launcher.StationEntry(row, width=14)
         self.from_field.pack(side="left", padx=(4, 6))
         tk.Button(row, text="⇄", command=self.swap_stations, bg=BLUE, fg="white",
                   activebackground=BLUE_DARK, activeforeground="white",
                   font=(FONT, 12, "bold"), relief="flat", width=3,
                   cursor="hand2").pack(side="left", padx=10, ipady=6)
-        ttk.Label(row, text="到达站", bg=CARD, fg=GRAY, font=(FONT, 10)).pack(side="left")
+        tk.Label(row, text="到达站", bg=CARD, fg=GRAY, font=(FONT, 10),
+                 width=6, anchor="w").pack(side="left")
         self.to_field = launcher.StationEntry(row, width=14)
         self.to_field.pack(side="left")
 
