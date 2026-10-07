@@ -43,6 +43,7 @@ from tkinter import messagebox, scrolledtext, ttk
 
 import appcommon
 import engine as engine_mod
+import filelock
 import logutil
 import notify as notify_mod
 import order as order_mod
@@ -118,8 +119,9 @@ def load_config():
 
 
 def save_config(config):
-    # 原子写：写一半被杀（关窗强退/断电）不会留下截断的 config.json 导致任务全丢
-    appcommon.atomic_write_json(CONFIG_PATH, config)
+    # 原子写 + 跨进程锁：与 launcher 的读-改-写互斥（config.json.lock）
+    with filelock.file_lock(CONFIG_PATH + ".lock"):
+        appcommon.atomic_write_json(CONFIG_PATH, config)
 
 
 def load_state():
@@ -132,7 +134,9 @@ def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
-    appcommon.write_state(path, state, tmp_kind="guisave")
+    # 跨进程锁：与 launcher.append_monitor_task 的 state 段互斥（state.json.lock）
+    with filelock.file_lock(path + ".lock"):
+        appcommon.write_state(path, state, tmp_kind="guisave")
 
 
 def mark_task_created(app, task, start_now):

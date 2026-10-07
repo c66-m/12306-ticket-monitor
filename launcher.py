@@ -51,15 +51,15 @@ import browser_order
 import filelock
 import logutil
 import notify
-import passengers as pax_mod
-import ticket as tk_mod
+import passengers as passengers_mod
+import ticket
 
 __version__ = "1.0.0"
 LAUNCHER_CFG_PATH = os.path.join(HERE, "launcher_config.json")
 LOG_DIR = os.path.join(HERE, "logs")
 
 # 席别勾选列表：唯一定义在 ticket.py（含动卧），此处只引用
-SEAT_OPTIONS = list(tk_mod.SEAT_CHOICES)
+SEAT_OPTIONS = list(ticket.SEAT_CHOICES)
 SEAT_ORDER = {v: i for i, v in enumerate(SEAT_OPTIONS)}
 # 监控系统任务的席别表：与 SEAT_OPTIONS 同一份（原先三处拷贝已收敛）
 MONITOR_SEAT_CHOICES = SEAT_OPTIONS
@@ -421,7 +421,7 @@ class Grabber(threading.Thread):
         if not seats:
             self.result = (False, "请至少勾选一种席别")
             return
-        orderable = [s for s in seats if s in tk_mod.SEAT_NAME_TO_CODE]
+        orderable = [s for s in seats if s in ticket.SEAT_NAME_TO_CODE]
         if len(orderable) != len(seats):
             log("[提醒] 席别 %s 暂不支持自动下单，已跳过" % "、".join(
                 s for s in seats if s not in orderable))
@@ -429,7 +429,7 @@ class Grabber(threading.Thread):
         if not seats:
             self.result = (False, "勾选的席别都无法自动下单，请改选其他席别")
             return
-        parsed_pri = tk_mod.seat_rules_parse(pri_raw)
+        parsed_pri = ticket.seat_rules_parse(pri_raw)
         if parsed_pri["rules"] or parsed_pri["bare"]:
             summary = ["%s=%s" % (tr, "/".join(ss))
                        for tr, ss in parsed_pri["rules"].items()]
@@ -441,7 +441,7 @@ class Grabber(threading.Thread):
         if not names:
             log("[提醒] 未选择乘车人，将尝试使用账号默认乘车人（可能失败）")
 
-        name2code, code2name = tk_mod.load_station_map()
+        name2code, code2name = ticket.load_station_map()
         fc, tc = name2code.get(from_), name2code.get(to_)
         if not fc or not tc:
             self.result = (False, "车站无法识别：%s → %s" % (from_, to_))
@@ -535,7 +535,7 @@ class Grabber(threading.Thread):
             while not self.stop_event.is_set():
                 n += 1
                 try:
-                    rows = tk_mod.query_tickets(fc, tc, date, purpose=purpose_of(lc))
+                    rows = ticket.query_tickets(fc, tc, date, purpose=purpose_of(lc))
                 except Exception as e:
                     log("[错误] 余票查询失败：%s（%s 秒后重试）" % (e, int(poll)))
                     if self.stop_event.wait(poll):
@@ -545,7 +545,7 @@ class Grabber(threading.Thread):
                 info, seat, seat_rank = None, None, None
                 by_code = {}
                 for row in rows:
-                    p = tk_mod.parse_row(row, code2name, date)
+                    p = ticket.parse_row(row, code2name, date)
                     by_code.setdefault(p.get("train_code"), p)
                 for code in (trains or list(by_code)):   # 按点选顺序（留空=全部车次）
                     p = by_code.get(code)
@@ -555,7 +555,7 @@ class Grabber(threading.Thread):
                     # 每趟车各自的席别候选（唯一口径 ticket.seat_candidates_for）：
                     # 「车次=席别」专属规则 ∩ 勾选集，交集空=该车跳过；无规则的车
                     # 按全局偏好排序。候选永远与该车实际有票求交。
-                    cand = tk_mod.seat_candidates_for(code, seats, pri_raw, avail)
+                    cand = ticket.seat_candidates_for(code, seats, pri_raw, avail)
                     for rank, s in enumerate(cand, 1):
                         if (code, s) not in bad:
                             info, seat, seat_rank = p, s, (rank, len(cand))
@@ -570,10 +570,10 @@ class Grabber(threading.Thread):
                         info["available_seats"].get(seat), info["start_time"],
                         "（候选 %d/%d）" % seat_rank if seat_rank else ""))
                     try:
-                        sc = tk_mod.SEAT_NAME_TO_CODE[seat]
+                        sc = ticket.SEAT_NAME_TO_CODE[seat]
                         # 网页端下单页不下发「无座」：按同价席别改判（动车组→二等座，
                         # 普速→硬座，见 ticket.ORDER_SEAT_ALIAS / EMU_SEAT_ALIAS）
-                        sc, _alias = tk_mod.order_seat_code(seat, sc, info.get("train_code"))
+                        sc, _alias = ticket.order_seat_code(seat, sc, info.get("train_code"))
                         if _alias:
                             log("[席别] %s 网页端下单页不下发，按同价改判为 %s 下单" % (seat, _alias))
                         ok, msg, extra = browser_order.order_via_browser(
@@ -879,7 +879,7 @@ from tkinter import ttk, messagebox, simpledialog
 
 FONT = ("Microsoft YaHei UI", 10) if sys.platform == "win32" else ("Helvetica", 11)
 
-ID_TYPES = {v: k for k, v in pax_mod.ID_TYPE_NAMES.items()}
+ID_TYPES = {v: k for k, v in passengers_mod.ID_TYPE_NAMES.items()}
 
 
 # ----------------------------- 车站搜索 -----------------------------
@@ -892,7 +892,7 @@ def get_station_index():
     global _STATION_INDEX
     if _STATION_INDEX is None:
         try:
-            _STATION_INDEX = tk_mod.load_station_index()
+            _STATION_INDEX = ticket.load_station_index()
             log("[车站] 车站索引就绪：%d 个车站" % len(_STATION_INDEX))
         except Exception as e:
             log("[提醒] 车站拼音索引加载失败（%s），本次只按站名匹配" % e)
@@ -1026,7 +1026,7 @@ def probe_city_kinds(code):
         if hub == code:
             continue
         try:
-            rows = tk_mod.query_tickets(code, hub, date)
+            rows = ticket.query_tickets(code, hub, date)
         except Exception as e:
             log("[提醒] 车站类型探测失败（%s→%s）：%s" % (code, hub, e))
             continue
@@ -1716,7 +1716,7 @@ class LauncherApp(tk.Frame):
 
         def worker():
             try:
-                n2c, _c2n = tk_mod.load_station_map()
+                n2c, _c2n = ticket.load_station_map()
                 get_station_index()  # 一并预热车站拼音索引（首次要下载）
                 codes = []
                 for n in names:
@@ -1995,7 +1995,7 @@ class LauncherApp(tk.Frame):
         self.pax_vars.clear()
         self.pax_purpose_vars.clear()
         try:
-            plist = pax_mod.load_passengers()
+            plist = passengers_mod.load_passengers()
         except Exception as e:
             plist = []
             self._put_log("[错误] 乘车人读取失败：%s" % e)
@@ -2003,7 +2003,7 @@ class LauncherApp(tk.Frame):
             ttk.Label(self.pax_box, text="（未添加乘车人，点右侧按钮添加）",
                       foreground="#6e7781").pack(side="left")
             return
-        sel = cur_sel or self.lc.get("passenger_names") or pax_mod.default_names() or [plist[0]["name"]]
+        sel = cur_sel or self.lc.get("passenger_names") or passengers_mod.default_names() or [plist[0]["name"]]
         saved = self.lc.get("pax_purpose") or {}
         default_code = self.lc.get("purpose_code") or "ADULT"
         for p in plist:
@@ -2031,7 +2031,7 @@ class LauncherApp(tk.Frame):
     def _on_seat_pri_change(self, *_a):
         """「首选席别」输入框的即时解析反馈（含 车次=席别 专属规则）。"""
         checked = [s for s, v in self.seat_vars.items() if v.get()]
-        text, bad = tk_mod.seat_priority_feedback(self.seat_pri_var.get(), checked=checked)
+        text, bad = ticket.seat_priority_feedback(self.seat_pri_var.get(), checked=checked)
         self.seat_pri_hint.configure(text=text,
                                      foreground="#cf222e" if bad else "#6e7781")
 
@@ -2079,7 +2079,7 @@ class LauncherApp(tk.Frame):
                 label = "%s · %s" % (s, "候补" if houbu else "无")
             else:
                 label = s
-            if s not in tk_mod.SEAT_NAME_TO_CODE:
+            if s not in ticket.SEAT_NAME_TO_CODE:
                 label += "（不能自动下单）"
             ttk.Checkbutton(self.seat_box, text=label, variable=v).grid(
                 row=i // 6, column=i % 6, sticky="w", padx=(0, 6), pady=1)
@@ -2141,15 +2141,15 @@ class LauncherApp(tk.Frame):
 
     def _query_work(self, lc):
         try:
-            name2code, code2name = tk_mod.load_station_map()
+            name2code, code2name = ticket.load_station_map()
             fc, tc = name2code.get(lc.get("from")), name2code.get(lc.get("to"))
             if not fc or not tc:
                 raise RuntimeError("车站无法识别：%s / %s" % (lc.get("from"), lc.get("to")))
             infos = []
             for dt in self._resolve_dates(lc):
-                rows = tk_mod.query_tickets(fc, tc, dt, purpose=purpose_of(lc))
+                rows = ticket.query_tickets(fc, tc, dt, purpose=purpose_of(lc))
                 for r in rows:
-                    info = tk_mod.parse_row(r, code2name, dt)
+                    info = ticket.parse_row(r, code2name, dt)
                     info["_date"] = dt
                     infos.append(info)
             self.dataq.put(("trains", infos))
@@ -2212,7 +2212,7 @@ class LauncherApp(tk.Frame):
                     allnames.append(n)
             if i.get("houbu"):
                 houbu = True
-        order = {n: idx for idx, n in enumerate(tk_mod.SEAT_SHOW_ORDER)}
+        order = {n: idx for idx, n in enumerate(ticket.SEAT_SHOW_ORDER)}
         allnames.sort(key=lambda x: order.get(x, 99))
         self.trains_var.set(",".join(codes))
         # 选中车次后席别区按「该车提供的全部席别」刷新（含无票），抢票时也能勾
@@ -2266,7 +2266,7 @@ class LauncherApp(tk.Frame):
                 merged.setdefault(k, v)
                 if k not in names:
                     names.append(k)
-        order = {n: idx for idx, n in enumerate(tk_mod.SEAT_SHOW_ORDER)}
+        order = {n: idx for idx, n in enumerate(ticket.SEAT_SHOW_ORDER)}
         names.sort(key=lambda x: order.get(x, 99))
         hit = [n for n in names if merged.get(n)]
         codes = [i.get("train_code") or "?" for i in infos]
@@ -2715,7 +2715,7 @@ class NewMonitorTaskDialog(tk.Toplevel):
         self.seat_vars = {}
         self.pax_vars = {}
         try:
-            self.name2code, self.code2name = tk_mod.load_station_map()
+            self.name2code, self.code2name = ticket.load_station_map()
         except Exception as e:
             messagebox.showerror("错误", "车站代码表加载失败：%s" % e, parent=self)
             self.destroy()
@@ -2729,7 +2729,7 @@ class NewMonitorTaskDialog(tk.Toplevel):
         checked = [s for s, v in self.seat_vars.items() if v.get()]
         trains = [t.strip().upper() for t in
                   re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
-        text, bad = tk_mod.seat_priority_feedback(self.seat_pri_var.get(),
+        text, bad = ticket.seat_priority_feedback(self.seat_pri_var.get(),
                                                   checked=checked, trains=trains)
         self.seat_pri_hint.configure(text=text,
                                      foreground="#cf222e" if bad else "#6e7781")
@@ -2797,7 +2797,7 @@ class NewMonitorTaskDialog(tk.Toplevel):
         gf.pack(fill="x", padx=10, pady=4)
         sel = {n for n, v in self.app.pax_vars.items() if v.get()}
         try:
-            plist = pax_mod.load_passengers()
+            plist = passengers_mod.load_passengers()
         except Exception:
             plist = []
         self.pax_frame = ttk.Frame(gf)
@@ -2883,9 +2883,9 @@ class NewMonitorTaskDialog(tk.Toplevel):
             # 席别区会按车次余票补出「一等卧/二等卧/高级动卧」这类不支持下单的席别名，
             # 开着自动下单又带上它们 → engine 每轮都以「未知席别」失败刷日志，任务永远抢不到。
             # 与抢票路径同一条规则（见 Grabber._run）：开自动下单时剔除并说明。
-            bad = [s for s in seats if s not in tk_mod.SEAT_NAME_TO_CODE]
+            bad = [s for s in seats if s not in ticket.SEAT_NAME_TO_CODE]
             if bad:
-                seats = [s for s in seats if s in tk_mod.SEAT_NAME_TO_CODE]
+                seats = [s for s in seats if s in ticket.SEAT_NAME_TO_CODE]
                 self.app._put_log("[提醒] 席别 %s 暂不支持自动下单，已从该监控任务移除" % "、".join(bad))
             if not seats:
                 messagebox.showwarning(
@@ -2903,7 +2903,7 @@ class NewMonitorTaskDialog(tk.Toplevel):
                                   pax_purpose=self.app.lc.get("pax_purpose") or {},
                                   seat_priority=pri_raw)
         if pri_raw:
-            parsed = tk_mod.seat_rules_parse(pri_raw)
+            parsed = ticket.seat_rules_parse(pri_raw)
             summary = []
             for tr, ss in parsed["rules"].items():
                 summary.append("%s=%s" % (tr, "/".join(ss)))
@@ -2945,7 +2945,7 @@ class PassengerDialog(tk.Toplevel):
         self.transient(master.winfo_toplevel())
         self.grab_set()
         try:
-            self.plist = pax_mod.load_passengers()
+            self.plist = passengers_mod.load_passengers()
         except Exception as e:
             self.plist = []
             messagebox.showwarning("读取失败", "乘车人数据读取失败：%s" % e, parent=self)
@@ -3028,7 +3028,7 @@ class PassengerDialog(tk.Toplevel):
             return
         self.plist = [p for p in self.plist if (p.get("name") or "") != name]
         try:
-            pax_mod.save_passengers(self.plist)
+            passengers_mod.save_passengers(self.plist)
         except Exception as e:
             messagebox.showerror("保存失败", str(e), parent=self)
             return
@@ -3062,7 +3062,7 @@ class PassengerDialog(tk.Toplevel):
         if not replaced:
             self.plist.append(rec)
         try:
-            pax_mod.save_passengers(self.plist)
+            passengers_mod.save_passengers(self.plist)
         except Exception as e:
             messagebox.showerror("保存失败", "加密保存失败：%s" % e, parent=self)
             return
@@ -3098,7 +3098,7 @@ def ensure_passengers():
     if not names:
         return
     try:
-        pax_mod.save_passengers([
+        passengers_mod.save_passengers([
             {"name": n, "id_type_code": "1", "id_no": "", "mobile": "",
              "is_default": i == 0, "is_adult": True}
             for i, n in enumerate(names)])

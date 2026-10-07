@@ -37,6 +37,7 @@ except Exception:
     pass
 
 import appcommon
+import filelock
 import notify as notify_mod
 import order as order_mod
 import ticket
@@ -221,9 +222,11 @@ class MonitorEngine(object):
             if snapshot is None:
                 snapshot = copy.deepcopy(dict(state))
             # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
-            # 临时名/重试/直写兜底语义由 appcommon 参数化保留
-            appcommon.atomic_write_json(self.state_path, snapshot,
-                                        fallback_direct=True)
+            # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
+            # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
+            with filelock.file_lock(self.state_path + ".lock"):
+                appcommon.atomic_write_json(self.state_path, snapshot,
+                                            fallback_direct=True)
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
         except OSError:
