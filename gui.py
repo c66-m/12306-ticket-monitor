@@ -220,6 +220,34 @@ def remove_task_from_config(config, task):
     return config
 
 
+def delete_task_everywhere(app, task):
+    """删除任务：config 移除 + state 条目同步清除（加锁）+ 通知运行中引擎。
+
+    只删 config 会留下三处问题：state.json 条目成孤儿；引擎内存副本在下次
+    _sync_config 的 mtime 检查前幽灵监控（≤一个轮询间隔）；同名重建继承陈旧
+    状态/防重记录。
+
+    引擎运行时经 live engine 清内存状态（立即停该任务，不等 mtime 检查；
+    与 set_task_status 同一跨线程约定）；引擎未运行时直接加锁改文件。
+    """
+    name = task.get("name") or ""
+    update_config_locked(lambda config: remove_task_from_config(config, task))
+    if app is not None and getattr(app, "engine_thread", None) is not None \
+            and app.engine_thread.is_alive():
+        try:
+            app.get_ops_engine().note_task_deleted(name)
+            return
+        except Exception as e:
+            LOG.warning("通知引擎删除任务「%s」失败，改走文件路径：%s", name, e)
+
+    def _clear(state):
+        tasks = state.get("tasks")
+        if isinstance(tasks, dict):
+            tasks.pop(name, None)
+
+    update_state_locked(_clear)
+
+
 def normalize_email_settings(email):
     """校验并清洗邮件配置：
     - 发件邮箱必须是完整地址，否则抛 ValueError
@@ -1794,6 +1822,24 @@ class NotifyDialog(NotifyFormMixin, tk.Toplevel):
 
 # ----------------------------- 登录会话 -----------------------------
 
+def _relogin_ok_via_script(script):
+    """运行 capture_session.py 做重登：仅当退出码为 0 返回 True。
+
+    旧代码 subprocess.run(...) 后 ok = True 硬编码——退出码非 0（登录失败）
+    也被当成成功，侧边栏误置"已登录"。超时（300s）同样视为失败返回 False，
+    不挂死、不抛到界面。
+    """
+    try:
+        proc = subprocess.run([sys.executable, script], cwd=HERE, timeout=300)
+    except subprocess.TimeoutExpired:
+        LOG.error("重新登录失败：capture_session.py 运行超时（300s）")
+        return False
+    ok = proc.returncode == 0
+    if not ok:
+        LOG.error("重新登录失败：capture_session.py 退出码 %s", proc.returncode)
+    return ok
+
+
 class SessionDialog(tk.Toplevel):
     def __init__(self, master, app=None):
         super().__init__(master)
@@ -1883,9 +1929,9 @@ class SessionDialog(tk.Toplevel):
                     import browser_order
                     ok = bool(browser_order.login())
                 else:
-                    # capture_session.py 若挂住不能永久卡住重登线程
-                    subprocess.run([sys.executable, script], cwd=HERE, timeout=300)
-                    ok = True
+                    # capture_session.py 若挂住不能永久卡住重登线程；
+                    # 按退出码判定成败：失败不再被当成功
+                    ok = _relogin_ok_via_script(script)
             except Exception as e:
                 LOG.error("重新登录失败: %s", e)
             # 跨线程调 after 违反 Tk 规则，走与 run_async 相同的队列
@@ -2439,8 +2485,7 @@ class TaskPage(ttk.Frame):
                     eng.set_task_status(task, "monitoring", "右键菜单重置", force=True)
             elif action == "delete":
                 if messagebox.askyesno("确认", "确定从配置中删除任务「%s」？" % name, parent=self):
-                    update_config_locked(
-                        lambda config: remove_task_from_config(config, task))
+                    delete_task_everywhere(self.app, task)
         finally:
             self.app.refresh_tasks()
         # 先刷新列表再弹窗，减小阻塞期间被旧状态覆盖的窗口

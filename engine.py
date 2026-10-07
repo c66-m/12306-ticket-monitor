@@ -195,6 +195,10 @@ class MonitorEngine(object):
             LOG.error("[网络] 车站数据加载失败，将以空表降级运行：%s", e)
             self.name2code, self.code2name = {}, {}
         self.tasks = self.config.get("tasks") or []
+        # 已删除任务名的墓碑（内存态）：删任务与在途轮询竞速时，拦住
+        # _note_failure / 轮询后 setdefault 把已清掉的 state 条目复活。
+        # _sync_config 见到同名任务重建即清除，不影响新任务。
+        self._deleted_names = set()
 
         self.base_interval = int(self.config.get("poll_interval_seconds", 45))
         self.min_interval = max(MIN_INTERVAL_FLOOR,
@@ -356,6 +360,12 @@ class MonitorEngine(object):
         self.min_interval = max(MIN_INTERVAL_FLOOR,
                                 int(self.config.get("min_interval_seconds", 30)))
         self.tasks = self.config.get("tasks") or []
+        # 同名任务重建后清墓碑：删任务时记的墓碑只拦"已删除"的在途写回，
+        # 新任务必须正常轮询
+        deleted = getattr(self, "_deleted_names", None)
+        if deleted:
+            current_names = {t.get("name") or "" for t in self.tasks}
+            self._deleted_names = {n for n in deleted if n not in current_names}
         self._ensure_task_names()
         self._resume_or_init_status()  # 仅补缺省状态，不覆盖已有状态
         LOG.info("[配置] 已同步任务列表，共 %d 个任务", len(self.tasks))
@@ -424,6 +434,29 @@ class MonitorEngine(object):
                 del self.state["dedup"][k]
         self._save_state()
 
+    def note_task_deleted(self, name):
+        """GUI 删除任务时调用：立即从内存状态中清除该任务条目并落盘。
+
+        不等下一次 _sync_state 的 mtime 检查——否则删任务后、引擎下次同步前
+        （≤一个轮询间隔）该任务仍会被调度（幽灵监控），且内存里的旧条目可能
+        被后续 _save_state 写回文件、复活成孤儿 state。同名重建任务也不会再
+        继承陈旧状态。
+
+        另记墓碑：删任务若恰撞上该任务的在途轮询，_note_failure 与轮询后的
+        setdefault 会把条目复活——墓碑拦住这两次写回（_sync_config 见到同名
+        重建即清墓碑）。
+        """
+        tasks = self.state.get("tasks")
+        if isinstance(tasks, dict):
+            tasks.pop(name, None)
+        if name:
+            # 兼容绕过 __init__ 构造的旧实例（测试的 make_engine 等）
+            deleted = getattr(self, "_deleted_names", None)
+            if deleted is None:
+                deleted = self._deleted_names = set()
+            deleted.add(name)
+        self._save_state()
+
     # ----------------------------- 自适应频率 -----------------------------
 
     @staticmethod
@@ -480,6 +513,9 @@ class MonitorEngine(object):
 
     def _run_task(self, task):
         """执行一个任务的一轮扫描。返回 (退出循环标志, 是否发生可恢复异常)。"""
+        if (task.get("name") or "") in getattr(self, "_deleted_names", ()):
+            # 任务已被 GUI 删除：本轮不再执行（立即停），也不重建 state 条目
+            return True, False
         name = task["name"]
         entry = self.state["tasks"].setdefault(name, {})
         entry["fail_streak"] = entry.get("fail_streak", 0)
@@ -854,6 +890,10 @@ class MonitorEngine(object):
 
     def _note_failure(self, task, message):
         name = task["name"]
+        if (name or "") in getattr(self, "_deleted_names", ()):
+            # 任务在本轮询中途被 GUI 删除：在途失败不再写回 state，
+            # 不复活已清掉的条目（删任务后 state 无残留）
+            return
         entry = self.state["tasks"].setdefault(name, {})
         entry["fail_streak"] = entry.get("fail_streak", 0) + 1
         entry["message"] = "{0}（连续失败 {1} 次，将自动退避重试）".format(message, entry["fail_streak"])
@@ -1022,6 +1062,11 @@ class MonitorEngine(object):
                         LOG.error("[错误] 任务「%s」内部异常: %s", task["name"], e)
                         self._note_failure(task, "内部异常: {0}".format(e))
                         broke, recoverable = True, True
+                    if (task.get("name") or "") in getattr(self, "_deleted_names", ()):
+                        # 任务在本轮询中途被 GUI 删除：在途结果不再写回 state，
+                        # 不重建条目；丢弃本轮调度记录（删任务后 state 无残留）
+                        next_due.pop(i, None)
+                        continue
                     entry = self.state["tasks"].setdefault(task["name"], {})
                     streak = entry.get("fail_streak", 0)
                     if recoverable and streak:

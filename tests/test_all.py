@@ -4068,6 +4068,150 @@ class TestTask52BusyProbe(TempDirCase):
 
 
 
+class TestDeleteTaskClearsState(TempDirCase):
+    """Task 53(a): gui 删任务同步清 state 条目 + 通知运行中引擎立即停。
+
+    改前：只删 config —— state.json 条目成孤儿；引擎内存副本在下次 mtime
+    检查前幽灵监控（≤一个轮询间隔）；同名重建继承陈旧状态/防重。
+    改后：delete_task_everywhere() 做 config 移除 + state 条目清除（加锁）+
+    运行中引擎立即停该任务。
+    """
+
+    def _patch_gui_paths(self):
+        st = os.path.join(self.tmp, "state.json")
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": "t1", "uid": "u1"}],
+                       "state_file": st}, f)
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": {"t1": {"status": "monitoring",
+                                       "fail_streak": 0}},
+                       "dedup": {}, "retry": {}}, f)
+        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+            p = mock.patch.object(gui, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        return cfg, st
+
+    def _dead_app(self):
+        app = mock.Mock()
+        app.engine_thread = None
+        return app
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_delete_task_removes_config_and_state_entries(self):
+        # RED on old code: 根本没有 delete_task_everywhere（AttributeError）；
+        # 旧 _op 只调 update_config_locked 删 config，state 条目成孤儿
+        cfg, st = self._patch_gui_paths()
+        gui.delete_task_everywhere(self._dead_app(), {"name": "t1", "uid": "u1"})
+        self.assertEqual(self._read(cfg)["tasks"], [])
+        self.assertNotIn("t1", self._read(st)["tasks"])
+
+    def test_delete_task_notifies_live_engine(self):
+        # 引擎运行时：live engine 的内存状态条目也被清除（立即停，不等 mtime）
+        cfg, st = self._patch_gui_paths()
+        eng = mock.Mock()
+        app = mock.Mock()
+        app.engine_thread = mock.Mock()
+        app.engine_thread.is_alive.return_value = True
+        app.get_ops_engine.return_value = eng
+        gui.delete_task_everywhere(app, {"name": "t1", "uid": "u1"})
+        eng.note_task_deleted.assert_called_once_with("t1")
+        self.assertEqual(self._read(cfg)["tasks"], [])
+
+    def test_note_task_deleted_clears_memory_and_file(self):
+        # RED on old code: MonitorEngine 根本没有 note_task_deleted
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        self.assertIn("t1", e.state["tasks"])
+        e.note_task_deleted("t1")
+        self.assertNotIn("t1", e.state["tasks"])
+        self.assertNotIn("t1", self._read(st)["tasks"])
+
+    def test_note_task_deleted_missing_name_is_noop(self):
+        # 回归 pin：删不存在的任务名不抛异常、不污染 state
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        e.note_task_deleted("ghost")
+        self.assertIn("t1", e.state["tasks"])
+
+    def test_inflight_failure_does_not_resurrect_deleted_task(self):
+        # 删任务撞上在途轮询：在途失败不复活已清掉的 state 条目
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        e.note_task_deleted("t1")
+        self.assertNotIn("t1", e.state["tasks"])
+        e._note_failure({"name": "t1", "from": "A", "to": "B"}, "查询异常")
+        self.assertNotIn("t1", e.state["tasks"])
+        self.assertNotIn("t1", self._read(st)["tasks"])
+
+    def test_run_task_skipped_for_deleted_task(self):
+        # 已删除任务的轮询直接跳过：不重建 state 条目、不触发下单
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        e.note_task_deleted("t1")
+        with mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               side_effect=AssertionError("must not order")):
+            broke, recoverable = e._run_task({"name": "t1", "from": "A",
+                                              "to": "B", "dates": [],
+                                              "trains": []})
+        self.assertTrue(broke)
+        self.assertFalse(recoverable)
+        self.assertNotIn("t1", e.state["tasks"])
+        self.assertNotIn("t1", self._read(st)["tasks"])
+
+    def test_tombstone_cleared_when_task_recreated(self):
+        # 同名重建后墓碑清除：在途失败恢复正常记录，新任务不受影响
+        cfg, st = self._patch_gui_paths()
+        e = engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+        e.note_task_deleted("t1")
+        self.assertIn("t1", e._deleted_names)
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": "t1", "uid": "u1"}],
+                       "state_file": st}, f)
+        e._config_mtime = None  # 强制触发 _sync_config
+        self.assertTrue(e._sync_config())
+        self.assertNotIn("t1", e._deleted_names)
+        e._note_failure({"name": "t1", "from": "A", "to": "B"}, "查询异常")
+        self.assertIn("t1", e.state["tasks"])
+
+
+class TestReloginScriptResult(TempDirCase):
+    """Task 53(b): capture_session.py 重登链按退出码判定成败。
+
+    改前：subprocess.run(...) 后 ok = True 硬编码——退出码 1（失败）的登录
+    也被当成成功，_after_relogin 置侧边栏"已登录"。
+    改后：退出码非 0 → ok=False 并如实提示；超时同样失败（不挂死）。
+    """
+
+    def test_script_exit_1_is_not_ok(self):
+        # RED on old code: 根本没有 _relogin_ok_via_script（AttributeError）；
+        # 旧内联代码在 returncode=1 时仍置 ok=True（失败被当成功）
+        proc = mock.Mock()
+        proc.returncode = 1
+        with mock.patch.object(gui.subprocess, "run",
+                               return_value=proc) as run:
+            self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
+        run.assert_called_once()
+
+    def test_script_exit_0_is_ok(self):
+        # 回归 pin：成功路径语义不变
+        proc = mock.Mock()
+        proc.returncode = 0
+        with mock.patch.object(gui.subprocess, "run", return_value=proc):
+            self.assertTrue(gui._relogin_ok_via_script("capture_session.py"))
+
+    def test_script_timeout_is_failure_not_hang(self):
+        # 300s 超时 → False（不挂死、不抛到界面）
+        import subprocess as _sp
+        with mock.patch.object(gui.subprocess, "run",
+                               side_effect=_sp.TimeoutExpired("cmd", 300)):
+            self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
