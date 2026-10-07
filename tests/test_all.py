@@ -1764,26 +1764,31 @@ class TestMonitorInterruptRound2(TempDirCase):
 
     def test_menu_notify_to_none_raises_keyboard_interrupt(self):
         # 同上：收件人输入时 Ctrl+C/EOF，旧代码 None.replace() 抛 AttributeError。
+        # Task 50 后授权码走 getpass：read 序列少 1 个，getpass 需 mock。
         import monitor as monitor_mod
         with mock.patch.object(monitor_mod, "load_config", return_value={}), \
              mock.patch.object(monitor_mod, "read",
-                               side_effect=["", "465", "", "", "", None]):
+                               side_effect=["", "465", "", "", None]), \
+             mock.patch("getpass.getpass", return_value="pw"):
             with self.assertRaises(KeyboardInterrupt):
                 monitor_mod.menu_notify()
 
     def test_menu_notify_normal_port_unchanged(self):
         # 回归 pin：正常输入行为不变（旧代码即通过）；save_config 被 mock，
-        # 不写真实 config.json，ask_yes_no 走第 7 个 read 返回 "n"，不发测试邮件。
+        # 不写真实 config.json，ask_yes_no 走第 6 个 read 返回 "n"，不发测试邮件。
+        # Task 50 后授权码走 getpass：read 序列少 1 个，"pw" 改由 getpass 提供。
         import monitor as monitor_mod
         saved = {}
         with mock.patch.object(monitor_mod, "load_config", return_value={}), \
              mock.patch.object(monitor_mod, "read", side_effect=[
-                 "", "587", "u@x.com", "pw", "", "a@x.com", "n"]), \
+                 "", "587", "u@x.com", "", "a@x.com", "n"]), \
+             mock.patch("getpass.getpass", return_value="pw"), \
              mock.patch.object(monitor_mod, "save_config",
                                side_effect=lambda c: saved.update(c)):
             monitor_mod.menu_notify()
         self.assertEqual(saved["notify"]["email"]["smtp_port"], 587)
         self.assertEqual(saved["notify"]["email"]["to"], ["a@x.com"])
+        self.assertEqual(saved["notify"]["email"]["password"], "pw")
 
 
 class TestMonitorInterruptRound3(TempDirCase):
@@ -1868,6 +1873,8 @@ class TestMonitorInterruptRound4(TempDirCase):
 
     def test_notify_username_password_none_keep_original(self):
         # 通知设置在发件邮箱/授权码处 Ctrl+C：旧代码存 None；新代码保留原值
+        # Task 50 后授权码走 getpass：在授权码处模拟 Ctrl+C（getpass 抛
+        # KeyboardInterrupt），用户名仍走 read 返回 None 走 or-保留。
         import monitor as monitor_mod
         cfg = {"notify": {"email": {"enabled": True, "smtp_host": "smtp.qq.com",
                 "smtp_port": 465, "username": "old@x.com", "password": "oldsecret",
@@ -1877,11 +1884,14 @@ class TestMonitorInterruptRound4(TempDirCase):
              mock.patch.object(monitor_mod, "save_config",
                                side_effect=lambda c: saved_cfg.update(c)), \
              mock.patch.object(monitor_mod, "read",
-                               side_effect=["", "465", None, None, "", "a@b.com", "n"]):
-            monitor_mod.menu_notify()
-        email = saved_cfg["notify"]["email"]
-        self.assertEqual(email["username"], "old@x.com")
-        self.assertEqual(email["password"], "oldsecret")
+                               side_effect=["", "465", None]), \
+             mock.patch("getpass.getpass", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor_mod.menu_notify()
+        # 中断发生在保存前：save_config 未被调用，原配置未动。
+        self.assertEqual(saved_cfg, {})
+        self.assertEqual(cfg["notify"]["email"]["username"], "old@x.com")
+        self.assertEqual(cfg["notify"]["email"]["password"], "oldsecret")
 
     def test_corrupt_name_none_crashes_task_join(self):
         # 危害演示（round 4 时：旧代码在末尾 join 抛 TypeError）。
@@ -3528,6 +3538,82 @@ class TestLockedRMW(TempDirCase):
         with open(cfg, encoding="utf-8") as f:
             tasks = json.load(f)["tasks"]
         self.assertEqual(len(tasks), n)
+
+
+class TestTask50MonitorSecretsAndEmptyDates(TempDirCase):
+    """Task 50 (P2): (a) monitor 授权码明文回显 → 改用 getpass；
+    (b) menu_task_list 空 dates 时 IndexError → 显示占位。"""
+
+    def _run_menu_notify(self, reads, getpass_ret):
+        import monitor as monitor_mod
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "read", side_effect=reads), \
+             mock.patch("getpass.getpass", return_value=getpass_ret) as gp, \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved.update(c)):
+            monitor_mod.menu_notify()
+        return saved, gp
+
+    def test_menu_notify_password_via_getpass(self):
+        # 旧代码用 read() 明文输入授权码（第 4 个 read）；getpass 从未被调用。
+        saved, gp = self._run_menu_notify(
+            ["", "465", "", "oldpw", "", "a@x.com", "n"], "newpw123")
+        gp.assert_called_once()
+        self.assertEqual(saved["notify"]["email"]["password"], "newpw123")
+
+    def test_menu_notify_empty_getpass_keeps_old_password(self):
+        # getpass 回车（空串）→ 保留旧授权码，与旧 read 空输入语义一致。
+        import monitor as monitor_mod
+        cfg = {"notify": {"email": {"enabled": True, "smtp_host": "smtp.qq.com",
+                                    "smtp_port": 465, "username": "u@x.com",
+                                    "password": "keepme", "from": "u@x.com",
+                                    "to": ["a@x.com"]}}}
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value=cfg), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "465", "", "", "", "n"]), \
+             mock.patch("getpass.getpass", return_value=""), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved.update(c)):
+            monitor_mod.menu_notify()
+        self.assertEqual(saved["notify"]["email"]["password"], "keepme")
+
+    def test_menu_task_list_empty_dates_no_crash(self):
+        # 旧代码 dates[0] 在空 dates 时抛 IndexError。
+        import monitor as monitor_mod
+        task = {"name": "t1", "from": "北京", "to": "上海",
+                "dates": [], "trains": [], "seat_types": [],
+                "priority": 5, "passenger_names": []}
+        eng = mock.MagicMock()
+        eng.task_status.return_value = "idle"
+        eng.state = {"tasks": {}}
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"tasks": [task]}), \
+             mock.patch.object(monitor_mod, "fresh_engine", return_value=eng), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_task_list()  # 不得抛 IndexError
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        self.assertIn("未配置日期", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_menu_task_list_normal_dates_unchanged(self):
+        # 回归 pin：正常 dates 显示首日（旧代码即通过）。
+        import monitor as monitor_mod
+        task = {"name": "t1", "from": "北京", "to": "上海",
+                "dates": ["2099-01-01", "2099-01-02"], "trains": [],
+                "seat_types": [], "priority": 5, "passenger_names": []}
+        eng = mock.MagicMock()
+        eng.task_status.return_value = "idle"
+        eng.state = {"tasks": {}}
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"tasks": [task]}), \
+             mock.patch.object(monitor_mod, "fresh_engine", return_value=eng), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_task_list()
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        self.assertIn("2099-01-01", printed)
+        self.assertNotIn("未配置日期", printed)
 
 
 if __name__ == "__main__":
