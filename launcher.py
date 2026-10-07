@@ -1734,8 +1734,22 @@ class LauncherApp(tk.Frame):
 
     def _build(self):
         self.grid_columnconfigure(0, weight=1)
+        # 整页滚动容器：窗口高度装不下时滚轮滚页、下方模块可达可点
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg="#f5f6f8")
+        self._vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._vsb.set)
+        self._vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.canvas, bg="#f5f6f8")
+        self._body_win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>", lambda e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(
+            self._body_win, width=e.width))
+        self.body.grid_columnconfigure(0, weight=1)
+        self.winfo_toplevel().bind("<MouseWheel>", self._page_wheel, add="+")
 
-        top = ttk.Frame(self, padding=(12, 8))
+        top = ttk.Frame(self.body, padding=(12, 8))
         top.grid(row=0, column=0, sticky="ew")
         ttk.Label(top, text=self.task_name or "12306 抢票启动器", font=(FONT[0], 15, "bold")).pack(side="left")
         ttk.Label(top, text="v" + __version__, foreground="#6e7781").pack(side="left", padx=(8, 0))
@@ -1743,14 +1757,14 @@ class LauncherApp(tk.Frame):
         self.update_lbl.pack(side="right")
 
         # 乘车人
-        pf = ttk.LabelFrame(self, text=" 乘车人（勾选参与抢票） ", padding=8)
+        pf = ttk.LabelFrame(self.body, text=" 乘车人（勾选参与抢票） ", padding=8)
         pf.grid(row=3, column=0, sticky="ew", padx=12, pady=(3, 0))
         self.pax_box = ttk.Frame(pf)
         self.pax_box.pack(side="left", fill="x", expand=True)
         ttk.Button(pf, text="新增/编辑", command=self._edit_pax).pack(side="right")
 
         # 行程
-        tf = ttk.LabelFrame(self, text=" 行程（车站支持拼音简拼 / 全拼 / 汉字 / 代码实时搜索） ", padding=8)
+        tf = ttk.LabelFrame(self.body, text=" 行程（车站支持拼音简拼 / 全拼 / 汉字 / 代码实时搜索） ", padding=8)
         tf.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 0))
         r0 = ttk.Frame(tf)
         r0.pack(fill="x")
@@ -1792,7 +1806,7 @@ class LauncherApp(tk.Frame):
         ttk.Entry(r2, textvariable=self.trains_var, width=16).pack(side="left", padx=(4, 0))
 
         # 车次列表（第 2 段：卡片式，点卡片即选车次）
-        qf = ttk.LabelFrame(self, text=" 车次列表（查询实时余票，点卡片选中车次） ", padding=8)
+        qf = ttk.LabelFrame(self.body, text=" 车次列表（查询实时余票，点卡片选中车次） ", padding=8)
         qf.grid(row=2, column=0, sticky="ew", padx=12, pady=(3, 0))
         q0 = ttk.Frame(qf)
         q0.pack(fill="x")
@@ -1801,12 +1815,9 @@ class LauncherApp(tk.Frame):
         self.query_state = ttk.Label(q0, text="", foreground="#6e7781")
         self.query_state.pack(side="left", padx=8)
         ttk.Button(q0, text="清空列表", command=self._clear_train_rows).pack(side="right")
-        ttk.Label(q0, text="秒自动刷新", foreground="#6e7781").pack(side="right")
-        self.refresh_sec_var = tk.IntVar(value=60)
-        ttk.Spinbox(q0, from_=20, to=600, increment=10, textvariable=self.refresh_sec_var,
-                    width=4).pack(side="right", padx=(0, 2))
-        self.auto_refresh_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(q0, text="余票自动刷新", variable=self.auto_refresh_var).pack(side="right", padx=(10, 4))
+        # 余票自动刷新：默认 2 秒/次、默认开启；控制界面按需求隐藏（变量仍驱动 _tick）
+        self.refresh_sec_var = tk.IntVar(value=2)
+        self.auto_refresh_var = tk.BooleanVar(value=True)
 
         q1 = ttk.Frame(qf)
         q1.pack(fill="x", pady=(6, 0))
@@ -1830,17 +1841,16 @@ class LauncherApp(tk.Frame):
         self.cardlist.pack(fill="x", pady=(6, 0))
         self.cardlist.render([])
 
-        # 该车次全部席别（含无票）：点卡片选中车次后在这里列出来（车型参考见 KIND_SEAT_HINT）
-        self.seat_detail = tk.Frame(qf, bg="#ffffff", highlightthickness=1,
+        # 席别（第 4 段）。票种不在这里——已下移到「乘车人」区，按每个人分别选成人/学生
+        self.sf = ttk.LabelFrame(
+            self.body, text=" 席别（点车次卡片可按该车实际余票刷新） ", padding=8)
+        sf = self.sf
+        sf.grid(row=4, column=0, sticky="ew", padx=12, pady=(3, 0))
+        # 该车次全部席别（含无票）：已从车次列表区迁入席别区（与勾选/首选同区）
+        self.seat_detail = tk.Frame(sf, bg="#ffffff", highlightthickness=1,
                                     highlightbackground="#eaeef2")
         self.seat_detail.pack(fill="x", pady=(4, 0))
         self._render_seat_detail([])
-
-        # 席别（第 4 段）。票种不在这里——已下移到「乘车人」区，按每个人分别选成人/学生
-        self.sf = ttk.LabelFrame(
-            self, text=" 席别（点车次卡片可按该车实际余票刷新） ", padding=8)
-        sf = self.sf
-        sf.grid(row=4, column=0, sticky="ew", padx=12, pady=(3, 0))
         # 首选席别：填了就先抢它（可逗号分隔多个），首选都没票才按下面勾选顺序
         t0 = ttk.Frame(sf)
         t0.pack(fill="x")
@@ -1862,7 +1872,7 @@ class LauncherApp(tk.Frame):
         self._rebuild_seats()
 
         # 开抢时间
-        ef = ttk.LabelFrame(self, text=" 开抢时间 ", padding=8)
+        ef = ttk.LabelFrame(self.body, text=" 开抢时间 ", padding=8)
         ef.grid(row=5, column=0, sticky="ew", padx=12, pady=(3, 0))
         r0e = ttk.Frame(ef)
         r0e.pack(fill="x")
@@ -1886,7 +1896,7 @@ class LauncherApp(tk.Frame):
         ttk.Label(r1e, text="分钟登录预热（到点立即填单下单，0=不预热）").pack(side="left")
 
         # 主按钮 + 状态
-        bf = ttk.Frame(self)
+        bf = ttk.Frame(self.body)
         bf.grid(row=6, column=0, sticky="ew", padx=12, pady=(10, 0))
         self.go_btn = tk.Button(bf, text="立 即 抢 票", font=(FONT[0], 14, "bold"),
                                 bg="#cf222e", fg="white", activebackground="#a40e26",
@@ -1896,7 +1906,7 @@ class LauncherApp(tk.Frame):
         ttk.Button(bf, text="新建监控任务", command=self.open_new_monitor_task).pack(side="right", padx=(8, 0))
         ttk.Button(bf, text="测试会话", command=self._test_session).pack(side="right", padx=(8, 0))
 
-        stf = ttk.Frame(self)
+        stf = ttk.Frame(self.body)
         stf.grid(row=7, column=0, sticky="ew", padx=12, pady=(8, 0))
         self.dot = tk.Canvas(stf, width=14, height=14, highlightthickness=0)
         self.dot.pack(side="left")
@@ -1905,9 +1915,9 @@ class LauncherApp(tk.Frame):
         self.status_lbl.pack(side="left", padx=6)
 
         # 日志
-        lg = ttk.LabelFrame(self, text=" 日志 ", padding=4)
+        lg = ttk.LabelFrame(self.body, text=" 日志 ", padding=4)
         lg.grid(row=8, column=0, sticky="nsew", padx=12, pady=(8, 12))
-        self.grid_rowconfigure(8, weight=1)
+        self.body.grid_rowconfigure(8, weight=1)
         txt = tk.Text(lg, height=3, wrap="word", state="disabled", font=(FONT[0], 9))
         sb = ttk.Scrollbar(lg, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
@@ -2028,6 +2038,26 @@ class LauncherApp(tk.Frame):
 
     # ---- 车次查询与席别联动 ----
 
+    def _page_wheel(self, e):
+        """整页滚轮：指针在正文/页画布上时滚整页；车次卡片列表有自己的滚动。"""
+        try:
+            if not self.canvas.winfo_exists():
+                return
+            stops = [self.canvas, self.body]
+            cl = getattr(self, "cardlist", None)
+            if cl is not None:
+                stops.append(cl.canvas)
+            w = self.winfo_containing(e.x_root, e.y_root)
+            while w is not None and not any(w is st for st in stops):
+                w = w.master
+            if w is None or w is getattr(self, "cardlist", None).canvas:
+                return
+            self.canvas.yview_scroll(int(-e.delta / 120), "units")
+        except tk.TclError:
+            pass
+        except Exception:
+            return
+
     def _on_seat_pri_change(self, *_a):
         """「首选席别」输入框的即时解析反馈（含 车次=席别 专属规则）。"""
         checked = [s for s, v in self.seat_vars.items() if v.get()]
@@ -2103,8 +2133,7 @@ class LauncherApp(tk.Frame):
             return
         if not self._sync_inputs():
             if silent:
-                self.auto_refresh_var.set(False)
-                self._put_log("[提醒] 行程信息不完整，已关闭余票自动刷新")
+                self._put_log("[提醒] 行程信息不完整，本轮跳过余票自动刷新")
             else:
                 messagebox.showwarning("参数不完整",
                                        "请填写出发站 / 到达站，日期格式 YYYY-MM-DD", parent=self._mp)
@@ -2370,9 +2399,9 @@ class LauncherApp(tk.Frame):
         if not self.auto_refresh_var.get() or self._querying or self.grabber:
             return
         try:
-            gap = max(20, int(self.refresh_sec_var.get() or 60))
+            gap = max(2, int(self.refresh_sec_var.get() or 2))
         except (tk.TclError, ValueError):
-            gap = 60
+            gap = 2
         if time.time() - self._last_query_ts >= gap:
             self.query_trains(silent=True)
 
