@@ -1692,6 +1692,48 @@ class TestMonitorInterruptRound5(TempDirCase):
         self.assertTrue(any("1 条" in p for p in printed))
 
 
+class TestMonitorInterruptRound6(TempDirCase):
+    """Task 28 round 6 (P1): menu_history 展示购票历史时，历史记录的 passengers
+    含 None（pre-fix 脏任务文件曾写入历史）→ `"、".join(...)` 抛 TypeError。
+    修法：join 前过滤 falsy 姓名；有丢弃时在末尾打一条 [警告]（与 round 5 同形，
+    不静默吞）。"""
+
+    def _run_history(self, records):
+        import monitor as monitor_mod
+        hist_path = os.path.join(self.tmp, "order_history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        printed = []
+        # os.path.join(HERE, abs_path) == abs_path，可直接指向临时文件
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"history_file": hist_path}), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(" ".join(map(str, a)))):
+            monitor_mod.menu_history()
+        return printed
+
+    def _record(self, passengers):
+        return {"time": "2026-10-08 10:00:00", "task": "t1",
+                "date": "2026-10-09", "train": "G101",
+                "from": "北京", "to": "上海", "seat": "二等座",
+                "passengers": passengers,
+                "result": "success", "message": "ok"}
+
+    def test_dirty_passenger_name_in_history_no_crash(self):
+        printed = self._run_history([self._record([None, "张三"])])
+        out = "\n".join(printed)
+        self.assertIn("张三", out)
+        self.assertTrue(any("[警告]" in p for p in printed),
+                        "应提示有姓名为空的历史记录被跳过显示")
+
+    def test_clean_history_renders_and_no_warning(self):
+        # 回归 pin：干净记录渲染与旧代码一致，且不打警告
+        printed = self._run_history([self._record(["张三", "李四"])])
+        out = "\n".join(printed)
+        self.assertIn("张三、李四", out)
+        self.assertFalse(any("[警告]" in p for p in printed))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

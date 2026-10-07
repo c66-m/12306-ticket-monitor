@@ -490,18 +490,24 @@ def menu_history():
     print("\n===== 购票历史与通知记录（共 %d 条） =====" % len(history))
     label = {"success": "下单成功", "dup": "防重跳过", "failed": "下单失败",
              "hit_no_order": "命中未下单"}
+    dropped_names = 0
     for r in reversed(history[-50:]):
         print("-" * 100)
         print("  {0}  {1}".format(r.get("time"), r.get("task", "")))
+        raw_names = r.get("passengers") or []
+        names = [n for n in raw_names if n]
+        dropped_names += len(raw_names) - len(names)
         print("  {0} {1}  {2}->{3}  席别:{4}  乘车人:{5}".format(
             r.get("date", ""), r.get("train", ""), r.get("from", ""), r.get("to", ""),
-            r.get("seat", ""), "、".join(r.get("passengers") or [])))
+            r.get("seat", ""), "、".join(names)))
         if r.get("order_no"):
             print("  订单号:{0}".format(r["order_no"]))
         print("  结果:{0}   {1}".format(
             label.get(r.get("result"), r.get("result")), r.get("message", "")))
         if r.get("notify"):
             print("  通知:{0}".format(r["notify"]))
+    if dropped_names:
+        print("  [警告] 历史记录中有 {0} 条姓名为空的乘车人，已跳过显示。".format(dropped_names))
     print("-" * 100)
 
 
