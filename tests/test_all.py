@@ -2487,6 +2487,42 @@ class TestTrainCodeCase(TempDirCase):
         self.assertIn("K225", out)
 
 
+class TestSessionCheckTransient(TempDirCase):
+    """Task 39: 浏览器分支会话体检区分 transient/permanent。
+
+    session_ok 对 goto 超时等任何异常都返回 (False, "校验异常: ...")；
+    这是 12306 偶发卡顿类的瞬时故障，任务不得被标 failed，只走冷却重试。
+    只有明确的会话失效才标记 failed。
+    """
+
+    def _browser_engine(self):
+        e = make_engine(self.tmp)
+        e.config["order_mode"] = "browser"
+        t = task_of("t1")
+        e.tasks = [t]
+        e.state["tasks"]["t1"] = {"status": "monitoring"}
+        e._last_session_check = 0  # 距上次超过 20 分钟，本次必体检
+        return e, t
+
+    def test_check_exception_is_transient(self):
+        # 旧代码：permanent = not ok → 任务被标 failed，需人工逐个恢复
+        e, t = self._browser_engine()
+        with mock.patch.object(browser_order, "busy", return_value=False), \
+             mock.patch.object(browser_order, "check_session",
+                               return_value=(False, "校验异常: page.goto 超时")):
+            e.check_session_if_needed()
+        self.assertEqual(e.task_status(t), "monitoring")
+
+    def test_genuine_session_invalid_is_permanent(self):
+        # 明确的会话失效仍标记 failed（回归 pin，旧代码即通过）
+        e, t = self._browser_engine()
+        with mock.patch.object(browser_order, "busy", return_value=False), \
+             mock.patch.object(browser_order, "check_session",
+                               return_value=(False, "接口返回 status=false（会话已失效）")):
+            e.check_session_if_needed()
+        self.assertEqual(e.task_status(t), "failed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -887,7 +887,8 @@ class MonitorEngine(object):
 
     def check_session_if_needed(self):
         """定期检查登录会话；确认失效时把开启自动下单的监控中任务标记为失败。
-        临时故障（网络异常/系统繁忙页）只告警不杀任务，稍后自动重试。"""
+        临时故障（网络异常/系统繁忙页/浏览器校验异常）只告警不杀任务，稍后自动重试。
+        浏览器分支中，「校验异常」开头的校验结果视为临时故障，不标记任务失败。"""
         now = time.time()
         mark = getattr(self, "_last_session_check", 0)
         if now - mark < 1200:  # 20 分钟一次
@@ -908,7 +909,10 @@ class MonitorEngine(object):
                     self._last_session_check = now - 1140
                     return
                 ok, who = browser_order.check_session(timeout=6)
-                permanent = not ok
+                # session_ok 对 goto 超时等任何异常都返回 (False, "校验异常: ...")：
+                # 这是 12306 偶发卡顿类的瞬时故障，只走冷却重试；只有明确的会话失效
+                # 才把任务标记为失败。
+                permanent = not ok and not str(who or "").startswith("校验异常")
             except Exception as e:
                 ok, who, permanent = False, "浏览器会话校验异常: %s" % str(e)[:100], False
         else:
