@@ -348,6 +348,46 @@ class TestEngineDateValidation(TempDirCase):
         self.assertGreaterEqual(e.task_interval(t), 300)
 
 
+class TestEngineDatesSanitization(TempDirCase):
+    """Task 24 (P1): dates 混入非字符串条目不得崩引擎进程。"""
+
+    def test_expand_dates_skips_int_entry(self):
+        # 未加引号的手误：整数日期应被跳过并记警告，不抛异常
+        t = {"name": "t24", "dates": [20261009, "2026-10-09"]}
+        self.assertEqual(engine_mod.expand_dates(t), ["2026-10-09"])
+
+    def test_expand_dates_skips_none_bool_float(self):
+        t = {"name": "t24", "dates": [None, True, 3.5, "2026-10-09"]}
+        self.assertEqual(engine_mod.expand_dates(t), ["2026-10-09"])
+
+    def test_future_dates_tolerates_int_entry(self):
+        t = {"name": "t24", "dates": [20261009]}
+        kept, expired = engine_mod.future_dates(
+            t, today=datetime.date(2026, 10, 8))
+        self.assertEqual((kept, expired), ([], 0))
+
+    def test_soonest_date_none_for_int_only_task(self):
+        t = {"name": "t24", "dates": [20261009]}
+        self.assertIsNone(engine_mod.MonitorEngine._soonest_date(t))
+
+    def test_task_interval_long_fallback_for_int_only_task(self):
+        # 全是非法条目 → 视同无有效日期，走兜底长间隔而非崩进程
+        e = make_engine(self.tmp)
+        e.config = {"adaptive": {"enabled": True, "peak_hours": [0, 24],
+                                 "peak_multiplier": 1.0, "rush_within_hours": 24}}
+        t = task_of("t24", dates=[20261009], date_range=[])
+        self.assertGreaterEqual(e.task_interval(t), 300)
+
+    def test_task_interval_mixed_dates_uses_valid_entry(self):
+        # 混入非法条目但有合法未来日期：正常计算，不崩也不走兜底
+        e = make_engine(self.tmp)
+        e.config = {"adaptive": {"enabled": True, "peak_hours": [0, 24],
+                                 "peak_multiplier": 1.0, "rush_within_hours": 24}}
+        t = task_of("t24", dates=[20261009, "2099-01-01"], date_range=[])
+        iv = e.task_interval(t)
+        self.assertLess(iv, 300)
+
+
 class TestEnginePriorityValidation(TempDirCase):
     """Task 2 (P1): 非数字 priority 不得崩调度排序。"""
 

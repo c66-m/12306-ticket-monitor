@@ -97,7 +97,15 @@ def _safe_priority(task):
 
 def expand_dates(task):
     """把 dates + date_range 展开成日期列表（去重保序）。"""
-    result = list(task.get("dates") or [])
+    result = []
+    for d in task.get("dates") or []:
+        if isinstance(d, str):
+            result.append(d)
+        else:
+            # 非字符串条目（如未加引号的整数日期）：记警告后跳过，
+            # 绝不让单个任务的手误崩掉整个引擎进程
+            LOG.warning("[配置] 任务「%s」的 dates 含非法条目已跳过：%r",
+                        task.get("name"), d)
     dr = task.get("date_range")
     if dr and len(dr) == 2:
         try:
@@ -132,7 +140,7 @@ def future_dates(task, today=None):
                 kept.append(d)
             else:
                 expired += 1
-        except ValueError:
+        except (ValueError, TypeError):
             expired += 1
     return kept, expired
 
@@ -404,7 +412,7 @@ class MonitorEngine(object):
                                - datetime.datetime.now()).total_seconds() / 3600.0
                     if 0 <= delta_h <= rush_hours:
                         mult = min(mult, ad.get("rush_multiplier", 0.75))
-                except ValueError:
+                except (ValueError, TypeError):
                     pass
             prio = _safe_priority(task)
             prio = min(max(prio, 1), 10)
