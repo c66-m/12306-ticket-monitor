@@ -461,6 +461,8 @@ class Grabber(threading.Thread):
             return
         fc, tc = name2code.get(from_), name2code.get(to_)
         if not fc or not tc:
+            # 新开车站可能不在本地缓存里：后台强制刷新一次，下次可查到
+            ticket.note_station_missing(from_ if not fc else to_)
             self.result = (False, "车站无法识别：%s → %s" % (from_, to_))
             return
 
@@ -2356,6 +2358,8 @@ class LauncherApp(tk.Frame):
             name2code, code2name = ticket.load_station_map()
             fc, tc = name2code.get(lc.get("from")), name2code.get(lc.get("to"))
             if not fc or not tc:
+                # 新开车站可能不在本地缓存里：后台强制刷新一次，下次可查到
+                ticket.note_station_missing(lc.get("from") if not fc else lc.get("to"))
                 raise RuntimeError("车站无法识别：%s / %s" % (lc.get("from"), lc.get("to")))
             infos = []
             for dt in self._resolve_dates(lc):

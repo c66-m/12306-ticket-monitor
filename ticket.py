@@ -323,72 +323,167 @@ def get_session():
     return _SESSION
 
 
-def load_station_map(cache_path="station_name.json"):
-    """下载并解析车站代码表，返回 {名称: 代码} 与 {代码: 名称} 两个字典。
-    本地缓存损坏时自动重新下载（与 load_station_index 行为一致）。"""
-    import os
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_path)
-    if os.path.exists(here):
-        try:
-            with open(here, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("name2code") and data.get("code2name"):
-                return data["name2code"], data["code2name"]
-        except Exception:
-            pass  # 缓存损坏/空：走重新下载
+_STATION_CACHE_TTL = 7 * 24 * 3600  # 车站缓存有效期：7 天
+_STATION_DL_LOCK = threading.Lock()  # 下载串行化：多线程冷启动只下载一次
 
+
+def _abs_cache_path(cache_path):
+    import os
+    if os.path.isabs(cache_path):
+        return cache_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_path)
+
+
+def _sibling_cache_path(path, name):
+    import os
+    d = os.path.dirname(path)
+    return os.path.join(d, name) if d else _abs_cache_path(name)
+
+
+def _read_json_cache(path):
+    import os
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass  # 损坏：走重新下载
+    return None
+
+
+def _cache_fresh(path):
+    import os
+    try:
+        return (time.time() - os.path.getmtime(path)) < _STATION_CACHE_TTL
+    except OSError:
+        return False
+
+
+def _download_station_js_text():
+    """下载 station_name.js 原文（单次下载入口；调用方负责串行化）。"""
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Referer": "https://kyfw.12306.cn/otn/leftTicket/init"})
     r = s.get(STATION_JS_URL, timeout=20)
     r.raise_for_status()
-    text = r.text
+    return r.text
 
+
+def _parse_station_js(text):
+    """一次解析 → (name2code, code2name, stations)。
+
+    两个正则与旧 load_station_map / load_station_index 逐字一致，
+    只是跑在同一份下载文本上：两视图不可能分叉。
+    """
     name2code, code2name = {}, {}
     # 格式：@简拼|名称|代码|拼音|...
     for m in re.finditer(r"@[a-zA-Z]+\|([^|]+)\|([A-Z]{3})\|", text):
         name, code = m.group(1), m.group(2)
         name2code[name] = code
         code2name[code] = name
-
+    stations = []
+    # 格式：@bjb|北京北|VAP|beijingbei|bjb|0
+    for m in re.finditer(r"@([a-z]+)\|([^|]+)\|([A-Z]{3})\|([a-z]+)\|", text):
+        stations.append({"name": m.group(2), "code": m.group(3),
+                         "py": m.group(4), "spy": m.group(1)})
     if not name2code:
         raise RuntimeError("车站代码表解析失败，请检查 station_name.js 格式是否变更")
+    return name2code, code2name, stations
 
-    with open(here, "w", encoding="utf-8") as f:
-        json.dump({"name2code": name2code, "code2name": code2name}, f, ensure_ascii=False, indent=2)
+
+def _write_station_caches(map_path, index_path, name2code, code2name, stations):
+    with open(map_path, "w", encoding="utf-8") as f:
+        json.dump({"name2code": name2code, "code2name": code2name}, f,
+                  ensure_ascii=False, indent=2)
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump({"stations": stations}, f, ensure_ascii=False)
+
+
+def _refresh_station_cache(map_path, index_path, force=False):
+    """单次下载 + 单次解析 → 写两个缓存文件。
+
+    返回 (name2code, code2name, stations)。force=False 时锁内二次检查：
+    等锁期间并发线程可能已刷新，避免重复下载；force=True 用于手动刷新
+    与缺站刷新（缓存"新鲜"但缺新站时也必须下载）。
+    """
+    with _STATION_DL_LOCK:
+        if not force:
+            m = _read_json_cache(map_path)
+            i = _read_json_cache(index_path)
+            if (m and m.get("name2code") and m.get("code2name")
+                    and i and i.get("stations")
+                    and _cache_fresh(map_path) and _cache_fresh(index_path)):
+                return m["name2code"], m["code2name"], i["stations"]
+        text = _download_station_js_text()
+        name2code, code2name, stations = _parse_station_js(text)
+        _write_station_caches(map_path, index_path, name2code, code2name, stations)
+        return name2code, code2name, stations
+
+
+def _refresh_quiet(map_path, index_path, force=False):
+    try:
+        _refresh_station_cache(map_path, index_path, force=force)
+    except Exception:
+        pass  # 后台刷新 best-effort：失败下次调用再试，不打扰主流程
+
+
+def _refresh_station_cache_async(map_path, index_path, force=False):
+    t = threading.Thread(target=_refresh_quiet,
+                         args=(map_path, index_path, force), daemon=True)
+    t.start()
+    return t
+
+
+def refresh_station_cache(map_path="station_name.json", index_path="station_index.json"):
+    """手动刷新入口：立即重新下载车站数据并写缓存。
+
+    返回 (name2code, code2name, stations)。
+    """
+    return _refresh_station_cache(_abs_cache_path(map_path),
+                                  _abs_cache_path(index_path), force=True)
+
+
+def note_station_missing(name=None):
+    """查不到车站时调用：后台强制刷新车站缓存（best-effort），新开车站下次可查到。"""
+    _refresh_station_cache_async(_abs_cache_path("station_name.json"),
+                                 _abs_cache_path("station_index.json"),
+                                 force=True)
+
+
+def load_station_map(cache_path="station_name.json"):
+    """车站代码表 ({名称: 代码}, {代码: 名称})。
+
+    缓存 7 天 TTL：过期时立即返回旧数据并后台刷新（不阻塞调用方）；
+    无可用缓存时同步下载（冷启动必须拿到数据，下载失败抛异常，
+    调用方按旧语义降级/收尾）。与 load_station_index 共享单次下载：
+    两视图来自同一份文本，永不分叉。
+    """
+    here = _abs_cache_path(cache_path)
+    data = _read_json_cache(here)
+    if data and data.get("name2code") and data.get("code2name"):
+        if not _cache_fresh(here):
+            _refresh_station_cache_async(
+                here, _sibling_cache_path(here, "station_index.json"))
+        return data["name2code"], data["code2name"]
+    name2code, code2name, _stations = _refresh_station_cache(
+        here, _sibling_cache_path(here, "station_index.json"))
     return name2code, code2name
 
 
 def load_station_index(cache_path="station_index.json"):
-    """下载并解析车站全量索引，返回 [{"name","code","py","spy"}, ...]（约 3300 站）。
+    """车站全量索引 [{"name","code","py","spy"}, ...]（约 3300 站）。
 
     py=全拼（beijingbei） spy=简拼（bjb），供启动器本地模糊搜索使用。
-    优先读本地缓存；缓存缺失/损坏时重新下载并写缓存。"""
-    import os
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_path)
-    if os.path.exists(here):
-        try:
-            with open(here, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("stations"):
-                    return data["stations"]
-        except Exception:
-            pass
-
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Referer": "https://kyfw.12306.cn/otn/leftTicket/init"})
-    r = s.get(STATION_JS_URL, timeout=20)
-    r.raise_for_status()
-
-    stations = []
-    # 格式：@bjb|北京北|VAP|beijingbei|bjb|0
-    for m in re.finditer(r"@([a-z]+)\|([^|]+)\|([A-Z]{3})\|([a-z]+)\|", r.text):
-        stations.append({"name": m.group(2), "code": m.group(3),
-                         "py": m.group(4), "spy": m.group(1)})
-    if not stations:
-        raise RuntimeError("车站索引解析失败，请检查 station_name.js 格式是否变更")
-
-    with open(here, "w", encoding="utf-8") as f:
-        json.dump({"stations": stations}, f, ensure_ascii=False)
+    缓存语义同 load_station_map：7 天 TTL，过期先给旧数据、后台刷新。
+    """
+    here = _abs_cache_path(cache_path)
+    data = _read_json_cache(here)
+    if data and data.get("stations"):
+        if not _cache_fresh(here):
+            _refresh_station_cache_async(
+                _sibling_cache_path(here, "station_name.json"), here)
+        return data["stations"]
+    _name2code, _code2name, stations = _refresh_station_cache(
+        _sibling_cache_path(here, "station_name.json"), here)
     return stations
 
 

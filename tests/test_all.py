@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -4576,6 +4577,103 @@ class TestSaveStateInLockRMW(TempDirCase):
         with open(e.state_path, encoding="utf-8") as f:
             final = json.load(f)
         self.assertEqual(final["tasks"]["A"]["status"], "monitoring")
+
+
+class TestStationCacheRefresh(TempDirCase):
+    """Task 58: 车站数据三件套（双下载 / TTL 刷新 / import 副作用）。
+
+    - 冷启动 load_station_map + load_station_index 只下载一次（改前两次）；
+    - 过期缓存：立即返回旧数据 + 后台刷新（改前永不刷新）；
+    - import station_db 不得拖入 launcher（3600 行 GUI 模块 + _ensure_stdio 副作用）。
+    """
+
+    SAMPLE_JS = "@bjb|北京北|VAP|beijingbei|bjb|0@shh|上海|SHH|shanghai|shh|0"
+
+    def _mock_session(self):
+        resp = mock.Mock()
+        resp.text = self.SAMPLE_JS
+        resp.raise_for_status = mock.Mock()
+        sess = mock.Mock()
+        sess.get.return_value = resp
+        return sess
+
+    def _paths(self):
+        return (os.path.join(self.tmp, "station_name.json"),
+                os.path.join(self.tmp, "station_index.json"))
+
+    def _wait_for(self, pred, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return pred()
+
+    def _fresh(self, path):
+        try:
+            return os.path.getmtime(path) > time.time() - 3600
+        except OSError:
+            return False
+
+    def test_single_download_for_both_views(self):
+        mp, ip = self._paths()
+        sess = self._mock_session()
+        with mock.patch.object(ticket.requests, "Session", return_value=sess):
+            n2c, c2n = ticket.load_station_map(mp)
+            stations = ticket.load_station_index(ip)
+        self.assertEqual(sess.get.call_count, 1)  # 改前：两次下载
+        self.assertEqual(n2c["北京北"], "VAP")
+        self.assertEqual(c2n["SHH"], "上海")
+        self.assertEqual(stations[0], {"name": "北京北", "code": "VAP",
+                                      "py": "beijingbei", "spy": "bjb"})
+        self.assertEqual(stations[1]["code"], "SHH")
+
+    def test_expired_cache_returns_stale_then_refreshes(self):
+        mp, ip = self._paths()
+        with open(mp, "w", encoding="utf-8") as f:
+            json.dump({"name2code": {"老站": "OLD"},
+                       "code2name": {"OLD": "老站"}}, f)
+        with open(ip, "w", encoding="utf-8") as f:
+            json.dump({"stations": [{"name": "老站", "code": "OLD",
+                                     "py": "laozhan", "spy": "lz"}]}, f)
+        old = time.time() - 8 * 24 * 3600
+        os.utime(mp, (old, old))
+        os.utime(ip, (old, old))
+        sess = self._mock_session()
+        with mock.patch.object(ticket.requests, "Session", return_value=sess):
+            n2c, _c2n = ticket.load_station_map(mp)
+            self.assertEqual(n2c["老站"], "OLD")  # 过期也先给旧数据，不阻塞
+            self.assertTrue(self._wait_for(lambda: sess.get.call_count == 1),
+                            "过期缓存未触发后台刷新")
+            self.assertTrue(self._wait_for(lambda: self._fresh(mp)),
+                            "后台刷新未写回缓存")
+        n2c2, _ = ticket.load_station_map(mp)
+        self.assertEqual(n2c2["北京北"], "VAP")
+        stations = ticket.load_station_index(ip)
+        self.assertEqual(stations[0]["code"], "VAP")
+
+    def test_manual_refresh_entry(self):
+        mp, ip = self._paths()
+        sess = self._mock_session()
+        with mock.patch.object(ticket.requests, "Session", return_value=sess):
+            n2c, c2n, stations = ticket.refresh_station_cache(mp, ip)
+        self.assertEqual(sess.get.call_count, 1)
+        self.assertTrue(os.path.exists(mp) and os.path.exists(ip))
+        self.assertEqual(n2c["北京北"], "VAP")
+        self.assertEqual(len(stations), 2)
+
+    def test_note_station_missing_triggers_background_refresh(self):
+        with mock.patch.object(ticket, "_refresh_station_cache_async") as bg:
+            ticket.note_station_missing("新开站")
+            bg.assert_called_once()
+
+    def test_import_station_db_has_no_launcher_side_effect(self):
+        code = ("import sys; sys.path.insert(0, %r); import station_db; "
+                "print('launcher' in sys.modules)" % HERE)
+        proc = subprocess.run([sys.executable, "-c", code], cwd=HERE,
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
+        self.assertEqual(proc.stdout.strip(), "False")  # 改前：True（顶层 import launcher）
 
 
 if __name__ == "__main__":

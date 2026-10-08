@@ -51,14 +51,12 @@ def search(text, limit=20):
     return launcher.search_stations(text, limit=limit)
 
 
-import launcher  # query 分支也需要
-
-
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "rebuild":
         rebuild()
     elif args and args[0] == "query":
+        import launcher  # 延迟导入：import station_db 时不拖入 GUI 模块
         for st in search(" ".join(args[1:]) or "", limit=20):
             kind = launcher.load_station_kinds().get(st["code"], "待识别")
             print("{name} {code} {kind}".format(kind=kind, **st))
