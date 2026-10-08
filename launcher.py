@@ -302,6 +302,68 @@ def mask_mobile(m):
     return m
 
 
+def _mask_order_no(no):
+    """订单号脱敏（日志用；与 engine._mask_order_no 同口径）：保留前后各 4 位，
+    中间打码；过短则全打码。"""
+    s = str(no or "")
+    if len(s) <= 8:
+        return "****"
+    return s[:4] + "****" + s[-4:]
+
+
+def _mask_names(names):
+    """乘车人姓名打码（日志用；与 engine._mask_names 同口径）：保留首字其余打码；
+    ['张三','李四'] -> '张*、李*'。"""
+    out = []
+    for n in names or []:
+        n = (n or "").strip()
+        if not n:
+            continue
+        out.append(n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*")
+    return "、".join(out)
+
+
+_ORDER_NO_RE = re.compile(r"(订单号\s?)([A-Za-z0-9]{4,})")
+
+
+def _mask_pii_text(text):
+    """日志文本 PII 脱敏（Task 84c）：把文本中「订单号 XXX」形式的订单号打码；
+    无 PII 的文本原样返回。只用于日志路径，不碰用户界面与历史记录。"""
+    return _ORDER_NO_RE.sub(
+        lambda m: m.group(1) + _mask_order_no(m.group(2)), text or "")
+
+
+def _normalize_trains(raw, warn):
+    """trains 字段归一化（Task 84a；与 engine.normalize_trains 同口径）：
+    裸字符串（如漏写方括号的 "G101"）按单个车次处理并记警告，绝不逐字符拆
+    （旧代码会拆成 ['G','1','0','1'] 静默漏单）；形状非法记警告后忽略；
+    非字符串条目跳过。"""
+    raw = raw or []
+    if isinstance(raw, str):
+        warn("[提醒] trains 为字符串，已按单个车次处理：%s" % raw)
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        warn("[提醒] trains 形状非法，已忽略：%r" % (raw,))
+        raw = []
+    return [t.strip().upper() for t in raw
+            if isinstance(t, str) and t.strip()]
+
+
+def _save_passengers_or_warn(passengers, parent):
+    """保存乘车人；磁盘盒子不可解密被拒写（return False）时弹 error 并返回 False。
+
+    Task 84(d)：与 gui._save_passengers_or_warn 同口径。调用方在 False 时不得
+    显示成功、不得刷新列表。抛出的异常仍由调用方 try/except 处理。"""
+    if passengers_mod.save_passengers(passengers):
+        return True
+    messagebox.showerror("保存失败",
+                         "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
+                         "已拒绝覆盖以保护原数据。\n"
+                         "请在原机器解密后迁移，或使用 --force 放弃旧数据。",
+                         parent=parent)
+    return False
+
+
 # ----------------------------- 时间工具 -----------------------------
 
 def parse_dt(s):
@@ -431,7 +493,7 @@ class Grabber(threading.Thread):
             hist_path = os.path.join(HERE, "order_history.json")
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
-        trains = [t.strip().upper() for t in (lc.get("trains") or []) if t and t.strip()]
+        trains = _normalize_trains(lc.get("trains"), log)
         seats = [s for s in (lc.get("seat_types") or []) if s]
         pri_raw = lc.get("seat_priority") or ""
         names = [n for n in (lc.get("passenger_names") or []) if n]
@@ -652,7 +714,9 @@ class Grabber(threading.Thread):
                     exc_key, exc_streak = None, 0  # 本次下单尝试正常返回：异常 streak 断开
                     if ok:
                         self.result = (True, msg)
-                        log("[抢到] %s" % msg)
+                        # Task 84c：日志路径 PII 脱敏（订单号打码）；self.result /
+                        # 历史记录 / 通知里的原文不动，用户仍能在界面看到完整订单号
+                        log("[抢到] %s" % _mask_pii_text(msg))
                         try:
                             order_no = (extra or {}).get("order_no") or ""
                             appcommon.append_history(
@@ -680,7 +744,9 @@ class Grabber(threading.Thread):
                             self.result = (True,
                                 "订单已提交成功（未支付）：订单号 %s，下单时间 %s，请尽快去 12306 支付"
                                 % (order_no, recent.get("order_time") or "未知"))
-                            log("[抢到] %s" % self.result[1])
+                            # Task 84c：日志里的订单号打码（与 Task 61 同口径）；
+                            # self.result[1] 原文保留，用户界面仍显示完整订单号
+                            log("[抢到] %s" % _mask_pii_text(self.result[1]))
                             try:
                                 appcommon.append_history(
                                     hist_path,
@@ -858,11 +924,11 @@ def merge_trains_from_monitor(lc, saver=None):
         return False
     mon = []
     for t in (cfg.get("tasks") or []):
-        for tr in (t.get("trains") or []):
-            tr = str(tr).strip().upper()
+        # Task 84a：字符串 trains 按单车次归一化，绝不逐字符拆
+        for tr in _normalize_trains(t.get("trains"), log):
             if tr and tr not in mon:
                 mon.append(tr)
-    cur = [str(t).strip().upper() for t in (lc.get("trains") or []) if str(t).strip()]
+    cur = _normalize_trains(lc.get("trains"), log)
     old_synced = set(lc.get("synced_trains") or [])
     synced = set(old_synced)
     added = []
@@ -3374,7 +3440,9 @@ class PassengerDialog(tk.Toplevel):
             return
         self.plist = [p for p in self.plist if (p.get("name") or "") != name]
         try:
-            passengers_mod.save_passengers(self.plist)
+            # Task 84d：拒写（False）弹 error，不刷新列表、不显示成功
+            if not _save_passengers_or_warn(self.plist, self):
+                return
         except Exception as e:
             messagebox.showerror("保存失败", str(e), parent=self)
             return
@@ -3408,7 +3476,9 @@ class PassengerDialog(tk.Toplevel):
         if not replaced:
             self.plist.append(rec)
         try:
-            passengers_mod.save_passengers(self.plist)
+            # Task 84d：拒写（False）弹 error，不显示"已保存"
+            if not _save_passengers_or_warn(self.plist, self):
+                return
         except Exception as e:
             messagebox.showerror("保存失败", "加密保存失败：%s" % e, parent=self)
             return
@@ -3444,13 +3514,19 @@ def ensure_passengers():
     if not names:
         return
     try:
-        passengers_mod.save_passengers([
+        ok = passengers_mod.save_passengers([
             {"name": n, "id_type_code": "1", "id_no": "", "mobile": "",
              "is_default": i == 0, "is_adult": True}
             for i, n in enumerate(names)])
-        log("[提醒] 已从监控任务导入乘车人：%s（证件号请点「新增/编辑」补全）" % "、".join(names))
     except Exception as e:
         log("[错误] 乘车人导入失败：%s" % e)
+        return
+    # Task 84d：拒写（False）不得记"已导入"成功日志；Task 84c：姓名打码
+    if not ok:
+        log("[错误] 乘车人导入被拒：磁盘已有数据在本机不可解密，已保护原数据（本次未导入）")
+    else:
+        log("[提醒] 已从监控任务导入乘车人：%s（证件号请点「新增/编辑」补全）"
+            % _mask_names(names))
 
 
 class GrabTaskWindow(tk.Toplevel):

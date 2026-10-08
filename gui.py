@@ -174,11 +174,24 @@ def update_config_locked(mutator):
 
     mutator(config) 就地修改读到的 dict；返回其返回值。
     替代「load_config() → 改 → save_config()」的锁外读模式（双端并发改任务丢数据）。
+
+    Task 84b：config.json 损坏（JSON 解析失败）时友好中止——弹 error 提示并抛
+    友好异常（不 traceback、不覆盖旧文件）；与 Task 75 读侧口径一致。
     """
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                config = json.load(f)
+            try:
+                with open(CONFIG_PATH, encoding="utf-8") as f:
+                    config = json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                LOG.warning("config.json 已损坏，拒绝覆盖写入：%s", CONFIG_PATH)
+                messagebox.showerror(
+                    "配置损坏",
+                    "config.json 已损坏，本次保存已取消（旧文件未被覆盖）。\n"
+                    "请手动修复该文件，或备份后删除让程序重建。",
+                    parent=None)
+                raise RuntimeError(
+                    "config.json 已损坏：本次保存已取消，旧文件未被覆盖")
             result = mutator(config)
             # Task 66: config.json 含密钥，落盘 0600
             appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)

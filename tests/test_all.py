@@ -8226,6 +8226,170 @@ class TestTask82StationDbRebuildRefusesZero(TempDirCase):
         self.assertIn("共 2 站", out, "正常重建的输出不得变化")
 
 
+class TestTask84LauncherP3(TempDirCase):
+    """Task 84: launcher P3 bundle（a–d）。无 Tk 真机，全部 mock/桩测试。"""
+
+    def _var(self, value):
+        v = mock.Mock()
+        v.get.return_value = value
+        return v
+
+    # ---- (a) trains 字符串不得逐字符拆 ----
+
+    def test_normalize_trains_string_single_with_warning(self):
+        warned = []
+        got = launcher._normalize_trains("G101", warned.append)
+        self.assertEqual(got, ["G101"])
+        self.assertEqual(len(warned), 1, "字符串 trains 必须记一次警告")
+
+    def test_normalize_trains_list_unchanged(self):
+        warned = []
+        got = launcher._normalize_trains([" g101 ", "K2"], warned.append)
+        self.assertEqual(got, ["G101", "K2"])
+        self.assertEqual(warned, [])
+
+    def test_normalize_trains_non_string_items_skipped(self):
+        warned = []
+        got = launcher._normalize_trains(["G101", 123, None], warned.append)
+        self.assertEqual(got, ["G101"])
+
+    def test_normalize_trains_illegal_shape_ignored_with_warning(self):
+        warned = []
+        got = launcher._normalize_trains(123, warned.append)
+        self.assertEqual(got, [])
+        self.assertEqual(len(warned), 1)
+
+    def test_grabber_run_wires_normalize_trains(self):
+        import queue as _queue
+        th = object.__new__(launcher.Grabber)
+        th.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+                 "trains": "G101", "seat_types": [], "seat_priority": "",
+                 "passenger_names": []}
+        th.logq = _queue.Queue()
+        th.stop_event = threading.Event()
+        th.result = None
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "_normalize_trains",
+                               wraps=launcher._normalize_trains) as sp:
+            th._run()
+        self.assertEqual(th.result, (False, "请至少勾选一种席别"))
+        sp.assert_called_once()
+        self.assertEqual(sp.call_args[0][0], "G101")
+
+    def test_merge_trains_from_monitor_string_not_char_split(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"trains": "G101"}]}, f, ensure_ascii=False)
+        lc = {"trains": []}
+        logged = []
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", logged.append):
+            ret = launcher.merge_trains_from_monitor(lc, saver=lambda c: None)
+        self.assertTrue(ret)
+        self.assertEqual(lc["trains"], ["G101"])
+
+    # ---- (b) update_config_locked 写路径损坏配置 ----
+
+    def test_update_config_locked_damaged_config_friendly_abort(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("{损坏的 json,,,")
+        with open(cfg, "rb") as f:
+            before = f.read()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "messagebox") as mb:
+            with self.assertRaises(Exception) as cm:
+                gui.update_config_locked(lambda c: c)
+        self.assertNotIsInstance(
+            cm.exception, (json.JSONDecodeError, UnicodeDecodeError),
+            "损坏配置不得抛出原始 JSON 解析异常（traceback）")
+        self.assertIn("损坏", str(cm.exception))
+        mb.showerror.assert_called_once()
+        with open(cfg, "rb") as f:
+            self.assertEqual(f.read(), before,
+                             "损坏的旧文件不得被覆盖")
+
+    # ---- (c) log 路径 PII 脱敏 ----
+
+    def test_mask_pii_text_masks_order_no(self):
+        masked = launcher._mask_pii_text(
+            "订单已提交成功（未支付）：订单号 E123456789，下单时间 2026-10-08，请尽快去 12306 支付")
+        self.assertNotIn("E123456789", masked)
+        self.assertIn("订单号", masked)
+        plain = "已提交订单（未支付）：https://kyfw.12306.cn/otn/payOrder/init"
+        self.assertEqual(launcher._mask_pii_text(plain), plain)
+
+    def test_mask_names(self):
+        self.assertEqual(launcher._mask_names(["张三丰", "李"]), "张**、*")
+
+    def test_ensure_passengers_log_masks_names(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"passenger_names": ["张三丰"]}]},
+                      f, ensure_ascii=False)
+        logged = []
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", logged.append), \
+             mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=True) as m_save:
+            launcher.ensure_passengers()
+        m_save.assert_called_once()
+        text = "".join(logged)
+        self.assertNotIn("张三丰", text)
+        self.assertIn("张**", text)
+
+    # ---- (d) save_passengers 拒写（False）不得显示成功 ----
+
+    def _make_passenger_dialog(self):
+        dlg = object.__new__(launcher.PassengerDialog)
+        dlg.plist = []
+        dlg.name_var = self._var("张三")
+        dlg.id_var = self._var("110101199001011234")
+        dlg.default_var = self._var(False)
+        dlg.type_var = self._var("二代身份证")
+        dlg.mob_var = self._var("13800000000")
+        dlg.adult_var = self._var(True)
+        dlg.pick = mock.Mock()
+        dlg.on_saved = None
+        return dlg
+
+    def test_passenger_dialog_save_refusal_shows_error_not_success(self):
+        dlg = self._make_passenger_dialog()
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=False), \
+             mock.patch.object(launcher, "messagebox") as mb:
+            launcher.PassengerDialog._save(dlg)
+        mb.showerror.assert_called_once()
+        mb.showinfo.assert_not_called()
+        dlg.pick.configure.assert_not_called()
+
+    def test_passenger_dialog_delete_refusal_no_refresh(self):
+        dlg = self._make_passenger_dialog()
+        dlg.plist = [{"name": "张三"}]
+        dlg.pick.get.return_value = "张三"
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=False), \
+             mock.patch.object(launcher, "messagebox") as mb:
+            launcher.PassengerDialog._delete(dlg)
+        mb.showerror.assert_called_once()
+        dlg.pick.configure.assert_not_called()
+
+    def test_ensure_passengers_refusal_no_false_success_log(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"passenger_names": ["张三"]}]},
+                      f, ensure_ascii=False)
+        logged = []
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", logged.append), \
+             mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=False):
+            launcher.ensure_passengers()
+        text = "".join(logged)
+        self.assertNotIn("已从监控任务导入乘车人", text)
+        self.assertIn("错误", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
