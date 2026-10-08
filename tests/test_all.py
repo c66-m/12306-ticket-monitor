@@ -8722,6 +8722,153 @@ class TestTask87StaleReadDegradation(TempDirCase):
         self.assertNotIn("已保存", printed)
 
 
+class TestTask88ConvergenceLeftovers(TempDirCase):
+    """Task 88 (P3): 收敛残留 bundle——
+    (a) menu_task_list 的 trains/seat_types 非 list（如 int）→ TypeError 崩菜单；
+    (b) launcher 四处展示路径 ","/"、".join 对字符串 trains 逐字符拆（纯展示）；
+    (c) launcher _put_log 的"[查询]"分支经 _ptxt 记全量乘车人姓名；
+    (d) menu_passengers 四处 load→think→save 写侧连跨进程锁都没有，
+        并发写入可被静默丢失（Task 87 同口径：filelock + 乐观并发检查）。
+    """
+
+    @staticmethod
+    def _printed(mprint):
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    @staticmethod
+    def _mock_engine():
+        eng = mock.MagicMock()
+        eng.task_status.side_effect = lambda t: t["name"]
+        eng.state = {"tasks": {}}
+        eng.base_interval = 300
+        return eng
+
+    def test_task_list_non_list_trains_no_crash(self):
+        # (a) 旧代码 "/".join(t.get("trains") or []) 对 int/"G101" 抛 TypeError
+        # 或逐字符拆（"G/1/0/1"），崩菜单/误导。
+        import monitor as monitor_mod
+        tasks = [{"name": "t1", "from": "北京", "to": "上海", "dates": [],
+                  "trains": 123, "seat_types": "G101"}]
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(monitor_mod, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_task_list()  # 旧代码 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("配置损坏", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_display_trains_string_not_char_split(self):
+        # (b) 旧代码无此 helper（AttributeError）；各展示点对 "G101"
+        # 会 join 成 "G,1,0,1" 逐字符拆。
+        import launcher as launcher_mod
+        self.assertEqual(launcher_mod._display_trains("G101"), ["G101"])
+        self.assertEqual(",".join(launcher_mod._display_trains("G101")), "G101")
+        self.assertEqual(launcher_mod._display_trains(["g1 ", ""]), ["G1"])
+        self.assertEqual(launcher_mod._display_trains(123), [])
+        self.assertEqual(launcher_mod._display_trains(None), [])
+
+    def test_mask_one_name(self):
+        # (c) 旧代码无此 helper（AttributeError）；_ptxt 记全名。
+        import launcher as launcher_mod
+        self.assertEqual(launcher_mod._mask_one_name("张三丰"), "张**")
+        self.assertEqual(launcher_mod._mask_one_name("李"), "*")
+        self.assertEqual(launcher_mod._mask_one_name(""), "")
+        # _mask_names 复用同一口径（单源）
+        self.assertEqual(launcher_mod._mask_names(["张三", "李四"]), "张*、李*")
+
+    def _patch_pax(self, pm):
+        p = os.path.join(self.tmp, "passengers.json")
+        mp = mock.patch.object(pm, "DEFAULT_PATH", p)
+        mp.start()
+        self.addCleanup(mp.stop)
+        return p
+
+    def test_passengers_stamp_mismatch_abandons(self):
+        # (d) 旧代码 save_passengers 无 expect_stamp 参数（TypeError）；
+        # 且旧行为会静默覆写思考期间的外部写入（数据丢失）。
+        import passengers as pm
+        self._patch_pax(pm)
+        pm.save_passengers([{"name": "A"}])
+        stamp = pm.passengers_stamp()
+        # 用户思考期间：另一进程（GUI/Launcher）写入 passengers.json
+        pm.save_passengers([{"name": "EXT"}])
+        with mock.patch("builtins.print") as mprint:
+            ok = pm.save_passengers([{"name": "A2"}], expect_stamp=stamp)
+        self.assertFalse(ok)
+        names = [x["name"] for x in pm.load_passengers()]
+        self.assertEqual(names, ["EXT"])  # 外部数据保留，未被覆写
+        self.assertIn("已放弃", self._printed(mprint))
+
+    def test_passengers_stamp_match_writes(self):
+        # 回归 pin：无外部写入时正常落盘。
+        import passengers as pm
+        self._patch_pax(pm)
+        pm.save_passengers([{"name": "A"}])
+        stamp = pm.passengers_stamp()
+        with mock.patch("builtins.print") as mprint:
+            ok = pm.save_passengers([{"name": "A", "x": 1}], expect_stamp=stamp)
+        self.assertTrue(ok)
+        self.assertEqual(pm.load_passengers()[0]["x"], 1)
+        self.assertNotIn("已放弃", self._printed(mprint))
+
+    def test_passengers_first_run_stamp_none(self):
+        # 首跑：文件不存在 → 指纹 None → 正常写入，不误报。
+        import passengers as pm
+        self._patch_pax(pm)
+        stamp = pm.passengers_stamp()
+        self.assertIsNone(stamp)
+        with mock.patch("builtins.print") as mprint:
+            ok = pm.save_passengers([{"name": "A"}], expect_stamp=stamp)
+        self.assertTrue(ok)
+        self.assertEqual([x["name"] for x in pm.load_passengers()], ["A"])
+        self.assertNotIn("已放弃", self._printed(mprint))
+
+    def test_passengers_stamp_identical_rewrite_no_false_positive(self):
+        # 外部重写了完全相同的字节 → 指纹一致 → 不误报放弃。
+        import passengers as pm
+        p = self._patch_pax(pm)
+        pm.save_passengers([{"name": "A"}])
+        stamp = pm.passengers_stamp()
+        with open(p, "rb") as f:
+            raw = f.read()
+        with open(p, "wb") as f:
+            f.write(raw)  # 外部相同内容重写
+        ok = pm.save_passengers([{"name": "A2"}], expect_stamp=stamp)
+        self.assertTrue(ok)
+        self.assertEqual([x["name"] for x in pm.load_passengers()], ["A2"])
+
+    def test_menu_passengers_external_write_abandons_and_reloads(self):
+        # (d) 端到端：op1 添加的思考期间（姓名输入时）外部写入；
+        # 旧代码静默覆写（names==["A","B"]），新代码放弃并重载。
+        import monitor as monitor_mod
+        import passengers as pm
+        self._patch_pax(pm)
+        pm.save_passengers([{"name": "A"}])
+        state = {"ops": 0}
+
+        def fake_read(prompt="", default=""):
+            if "选择操作" in prompt:
+                state["ops"] += 1
+                return "1" if state["ops"] == 1 else "0"
+            if "姓名：" in prompt:
+                # 用户思考期间：另一进程改了 passengers.json
+                pm.save_passengers([{"name": "EXT"}])
+                return "B"
+            return default
+
+        with mock.patch.object(monitor_mod, "read", side_effect=fake_read), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_passengers()
+        names = [x["name"] for x in pm.load_passengers()]
+        self.assertEqual(names, ["EXT"])  # 外部数据保留，未被 A+B 覆写
+        printed = self._printed(mprint)
+        self.assertIn("已放弃", printed)
+        self.assertIn("重新载入", printed)
+        self.assertNotIn("已添加并加密保存", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

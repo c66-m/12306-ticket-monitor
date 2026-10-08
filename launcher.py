@@ -311,15 +311,22 @@ def _mask_order_no(no):
     return s[:4] + "****" + s[-4:]
 
 
+def _mask_one_name(n):
+    """单个姓名打码（Task 88c：与 _mask_names 同口径的单源）：保留首字其余打码。"""
+    n = (n or "").strip()
+    if not n:
+        return ""
+    return n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*"
+
+
 def _mask_names(names):
     """乘车人姓名打码（日志用；与 engine._mask_names 同口径）：保留首字其余打码；
     ['张三','李四'] -> '张*、李*'。"""
     out = []
     for n in names or []:
-        n = (n or "").strip()
-        if not n:
-            continue
-        out.append(n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*")
+        m = _mask_one_name(n)
+        if m:
+            out.append(m)
     return "、".join(out)
 
 
@@ -347,6 +354,13 @@ def _normalize_trains(raw, warn):
         raw = []
     return [t.strip().upper() for t in raw
             if isinstance(t, str) and t.strip()]
+
+
+def _display_trains(raw):
+    """展示用车次归一化（Task 88b）：与 _normalize_trains 同口径（字符串按
+    单个车次、绝不逐字符拆），但不打日志——展示路径可能高频刷新，畸形值的
+    警告由数据消费路径（engine/launcher 运行链）负责；这里只解决展示。"""
+    return _normalize_trains(raw, lambda *a: None)
 
 
 def _save_passengers_or_warn(passengers, parent):
@@ -2233,7 +2247,7 @@ class LauncherApp(tk.Frame):
         self.to_ent.set_history(hist)
         self.from_ent.set(lc.get("from") or "")
         self.to_ent.set(lc.get("to") or "")
-        self.trains_var.set(",".join(lc.get("trains") or []))
+        self.trains_var.set(",".join(_display_trains(lc.get("trains"))))
         self.date_var.set(lc.get("date") or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
         self.date_to_var.set(lc.get("date_to") or "")
         # 票种不再全局设置：_refresh_pax() 里按每个乘车人各自的保存值建下拉
@@ -2447,7 +2461,10 @@ class LauncherApp(tk.Frame):
         lc = dict(self.lc)
         _pm = lc.get("pax_purpose") or {}
         _ptxt = "、".join(
-            "%s%s" % (n, "（学生票）" if _pm.get(n) == "0X00" else "")
+            # Task 88c：日志里的乘车人姓名打码（与 Task 61/84 同口径）；
+            # 学生票后缀保留（非 PII）。
+            "%s%s" % (_mask_one_name(n),
+                      "（学生票）" if _pm.get(n) == "0X00" else "")
             for n in (lc.get("passenger_names") or [])) or "账号默认乘车人"
         self._put_log("[查询] %s → %s %s（乘车人：%s；余票口径 %s）…" % (
             lc.get("from"), lc.get("to"), lc.get("date"), _ptxt,
@@ -2961,7 +2978,7 @@ class LauncherApp(tk.Frame):
         self.go_btn.configure(text="停 止", bg="#57606a")
         self._put_log("[启动] 开始抢票：%s → %s %s，车次 %s" % (
             self.lc.get("from"), self.lc.get("to"), self.lc.get("date"),
-            "、".join(self.lc.get("trains") or []) or "全部"))
+            "、".join(_display_trains(self.lc.get("trains"))) or "全部"))
         return True
 
     def stop_grab(self):
@@ -3032,7 +3049,7 @@ class LauncherApp(tk.Frame):
             return
         self.from_ent.set(p.get("from") or "")
         self.to_ent.set(p.get("to") or "")
-        self.trains_var.set(",".join(p.get("trains") or []))
+        self.trains_var.set(",".join(_display_trains(p.get("trains"))))
         for s, v in self.seat_vars.items():
             v.set(s in (p.get("seat_types") or []))
         self.seat_pri_var.set(str(p.get("seat_priority") or ""))
@@ -3670,7 +3687,9 @@ class TaskManagerPanel(tk.Frame):
         bits = ["%s → %s" % (task.get("from") or "?", task.get("to") or "?"),
                 (task.get("date") or "?") + ("~%s" % task["date_to"] if task.get("date_to") else "")]
         if task.get("trains"):
-            bits.append("/".join(task.get("trains")))
+            _dtr = _display_trains(task.get("trains"))
+            if _dtr:
+                bits.append("/".join(_dtr))
         ttk.Label(row, text=" · ".join(bits), foreground="#57606a").pack(
             side="left", padx=(6, 0), fill="x", expand=True)
         label, color = self.STATUS_LABELS.get(task.get("status") or "idle", ("就绪", "#6e7781"))

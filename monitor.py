@@ -150,6 +150,21 @@ def update_state_locked(mutator):
         _lock_timeout_abort()
 
 
+def _save_passengers_or_refresh(passengers, pax_stamp):
+    """保存乘车人（Task 88d：Task 87 同口径的乐观并发检查）。
+
+    pax_stamp 为 menu_passengers 在 load 后取到的 passengers.json 字节指纹。
+    save_passengers 在锁内发现指纹变化 → 已打印警告并返回 False（放弃本次
+    保存，不覆写对方修改）；这里重载磁盘最新数据，返回 (False, 最新数据,
+    新指纹)，调用方继续循环（用户重做即可）。
+    成功 → (True, 原数据, 新指纹)。
+    """
+    if passengers_mod.save_passengers(passengers, expect_stamp=pax_stamp):
+        return True, passengers, passengers_mod.passengers_stamp()
+    fresh = passengers_mod.load_passengers()
+    return False, fresh, passengers_mod.passengers_stamp()
+
+
 def pause():
     try:
         input("\n按回车返回主菜单...")
@@ -421,6 +436,20 @@ def _task_keys_ok(t):
     return isinstance(t, dict) and "name" in t and "from" in t and "to" in t
 
 
+def _join_str_list(raw):
+    """展示用：把字符串列表 join 成 "/" 分隔文本。
+
+    Task 88a：raw 为 None → ""（调用方再按空处理）；为 list/tuple 且
+    全是 str → "/".join；其他形状（int/字符串/含非 str 条目等手改损坏）
+    → None，调用方展示"（配置损坏）"占位并记警告，绝不 TypeError/逐字符拆。
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, (list, tuple)) and all(isinstance(x, str) for x in raw):
+        return "/".join(raw)
+    return None
+
+
 def menu_task_list():
     config = load_config()
     tasks = config.get("tasks") or []
@@ -443,6 +472,14 @@ def menu_task_list():
                   "（配置损坏，请检查 config.json）。".format(i, "/".join(missing)))
             print("  {0:<3}{1}".format(i, "（配置损坏）"))
             continue
+        # Task 88a：trains/seat_types 非 list（如手改成 int/字符串）时
+        # "/".join 会 TypeError 或逐字符拆——记警告后用占位显示，不崩菜单
+        #（与 Task 83 的 from/to 非 str 口径一致）。
+        trains_txt = _join_str_list(t.get("trains"))
+        seats_txt = _join_str_list(t.get("seat_types"))
+        if trains_txt is None or seats_txt is None:
+            print("  [警告] 第 {0} 个任务的车次/席别字段形状非法"
+                  "（配置损坏），已用占位显示。".format(i))
         dates = engine_mod.expand_dates(t)
         status = eng.task_status(t)
         dates_disp = (dates[0] + ("..." if len(dates) > 1 else "")) \
@@ -466,8 +503,8 @@ def menu_task_list():
             i, name_disp[:26],
             route,
             dates_disp[:20],
-            ("/".join(t.get("trains") or []) or "全部")[:14],
-            ("/".join(t.get("seat_types") or []))[:14],
+            ((trains_txt if trains_txt is not None else "（配置损坏）") or "全部")[:14],
+            (seats_txt if seats_txt is not None else "（配置损坏）")[:14],
             t.get("priority", 5),
             engine_mod.STATUS_LABELS.get(status, status)))
         msg = (eng.state["tasks"].get(t["name"], {}).get("message", ""))
@@ -558,6 +595,10 @@ def _mask_id(id_no):
 
 def menu_passengers():
     passengers = passengers_mod.load_passengers()
+    # Task 88d：load 后立即取指纹；4 处保存传指纹做乐观并发检查——用户
+    # 思考期间若 GUI/launcher 改了 passengers.json，本次保存会被放弃
+    # （不静默覆写对方修改），并重载最新数据让用户重做。
+    pax_stamp = passengers_mod.passengers_stamp()
     while True:
         print("\n===== 乘车人管理（数据加密存储于本地） =====")
         if not passengers:
@@ -602,8 +643,11 @@ def menu_passengers():
                 "name": name, "id_type_code": id_type or "1", "id_no": id_no,
                 "mobile": mobile, "is_default": is_default, "is_adult": is_adult,
             })
-            passengers_mod.save_passengers(passengers)
-            print("  已添加并加密保存。")
+            ok, passengers, pax_stamp = _save_passengers_or_refresh(passengers, pax_stamp)
+            if ok:
+                print("  已添加并加密保存。")
+            else:
+                print("  已重新载入最新数据，请重新操作。")
         elif op == "2":
             raw = read("  编辑第几位：", "")
             if raw is None:
@@ -621,8 +665,11 @@ def menu_passengers():
                     "y" if p.get("is_default") else "n")
                 p.update({"name": name, "id_no": id_no, "mobile": mobile,
                           "is_default": is_default})
-                passengers_mod.save_passengers(passengers)
-                print("  已更新并加密保存。")
+                ok, passengers, pax_stamp = _save_passengers_or_refresh(passengers, pax_stamp)
+                if ok:
+                    print("  已更新并加密保存。")
+                else:
+                    print("  已重新载入最新数据，请重新操作。")
         elif op == "3":
             raw = read("  删除第几位：", "")
             if raw is None:
@@ -633,8 +680,11 @@ def menu_passengers():
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 if ask_yes_no("  确认删除该乘车人？", "n"):
                     del passengers[int(raw) - 1]
-                    passengers_mod.save_passengers(passengers)
-                    print("  已删除。")
+                    ok, passengers, pax_stamp = _save_passengers_or_refresh(passengers, pax_stamp)
+                    if ok:
+                        print("  已删除。")
+                    else:
+                        print("  已重新载入最新数据，请重新操作。")
         elif op == "4":
             raw = read("  设为默认的第几位：", "")
             if raw is None:
@@ -646,8 +696,11 @@ def menu_passengers():
                 for p in passengers:
                     p["is_default"] = False
                 passengers[int(raw) - 1]["is_default"] = True
-                passengers_mod.save_passengers(passengers)
-                print("  已设为默认乘车人（自动下单时优先使用）。")
+                ok, passengers, pax_stamp = _save_passengers_or_refresh(passengers, pax_stamp)
+                if ok:
+                    print("  已设为默认乘车人（自动下单时优先使用）。")
+                else:
+                    print("  已重新载入最新数据，请重新操作。")
 
 
 # ----------------------------- 菜单 5：历史记录 -----------------------------

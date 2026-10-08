@@ -28,11 +28,13 @@
 """
 
 import base64
+import hashlib
 import json
 import logging
 import time
 
 import appcommon
+import filelock
 import os
 import sys
 
@@ -372,6 +374,25 @@ def load_passengers(path=None):
         return []
 
 
+# 乐观并发检查的哨兵：save_passengers 的 expect_stamp 取此值表示"不检查"
+#（旧调用方式）；None 是合法指纹，表示"load 时文件不存在"
+#（与 monitor._STAMP_UNSET / Task 87 同口径）。
+_STAMP_UNSET = object()
+
+
+def passengers_stamp(path=None):
+    """passengers.json 当前内容的字节指纹（sha256 十六进制）。
+
+    文件不存在或不可读时返回 None。用字节哈希而非 mtime：他进程重写
+    相同内容不误报；任何字节变化必检出。"""
+    path = path or DEFAULT_PATH
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def _is_undecryptable_box(path):
     """磁盘盒子在本环境是否不可解密（拒写守卫用）。
 
@@ -391,24 +412,46 @@ def _is_undecryptable_box(path):
         return True
 
 
-def save_passengers(passengers, path=None, force=False):
+def save_passengers(passengers, path=None, force=False, expect_stamp=_STAMP_UNSET):
     """加密保存乘车人列表。成功返回 True。
 
     若磁盘上已有文件且在本环境不可解密（dpapi 盒子拷到 Linux /
     换了 Windows 用户），默认拒绝覆写——否则源机器可恢复的密文会被
     永久销毁。确需放弃旧数据时传 force=True（对应 --force）。
+
+    expect_stamp 为 passengers_stamp() 在 load 后取到的指纹时做乐观并发
+    检查（Task 88d，与 monitor.save_config 的 Task 87 口径一致）：在
+    跨进程锁内重读当前指纹，不一致说明用户交互期间有外部写入——打印警告
+    并返回 False（放弃本次保存，不静默覆写对方的修改）；一致则写入并
+    返回 True。不传 expect_stamp 时保持旧行为（直接写）。
+    整个"检查-写"包在 filelock（path + ".lock" sidecar，全仓既有约定）
+    内，与 GUI/launcher 的并发写互斥。
     """
     path = path or DEFAULT_PATH
-    if not force and _is_undecryptable_box(path):
-        LOG.error("[安全] 拒绝覆盖不可解密的 passengers 数据（%s），"
-                  "请在原机器解密后迁移；如确认放弃请用 --force", path)
+    try:
+        with filelock.file_lock(path + ".lock"):
+            if expect_stamp is not _STAMP_UNSET \
+                    and passengers_stamp(path) != expect_stamp:
+                # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
+                print("  [警告] passengers.json 在编辑期间被其他程序修改，"
+                      "本次保存已放弃（未覆盖对方的修改）。")
+                return False
+            if not force and _is_undecryptable_box(path):
+                LOG.error("[安全] 拒绝覆盖不可解密的 passengers 数据（%s），"
+                          "请在原机器解密后迁移；如确认放弃请用 --force", path)
+                return False
+            payload = json.dumps({"passengers": list(passengers)}, ensure_ascii=False, indent=2)
+            enc_name, data_text = _encrypt(payload)
+            box = {"version": 1, "enc": enc_name, "data": data_text}
+            # 原子写：写一半被杀不留半截密文（密文损坏 = 乘车人数据全丢）
+            appcommon.atomic_write_json(path, box)
+            return True
+    except TimeoutError:
+        # 锁争用：保持 bool 契约（GUI/launcher 调用方只处理 False，不接异常），
+        # 记 error 后返回 False（与 Task 81d 的 upsert_order 同口径）。
+        LOG.error("[警告] passengers.json 正被其他进程占用，本次保存已跳过，"
+                  "请稍后重试")
         return False
-    payload = json.dumps({"passengers": list(passengers)}, ensure_ascii=False, indent=2)
-    enc_name, data_text = _encrypt(payload)
-    box = {"version": 1, "enc": enc_name, "data": data_text}
-    # 原子写：写一半被杀不留半截密文（密文损坏 = 乘车人数据全丢）
-    appcommon.atomic_write_json(path, box)
-    return True
 
 
 # ----------------------------- 业务辅助 -----------------------------
