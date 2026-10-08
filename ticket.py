@@ -26,12 +26,16 @@
 """
 
 import sys
+import os
 import re
 import json
 import time
 import threading
+import logging
 
 import requests
+
+LOG = logging.getLogger("monitor")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -390,12 +394,27 @@ def _parse_station_js(text):
     return name2code, code2name, stations
 
 
+def _atomic_write_json(path, obj, **dump_kw):
+    """tmp+replace 原子写：中途被 kill 只丢 tmp，不截断目标文件。"""
+    tmp = "{0}.tmp{1}".format(path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, **dump_kw)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_station_caches(map_path, index_path, name2code, code2name, stations):
-    with open(map_path, "w", encoding="utf-8") as f:
-        json.dump({"name2code": name2code, "code2name": code2name}, f,
-                  ensure_ascii=False, indent=2)
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump({"stations": stations}, f, ensure_ascii=False)
+    _atomic_write_json(map_path,
+                       {"name2code": name2code, "code2name": code2name},
+                       indent=2)
+    _atomic_write_json(index_path, {"stations": stations})
 
 
 def _refresh_station_cache(map_path, index_path, force=False):
@@ -516,10 +535,19 @@ def query_tickets(from_code, to_code, date, purpose="ADULT"):
         except (requests.RequestException, ValueError) as e:
             last = e
             continue  # 端点 404/超时/返回非 JSON：换下一个端点
+        if not isinstance(data, dict):
+            # 某端点可能返回 JSON 数组：按"无有效数据"处理，换下一个端点，不崩
+            last = RuntimeError(
+                "查询接口返回非 JSON 对象：{0}".format(type(data).__name__))
+            continue
         if data.get("httpstatus") != 200:
             last = RuntimeError("查询接口返回异常：{0}".format(data))
             continue
-        return (data.get("data") or {}).get("result") or []
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            last = RuntimeError("查询接口返回无有效数据")
+            continue
+        return payload.get("result") or []
     if last is None:
         last = RuntimeError("查询接口无可用端点")
     raise last
@@ -554,6 +582,30 @@ def train_seat_kind(train_code):
     return c[0] if c[:1] in ("G", "D", "C") else "普速"
 
 
+def _split_seat_codes(codes):
+    """p35 席别码串 → 席别名列表（按码表 longest-match 解析）。
+
+    官方码表含多字符码（如 "WZ"）；逐字符遍历在官方新增多字符码时会错位
+    （"WZ" 只是碰巧对：'W'→无座、'Z' 被静默跳过）。未知码记 warning 后
+    跳过一位，不静默。"""
+    s = str(codes or "").upper()
+    names = []
+    keys = sorted(SEAT_CODE_NAMES_ALL, key=len, reverse=True)
+    i = 0
+    while i < len(s):
+        for k in keys:
+            if s.startswith(k, i):
+                n = SEAT_CODE_NAMES_ALL[k]
+                if n not in names:
+                    names.append(n)
+                i += len(k)
+                break
+        else:
+            LOG.warning("[余票] 未知席别码 %r（码串 %r），已跳过", s[i:i + 4], s)
+            i += 1
+    return names
+
+
 def seat_names_all(codes, available=None, train_code=None):
     """该车次提供的全部席别名（含无票），按 SEAT_SHOW_ORDER 排序。
 
@@ -561,11 +613,7 @@ def seat_names_all(codes, available=None, train_code=None):
     「无座」列而 p35 不含 WZ，所以固定补上；available 里出现过的名字也并入。
     codes 为空（未放票/接口没回码串）时按车型兜底（train_code → SEAT_KIND_SEATS），
     保证抢票（票还没放或已售完）时也能看到该车应有的全部席别。"""
-    names = []
-    for ch in str(codes or "").upper():
-        n = SEAT_CODE_NAMES_ALL.get(ch)
-        if n and n not in names:
-            names.append(n)
+    names = _split_seat_codes(codes)
     for n in (available or {}):
         if n not in names:
             names.append(n)
@@ -589,7 +637,7 @@ def parse_row(row, code2name, query_date=None):
         return f[i] if i < len(f) else None
 
     # 余票按 20~33 号字段逐席别给出（映射与官方 queryLeftTicket 脚本一致）：
-    #   值为 "有"/数字 = 有票；"" / "无" / "*" / "候补" = 不可购
+    #   值为 "有"/正整数 = 有票；"" / "无" / "*" / "候补" / "0" = 不可购
     # 卧铺字段在普速车与动车之间共用（官方 DTO 字段名 dd.gr_num / dd.rw_num / dd.yw_num）：
     #   21 = 高级软卧(6)/高级动卧(A)、23 = 软卧(4)/动卧(F)/一等卧(I)、28 = 硬卧(3)/二等卧(J)。
     # 本行该叫什么由席别码串 p35(seat_types) 决定，否则勾选「动卧」的任务永远命中不了；
@@ -608,7 +656,7 @@ def parse_row(row, code2name, query_date=None):
         (29, "硬座"), (30, "二等座"), (31, "一等座"),
         (32, "商务座"),
     ]
-    no_ticket = ("", "无", "*", "候补")
+    no_ticket = ("", "无", "*", "候补", "0")
     available = {}
     for idx, name in seat_fields:
         value = (get(idx) or "").strip()

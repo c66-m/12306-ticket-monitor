@@ -43,6 +43,15 @@ def rebuild():
     known = sum(1 for r in rows if r["kind"] != "待识别")
     print("stations_db.json：共 %d 站（运营中），已识别车型 %d 站，更新于 %s"
           % (len(rows), known, now))
+    unknown = [r for r in rows if r["kind"] == "待识别"]
+    if unknown:
+        # 未知 kind 不静默定死：明确提示用户核对确认（首次查询使用时会自动
+        # 学习补全，但用户应知道哪些站尚未识别）。
+        sample = "、".join(r["name"] for r in unknown[:20])
+        more = " 等" if len(unknown) > 20 else ""
+        print("注意：%d 个车站车型「待识别」（如：%s%s），已在库中标记待识别；"
+              "首次查询使用时会自动学习补全，请核对确认。"
+              % (len(unknown), sample, more))
     return db
 
 

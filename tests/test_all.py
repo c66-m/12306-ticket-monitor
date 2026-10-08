@@ -5360,6 +5360,91 @@ class TestPassengersP3(TempDirCase):
         self.assertFalse(os.path.exists(self.key_path), "解密路径绝不能重新生成密钥")
 
 
+
+
+class TestTicketP3(TempDirCase):
+    """Task 64: ticket/车站 P3（数组响应崩 / "0" 当有票 / 席别码遍历 / 缓存非原子 / 待识别）。"""
+
+    def test_query_tickets_array_response_no_crash(self):
+        """(a) 端点返回 JSON 数组：旧代码 data.get("httpstatus") 抛 AttributeError 逃出 except。"""
+        sess = mock.Mock()
+        resp = mock.Mock()
+        resp.raise_for_status.return_value = None
+        resp.json.side_effect = [
+            ["not", "a", "dict"],
+            {"httpstatus": 200, "data": {"result": ["row1"]}},
+        ]
+        sess.get.return_value = resp
+        with mock.patch.object(ticket, "get_session", return_value=sess):
+            self.assertEqual(
+                ticket.query_tickets("VNP", "ZAF", "2026-10-10"), ["row1"])
+
+    def test_query_tickets_all_array_raises_runtimeerror(self):
+        """(a) 全部端点都回数组：应 RuntimeError（无可用端点），而非 AttributeError。"""
+        sess = mock.Mock()
+        resp = mock.Mock()
+        resp.raise_for_status.return_value = None
+        resp.json.side_effect = [[1], [2], [3], [4]]
+        sess.get.return_value = resp
+        with mock.patch.object(ticket, "get_session", return_value=sess):
+            with self.assertRaises(RuntimeError):
+                ticket.query_tickets("VNP", "ZAF", "2026-10-10")
+
+    def test_parse_row_zero_string_is_no_ticket(self):
+        """(b) 余票 "0" 字符串：旧代码 truthy 且不在 no_ticket 中 → 被当有票。"""
+        info = ticket.parse_row(synthetic_row(hard_seat="0"), {}, None)
+        self.assertNotIn("硬座", info["available_seats"])
+
+    def test_seat_names_all_multichar_code_parsing(self):
+        """(c) 多字符码按码表 longest-match 解析：旧代码逐字符，"AB"→'A' 错位。"""
+        with mock.patch.dict(ticket.SEAT_CODE_NAMES_ALL, {"AB": "\u6d4b\u8bd5\u5e2d"}):
+            names = ticket.seat_names_all("AB")
+        self.assertIn("\u6d4b\u8bd5\u5e2d", names)
+        self.assertNotIn("高级动卧", names)
+
+    def test_seat_names_all_unknown_code_warns(self):
+        """(c) 未知席别码：记 warning 后跳过，不静默。"""
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            ticket.seat_names_all("Q9")
+        self.assertTrue(any("未知席别码" in m for m in cm.output),
+                        "应有未知席别码告警: %s" % (cm.output,))
+
+    def test_write_station_caches_atomic_on_dump_failure(self):
+        """(d) 写缓存中途崩溃：旧代码 open("w") 已截断目标；新代码 tmp+replace 目标完好。"""
+        map_path = os.path.join(self.tmp, "station_name.json")
+        index_path = os.path.join(self.tmp, "station_index.json")
+        old = '{"name2code": {"old": 1}}'
+        with open(map_path, "w", encoding="utf-8") as f:
+            f.write(old)
+        with mock.patch.object(ticket.json, "dump",
+                               side_effect=RuntimeError("模拟崩溃")):
+            with self.assertRaises(RuntimeError):
+                ticket._write_station_caches(map_path, index_path, {}, {}, [])
+        with open(map_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), old)
+
+    def test_station_db_rebuild_marks_unknown_kind_with_notice(self):
+        """(e) rebuild：未知 kind 打印显式提示（不静默定死为"待识别"）。"""
+        import station_db
+        fake_idx = [
+            {"name": "北京", "code": "VNP", "py": "beijing", "spy": "bj"},
+            {"name": "新站", "code": "XXX", "py": "xinzhan", "spy": "xz"},
+        ]
+        fake_launcher = mock.Mock()
+        fake_launcher.get_station_index.return_value = fake_idx
+        fake_launcher.load_station_kinds.return_value = {"VNP": "G"}
+        db_path = os.path.join(self.tmp, "stations_db.json")
+        with mock.patch.dict(sys.modules, {"launcher": fake_launcher}), \
+                mock.patch.object(station_db, "DB_PATH", db_path), \
+                mock.patch("builtins.print") as mprint:
+            db = station_db.rebuild()
+        printed = "\n".join(
+            str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("待识别", printed)
+        kinds = {r["code"]: r["kind"] for r in db["stations"]}
+        self.assertEqual(kinds["XXX"], "待识别")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
