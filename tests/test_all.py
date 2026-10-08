@@ -9614,6 +9614,218 @@ class TestTask95WarmReuseSessionRevalidation(TempDirCase):
         self.assertIsNone(calls["warm"])
 
 
+class TestTask96LauncherP3(TempDirCase):
+    """Task 96：launcher P3 bundle（a 回归 / b Spinbox / c 脏条目 / d 脏配置 / e 关窗同步）。
+
+    无 Tk 真机，全部 mock/桩测试（沿 Task 74/84/90 口径）。
+    """
+
+    # ---- (a) Task 90 回归：成功保存后未刷新 _pax_stamp ----
+
+    def _make_pax_dialog(self):
+        dlg = object.__new__(launcher.PassengerDialog)
+        dlg.plist = [{"name": "A"}]
+        dlg._pax_stamp = "old-stamp"
+        dlg.pick = mock.Mock()
+        return dlg
+
+    def test_second_save_no_false_alarm(self):
+        # 回归（Task 90/commit 516f92e）：成功保存后未刷新 _pax_stamp，
+        # 同一会话第二次保存必误报"被外部修改"并放弃。
+        disk = {"stamp": "old-stamp"}
+
+        def fake_save(passengers, expect_stamp):
+            if expect_stamp is not launcher.passengers_mod._STAMP_UNSET \
+                    and expect_stamp != disk["stamp"]:
+                return False  # 指纹不匹配 → 锁内放弃（真实 save_passengers 语义）
+            disk["stamp"] = "stamp-after-write"
+            return True
+
+        dlg = self._make_pax_dialog()
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               side_effect=fake_save), \
+             mock.patch.object(launcher.passengers_mod, "passengers_stamp",
+                               side_effect=lambda: disk["stamp"]), \
+             mock.patch.object(launcher, "messagebox"), \
+             mock.patch.object(launcher.PassengerDialog, "_refresh_plist"):
+            ok1, r1 = dlg._save_passengers_or_refresh(None)
+            ok2, r2 = dlg._save_passengers_or_refresh(None)
+        self.assertTrue(ok1)
+        self.assertEqual(r1, "ok")
+        self.assertTrue(ok2, "第二次保存不应误报外部修改（回归）")
+        self.assertEqual(r2, "ok")
+
+    # ---- (b) 新建监控任务"优先级" Spinbox 手输非数字 ----
+
+    def _make_new_task_dialog(self):
+        import tkinter as tk
+        dlg = object.__new__(launcher.NewMonitorTaskDialog)
+
+        def _v(value):
+            v = mock.Mock()
+            v.get.return_value = value
+            return v
+
+        dlg.from_cb = _v("北京")
+        dlg.to_cb = _v("上海")
+        dlg.name2code = {"北京": "BJP", "上海": "SHH"}
+        dlg.date_var = _v("2026-10-10")
+        sv = _v(True)
+        dlg.seat_vars = {"二等座": sv}
+        dlg.auto_var = _v(False)
+        dlg.trains_var = _v("G101")
+        dlg.pax_vars = {}
+        dlg.seat_pri_var = _v("")
+        dlg.purpose_var = _v("成人票")
+        dlg.stop_var = _v(True)
+        dlg.prio_var = mock.Mock()
+        dlg.prio_var.get.side_effect = tk.TclError(
+            'expected integer but got "abc"')
+        dlg.app = mock.Mock()
+        dlg.app.lc = {}
+        dlg.app._put_log = mock.Mock()
+        dlg.destroy = mock.Mock()
+        dlg._parse_dates = mock.Mock(return_value=(["2026-10-10"], []))
+        return dlg
+
+    def test_prio_spinbox_non_numeric_uses_default(self):
+        # Task 96b：Spinbox 手输非数字 → tk.IntVar.get() 抛 TclError（Task 74e 同类）。
+        # 改后：友好提示 + 安全默认值 5，不抛。
+        dlg = self._make_new_task_dialog()
+        with mock.patch.object(launcher, "messagebox") as mb, \
+             mock.patch.object(launcher, "append_monitor_task",
+                               return_value="任务名") as m_append:
+            dlg._create(False)
+        mb.showwarning.assert_called_once()
+        m_append.assert_called_once()
+        task = m_append.call_args[0][0]
+        self.assertEqual(task["priority"], 5)
+
+    def test_prio_spinbox_numeric_still_works(self):
+        # 数字输入不受影响：不弹警告，原值透传。
+        dlg = self._make_new_task_dialog()
+        dlg.prio_var.get.side_effect = None
+        dlg.prio_var.get.return_value = 8
+        with mock.patch.object(launcher, "messagebox") as mb, \
+             mock.patch.object(launcher, "append_monitor_task",
+                               return_value="任务名") as m_append:
+            dlg._create(False)
+        mb.showwarning.assert_not_called()
+        task = m_append.call_args[0][0]
+        self.assertEqual(task["priority"], 8)
+
+    # ---- (c) grab_tasks.json 非 dict 条目 ----
+
+    def test_add_row_skips_non_dict(self):
+        # Task 96c：grab_tasks.json 含非 dict 条目 → _add_row 的 task.get 崩启动。
+        # 改后：记 warning 后跳过展示，不崩。
+        panel = object.__new__(launcher.TaskManagerPanel)
+        panel._row_widgets = {}
+        panel.list_box = mock.Mock()
+        with mock.patch.object(launcher, "ttk") as m_ttk, \
+             mock.patch.object(launcher, "LOG") as m_log:
+            panel._add_row("junk-string")
+            panel._add_row(123)
+            panel._add_row(None)
+        m_ttk.Frame.assert_not_called()
+        self.assertEqual(panel._row_widgets, {})
+        self.assertEqual(m_log.warning.call_count, 3)
+
+    def test_add_row_dict_still_renders(self):
+        # 正常 dict 条目不受影响：仍建行。
+        panel = object.__new__(launcher.TaskManagerPanel)
+        panel._row_widgets = {}
+        panel.list_box = mock.Mock()
+        task = {"id": "t1", "name": "京沪", "from": "北京", "to": "上海",
+                "date": "2026-10-10"}
+        with mock.patch.object(launcher, "ttk") as m_ttk, \
+             mock.patch.object(launcher, "LOG") as m_log:
+            panel._add_row(task)
+        m_ttk.Frame.assert_called_once()
+        self.assertIn("t1", panel._row_widgets)
+        m_log.warning.assert_not_called()
+
+    # ---- (d) launcher_config.json 脏值 ----
+
+    def _make_app_for_sync(self, lc_extra):
+        app = object.__new__(launcher.LauncherApp)
+        lc = {"from": "", "to": "", "trains": [], "seat_types": [],
+              "date": "", "date_to": "", "start_time": "",
+              "station_history": [], "passenger_names": [],
+              "pax_purpose": {}, "remind_minutes": 10, "warm_minutes": 10,
+              "presets": []}
+        lc.update(lc_extra)
+        app.lc = lc
+        app.from_ent = mock.Mock()
+        app.to_ent = mock.Mock()
+        app.trains_var = mock.Mock()
+        app.date_var = mock.Mock()
+        app.date_to_var = mock.Mock()
+        app.seat_vars = {}
+        app.seat_pri_var = mock.Mock()
+        app.start_var = mock.Mock()
+        app.remind_var = mock.Mock()
+        app.warm_var = mock.Mock()
+        app.preset_cb = mock.Mock()
+        app._put_log = mock.Mock()
+        app._refresh_pax = mock.Mock()
+        app._save_cfg = mock.Mock()
+        return app
+
+    def test_sync_from_lc_dirty_values(self):
+        # Task 96d：remind_minutes 非数字 / presets 非 dict 条目 → 不崩，
+        # 脏值记 warning 后用安全默认值。
+        app = self._make_app_for_sync({
+            "remind_minutes": "abc", "warm_minutes": "xyz",
+            "presets": ["junk", {"name": "p1"}]})
+        with mock.patch.object(launcher, "merge_trains_from_monitor",
+                               return_value=False), \
+             mock.patch("os.path.getmtime", side_effect=OSError("no")):
+            app._sync_from_lc()
+        app.remind_var.set.assert_called_with(10)
+        app.warm_var.set.assert_called_with(10)
+        app.preset_cb.configure.assert_called_once_with(values=["p1"])
+        warns = [c for c in app._put_log.call_args_list
+                 if "警告" in str(c)]
+        self.assertGreaterEqual(len(warns), 3)  # remind/warm/presets 各一条
+
+    def test_sync_from_lc_clean_values_unchanged(self):
+        # 干净配置不受影响：原值透传，无警告。
+        app = self._make_app_for_sync({
+            "remind_minutes": 15, "warm_minutes": 20,
+            "presets": [{"name": "p1"}, {"name": "p2"}]})
+        with mock.patch.object(launcher, "merge_trains_from_monitor",
+                               return_value=False), \
+             mock.patch("os.path.getmtime", side_effect=OSError("no")):
+            app._sync_from_lc()
+        app.remind_var.set.assert_called_with(15)
+        app.warm_var.set.assert_called_with(20)
+        app.preset_cb.configure.assert_called_once_with(values=["p1", "p2"])
+        warns = [c for c in app._put_log.call_args_list
+                 if "警告" in str(c)]
+        self.assertEqual(len(warns), 0)
+
+    # ---- (e) GrabTaskWindow._on_close 同步界面编辑 ----
+
+    def test_grab_task_window_on_close_syncs_ui(self):
+        # Task 96e：_on_close 未调 _ui_to_lc → 2 秒内关窗丢界面编辑。
+        # 改后：关闭时同步界面编辑到配置（与独立模式一致）。
+        win = object.__new__(launcher.GrabTaskWindow)
+        win.app = mock.Mock()
+        win.app.grabber = None
+        win.app.lc = {"status": "running"}
+        win.task = {"id": "t1", "name": "n"}
+        win.manager = mock.Mock()
+        win.destroy = mock.Mock()
+        launcher.GrabTaskWindow._on_close(win)
+        win.app._ui_to_lc.assert_called_once_with(save=False)
+        # 状态修正 + 写回任务库仍走原流程
+        self.assertEqual(win.app.lc["status"], "idle")
+        win.manager._upsert_task.assert_called_once()
+        win.manager._on_window_closed.assert_called_once_with("t1")
+        win.destroy.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

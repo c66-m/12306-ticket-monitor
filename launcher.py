@@ -2269,9 +2269,27 @@ class LauncherApp(tk.Frame):
             v.set(s in (lc.get("seat_types") or []))
         self.seat_pri_var.set(str(lc.get("seat_priority") or ""))
         self.start_var.set(lc.get("start_time") or "")
-        self.remind_var.set(int(lc.get("remind_minutes") or 10))
-        self.warm_var.set(max(0, min(30, int(lc.get("warm_minutes") or 10))))
-        names = [p.get("name") or "" for p in (lc.get("presets") or [])]
+        # Task 96d：launcher_config.json 脏值不崩任务窗口（Task 68 同类，
+        # launcher 读侧设防）——非数字用安全默认值，presets 非 dict 条目跳过，
+        # 均记 warning。
+        try:
+            self.remind_var.set(int(lc.get("remind_minutes") or 10))
+        except (ValueError, TypeError):
+            self._put_log("[警告] 配置 remind_minutes 非法（%r），已用默认值 10"
+                          % (lc.get("remind_minutes"),))
+            self.remind_var.set(10)
+        try:
+            self.warm_var.set(max(0, min(30, int(lc.get("warm_minutes") or 10))))
+        except (ValueError, TypeError):
+            self._put_log("[警告] 配置 warm_minutes 非法（%r），已用默认值 10"
+                          % (lc.get("warm_minutes"),))
+            self.warm_var.set(10)
+        names = []
+        for p in (lc.get("presets") or []):
+            if not isinstance(p, dict):
+                self._put_log("[警告] 配置 presets 条目非 dict，已跳过：%r" % (p,))
+                continue
+            names.append(p.get("name") or "")
         self.preset_cb.configure(values=names)
         if names:
             self.preset_cb.current(0)
@@ -3339,10 +3357,19 @@ class NewMonitorTaskDialog(tk.Toplevel):
                   re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
         passengers = [n for n, v in self.pax_vars.items() if v.get()]
         pri_raw = self.seat_pri_var.get().strip()
+        # Task 96b：Spinbox 手输非数字时 tk.IntVar.get() 抛 TclError（Task 74e
+        # 同类，launcher 侧漏网；与 _ui_to_lc 的 remind/warm 兜底同口径）→
+        # 友好提示并用安全默认值 5。
+        try:
+            prio = self.prio_var.get()
+        except (tk.TclError, ValueError, TypeError):
+            messagebox.showwarning("优先级无效", "优先级请输入 1-10 的数字，已使用默认值 5。",
+                                   parent=self)
+            prio = 5
         task = build_monitor_task(from_name, to_name, dates, date_range, trains,
                                   seats, passengers, self.purpose_var.get(),
                                   self.auto_var.get(), self.stop_var.get(),
-                                  self.prio_var.get(),
+                                  prio,
                                   pax_purpose=self.app.lc.get("pax_purpose") or {},
                                   seat_priority=pri_raw)
         if pri_raw:
@@ -3482,6 +3509,9 @@ class PassengerDialog(tk.Toplevel):
         锁超时 → error，返回 (False, "refused")（不重载，不丢内存数据）。
         """
         if _save_passengers_or_warn(self.plist, parent, self._pax_stamp):
+            # Task 96a 回归修复（Task 90 遗漏）：成功保存后刷新指纹，否则同一
+            # 会话第二次保存必误报"被外部修改"（gui 侧每次 refresh，无此问题）。
+            self._pax_stamp = passengers_mod.passengers_stamp()
             return True, "ok"
         if passengers_mod.passengers_stamp() != self._pax_stamp:
             # 外部写入导致放弃：重载最新数据+新指纹。
@@ -3632,6 +3662,13 @@ class GrabTaskWindow(tk.Toplevel):
                     self.app.grabber.join(timeout=15)
                 except Exception:
                     pass
+            # Task 96e：关窗前先把界面编辑同步到内存配置（与独立模式 _on_close
+            # 一致）；2 秒内关窗不再丢编辑。save=False：落盘由下面的 _save_task
+            # 统一写回任务库（先做状态修正），避免写两次。
+            try:
+                self.app._ui_to_lc(save=False)
+            except Exception:
+                pass
             # 抢到的任务保留"已抢到"状态，别在关窗时被抹成"就绪"
             if self.app.lc.get("status") != "ok":
                 self.app.lc["status"] = "idle"
@@ -3723,6 +3760,11 @@ class TaskManagerPanel(tk.Frame):
             self._add_row(t)
 
     def _add_row(self, task):
+        # Task 96c：grab_tasks.json 脏条目（非 dict）→ task.get 致任务管理器
+        # 启动崩溃（Task 74g/83 同类脏数据崩溃）；记 warning 后跳过展示，不崩。
+        if not isinstance(task, dict):
+            LOG.warning("抢票任务条目非 dict，已跳过展示：%r" % (task,))
+            return
         tid = task.get("id")
         row = ttk.Frame(self.list_box)
         row.pack(fill="x", pady=3)
