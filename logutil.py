@@ -12,16 +12,23 @@ DayFileHandler：按天滚动的文件日志，文件名保持 logs/<prefix>_YYY
 import datetime
 import logging
 import os
+import re
+
+# 日志留存天数：超过该天数的 <prefix>_YYYYMMDD.log 在打开新一天文件时自动清理，
+# 长期运行不再把磁盘写满。只删匹配命名规则且超期的文件，不碰当天文件。
+LOG_RETENTION_DAYS = 30
 
 
 class DayFileHandler(logging.Handler):
-    def __init__(self, log_dir, prefix, encoding="utf-8"):
+    def __init__(self, log_dir, prefix, encoding="utf-8",
+                 retention_days=LOG_RETENTION_DAYS):
         super().__init__()
         self._dir = log_dir
         self._prefix = prefix
         self._encoding = encoding
         self._day = None
         self._fh = None
+        self._retention_days = retention_days
 
     def _open(self):
         os.makedirs(self._dir, exist_ok=True)
@@ -30,6 +37,30 @@ class DayFileHandler(logging.Handler):
             self._prefix, today.strftime("%Y%m%d")))
         self._fh = open(path, "a", encoding=self._encoding)
         self._day = today
+        self._prune_old_logs(today)
+
+    def _prune_old_logs(self, today):
+        """删除超过留存期的旧日志文件（best-effort，失败不影响写日志）。"""
+        cutoff = today - datetime.timedelta(days=self._retention_days)
+        pattern = re.compile(r"^{0}_(\d{{8}})\.log$".format(
+            re.escape(self._prefix)))
+        try:
+            names = os.listdir(self._dir)
+        except OSError:
+            return
+        for fname in names:
+            m = pattern.match(fname)
+            if not m:
+                continue
+            try:
+                fday = datetime.datetime.strptime(m.group(1), "%Y%m%d").date()
+            except ValueError:
+                continue
+            if fday < cutoff:
+                try:
+                    os.remove(os.path.join(self._dir, fname))
+                except OSError:
+                    pass
 
     def emit(self, record):
         # Handler.handle() 已在锁内调用 emit，跨线程切换文件/写人是安全的
@@ -44,6 +75,12 @@ class DayFileHandler(logging.Handler):
                     self._fh = None
                 self._open()
             self._fh.write(self.format(record) + "\n")
+            # 关键路径 flush：进程硬崩（kill -9/断电）不丢已打日志的尾部。
+            # 日志量小（轮询级），每次 flush 开销可忽略。
+            try:
+                self._fh.flush()
+            except Exception:
+                pass
         except Exception:
             self.handleError(record)
 

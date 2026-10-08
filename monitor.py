@@ -97,6 +97,24 @@ def update_config_locked(mutator):
         _lock_timeout_abort()
 
 
+def update_state_locked(mutator):
+    """state.json 读-改-写原子接口：整包在 file_lock 内，与引擎/launcher/gui 互斥。
+
+    mutator(state) 就地修改读到的 dict；返回其返回值。
+    路径解析沿用 gui.save_state 的口径（config 的 state_file，默认 state.json）。
+    """
+    config = load_config()
+    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    try:
+        with filelock.file_lock(path + ".lock"):
+            state = engine_mod.load_state_file(path)
+            result = mutator(state)
+            appcommon.write_state(path, state, tmp_kind="monsave")
+            return result
+    except TimeoutError:
+        _lock_timeout_abort()
+
+
 def pause():
     try:
         input("\n按回车返回主菜单...")
@@ -423,7 +441,21 @@ def menu_task_ops():
         if ask_yes_no("  确认从配置中删除任务「%s」？" % task["name"], "n"):
             del config["tasks"][idx]
             save_config(config)
+            # 同步清 state 条目（加锁），与 Task 53 gui 侧口径一致：
+            # 只删 config 会留下 state 僵尸数据，同名重建继承陈旧状态/防重。
+            # monitor CLI 无 live engine（fresh_engine 每次新建实例），故直接
+            # 加锁改文件；运行中的引擎经 _sync_config/_sync_state 的 mtime 收敛。
+            _clear_task_state(task["name"])
             print("  已删除任务。")
+
+
+def _clear_task_state(name):
+    """删除任务时同步清除其 state.json 条目（加锁读-改-写）。"""
+    def _clear(state):
+        tasks = state.get("tasks")
+        if isinstance(tasks, dict):
+            tasks.pop(name, None)
+    update_state_locked(_clear)
 
 
 # ----------------------------- 菜单 4：乘车人管理 -----------------------------
@@ -601,7 +633,7 @@ def menu_session():
     cookie_path = os.path.join(HERE, config.get("session_cookies_file", "session_cookies.json"))
     if os.path.exists(cookie_path):
         try:
-            s = order_mod.load_session(config.get("session_cookies_file"))
+            s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))
             ok, who = order_mod.check_login(s)
             print("  会话文件：%s" % cookie_path)
             print("  当前状态：%s" % ("有效（%s）" % who if ok else "失效（%s）" % who))
@@ -618,7 +650,7 @@ def menu_session():
         subprocess.call([sys.executable, script], cwd=HERE)
     elif op == "2":
         try:
-            s = order_mod.load_session(config.get("session_cookies_file"))
+            s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))
             ok, who = order_mod.check_login(s)
             if not ok:
                 print("  会话无效：%s" % who)

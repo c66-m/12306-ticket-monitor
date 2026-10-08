@@ -4901,6 +4901,115 @@ class TestNotifyP3(TempDirCase):
         m.assert_called_once_with("y")
 
 
+class TestMonitorLogP3(TempDirCase):
+    """Task 61 (P3): monitor 缺 default / 删任务僵尸 / 日志留存+flush / PII 脱敏。"""
+
+    def test_load_session_gets_default_not_none(self):
+        # (a) load_session(config.get("session_cookies_file")) key 缺失传 None；
+        # 应与 :601 一致补 default "session_cookies.json"。
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod.os.path, "exists",
+                               return_value=True), \
+             mock.patch.object(order_mod, "load_session") as m_ls, \
+             mock.patch.object(order_mod, "check_login",
+                               return_value=(True, "x")), \
+             mock.patch.object(monitor_mod, "read", return_value=""):
+            monitor_mod.menu_session()
+        m_ls.assert_called_once_with("session_cookies.json")
+
+    def test_op5_delete_clears_state_entry(self):
+        # (b) 删任务 op5 只删 config，state 残留僵尸；应同步清 state 条目。
+        import monitor as monitor_mod
+        cfg = {"tasks": [{"name": "T1", "from": "A", "to": "B",
+                           "dates": ["2026-10-10"], "trains": ["G1"],
+                           "seat_types": ["硬座"]}]}
+        captured = {}
+
+        def fake_update_state_locked(mutator):
+            st = {"tasks": {"T1": {"status": "monitoring"}}}
+            mutator(st)
+            captured["state"] = st
+
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value=cfg), \
+             mock.patch.object(monitor_mod, "save_config"), \
+             mock.patch.object(monitor_mod, "fresh_engine"), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["1", "5"]), \
+             mock.patch.object(monitor_mod, "ask_yes_no",
+                               return_value=True), \
+             mock.patch.object(monitor_mod, "update_state_locked",
+                               side_effect=fake_update_state_locked):
+            monitor_mod.menu_task_ops()
+        self.assertIn("state", captured, "删任务未同步清理 state")
+        self.assertNotIn("T1", captured["state"]["tasks"])
+
+    def test_log_retention_prunes_old_files(self):
+        # (c) 日志保留 30 天自动清理：过期文件删，当天文件留。
+        import datetime as dt
+        log_dir = os.path.join(self.tmp, "logs")
+        os.makedirs(log_dir)
+        old = os.path.join(log_dir, "m_20000101.log")
+        today_name = "m_{0}.log".format(dt.date.today().strftime("%Y%m%d"))
+        today = os.path.join(log_dir, today_name)
+        open(old, "w").write("old")
+        open(today, "w").write("today")
+        h = logutil.DayFileHandler(log_dir, "m")
+        try:
+            h.emit(logging.LogRecord("t", logging.INFO, __file__, 1,
+                                     "x", None, None))
+        finally:
+            h.close()
+        self.assertFalse(os.path.exists(old), "过期日志未被清理")
+        self.assertTrue(os.path.exists(today), "当天日志被误删")
+
+    def test_log_emit_flushes(self):
+        # (c) 写缓冲 flush：硬崩不丢尾——emit 后不 close 也能读到内容。
+        log_dir = os.path.join(self.tmp, "logs2")
+        h = logutil.DayFileHandler(log_dir, "m")
+        try:
+            h.emit(logging.LogRecord("t", logging.INFO, __file__, 1,
+                                     "hello-flush", None, None))
+            import datetime as dt
+            path = os.path.join(
+                log_dir,
+                "m_{0}.log".format(dt.date.today().strftime("%Y%m%d")))
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+        finally:
+            h.close()
+        self.assertIn("hello-flush", content, "emit 后未 flush，硬崩会丢尾")
+
+    def test_mask_order_no(self):
+        # (d) 订单号截断脱敏。
+        self.assertEqual(engine_mod._mask_order_no("E123456789"),
+                         "E123****6789")
+        self.assertEqual(engine_mod._mask_order_no("123"), "****")
+        self.assertEqual(engine_mod._mask_order_no(""), "****")
+
+    def test_mask_names(self):
+        # (d) 乘车人姓名打码。
+        self.assertEqual(engine_mod._mask_names(["张三", "李四"]), "张*、李*")
+        self.assertEqual(engine_mod._mask_names([]), "")
+
+    def test_record_success_log_desensitized(self):
+        # (d) _record_success 的 LOG 不得含全名/全订单号。
+        e = make_engine(self.tmp)
+        e._notify = lambda task, subject, body: {}
+        task = {"name": "T1"}
+        info = {"train_code": "G1", "from_name": "A", "to_name": "B",
+                "start_time": "08:00", "arrive_time": "12:00"}
+        extra = {"passengers": "张三、李四", "order_no": "E123456789"}
+        with mock.patch.object(engine_mod, "LOG") as m_log:
+            e._record_success(task, info, "2026-10-10", "硬座", extra)
+        logged = " ".join(str(c.args) for c in m_log.info.call_args_list)
+        self.assertNotIn("张三", logged)
+        self.assertNotIn("李四", logged)
+        self.assertNotIn("E123456789", logged)
+        self.assertIn("张*", logged)
+        self.assertIn("E123****6789", logged)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

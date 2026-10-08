@@ -75,6 +75,25 @@ DEDUPE_VALUES = {
 
 LOG = logging.getLogger("monitor")
 
+
+def _mask_order_no(ono):
+    """订单号脱敏（日志用）：保留前后各 4 位，中间打码；过短则全打码。"""
+    s = str(ono or "")
+    if len(s) <= 8:
+        return "****"
+    return s[:4] + "****" + s[-4:]
+
+
+def _mask_names(names):
+    """乘车人姓名打码（日志用）：保留首字其余打码；['张三','李四'] -> '张*、李*'。"""
+    out = []
+    for n in names or []:
+        n = (n or "").strip()
+        if not n:
+            continue
+        out.append(n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*")
+    return "、".join(out)
+
 _WARNED_PRIORITIES = set()
 
 
@@ -702,7 +721,7 @@ class MonitorEngine(object):
                         okey = "%s|%s" % (date, train_code)
                         LOG.info("[防重核查] 任务「%s」%s %s 官方查询结果=%s %s",
                                  name, date, train_code, cls,
-                                 ("订单号 %s,官方状态「%s」" % (ono, raw)) if ono else raw)
+                                 ("订单号 %s,官方状态「%s」" % (_mask_order_no(ono), raw)) if ono else raw)
                         decision = {"unpaid": "待支付:任务停止,请尽快支付",
                                     "paid": "已支付:判定为已购得,任务停止",
                                     "cancelled": "已取消:清除本地防重记录,允许重新下单",
@@ -781,7 +800,7 @@ class MonitorEngine(object):
                                     task, info, date, seat_name,
                                     {"passengers": "、".join(p_names), "order_no": ono})
                                 LOG.info("[结果回读] 任务「%s」%s 官方已生成订单 %s（下单时间 %s），判定本次成功",
-                                         name, date, ono, recent.get("order_time") or "未知")
+                                         name, date, _mask_order_no(ono), recent.get("order_time") or "未知")
                                 if stop_after:
                                     self.set_task_status(
                                         task, "success",
@@ -934,7 +953,8 @@ class MonitorEngine(object):
         })
         LOG.info("[抢到] 任务「%s」已提交订单：%s %s %s 乘车人:%s 订单号:%s",
                  name, date, info["train_code"], seat_display,
-                 extra.get("passengers", ""), order_no or "未知")
+                 _mask_names((extra.get("passengers", "") or "").split("、")),
+                 _mask_order_no(order_no) if order_no else "未知")
 
     def _note_failure(self, task, message):
         name = task["name"]
