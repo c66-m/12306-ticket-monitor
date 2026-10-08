@@ -26,6 +26,7 @@ import copy
 import datetime
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -114,6 +115,84 @@ def _safe_priority(task):
         return 5
 
 
+# 日期展开跨度上限（天）：手改配置配出超长区间/超长日期列表时截断并明确报错，
+# 防止每轮数百次查询触发 12306 限流/封 IP（Task 68c；GUI 交互 picker 另有 5 天上限）
+MAX_EXPAND_DAYS = 31
+
+_WARNED_CONFIG = set()
+
+
+def _safe_config_int(raw, default, what):
+    """配置整数安全取值：非法形状记一次警告后回默认值（Task 68a）。
+
+    供 poll_interval_seconds / min_interval_seconds 共用：手改配置写成
+    "abc" 时旧代码 int() 抛 ValueError 崩掉整个引擎进程。
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        key = ("int", what, repr(raw))
+        if key not in _WARNED_CONFIG:
+            _WARNED_CONFIG.add(key)
+            LOG.warning("[配置] %s=%r 非法，已按默认值 %r 处理",
+                        what, raw, default)
+        return default
+
+
+def _safe_config_float(raw, default, what):
+    """配置浮点数安全取值：非法形状/非有限值记一次警告后回默认值（Task 68a）。
+
+    供 adaptive 的各类 multiplier 共用：配成字符串时旧代码 iv*mult 抛
+    TypeError 崩进程。
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        v = None
+    if v is None or not math.isfinite(v):
+        key = ("float", what, repr(raw))
+        if key not in _WARNED_CONFIG:
+            _WARNED_CONFIG.add(key)
+            LOG.warning("[配置] %s=%r 非法，已按默认值 %r 处理",
+                        what, raw, default)
+        return default
+    return v
+
+
+def _sanitize_tasks(raw):
+    """tasks 字段形状校验（Task 68a）：非列表→记 error 后视为空；非 dict 条目→
+    记 error 后跳过该条。绝不让手改配置的形状手误崩掉引擎进程。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        LOG.error("[配置] tasks 字段非列表，已忽略全部任务：%r", raw)
+        return []
+    out = []
+    for t in raw:
+        if isinstance(t, dict):
+            out.append(t)
+        else:
+            LOG.error("[配置] tasks 含非法条目已跳过：%r", t)
+    return out
+
+
+def normalize_trains(task):
+    """trains 字段归一化（Task 68b）：裸字符串（如漏写方括号的 "G101"）按单个
+    车次处理并记警告，绝不逐字符拆（旧代码会拆成 ['G','1','0','1'] 静默漏单）。
+    非字符串条目跳过（旧代码直接 AttributeError）。"""
+    raw = task.get("trains") or []
+    if isinstance(raw, str):
+        LOG.warning("[配置] 任务「%s」的 trains 为字符串，已按单个车次处理：%r",
+                    task.get("name"), raw)
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        LOG.warning("[配置] 任务「%s」的 trains 形状非法，已忽略：%r",
+                    task.get("name"), raw)
+        raw = []
+    return [t.strip().upper() for t in raw
+            if isinstance(t, str) and t.strip()]
+
+
 def expand_dates(task):
     """把 dates + date_range 展开成日期列表（去重保序）。"""
     result = []
@@ -147,6 +226,16 @@ def expand_dates(task):
                         task.get("name"), dr)
         else:
             if d1 >= d0:
+                span = (d1 - d0).days + 1
+                if span > MAX_EXPAND_DAYS:
+                    cut = d0 + datetime.timedelta(days=MAX_EXPAND_DAYS - 1)
+                    LOG.error(
+                        "[配置] 任务「%s」的 date_range 跨度 %d 天超过上限 %d 天，"
+                        "已截断为 %s~%s；超长区间会导致每轮数百次查询、"
+                        "触发 12306 限流/封 IP",
+                        task.get("name"), span, MAX_EXPAND_DAYS,
+                        d0.isoformat(), cut.isoformat())
+                    d1 = cut
                 d = d0
                 while d <= d1:
                     result.append(d.isoformat())
@@ -161,6 +250,12 @@ def expand_dates(task):
         if x not in seen:
             seen.add(x)
             uniq.append(x)
+    if len(uniq) > MAX_EXPAND_DAYS:
+        LOG.error(
+            "[配置] 任务「%s」的监控日期共 %d 个超过上限 %d 天，已截断为前 %d 个；"
+            "超长日期列表会导致每轮数百次查询、触发 12306 限流/封 IP",
+            task.get("name"), len(uniq), MAX_EXPAND_DAYS, MAX_EXPAND_DAYS)
+        uniq = uniq[:MAX_EXPAND_DAYS]
     return uniq
 
 
@@ -213,15 +308,19 @@ class MonitorEngine(object):
             # 联网后下次启动自动恢复
             LOG.error("[网络] 车站数据加载失败，将以空表降级运行：%s", e)
             self.name2code, self.code2name = {}, {}
-        self.tasks = self.config.get("tasks") or []
+        self.tasks = _sanitize_tasks(self.config.get("tasks"))
         # 已删除任务名的墓碑（内存态）：删任务与在途轮询竞速时，拦住
         # _note_failure / 轮询后 setdefault 把已清掉的 state 条目复活。
         # _sync_config 见到同名任务重建即清除，不影响新任务。
         self._deleted_names = set()
 
-        self.base_interval = int(self.config.get("poll_interval_seconds", 45))
+        self.base_interval = _safe_config_int(
+            self.config.get("poll_interval_seconds", 45), 45,
+            "poll_interval_seconds")
         self.min_interval = max(MIN_INTERVAL_FLOOR,
-                                int(self.config.get("min_interval_seconds", 30)))
+                                _safe_config_int(
+                                    self.config.get("min_interval_seconds", 30),
+                                    30, "min_interval_seconds"))
         if self.min_interval < 15:
             LOG.info("min_interval_seconds=%s：轮询较激进，注意 12306 限流/封 IP 风险",
                      self.min_interval)
@@ -416,10 +515,14 @@ class MonitorEngine(object):
         except Exception as e:
             LOG.warning("[配置] config.json 重新读取失败：%s", e)
             return False
-        self.base_interval = int(self.config.get("poll_interval_seconds", 45))
+        self.base_interval = _safe_config_int(
+            self.config.get("poll_interval_seconds", 45), 45,
+            "poll_interval_seconds")
         self.min_interval = max(MIN_INTERVAL_FLOOR,
-                                int(self.config.get("min_interval_seconds", 30)))
-        self.tasks = self.config.get("tasks") or []
+                                _safe_config_int(
+                                    self.config.get("min_interval_seconds", 30),
+                                    30, "min_interval_seconds"))
+        self.tasks = _sanitize_tasks(self.config.get("tasks"))
         # 同名任务重建后清墓碑：删任务时记的墓碑只拦"已删除"的在途写回，
         # 新任务必须正常轮询
         deleted = getattr(self, "_deleted_names", None)
@@ -534,6 +637,9 @@ class MonitorEngine(object):
     def task_interval(self, task):
         """计算任务的有效轮询间隔（秒）。"""
         ad = self.config.get("adaptive") or {}
+        if not isinstance(ad, dict):
+            LOG.warning("[配置] adaptive 字段非字典，已禁用自适应频率：%r", ad)
+            ad = {}
         iv = float(self.base_interval)
         if ad.get("enabled", True):
             soon = self._soonest_date(task)
@@ -545,15 +651,30 @@ class MonitorEngine(object):
                 return max(self.base_interval, NO_DATES_FALLBACK_INTERVAL)
             hour = datetime.datetime.now().hour
             peak = ad.get("peak_hours") or [6, 23]
-            mult = ad.get("peak_multiplier", 1.0) if peak[0] <= hour < peak[1] \
-                else ad.get("offpeak_multiplier", 1.6)
-            rush_hours = ad.get("rush_within_hours", 24)
+            if (isinstance(peak, (list, tuple)) and len(peak) == 2
+                    and all(isinstance(x, (int, float)) for x in peak)):
+                in_peak = peak[0] <= hour < peak[1]
+            else:
+                # 非法形状（单元素列表/字符串等）：记警告后禁用自适应频率，
+                # 绝不让手改配置崩掉引擎进程（Task 68a）
+                LOG.warning("[配置] adaptive.peak_hours 形状非法 %r，已禁用自适应频率",
+                            peak)
+                return max(self.min_interval, iv)
+            mult = (_safe_config_float(ad.get("peak_multiplier", 1.0), 1.0,
+                                       "adaptive.peak_multiplier")
+                    if in_peak else
+                    _safe_config_float(ad.get("offpeak_multiplier", 1.6), 1.6,
+                                       "adaptive.offpeak_multiplier"))
+            rush_hours = _safe_config_float(ad.get("rush_within_hours", 24), 24,
+                                            "adaptive.rush_within_hours")
             if rush_hours:
                 try:
                     delta_h = (datetime.datetime.fromisoformat(soon)
                                - datetime.datetime.now()).total_seconds() / 3600.0
                     if 0 <= delta_h <= rush_hours:
-                        mult = min(mult, ad.get("rush_multiplier", 0.75))
+                        mult = min(mult, _safe_config_float(
+                            ad.get("rush_multiplier", 0.75), 0.75,
+                            "adaptive.rush_multiplier"))
                 except (ValueError, TypeError):
                     pass
             prio = _safe_priority(task)
@@ -603,7 +724,7 @@ class MonitorEngine(object):
             self.set_task_status(task, "failed", "监控日期已全部过期，任务自动停止")
             return False, False
 
-        trains = [t.strip().upper() for t in (task.get("trains") or []) if t.strip()]
+        trains = normalize_trains(task)
         seats_want_all = [s for s in (task.get("seat_types") or [])]
         seats_by_date = task.get("seats_by_date") or {}
         auto_order = bool(task.get("auto_order", True))
@@ -1124,7 +1245,14 @@ class MonitorEngine(object):
                 for i, task in due:
                     if stop_event is not None and stop_event.is_set():
                         break
-                    interval = self.task_interval(task)
+                    try:
+                        interval = self.task_interval(task)
+                    except Exception as e:
+                        # 兜底：task_interval 已做形状校验，此处只防未知异常崩进程
+                        LOG.error("[配置] 任务「%s」计算轮询间隔异常，"
+                                  "已用兜底间隔 %ss：%s",
+                                  task.get("name"), self.base_interval, e)
+                        interval = self.base_interval
                     try:
                         broke, recoverable = self._run_task(task)
                     except Exception as e:

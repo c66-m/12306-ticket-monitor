@@ -5843,6 +5843,131 @@ class TestTask67MonitorMenuRobustness(TempDirCase):
         self.assertNotIn("Traceback", printed)
 
 
+class TestTask68EngineConfigShapes(TempDirCase):
+    """Task 68 (P1/P2): 非法配置形状不得崩引擎进程；trains 字符串不逐字符拆；日期跨度设上限。"""
+
+    def _write_config(self, cfg):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return p
+
+    def _engine_with(self, cfg):
+        cfg = dict(cfg)
+        cfg.setdefault("state_file", os.path.join(self.tmp, "state.json"))
+        cfg.setdefault("history_file", os.path.join(self.tmp, "order_history.json"))
+        p = self._write_config(cfg)
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            e = engine_mod.MonitorEngine(config_path=p, setup_logging=False)
+        return e, p
+
+    def _adaptive_engine(self, adaptive):
+        e = make_engine(self.tmp)
+        e.config = {"adaptive": adaptive}
+        e.base_interval, e.min_interval = 45, 30
+        return e
+
+    # ---- (a) P1: 非法形状不崩进程 ----
+    def test_peak_hours_single_element_no_crash(self):
+        # peak_hours=[0]：0 <= hour 恒成立，旧代码必走到 peak[1] 抛 IndexError 崩进程
+        e = self._adaptive_engine({"enabled": True, "peak_hours": [0]})
+        t = task_of("t68a")
+        iv = e.task_interval(t)  # 旧代码 peak[1] 抛 IndexError 崩进程
+        self.assertIsInstance(iv, (int, float))
+
+    def test_peak_hours_string_no_crash(self):
+        e = self._adaptive_engine({"enabled": True, "peak_hours": "6-23"})
+        t = task_of("t68a")
+        iv = e.task_interval(t)  # 旧代码 peak[0] <= hour 抛 TypeError
+        self.assertIsInstance(iv, (int, float))
+
+    def test_peak_multiplier_string_no_crash(self):
+        e = self._adaptive_engine({"enabled": True, "peak_hours": [0, 24],
+                                   "peak_multiplier": "1.0",
+                                   "rush_within_hours": 0})
+        t = task_of("t68a")
+        iv = e.task_interval(t)  # 旧代码 iv * mult 抛 TypeError
+        self.assertIsInstance(iv, (int, float))
+
+    def test_poll_interval_abc_init_no_crash(self):
+        e, _ = self._engine_with({"tasks": [],
+                                  "poll_interval_seconds": "abc"})
+        # 旧代码 __init__ 里 int("abc") 抛 ValueError，引擎起不来
+        self.assertEqual(e.base_interval, 45)
+
+    def test_poll_interval_abc_sync_no_crash(self):
+        e, p = self._engine_with({"tasks": [], "poll_interval_seconds": 45})
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [], "poll_interval_seconds": "abc",
+                       "state_file": e.config["state_file"],
+                       "history_file": e.config["history_file"]}, f)
+        os.utime(p, (time.time() + 5, time.time() + 5))  # 保证 mtime 变化
+        e._sync_config()  # 旧代码 int("abc") 抛 ValueError
+        self.assertEqual(e.base_interval, 45)
+
+    def test_tasks_dict_sanitized(self):
+        e, _ = self._engine_with({"tasks": {"t1": {}}})
+        # 旧代码 enumerate(dict) 拿 key 调 .get 抛 AttributeError
+        self.assertEqual(e.tasks, [])
+
+    def test_tasks_non_dict_entry_skipped(self):
+        e, _ = self._engine_with({"tasks": [{"name": "ok"}, "garbage", 42]})
+        self.assertEqual([t["name"] for t in e.tasks], ["ok"])
+
+    def test_legal_adaptive_still_applies(self):
+        # 回归 pin：合法 adaptive 仍生效（全天高峰 ×2.0，优先级 5 → 90s）
+        e = self._adaptive_engine({"enabled": True, "peak_hours": [0, 24],
+                                   "peak_multiplier": 2.0,
+                                   "rush_within_hours": 0})
+        t = task_of("t68a", priority=5)
+        self.assertAlmostEqual(e.task_interval(t), 90)
+
+    # ---- (b) P2: trains 字符串不逐字符拆 ----
+    def test_trains_string_single_train(self):
+        got = engine_mod.normalize_trains({"name": "t68b", "trains": "G101"})
+        # 旧代码逐字符拆成 ['G', '1', '0', '1']，静默漏单
+        self.assertEqual(got, ["G101"])
+
+    def test_trains_string_warns(self):
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            engine_mod.normalize_trains({"name": "t68b", "trains": "G101"})
+        self.assertTrue(any("trains" in m for m in cm.output),
+                        "字符串 trains 未记 warning: %s" % cm.output)
+
+    def test_trains_list_unchanged(self):
+        # 回归 pin：合法列表行为不变
+        self.assertEqual(
+            engine_mod.normalize_trains({"trains": ["k225", " G101 "]}),
+            ["K225", "G101"])
+
+    # ---- (c) P2: 日期跨度上限 31 天 ----
+    def test_date_range_365d_truncated(self):
+        t = {"name": "t68c", "date_range": ["2026-01-01", "2026-12-31"]}
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            got = engine_mod.expand_dates(t)
+        self.assertEqual(len(got), 31)  # 旧代码返回 365 个日期
+        self.assertEqual(got[0], "2026-01-01")
+        self.assertEqual(got[-1], "2026-01-31")
+        self.assertTrue(any("截断" in m for m in cm.output),
+                        "截断未明确告知: %s" % cm.output)
+
+    def test_dates_list_over_31_truncated(self):
+        base = datetime.date(2026, 1, 1)
+        dates = [(base + datetime.timedelta(days=i)).isoformat()
+                 for i in range(40)]
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            got = engine_mod.expand_dates({"name": "t68c", "dates": dates})
+        self.assertEqual(len(got), 31)
+        self.assertTrue(any("截断" in m for m in cm.output),
+                        "截断未明确告知: %s" % cm.output)
+
+    def test_valid_5d_range_untouched(self):
+        # 回归 pin：合法短区间不受影响
+        t = {"name": "t68c", "date_range": ["2026-10-01", "2026-10-05"]}
+        self.assertEqual(len(engine_mod.expand_dates(t)), 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
