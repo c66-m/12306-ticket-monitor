@@ -1605,11 +1605,13 @@ class TestSearchStations(TempDirCase):
         # 同档(2字"长"字站约10个)按索引序,长葛位次不保证,但在结果内即可达
 
     def test_fault_tolerance_fullwidth_and_spaces(self):
-        self.assertEqual(launcher.search_stations("ｃｑ")[0]["name"], "重庆")   # 全角
+        # Task 74b：kind_rank 生效后"cq"系查询首选为普速优先的重庆北（同上注释）；
+        # 本用例 pin 的是全角/空格容错（仍有效），不是首选站本身。
+        self.assertEqual(launcher.search_stations("ｃｑ")[0]["name"], "重庆北")   # 全角
         r = [x["name"] for x in launcher.search_stations("长　葛")]
         self.assertEqual(r[0], "长葛")                                        # 全角空格+忽略空白
         r2 = launcher.search_stations("chong qing")
-        self.assertEqual(r2[0]["name"], "重庆")                               # 空格剔除
+        self.assertEqual(r2[0]["name"], "重庆")  # 空格剔除：拼音全拼精确命中仍优先
 
     def test_covers_all_matches_within_2s(self):
         import time as _time
@@ -1622,7 +1624,10 @@ class TestSearchStations(TempDirCase):
         self.assertLess(dt, 2.0)                            # 响应 ≤2 秒
 
     def test_ascii_ranking_unchanged(self):
-        self.assertEqual(launcher.search_stations("cq")[0]["name"], "重庆")
+        # Task 74b 后 kind_rank 生效（普速优先）：重庆北/东/西均为"高铁+动车+普速"
+        # 含普速 → rank 0，排在无 kind 记录的重庆(CQW) 之前。旧期望"重庆"是
+        # kind 查询恒 miss 时的失效排序。
+        self.assertEqual(launcher.search_stations("cq")[0]["name"], "重庆北")
         self.assertEqual(launcher.search_stations("chang")[0]["name"], "长春")
         self.assertEqual(launcher.search_stations("bjd")[0]["name"], "北京东")
 
@@ -4338,7 +4343,8 @@ class TestTask55AutoFired(TempDirCase):
         app._top = mock.Mock()
         logs = []
         app._put_log = logs.append
-        app._ui_to_lc = lambda: None
+        app._ui_to_lc = lambda save=True: None  # Task 74d：start_grab 调 _ui_to_lc(save=False)
+        app._save_cfg = mock.Mock()
         app._set_status = mock.Mock()
         app.go_btn = mock.Mock()
         import queue
@@ -6685,6 +6691,198 @@ class TestTask73MonitorCreateCancel(TempDirCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["trains"], [])
         self.assertEqual(tasks[0]["passenger_names"], ["张三"])
+
+
+class TestTask74Launcher(TempDirCase):
+    """Task 74: launcher P2/P3 bundle（a–h）。无 Tk 真机，全部 mock/桩测试。"""
+
+    def _var(self, value):
+        v = mock.Mock()
+        v.get.return_value = value
+        return v
+
+    def _make_app(self, **kw):
+        app = object.__new__(launcher.LauncherApp)
+        app.grabber = None
+        app.lc = {"from": "", "to": "", "trains": [], "seat_types": [],
+                  "date": "", "purpose_code": "ADULT", "passenger_names": []}
+        app.from_ent = self._var(kw.get("from_", "北京"))
+        app.to_ent = self._var(kw.get("to_", "上海"))
+        app.trains_var = self._var(kw.get("trains", "G101"))
+        app.seat_vars = {"二等座": self._var(True)}
+        app.seat_pri_var = self._var("")
+        app.date_var = self._var(kw.get("date", "2026-10-10"))
+        app.date_to_var = self._var("")
+        app.start_var = self._var("")
+        app.remind_var = self._var(kw.get("remind", "10"))
+        app.warm_var = self._var(kw.get("warm", "10"))
+        app.pax_vars = kw.get("pax_vars", {})
+        app.pax_purpose_vars = {}
+        app._save_cfg = mock.Mock()
+        app._set_status = mock.Mock()
+        app._put_log = mock.Mock()
+        app._top = mock.Mock()
+        app.go_btn = mock.Mock()
+        app.logq = mock.Mock()
+        app._auto_vfail_warned = False
+        return app
+
+    # ---- (b) kind_rank 大小写 ----
+
+    def test_search_stations_kind_rank_case_insensitive(self):
+        snapshot = dict(launcher._station_kinds)
+        old_path = launcher.STATION_KIND_PATH
+        launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
+        self.addCleanup(setattr, launcher, "STATION_KIND_PATH", old_path)
+
+        def _restore():
+            launcher._station_kinds.clear()
+            launcher._station_kinds.update(snapshot)
+        self.addCleanup(_restore)
+        with open(launcher.STATION_KIND_PATH, "w", encoding="utf-8") as f:
+            json.dump({"BJB": "普速", "VNP": "高铁"}, f)
+        launcher._station_kinds.clear()
+        stations = [
+            {"name": "北京北站X", "spy": "bjb", "py": "beijingbei", "code": "BJB"},
+            {"name": "北京南", "spy": "bjn", "py": "beijingnan", "code": "VNP"},
+        ]
+        with mock.patch.object(launcher, "get_station_index", return_value=stations):
+            out = launcher.search_stations("bj")
+        # 同分下普速站应排在高铁站前面（旧代码 kind 全 miss → 按站名长度排错）
+        self.assertEqual(out[0]["name"], "北京北站X")
+
+    # ---- (c) synced_trains 保留 ----
+
+    def test_load_launcher_config_preserves_synced_trains(self):
+        old = launcher.LAUNCHER_CFG_PATH
+        p = os.path.join(self.tmp, "launcher_config.json")
+        launcher.LAUNCHER_CFG_PATH = p
+        self.addCleanup(setattr, launcher, "LAUNCHER_CFG_PATH", old)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"trains": ["G1"], "synced_trains": ["G2", "G3"],
+                       "from": "北京"}, f)
+        lc = launcher.load_launcher_config()
+        self.assertEqual(lc["synced_trains"], ["G2", "G3"])
+        self.assertEqual(lc["trains"], ["G1"])
+
+    # ---- (d) 先校验后落盘 + 失败只记一条 warning ----
+
+    def test_start_grab_no_disk_write_on_validate_fail(self):
+        app = self._make_app()  # pax_vars={} → 自动开抢校验失败（未选乘车人）
+        app.start_grab(auto=True)
+        app._save_cfg.assert_not_called()  # 旧代码：_ui_to_lc 内已落盘
+
+    def test_start_grab_saves_on_validate_pass(self):
+        # 回归 pin：校验通过时仍落盘一次并启动线程（行为不变）
+        app = self._make_app(pax_vars={"张三": self._var(True)})
+        with mock.patch.object(launcher, "Grabber") as m_grabber:
+            ok = app.start_grab(auto=False)
+        self.assertTrue(ok)
+        self.assertEqual(app._save_cfg.call_count, 1)
+        m_grabber.assert_called_once()
+
+    def test_validate_fail_warn_once(self):
+        app = self._make_app()
+        app._validate_fail("未选乘车人", "未勾选乘车人，自动开抢已跳过", True)
+        app._validate_fail("未选乘车人", "未勾选乘车人，自动开抢已跳过", True)
+        app._top.bell.assert_called_once()
+        self.assertEqual(app._put_log.call_count, 1)  # 旧代码：每 500ms 记一条
+
+    # ---- (e) Spinbox 非数字兜底 ----
+
+    def test_ui_to_lc_spinbox_non_numeric(self):
+        app = self._make_app(remind="abc", warm="xyz")
+        app._ui_to_lc()  # 旧代码：int("abc") 抛 ValueError
+        self.assertEqual(app.lc["remind_minutes"], 10)
+        self.assertEqual(app.lc["warm_minutes"], 10)
+
+    def test_tick_remind_non_numeric_no_crash(self):
+        app = object.__new__(launcher.LauncherApp)
+        app._row_widgets = {}
+        app.grabber = None
+        future = (datetime.datetime.now() + datetime.timedelta(hours=2)
+                  ).strftime("%Y-%m-%d %H:%M:%S")
+        app.start_var = self._var(future)
+        app.warm_var = self._var("10")
+        app.remind_var = self._var("abc")
+        app.countdown_lbl = mock.Mock()
+        app.after = mock.Mock()
+        app.armed = False
+        app.auto_refresh_var = self._var(False)  # _tick 先调 _auto_refresh_trains
+        app._querying = False
+        app._tick()  # 旧代码：ValueError 从 _tick 逃出（控制台 traceback）
+        app.countdown_lbl.configure.assert_called()
+
+    # ---- (f) 测试会话异常走实例 logq ----
+
+    def test_test_session_error_to_instance_logq(self):
+        app = object.__new__(launcher.LauncherApp)
+        app.logq = mock.Mock()
+        app._put_log = mock.Mock()
+
+        def run_sync(target, daemon=True):
+            target()
+            m = mock.Mock()
+            m.start = mock.Mock()
+            return m
+
+        with mock.patch.object(launcher.browser_order, "check_session",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(launcher, "LOGQ") as m_logq, \
+             mock.patch("threading.Thread", side_effect=run_sync):
+            app._test_session()
+        app.logq.put.assert_called_once()
+        self.assertIn("会话校验异常", app.logq.put.call_args[0][0])
+        m_logq.put.assert_not_called()  # 旧代码：异常进了全局 LOGQ
+
+    # ---- (g) 历史记录非 dict 跳过 ----
+
+    def test_history_item_text_skips_non_dict(self):
+        with self.assertLogs(launcher.LOG, level="WARNING"):
+            self.assertIsNone(launcher._history_item_text("not-a-dict"))
+        self.assertIsNone(launcher._history_item_text(None))
+        self.assertEqual(
+            launcher._history_item_text({"from": "北京", "to": "上海",
+                                         "date": "2026-10-10"}),
+            "北京 → 上海    2026-10-10")
+
+    # ---- (a) 删任务停抢票线程 ----
+
+    def test_delete_task_stops_grabber_thread(self):
+        panel = object.__new__(launcher.TaskManagerPanel)
+        task = {"id": "t1", "name": "任务一", "status": "running"}
+        panel.tasks = [task]
+        w = mock.Mock()
+        w.winfo_exists.return_value = True
+        w.destroy.side_effect = AssertionError("must not destroy directly")
+        panel._windows = {"t1": w}
+        panel._mp = mock.Mock()
+        panel._find = lambda tid: task if tid == "t1" else None
+        panel._refresh_list = mock.Mock()
+        panel._put_log = mock.Mock()
+        with mock.patch.object(launcher.messagebox, "askyesno",
+                               return_value=True), \
+             mock.patch.object(launcher, "save_grab_tasks") as m_save:
+            panel._delete_task("t1")
+        w._on_close.assert_called_once_with()  # 旧代码：直接 w.destroy()
+        w.destroy.assert_not_called()
+        self.assertEqual(panel.tasks, [])
+        m_save.assert_called()
+
+    # ---- (h) 关窗保留已抢到 ----
+
+    def test_on_window_closed_keeps_ok(self):
+        panel = object.__new__(launcher.TaskManagerPanel)
+        panel.tasks = [{"id": "t1", "name": "n1", "status": "ok"},
+                       {"id": "t2", "name": "n2", "status": "running"}]
+        panel._windows = {}
+        panel._refresh_list = mock.Mock()
+        panel._put_log = mock.Mock()
+        with mock.patch.object(launcher, "save_grab_tasks"):
+            panel._on_window_closed("t1")
+            panel._on_window_closed("t2")
+        self.assertEqual(panel.tasks[0]["status"], "ok")  # 旧代码：被抹成 idle
+        self.assertEqual(panel.tasks[1]["status"], "idle")
 
 
 if __name__ == "__main__":

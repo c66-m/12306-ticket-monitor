@@ -238,6 +238,11 @@ def load_launcher_config():
                 for k, v in _DEFAULT_LC.items():
                     if k in saved:
                         lc[k] = saved[k]
+                # 保留未知键（如 merge_trains_from_monitor 写入的 synced_trains）：
+                # 否则用户删掉的同步车次会在重启后被再次自动加回
+                for k, v in saved.items():
+                    if k not in _DEFAULT_LC:
+                        lc[k] = v
         except Exception as e:
             log("[错误] launcher_config.json 读取失败：%s，使用默认配置" % e)
     return lc
@@ -1100,7 +1105,8 @@ def search_stations(text, limit=12):
         else:
             continue
         # 同分内普速站优先于高铁/动车站，再按站名长度（用户口径：普通车站靠前）
-        kind = load_station_kinds().get(name2code_rev.get(name, ""), "")
+        # name2code_rev 存的是小写 code，load_station_kinds() 的键是大写：查之前转大写
+        kind = load_station_kinds().get(name2code_rev.get(name, "").upper(), "")
         kind_rank = 0 if "普速" in kind else (1 if kind else 2)
         scored.append((score, kind_rank, len(name), idx, st))
     scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
@@ -1652,9 +1658,20 @@ class DateTimeDialog(tk.Toplevel):
         self.destroy()
 
 
+def _history_item_text(it):
+    """历史查询记录条目的显示文本；非 dict 条目记 warning 返回 None（调用方跳过）。
+
+    query_history 可能被手工改坏（如写成字符串数组），直接 it.get() 会
+    AttributeError 炸掉整个对话框（Tasks 24/25/28 修过同类脏数据崩溃）。
+    """
+    if not isinstance(it, dict):
+        LOG.warning("查询历史记录条目非 dict，已跳过：%r" % (it,))
+        return None
+    return "%s → %s    %s" % (it.get("from"), it.get("to"), it.get("date"))
+
+
 class QueryHistoryDialog(tk.Toplevel):
     """历史查询记录：双击一条即填回行程。"""
-
     def __init__(self, master, items, on_pick):
         super().__init__(master)
         self.items = list(items)
@@ -1672,7 +1689,10 @@ class QueryHistoryDialog(tk.Toplevel):
         sb.pack(side="right", fill="y")
         self.lb.pack(side="left", fill="both", expand=True)
         for it in self.items:
-            self.lb.insert("end", "%s → %s    %s" % (it.get("from"), it.get("to"), it.get("date")))
+            text = _history_item_text(it)
+            if text is None:
+                continue
+            self.lb.insert("end", text)
         self.lb.bind("<Double-Button-1>", self._pick)
         self.lb.bind("<Return>", self._pick)
         if self.items:
@@ -2173,7 +2193,7 @@ class LauncherApp(tk.Frame):
         self._auto_vfail_warned = False
         self.reminded = False
 
-    def _ui_to_lc(self):
+    def _ui_to_lc(self, save=True):
         lc = self.lc
         lc["from"] = self.from_ent.get()
         lc["to"] = self.to_ent.get()
@@ -2183,8 +2203,16 @@ class LauncherApp(tk.Frame):
         lc["date"] = self.date_var.get().strip()
         lc["date_to"] = self.date_to_var.get().strip()
         lc["start_time"] = self.start_var.get().strip()
-        lc["remind_minutes"] = max(0, min(120, int(self.remind_var.get() or 10)))
-        lc["warm_minutes"] = max(0, min(30, int(self.warm_var.get() or 10)))
+        # Spinbox 手输非数字时回退默认值（与 _tick 的 warm_var 兜底同口径），
+        # 否则 int() 抛 ValueError/TclError，只有控制台 traceback
+        try:
+            lc["remind_minutes"] = max(0, min(120, int(self.remind_var.get() or 10)))
+        except Exception:
+            lc["remind_minutes"] = 10
+        try:
+            lc["warm_minutes"] = max(0, min(30, int(self.warm_var.get() or 10)))
+        except Exception:
+            lc["warm_minutes"] = 10
         lc["passenger_names"] = [n for n, v in self.pax_vars.items() if v.get()]
         if self.pax_purpose_vars:
             lc["pax_purpose"] = {
@@ -2197,7 +2225,8 @@ class LauncherApp(tk.Frame):
             if stn and stn not in hist:
                 hist.insert(0, stn)
         lc["station_history"] = hist[:20]
-        self._save_cfg(lc)
+        if save:
+            self._save_cfg(lc)
 
     def _refresh_pax(self):
         cur_sel = {n for n, v in self.pax_vars.items() if v.get()}
@@ -2688,7 +2717,12 @@ class LauncherApp(tk.Frame):
                         _cd = "距开抢 %s" % fmt_countdown(diff)
                         _cd = ("⏰ " + _cd) if self.armed else ("⚠ 自动抢未启用 · " + _cd)
                         self.countdown_lbl.configure(text=_cd)
-                        remind = int(self.remind_var.get() or 0)
+                        # remind/warm 手输非数字时回退（与 warm_var 兜底同口径），
+                        # 否则 _tick 每 500ms 抛一次 TclError/ValueError 刷控制台
+                        try:
+                            remind = int(self.remind_var.get() or 0)
+                        except Exception:
+                            remind = 0
                         if self.armed and not self.reminded and remind > 0 and diff <= remind * 60:
                             self.reminded = True
                             self._put_log("[提醒] 距离开抢不到 %d 分钟！" % remind)
@@ -2811,12 +2845,12 @@ class LauncherApp(tk.Frame):
     def _validate_fail(self, title, msg, auto):
         """校验失败提示：手动弹模态框；自动只 bell+日志（无人值守弹模态会冻住主线程）。"""
         if auto:
-            # Task 55b 配套：校验失败允许下个 _tick 重试；bell 每个 armed 会话只响一次
-            #（否则 500ms 一次蜂鸣刷屏），日志每次都记以便盯着看重试仍在失败。
+            # Task 55b 配套：校验失败允许下个 _tick 重试；bell 与日志每个 armed 会话
+            # 只记一次（否则 500ms 一次蜂鸣/日志刷屏）。用户修正配置后自动重试仍会生效。
             if not getattr(self, "_auto_vfail_warned", False):
                 self._top.bell()
                 self._auto_vfail_warned = True
-            self._put_log("[自动开抢] 校验失败：%s" % msg)
+                self._put_log("[自动开抢] 校验失败：%s（修正配置后将自动重试）" % msg)
             return False
         messagebox.showwarning(title, msg, parent=self._mp)
         return False
@@ -2830,9 +2864,12 @@ class LauncherApp(tk.Frame):
     def start_grab(self, auto=False):
         if self.grabber and self.grabber.is_alive():
             return True  # 已在运行：视为已触发，避免 _tick 反复调用
-        self._ui_to_lc()
+        # 先同步界面到内存做校验，校验通过才落盘：失败时不写 grab_tasks.json，
+        # 否则 _tick 每 500ms 重试一次就全量重写一次磁盘文件
+        self._ui_to_lc(save=False)
         if not self._validate(auto=auto):
             return False
+        self._save_cfg(self.lc)
         if auto:
             # Task 55b：_validate() 通过之后才置位；失败时保持 False，
             # 下个 _tick 会重试（之前提前置位会缴械整点自动开抢且无重试）。
@@ -2876,7 +2913,9 @@ class LauncherApp(tk.Frame):
                 ok, who = browser_order.check_session()
                 self.logq.put("[会话] 校验结果：%s（%s）" % ("已登录" if ok else "未登录", who))
             except Exception as e:
-                LOGQ.put("[错误] 会话校验异常：%s" % e)
+                # 异常也走本窗口的实例 logq（经 _drain 显示在本窗口日志区），
+                # 不进管理器全局 LOGQ
+                self.logq.put("[错误] 会话校验异常：%s" % e)
         threading.Thread(target=worker, daemon=True).start()
 
     def _locate(self):
@@ -3623,7 +3662,12 @@ class TaskManagerPanel(tk.Frame):
             return
         w = self._windows.pop(tid, None)
         if w and w.winfo_exists():
-            w.destroy()
+            try:
+                # 必须走窗口自己的 _on_close（停抢票线程 -> join -> 保存 -> 销毁）；
+                # 直接 destroy 会把运行中的抢票线程晾在后台，可能为已删任务下单
+                w._on_close()
+            except Exception as e:
+                self._put_log("[警告] 删除任务时关闭窗口异常：%s" % e)
         self.tasks = [t for t in self.tasks if t.get("id") != tid]
         save_grab_tasks(self.tasks)
         self._refresh_list()
@@ -3645,7 +3689,10 @@ class TaskManagerPanel(tk.Frame):
         self._windows.pop(tid, None)
         for t in self.tasks:
             if t.get("id") == tid:
-                t["status"] = "idle"
+                # 抢到的任务保留"已抢到"状态（与 GrabTaskWindow._on_close 同口径），
+                # 别在关窗时被抹成"就绪"
+                if t.get("status") != "ok":
+                    t["status"] = "idle"
         save_grab_tasks(self.tasks)
         self._refresh_list()
         self._put_log("[任务] 「%s」窗口已关闭（已停止抢票并保存配置）"
