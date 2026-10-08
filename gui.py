@@ -2040,13 +2040,20 @@ def _relogin_ok_via_script(script):
     """运行 capture_session.py 做重登：仅当退出码为 0 返回 True。
 
     旧代码 subprocess.run(...) 后 ok = True 硬编码——退出码非 0（登录失败）
-    也被当成成功，侧边栏误置"已登录"。超时（300s）同样视为失败返回 False，
+    也被当成成功，侧边栏误置"已登录"。超时同样视为失败返回 False，
     不挂死、不抛到界面。
+    Task 99a：超时必须覆盖脚本实际总耗时（MAX_WAIT_SEC 等待 + Edge 启动
+    开销 + 最终验证），否则用户在等待末尾登录成功会被误判"运行超时"。
     """
     try:
-        proc = subprocess.run([sys.executable, script], cwd=HERE, timeout=300)
+        import capture_session as _cs
+        timeout = _cs.GUI_SUBPROCESS_TIMEOUT
+    except Exception:
+        timeout = 420  # 与 GUI_SUBPROCESS_TIMEOUT(=MAX_WAIT_SEC+120) 同值兜底
+    try:
+        proc = subprocess.run([sys.executable, script], cwd=HERE, timeout=timeout)
     except subprocess.TimeoutExpired:
-        LOG.error("重新登录失败：capture_session.py 运行超时（300s）")
+        LOG.error("重新登录失败：capture_session.py 运行超时（%ss）", timeout)
         return False
     ok = proc.returncode == 0
     if not ok:

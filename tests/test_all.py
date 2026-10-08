@@ -10178,6 +10178,125 @@ class TestTask98ProbeLoginP3(unittest.TestCase):
             self.assertEqual(mode, 0o600)
 
 
+class TestTask99CaptureSessionP3(unittest.TestCase):
+    """Task 99: capture_session P3（gui 超时误判 / 轮询无 Ctrl+C / 相对路径 CWD 歧义 / 已关闭浏览器 defensive）。"""
+
+    # ---- (a) gui 重登超时必须覆盖脚本实际总耗时 ----
+
+    def test_relogin_script_timeout_covers_script_total(self):
+        # RED on old code: timeout 硬编码 300 == MAX_WAIT_SEC(300)，
+        # 没留启动开销+最终验证的时间 → 用户在等待末尾登录成功会被误判"运行超时"
+        import capture_session
+        proc = mock.Mock()
+        proc.returncode = 0
+        with mock.patch("gui.subprocess.run", return_value=proc) as mrun:
+            self.assertTrue(gui._relogin_ok_via_script("capture_session.py"))
+        timeout = mrun.call_args.kwargs["timeout"]
+        self.assertGreaterEqual(timeout, capture_session.MAX_WAIT_SEC + 60)
+
+    def test_relogin_script_timeout_still_returns_false(self):
+        # 超时仍视为失败返回 False（行为不变，只是阈值对齐）
+        import capture_session
+        with mock.patch("gui.subprocess.run",
+                        side_effect=subprocess.TimeoutExpired("cmd", 1)):
+            self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
+
+    # ---- (b) 300s 轮询 Ctrl+C 优雅退出 ----
+
+    def test_wait_for_login_ctrl_c_cancels_gracefully(self):
+        # RED on old code: Ctrl+C 穿透 time.sleep(2) 抛 traceback（Task 78g 同类）
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = True
+        context = mock.Mock()
+        context.cookies.return_value = []
+        with mock.patch("time.sleep", side_effect=KeyboardInterrupt):
+            status = capture_session._wait_for_login(browser, context,
+                                                     time.time() + 300)
+        self.assertEqual(status, capture_session.LOGIN_CANCELLED)
+
+    # ---- (c) 相对路径按脚本目录解析 ----
+
+    def test_load_session_relative_path_resolves_against_here(self):
+        # RED on old code: 显式传相对路径时按 CWD 解析；
+        # 写侧（capture_session）按 HERE 写 → CWD≠脚本目录时"未找到会话文件"误导
+        with mock.patch("os.path.exists", return_value=False) as m_exists:
+            with self.assertRaises(RuntimeError):
+                order_mod.load_session("rel/cookies.json")
+        checked = m_exists.call_args[0][0]
+        self.assertEqual(checked, os.path.join(order_mod.HERE, "rel", "cookies.json"))
+
+    def test_load_session_absolute_path_passthrough(self):
+        # 绝对路径透传（pin：正常路径行为不变）
+        with mock.patch("os.path.exists", return_value=False) as m_exists:
+            with self.assertRaises(RuntimeError):
+                order_mod.load_session("/tmp/abs_cookies.json")
+        self.assertEqual(m_exists.call_args[0][0], "/tmp/abs_cookies.json")
+
+    def test_save_session_relative_path_resolves_against_here(self):
+        # 写侧也要统一口径（engine 回写轮换 Cookie 时传 config 相对路径）
+        # RED on old code: 按 CWD 落盘，与读侧/抓取侧 HERE 口径不一致
+        cookie = mock.Mock()
+        cookie.name = "tk"
+        cookie.value = "v"
+        cookie.domain = "kyfw.12306.cn"
+        cookie.path = "/otn"
+        session = mock.Mock()
+        session.cookies = [cookie]
+        with mock.patch.object(order_mod.appcommon, "atomic_write_json") as m_write:
+            order_mod.save_session(session, "rel/cookies.json")
+        written = m_write.call_args[0][0]
+        self.assertEqual(written, os.path.join(order_mod.HERE, "rel", "cookies.json"))
+
+    # ---- (d) 已关闭浏览器 defensive close ----
+
+    def _run_main(self, connected, wait_status=None, final_ok=False):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = connected
+        fake_mod = mock.MagicMock()  # playwright.sync_api：sync_playwright() 返回支持 with 的 MagicMock
+        with mock.patch.object(capture_session, "_order_mode",
+                               return_value="http"), \
+             mock.patch.object(capture_session, "_launch_browser",
+                               return_value=browser), \
+             mock.patch.object(capture_session, "_goto_login_page",
+                               return_value=True), \
+             mock.patch.object(capture_session, "_wait_for_login",
+                               return_value=(capture_session.LOGIN_OK
+                                             if wait_status is None else wait_status)), \
+             mock.patch.object(capture_session, "_final_verify",
+                               return_value=final_ok), \
+             mock.patch.dict("sys.modules",
+                             {"playwright": mock.MagicMock(),
+                              "playwright.sync_api": fake_mod}), \
+             mock.patch("builtins.print"):
+            rc = capture_session.main()
+        return rc, browser
+
+    def _run_main_final_verify_fail(self, connected):
+        return self._run_main(connected, final_ok=False)
+
+    def test_final_verify_fail_skips_close_on_disconnected_browser(self):
+        # RED on old code: _final_verify 失败后无条件 browser.close()；
+        # 用户在验证阶段关了窗口 → close 作用于已关闭浏览器
+        rc, browser = self._run_main_final_verify_fail(connected=False)
+        self.assertEqual(rc, 1)
+        browser.close.assert_not_called()
+
+    def test_final_verify_fail_closes_connected_browser(self):
+        # 正常路径行为不变：浏览器还开着 → 照常关闭
+        rc, browser = self._run_main_final_verify_fail(connected=True)
+        self.assertEqual(rc, 1)
+        browser.close.assert_called_once()
+
+    def test_main_cancel_closes_browser_and_returns_1(self):
+        # 取消路径 pin：_wait_for_login 返回 CANCELLED → 关浏览器 + 返回 1
+        import capture_session
+        rc, browser = self._run_main(True, wait_status=capture_session.LOGIN_CANCELLED)
+        self.assertEqual(rc, 1)
+        browser.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

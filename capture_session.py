@@ -39,14 +39,20 @@ COOKIE_PATH = os.path.join(HERE, "session_cookies.json")
 # order.load_session 按"有分隔符=复合键 / 无=旧格式"兼容读取。
 COOKIE_KEY_SEP = "\x1f"
 
-# _wait_for_login 的三种出口
+# _wait_for_login 的四种出口
 LOGIN_OK = "ok"
 LOGIN_TIMEOUT = "timeout"
 LOGIN_BROWSER_CLOSED = "browser_closed"
+LOGIN_CANCELLED = "cancelled"  # Task 99b：用户 Ctrl+C 取消等待
 
 LOGIN_URL = "https://kyfw.12306.cn/otn/resources/login.html"
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 MAX_WAIT_SEC = 300   # 等用户登录的最长时间
+
+# gui._relogin_ok_via_script 用 subprocess 跑本脚本时的超时：必须覆盖脚本
+# 实际总耗时（MAX_WAIT_SEC 等待 + Edge 启动开销 + 最终验证），否则用户在
+# 等待末尾登录成功会被误判"运行超时"（Task 99a）。
+GUI_SUBPROCESS_TIMEOUT = MAX_WAIT_SEC + 120
 
 
 def _order_mode():
@@ -105,23 +111,30 @@ def _wait_for_login(browser, context, deadline):
 
     浏览器被用户提前关闭时不再空转烧完 300s，而是早退并提示（Task 69d）。
     """
-    while time.time() < deadline:
-        time.sleep(2)
-        try:
-            connected = browser.is_connected()
-        except Exception:
-            connected = False
-        if not connected:
-            print("\n[失败] 检测到浏览器窗口已被关闭，停止等待登录。")
-            return LOGIN_BROWSER_CLOSED
-        try:
-            cookies = context.cookies()
-            names = [c.get("name") for c in cookies]
-        except Exception:
-            continue
-        # 登录后 12306 会种下 tk 且带签名（有效会话的必要条件之一）
-        if "tk" in names or any(n.startswith("tk") for n in names if n):
-            return LOGIN_OK
+    try:
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                connected = browser.is_connected()
+            except Exception:
+                connected = False
+            if not connected:
+                print("\n[失败] 检测到浏览器窗口已被关闭，停止等待登录。")
+                return LOGIN_BROWSER_CLOSED
+            try:
+                cookies = context.cookies()
+                names = [c.get("name") for c in cookies]
+            except Exception:
+                continue
+            # 登录后 12306 会种下 tk 且带签名（有效会话的必要条件之一）
+            if "tk" in names or any(n.startswith("tk") for n in names if n):
+                return LOGIN_OK
+    except KeyboardInterrupt:
+        # Task 99b：300s 轮询里 Ctrl+C 应优雅退出（Task 78g 同口径），
+        # 而不是把 traceback 抛给用户。内层 except Exception 抓不到
+        # KeyboardInterrupt（BaseException），它会穿透到这里被捕获。
+        print("\n[中断] 用户取消登录等待（Ctrl+C），退出。")
+        return LOGIN_CANCELLED
     return LOGIN_TIMEOUT
 
 
@@ -167,6 +180,21 @@ def _goto_login_page(page):
         print("[失败] 打不开 12306 登录页：{0}".format(e))
         print("       请检查网络连接 / 代理设置后重试。")
         return False
+
+
+def _safe_close_browser(browser):
+    """defensive close：关闭前先检查连接状态（Task 99d）。
+
+    Playwright 的 Browser.close() 在已关闭浏览器上的语义未在真机实测；
+    用户在最终验证阶段关闭浏览器窗口时 _final_verify 返回 False，此时
+    browser 已断开，直接 close 可能抛异常。连接已断开则跳过。
+    """
+    try:
+        connected = browser.is_connected()
+    except Exception:
+        connected = False
+    if connected:
+        browser.close()
 
 
 def _final_verify(page):
@@ -232,6 +260,9 @@ def main():
         status = _wait_for_login(browser, context, time.time() + MAX_WAIT_SEC)
         if status == LOGIN_BROWSER_CLOSED:
             return 1
+        if status == LOGIN_CANCELLED:
+            _safe_close_browser(browser)
+            return 1
         if status != LOGIN_OK:
             print("\n[失败] 未检测到登录状态（{0}s 超时）。窗口已自动关闭，请重试。".format(MAX_WAIT_SEC))
             browser.close()
@@ -243,7 +274,7 @@ def main():
         if not _final_verify(page):
             print("[失败] 最终验证未通过：没取到登录态数据，Cookie 不保存。")
             print("       请确认浏览器里确实已登录成功后重试。")
-            browser.close()
+            _safe_close_browser(browser)
             return 1
         print("[成功] 最终验证通过。")
 

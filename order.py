@@ -86,6 +86,21 @@ BASE_HEADERS = {
 }
 
 
+def _resolve_cookie_path(cookie_path):
+    """会话文件路径解析：相对路径按脚本目录（HERE）解析。
+
+    与 capture_session._cookie_path 同口径（Task 99c）：写侧（capture_session）
+    一直是 os.path.join(HERE, name)，读/写侧显式传相对路径时若按 CWD 解析，
+    CWD≠脚本目录就会"未找到会话文件"误导或写错位置。绝对路径透传；
+    None/非法值回退默认文件名。
+    """
+    name = cookie_path if isinstance(cookie_path, str) else None
+    name = name or "session_cookies.json"
+    if os.path.isabs(name):
+        return name
+    return os.path.join(HERE, name)
+
+
 def load_session(cookie_path=None):
     """加载 saved 会话 Cookie，返回 requests.Session。
 
@@ -93,7 +108,7 @@ def load_session(cookie_path=None):
     （_uab_collina 只属于 /otn/resources、_passport_session 只属于 /passport），
     拍平成「全局 Cookie」会让每个接口收到本不该出现的 Cookie，属明显的非浏览器特征。
     旧格式（纯 name->value）仍兼容，回落到原来的全局作用域。"""
-    path = cookie_path or os.path.join(HERE, "session_cookies.json")
+    path = _resolve_cookie_path(cookie_path)
     if not os.path.exists(path):
         raise RuntimeError("未找到会话文件 {0}，请先运行：python capture_session.py".format(path))
     with open(path, "r", encoding="utf-8") as f:
@@ -122,7 +137,7 @@ def save_session(session, cookie_path=None):
     Task 85a：与 capture_session._build_cookie_dict 同一序列化规则——同名
     多 path 按 (name,path,domain) 三元组复合键全部保留，不再按 name
     last-wins 丢数据；load_session 可解析（round-trip）。"""
-    path = cookie_path or os.path.join(HERE, "session_cookies.json")
+    path = _resolve_cookie_path(cookie_path)
     cookies = _build_cookie_dict([
         {"name": c.name, "value": c.value,
          "domain": getattr(c, "domain", "") or "",
