@@ -367,7 +367,10 @@ class MonitorEngine(object):
             LOG.warning("state.json 锁争用超时，本次跳过加载，稍后重试: %s", e)
             lock_timeout = True
             old = getattr(self, "state", None)
-            state, err = (old if isinstance(old, dict) else {}), None
+            # Task 72 rework：与正常路径同为 3-tuple 解包（read_fp 本路径恒为
+            # None——锁都没拿到，不可能有"读失败瞬间"指纹；下游 quarantine
+            # 分支因 lock_timeout 不会执行到）。
+            state, err, read_fp = (old if isinstance(old, dict) else {}), None, None
         state_ok = err is None and not lock_timeout
         if err is not None:
             if isinstance(err, OSError):
@@ -574,8 +577,19 @@ class MonitorEngine(object):
                        if isinstance(self.state, dict) else None)
         if isinstance(state_tasks, dict) and (
                 raw_tasks is None or isinstance(raw_tasks, list)):
-            for n in [n for n in state_tasks if n not in current_names]:
+            pruned = [n for n in state_tasks if n not in current_names]
+            for n in pruned:
                 del state_tasks[n]
+            if pruned:
+                # Task 72 rework：清理出的孤儿名一并落墓碑，否则
+                # _merge_state_for_save 的 union 合并会在下次 _save_state
+                # 把磁盘残留条目复活（内存已删、磁盘复活）。
+                # 墓碑清除步在后：pruned 不在 current_names 内，墓碑被保留；
+                # 同名任务回到配置时清除步会清掉该墓碑（语义不变）。
+                deleted = getattr(self, "_deleted_names", None)
+                if deleted is None:
+                    deleted = self._deleted_names = set()
+                deleted.update(pruned)
         # 同名任务重建后清墓碑：删任务时记的墓碑只拦"已删除"的在途写回，
         # 新任务必须正常轮询
         deleted = getattr(self, "_deleted_names", None)

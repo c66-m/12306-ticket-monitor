@@ -6557,6 +6557,35 @@ class TestTask72EngineState(TempDirCase):
         self.assertNotIn("ghost", e.state["tasks"])
         self.assertIn("keep", e.state["tasks"])
 
+    def test_pruned_orphan_stays_dead_on_disk(self):
+        # Task 72 rework (e)：内存清理后，磁盘上的孤儿条目不得被
+        # _merge_state_for_save 的 union 合并复活——清理时必须落墓碑。
+        e = make_engine(self.tmp)
+        disk_state = {"dedup": {}, "retry": {},
+                      "tasks": {"ghost": {"status": "monitoring"},
+                                "keep": {"status": "paused"}}}
+        with open(e.state_path, "w", encoding="utf-8") as f:
+            json.dump(disk_state, f)
+        # 模拟刚从磁盘加载的内存态
+        e.state = {"dedup": {}, "retry": {},
+                   "tasks": {"ghost": {"status": "monitoring"},
+                             "keep": {"status": "paused"}}}
+        self._write_config(e, [task_of("keep")])
+        self.assertTrue(e._sync_config())
+        # 墓碑必须保留（ghost 不在 current_names 内）
+        self.assertIn("ghost", getattr(e, "_deleted_names", ()))
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            reloaded = json.load(f)
+        self.assertNotIn("ghost", reloaded["tasks"],
+                         "磁盘上的孤儿条目被 union 合并复活了")
+        self.assertIn("keep", reloaded["tasks"])
+        # 同名任务回到配置 → 墓碑被清除，任务可正常轮询
+        self._write_config(e, [task_of("keep"), task_of("ghost")])
+        e._config_mtime = None  # 强制重同步（mtime 粒度可能不够）
+        self.assertTrue(e._sync_config())
+        self.assertNotIn("ghost", getattr(e, "_deleted_names", ()))
+
     def test_tombstone_capped(self):
         e = make_engine(self.tmp)
         e._deleted_names = {"t%d" % i for i in range(600)}
