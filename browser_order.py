@@ -707,8 +707,10 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
         而资质未核验时提交必被拒——这正是「订票失败」最常见的真因。
     purpose_map: {姓名: 票种代码}，按每个乘车人分别对齐票种（可混选）。
         未覆盖到的乘车人用 purpose 兜底。
-    warm: WarmSession 实例。命中则跳过开窗口 / 校验会话 / 导航 / 填条件这几步，
+    warm: WarmSession 实例。命中则跳过开窗口 / 导航 / 填条件这几步，
         直接在这张已经预热好的列表页上点「预订」（需求 2）。
+        注：会话有效性复验已改在 order_via_browser（wrapper 层）执行，
+        此处收到的 warm 均已通过复验。
     tm: 调用方给的耗时字典，边跑边填各阶段秒数（需求 3）。
     alias_name: 同价改判后的席别名（勾选无座 → 硬座）。非空表示 seat_code 已经是
         改判后的代码，失败时按「改判后仍不可售」上报，不要当成配置错误永久跳过。
