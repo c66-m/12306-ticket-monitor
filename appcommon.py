@@ -84,17 +84,23 @@ def replace_with_retry(src, dst, tries=5, delay=0.1, fallback_direct=False):
 
 
 def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
-                      replace_delay=0.1, fallback_direct=False):
+                      replace_delay=0.1, fallback_direct=False, mode=None):
     """原子写 JSON：临时名带 pid+线程标识（同进程多线程/多窗口互不踩），
     写完 replace 并对 Windows 占用做退避重试。
 
     fallback_direct=True 时 replace 重试耗尽改为直写（丢原子性保数据，
     仅 engine 的 state.json 兜底使用这一语义）。
+
+    mode: 可选，落盘权限（如 0o600 用于含 SMTP 授权码的 config.json）。
+    在 tmp 文件上 chmod 再 replace，目标文件继承该权限；不传则保持默认
+    行为不变。Windows 下 os.chmod 仅影响只读位，0o600 等价于无操作。
     """
     tmp = "{0}.{1}{2}-{3}".format(path, tmp_kind, os.getpid(),
                                   threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+    if mode is not None:
+        os.chmod(tmp, mode)
     replace_with_retry(tmp, path, tries=replace_tries, delay=replace_delay,
                        fallback_direct=fallback_direct)
     # 写后兜底清：进程在"写 tmp → replace"之间崩溃会留下残留 tmp 文件，

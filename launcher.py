@@ -964,6 +964,9 @@ def append_monitor_task(task, start_now=True):
                     cfg.setdefault("tasks", []).append(task)
                     with open(tmp, "w", encoding="utf-8") as f:
                         json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
+                    # （os.replace 继承 tmp 权限；Windows 下 chmod 仅影响只读位）
+                    os.chmod(tmp, 0o600)
                     try:
                         after = os.path.getmtime(cfg_path)
                     except OSError:

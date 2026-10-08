@@ -73,9 +73,10 @@ def _lock_timeout_abort():
 
 def save_config(config):
     # 原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）
+    # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
-            appcommon.atomic_write_json(CONFIG_PATH, config)
+            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -91,7 +92,8 @@ def update_config_locked(mutator):
         with filelock.file_lock(CONFIG_PATH + ".lock"):
             config = load_config()
             result = mutator(config)
-            appcommon.atomic_write_json(CONFIG_PATH, config)
+            # Task 66: config.json 含密钥，落盘 0600
+            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
             return result
     except TimeoutError:
         _lock_timeout_abort()
@@ -602,15 +604,30 @@ def menu_notify():
     email["smtp_port"] = int(port) if port.isdigit() else 465
     email["username"] = read("  发件邮箱：", email.get("username")) or email.get("username")
     old_pw = email.get("password") or ""
-    pw_prompt = "  邮箱授权码（非登录密码%s）："
-    pw_prompt = pw_prompt % ("；已设置 %d 位，回车=保留" % len(old_pw)) if old_pw \
-        else pw_prompt % ""
+    # Task 66: 已加密存储时不展示密文长度（会误导用户以为密码有那么长），只提示已设置
+    if isinstance(old_pw, str):
+        if old_pw.startswith(notify_mod._DPAPI_PREFIX):
+            pw_hint = "；已设置（加密保存），回车=保留"
+        elif old_pw:
+            pw_hint = "；已设置 %d 位，回车=保留" % len(old_pw)
+        else:
+            pw_hint = ""
+    else:
+        # 非字符串脏数据（手改配置）：不 len() 崩，只提示已设置
+        pw_hint = "；已设置，回车=保留" if old_pw else ""
+    pw_prompt = "  邮箱授权码（非登录密码%s）：" % pw_hint
     try:
         new_pw = getpass.getpass(pw_prompt).strip()
     except EOFError:
         # 与 read() 的 Ctrl+C/EOF 约定一致：交由 main_menu 的中断处理接住。
         raise KeyboardInterrupt
-    email["password"] = new_pw or old_pw
+    # Task 66: 授权码加密落盘。protect_secret 对空值/已加密值原样返回；
+    # 旧明文配置在此顺带迁移为密文；读取侧 secret_of 兼容明文与密文，
+    # 无锁死风险；非 Windows 无 DPAPI 时按 Task 63a 口径记 error 明示，
+    # 不再静默明文保存。非字符串（手改配置脏数据）原样透传，不在此处崩。
+    pw_to_store = new_pw or old_pw
+    email["password"] = notify_mod.protect_secret(pw_to_store) \
+        if isinstance(pw_to_store, str) else pw_to_store
     email["from"] = read("  发件人地址（回车=发件邮箱）：", "") or email.get("username")
     to_raw = read("  收件人（多个用逗号分隔）：", ",".join(email.get("to") or []))
     if to_raw is None:

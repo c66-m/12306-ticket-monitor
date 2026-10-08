@@ -1789,13 +1789,16 @@ class TestMonitorInterruptRound2(TempDirCase):
         # 不写真实 config.json，ask_yes_no 走第 6 个 read 返回 "n"，不发测试邮件。
         # Task 50 后授权码走 getpass：read 序列少 1 个，"pw" 改由 getpass 提供。
         import monitor as monitor_mod
+        import notify as notify_mod
         saved = {}
         with mock.patch.object(monitor_mod, "load_config", return_value={}), \
              mock.patch.object(monitor_mod, "read", side_effect=[
                  "", "587", "u@x.com", "", "a@x.com", "n"]), \
              mock.patch("getpass.getpass", return_value="pw"), \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)):
+                               side_effect=lambda c: saved.update(c)), \
+             mock.patch.object(notify_mod, "protect_secret",
+                               side_effect=lambda t: t):
             monitor_mod.menu_notify()
         self.assertEqual(saved["notify"]["email"]["smtp_port"], 587)
         self.assertEqual(saved["notify"]["email"]["to"], ["a@x.com"])
@@ -5641,6 +5644,109 @@ class TestTask65InteractionLoginChain(TempDirCase):
         self.assertTrue(launcher._is_soft_fail("当前排队人数较多，请等待"))
         self.assertFalse(launcher._is_soft_fail("余票不足"))
         self.assertFalse(launcher._is_soft_fail(""))
+
+
+class TestTask66SmtpPasswordEncryption(TempDirCase):
+    """Task 66 (P1): menu_notify 不得明文落盘 SMTP 授权码；config.json 写盘 0600。"""
+
+    def _run_menu_notify(self, config, read_seq, pw_input, protect_fake):
+        import monitor as monitor_mod
+        import notify as notify_mod
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value=config), \
+             mock.patch.object(monitor_mod, "read", side_effect=read_seq), \
+             mock.patch("getpass.getpass", return_value=pw_input), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved.update(c)), \
+             mock.patch.object(notify_mod, "protect_secret",
+                               side_effect=protect_fake) as ps:
+            monitor_mod.menu_notify()
+        return saved, ps
+
+    @staticmethod
+    def _fake_encrypt(t):
+        # 模拟 DPAPI 加密：已加密/空原样返回，明文加前缀（与 protect_secret 契约同形）
+        if not t or t.startswith("dpapi1:"):
+            return t
+        return "dpapi1:FAKE:" + t
+
+    def test_menu_notify_password_goes_through_protect_secret(self):
+        # 旧代码 email["password"] = new_pw 原样明文保存：protect_secret 从未被调用
+        saved, ps = self._run_menu_notify(
+            {}, ["", "465", "u@x.com", "", "a@x.com", "n"],
+            "newsecret", self._fake_encrypt)
+        ps.assert_called_once_with("newsecret")
+        self.assertEqual(saved["notify"]["email"]["password"],
+                         "dpapi1:FAKE:newsecret")
+
+    def test_menu_notify_migrates_old_plaintext_on_keep(self):
+        # 用户回车保留旧明文密码：保存时也必须加密（encrypt-on-save 迁移），
+        # 不能把旧明文继续落盘
+        config = {"notify": {"email": {"enabled": True, "smtp_host": "smtp.qq.com",
+                                       "smtp_port": 465, "username": "u@x.com",
+                                       "password": "oldplain", "from": "u@x.com",
+                                       "to": []}}}
+        saved, ps = self._run_menu_notify(
+            config, ["", "465", "", "", "", "n"], "", self._fake_encrypt)
+        ps.assert_called_once_with("oldplain")
+        self.assertEqual(saved["notify"]["email"]["password"],
+                         "dpapi1:FAKE:oldplain")
+
+    def test_menu_notify_keeps_already_encrypted(self):
+        # 已加密的值不再二次包裹（protect_secret 幂等）；旧代码此处本就通过，作回归 pin
+        config = {"notify": {"email": {"enabled": True, "smtp_host": "smtp.qq.com",
+                                       "smtp_port": 465, "username": "u@x.com",
+                                       "password": "dpapi1:REALCIPHERTEXT",
+                                       "from": "u@x.com", "to": []}}}
+        saved, ps = self._run_menu_notify(
+            config, ["", "465", "", "", "", "n"], "", self._fake_encrypt)
+        ps.assert_called_once_with("dpapi1:REALCIPHERTEXT")
+        self.assertEqual(saved["notify"]["email"]["password"],
+                         "dpapi1:REALCIPHERTEXT")
+
+    def test_menu_notify_non_string_password_passthrough(self):
+        # 手改配置把 password 写成非字符串：不崩，原样透传（旧代码在 len() 处
+        # 直接 TypeError 崩；此处只求不崩，发送侧的校验是其它 Task 的范围）
+        import monitor as monitor_mod
+        import notify as notify_mod
+        config = {"notify": {"email": {"password": 12345}}}
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value=config), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "465", "", "", "", "n"]), \
+             mock.patch("getpass.getpass", return_value=""), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved.update(c)), \
+             mock.patch.object(notify_mod, "protect_secret",
+                               side_effect=AssertionError("must not be called")):
+            monitor_mod.menu_notify()
+        self.assertEqual(saved["notify"]["email"]["password"], 12345)
+
+    def test_save_config_sets_0600(self):
+        # 旧代码 atomic_write_json 不设权限：config.json 落盘 0644，同组/备份可读
+        import stat as stat_mod
+        import monitor as monitor_mod
+        cfg_path = os.path.join(self.tmp, "config.json")
+        with mock.patch.object(monitor_mod, "CONFIG_PATH", cfg_path):
+            monitor_mod.save_config({"notify": {"email": {"password": "x"}}})
+        mode = stat_mod.S_IMODE(os.stat(cfg_path).st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_atomic_write_json_mode_param(self):
+        # 旧代码无 mode 参数：敏感文件无法收紧权限
+        import stat as stat_mod
+        import appcommon
+        p1 = os.path.join(self.tmp, "secret.json")
+        appcommon.atomic_write_json(p1, {"x": 1}, mode=0o600)
+        self.assertEqual(stat_mod.S_IMODE(os.stat(p1).st_mode), 0o600)
+        # 不传 mode 时行为不变：与普通 open 写盘权限一致（不强制、不改动）
+        ref = os.path.join(self.tmp, "ref.json")
+        with open(ref, "w", encoding="utf-8") as f:
+            f.write("{}")
+        p2 = os.path.join(self.tmp, "plain.json")
+        appcommon.atomic_write_json(p2, {"x": 1})
+        self.assertEqual(stat_mod.S_IMODE(os.stat(p2).st_mode),
+                         stat_mod.S_IMODE(os.stat(ref).st_mode))
 
 
 if __name__ == "__main__":

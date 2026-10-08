@@ -131,9 +131,10 @@ def _lock_timeout_abort():
 
 def save_config(config):
     # 原子写 + 跨进程锁：与 launcher 的读-改-写互斥（config.json.lock）
+    # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
-            appcommon.atomic_write_json(CONFIG_PATH, config)
+            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -167,7 +168,8 @@ def update_config_locked(mutator):
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 config = json.load(f)
             result = mutator(config)
-            appcommon.atomic_write_json(CONFIG_PATH, config)
+            # Task 66: config.json 含密钥，落盘 0600
+            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
             return result
     except TimeoutError:
         _lock_timeout_abort()
