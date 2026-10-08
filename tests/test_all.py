@@ -9826,6 +9826,280 @@ class TestTask96LauncherP3(TempDirCase):
         win.destroy.assert_called_once()
 
 
+class TestTask97MonitorP3(TempDirCase):
+    """Task 97 (P3): monitor 菜单健壮性 bundle——
+    (a) menu_task_ops 坏任务条目（非 dict / 缺 name）可选可崩；
+    (b) 不可哈希的 name（如 list）绕过 Task 83 的展示硬化；
+    (c) "tasks" 非 list 时建任务锁内 AttributeError；
+    (d) menu_passengers 内 ask_yes_no 的 Ctrl+C 回主菜单（违背 Task 83b
+        回子菜单裁决）；
+    (e) menu_notify 部分 prompt 把 Ctrl+C 消化为"保留旧值"；
+    (f) "回车=使用默认/全部成人"文案与 default_names 首个-only 回退不符；
+    (g) menu_quick_check 日期处 Ctrl+C 触发真实网络查询而非取消；
+    (h) menu_notify 的 to_default 对 "to":123 仍 TypeError（Task 92 评审
+        确认真实）。"""
+
+    @staticmethod
+    def _printed(mprint):
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    @staticmethod
+    def _mock_engine():
+        eng = mock.MagicMock()
+        # 复刻 engine.MonitorEngine.task_status 的真实行为：
+        # state["tasks"].get(task["name"])——不可哈希的 name 在此 TypeError。
+        def _status(t):
+            return eng.state["tasks"].get(t["name"], {}).get("status",
+                                                             "paused")
+        eng.task_status.side_effect = _status
+        eng.state = {"tasks": {}}
+        eng.base_interval = 300
+        return eng
+
+    # ---- (a) menu_task_ops 坏条目 ----
+
+    def test_task_ops_nondict_entry_no_crash(self):
+        # (a) 旧代码：选中 "not-a-dict" 后 eng.task_status(task) 内
+        # task["name"] 抛 TypeError 崩菜单。
+        import monitor as m
+        tasks = [{"name": "good", "from": "北京", "to": "上海", "dates": []},
+                 "not-a-dict"]
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch.object(m, "read", return_value="2"), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_ops()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_task_ops_missing_name_entry_no_crash(self):
+        # (a) 旧代码：缺 name 的 dict 在 task["name"] 处抛 KeyError 崩菜单。
+        import monitor as m
+        tasks = [{"name": "good", "from": "北京", "to": "上海", "dates": []},
+                 {"from": "北京", "to": "上海"}]
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch.object(m, "read", return_value="2"), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_ops()  # 旧代码抛 KeyError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+    # ---- (b) 不可哈希 name ----
+
+    def test_task_list_unhashable_name_no_crash(self):
+        # (b) 旧代码：eng.state["tasks"].get(["x"], {}) 抛 TypeError
+        #（_task_keys_ok 只查键存在，挡不住不可哈希的 name）。
+        import monitor as m
+        tasks = [{"name": ["x"], "from": "北京", "to": "上海", "dates": []}]
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_list()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+    # ---- (c) tasks 非 list ----
+
+    def _run_create_task_with_cfg(self, cfg):
+        import monitor as m
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = []
+        pm.default_names.return_value = []
+        printed = []
+
+        def fake_update(mut):
+            # 模拟 update_config_locked 的锁内行为：mutator 直接作用于 cfg。
+            mut(cfg)
+            return True
+
+        try:
+            with mock.patch.object(m, "passengers_mod", pm), \
+                 mock.patch.object(m, "pick_station",
+                                   side_effect=["北京", "上海"]), \
+                 mock.patch.object(m, "input_dates",
+                                   return_value=(["2026-10-09"], [])), \
+                 mock.patch.object(m, "ticket") as mock_ticket, \
+                 mock.patch.object(m, "pick_multi",
+                                   return_value=["二等座"]), \
+                 mock.patch.object(m, "read",
+                                   side_effect=["", "5", "y", "y", "", "n"]), \
+                 mock.patch.object(m, "load_config",
+                                   return_value=cfg), \
+                 mock.patch.object(m, "update_config_locked",
+                                   side_effect=fake_update), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a: printed.append(
+                                " ".join(map(str, a)))):
+                mock_ticket.load_station_map.return_value = (
+                    {"北京": "BJP", "上海": "SHH"},
+                    {"BJP": "北京", "SHH": "上海"})
+                mock_ticket.query_tickets.side_effect = Exception("offline")
+                m.menu_create_task()
+        except KeyboardInterrupt:
+            pass
+        return cfg, printed
+
+    def test_create_task_nonlist_tasks_no_crash(self):
+        # (c) 旧代码：config.setdefault("tasks", []).append(task) 对 dict
+        # 抛 AttributeError（锁内），菜单 traceback。
+        cfg = {"tasks": {"bad": 1}}
+        cfg, printed = self._run_create_task_with_cfg(cfg)
+        self.assertEqual(cfg["tasks"], {"bad": 1})  # 脏数据原样保留，不覆写
+        self.assertIn("警告", " ".join(printed))
+
+    # ---- (d) menu_passengers 内 ask_yes_no 的 Ctrl+C ----
+
+    GOOD = {"name": "张三", "id_type_code": "1",
+            "id_no": "110101199001011234", "mobile": "13800138000",
+            "is_default": True, "is_adult": True}
+
+    def test_passengers_add_ask_yes_no_ctrl_c_returns_to_submenu(self):
+        # (d) 旧代码：op1 添加流程中 ask_yes_no 处 Ctrl+C 抛 KeyboardInterrupt
+        # 回主菜单，违背 Task 83(b) 回子菜单裁决。
+        import monitor as m
+        import passengers as pm
+        reads = ["1", "张三", "1", "13800138000", "13800138000", None, "0"]
+        raised = False
+        with mock.patch.object(pm, "load_passengers",
+                               return_value=[]), \
+             mock.patch.object(m, "read", side_effect=reads), \
+             mock.patch("builtins.print") as mprint:
+            try:
+                m.menu_passengers()  # 旧代码抛 KeyboardInterrupt
+            except KeyboardInterrupt:
+                raised = True
+        self.assertFalse(raised, "Ctrl+C 应回到乘车人子菜单，不应抛回主菜单")
+        self.assertIn("已取消", self._printed(mprint))
+
+    def test_passengers_delete_confirm_ctrl_c_returns_to_submenu(self):
+        # (d) 旧代码：op3 删除确认处 Ctrl+C 抛回主菜单。
+        import monitor as m
+        import passengers as pm
+        raised = False
+        with mock.patch.object(pm, "load_passengers",
+                               return_value=[dict(self.GOOD)]), \
+             mock.patch.object(m, "read",
+                               side_effect=["3", "1", None, "0"]), \
+             mock.patch("builtins.print") as mprint:
+            try:
+                m.menu_passengers()  # 旧代码抛 KeyboardInterrupt
+            except KeyboardInterrupt:
+                raised = True
+        self.assertFalse(raised, "Ctrl+C 应回到乘车人子菜单，不应抛回主菜单")
+        self.assertIn("已取消", self._printed(mprint))
+
+    # ---- (e) menu_notify 的 Ctrl+C 消化 ----
+
+    def test_notify_ctrl_c_cancels_edit(self):
+        # (e) 旧代码：smtp_host 处 Ctrl+C → read()→None → `None or 旧值`
+        # 静默保留旧值，用户无法区分"取消"与"保留"。
+        import monitor as m
+        cfg = {"notify": {"email": {"enabled": True, "smtp_host": "smtp.qq.com",
+                                    "smtp_port": 465, "username": "u",
+                                    "password": "", "from": "", "to": []}}}
+        with mock.patch.object(m, "load_config",
+                               return_value=cfg), \
+             mock.patch.object(m, "read", return_value=None), \
+             mock.patch("builtins.print") as mprint:
+            with self.assertRaises(KeyboardInterrupt):
+                m.menu_notify()  # 旧代码不抛异常
+        printed = self._printed(mprint)
+        self.assertIn("已取消修改", printed)
+        self.assertNotIn("已保存", printed)
+
+    # ---- (f) 文案 ----
+
+    def test_create_task_passenger_prompt_text_matches_behavior(self):
+        # (f) default_names() 返回"默认乘车人（未设默认则仅第一位）"，
+        # 旧文案"回车=使用默认/全部成人"误导为"全部成人"。
+        import monitor as m
+        prompts = []
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = [dict(self.GOOD)]
+        pm.default_names.return_value = ["张三"]
+        try:
+            with mock.patch.object(m, "passengers_mod", pm), \
+                 mock.patch.object(m, "pick_station",
+                                   side_effect=["北京", "上海"]), \
+                 mock.patch.object(m, "input_dates",
+                                   return_value=(["2026-10-09"], [])), \
+                 mock.patch.object(m, "ticket") as mock_ticket, \
+                 mock.patch.object(m, "pick_multi",
+                                   return_value=["二等座"]), \
+                 mock.patch.object(m, "read",
+                                   side_effect=["", "", "5", "y", "y", "",
+                                                "n"]) as mread, \
+                 mock.patch.object(m, "load_config",
+                                   return_value={}), \
+                 mock.patch.object(m, "update_config_locked",
+                                   return_value=True), \
+                 mock.patch("builtins.print"):
+                mock_ticket.load_station_map.return_value = (
+                    {"北京": "BJP", "上海": "SHH"},
+                    {"BJP": "北京", "SHH": "上海"})
+                mock_ticket.query_tickets.side_effect = Exception("offline")
+                m.menu_create_task()
+        except KeyboardInterrupt:
+            pass
+        prompts = [c.args[0] for c in mread.call_args_list]
+        pax_prompts = [p for p in prompts if "选择乘车人" in p]
+        self.assertTrue(pax_prompts)
+        self.assertNotIn("全部成人", pax_prompts[0])
+
+    # ---- (g) menu_quick_check ----
+
+    def test_quick_check_ctrl_c_no_network(self):
+        # (g) 旧代码：日期处 Ctrl+C → read()→None → query_tickets(..., None)
+        # 发起真实网络查询，而非取消。
+        import monitor as m
+        with mock.patch.object(m.ticket, "load_station_map",
+                               return_value=({"北京": "BJP", "上海": "SHH"},
+                                             {})), \
+             mock.patch.object(m.ticket, "query_tickets") as mq, \
+             mock.patch.object(m, "pick_station",
+                               side_effect=["北京", "上海"]), \
+             mock.patch.object(m, "read", return_value=None), \
+             mock.patch("builtins.print"):
+            m.menu_quick_check()  # 旧代码调用 query_tickets
+        mq.assert_not_called()
+
+    # ---- (h) menu_notify to_default ----
+
+    def test_notify_to_int_no_crash(self):
+        # (h) 旧代码：",".join(123 or []) 抛 TypeError 崩菜单
+        #（Task 92 评审确认真实）。
+        import monitor as m
+        cfg = {"notify": {"email": {"enabled": True, "smtp_host": "h",
+                                    "smtp_port": 465, "username": "u",
+                                    "password": "", "from": "", "to": 123}}}
+
+        def fake_read(prompt, default=""):
+            return default
+
+        with mock.patch.object(m, "load_config",
+                               return_value=cfg), \
+             mock.patch.object(m, "read", side_effect=fake_read), \
+             mock.patch("getpass.getpass", return_value=""), \
+             mock.patch.object(m, "ask_yes_no", return_value=False), \
+             mock.patch.object(m, "save_config", return_value=True), \
+             mock.patch.object(m, "_config_stamp", return_value=None), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_notify()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

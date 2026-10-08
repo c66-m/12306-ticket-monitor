@@ -399,7 +399,9 @@ def menu_create_task():
             print("    {0:>2}. {1}{2}  {3}  {4}".format(
                 i, p.get("name"), mark, p.get("id_type_code", ""),
                 "成人" if p.get("is_adult", True) else "儿童/学生"))
-        sel = read("  选择乘车人（多个用逗号分隔，回车=使用默认/全部成人）：", "")
+        sel = read("  选择乘车人（多个用逗号分隔，回车=使用默认乘车人/首位）：", "")
+        # 注：回车走 passengers.default_names()——已设默认的乘车人；未设默认
+        # 时仅第一位（旧文案"全部成人"误导，Task 97f）。
         if sel is None:
             # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）。
             # 旧代码 `if sel:` 把 None 当"回车=默认乘车人"消化，静默建任务
@@ -455,8 +457,23 @@ def menu_create_task():
         "notify_channels": ["email"],
     }
 
-    if not update_config_locked(lambda config: config.setdefault("tasks", []).append(task)):
+    shape_ok = []
+
+    def _append_task(config):
+        tasks = config.setdefault("tasks", [])
+        if not isinstance(tasks, list):
+            # 脏数据（手改 config.json 致 tasks 非 list）：锁内不抛
+            # AttributeError，记警告后放弃本次创建，不覆写用户数据（Task 97c）。
+            return
+        tasks.append(task)
+        shape_ok.append(True)
+
+    if not update_config_locked(_append_task):
         # Task 92a: config.json 损坏，拒绝覆写——任务未创建（警告已由 load_config 打印）。
+        return
+    if not shape_ok:
+        print("  [警告] config.json 的 tasks 字段形状损坏（期望为列表），"
+              "任务未创建（请检查配置）。")
         return
     print("\n  [完成] 任务「{0}」已创建：{1}->{2} 日期 {3} 席别 {4} 乘车人 {5}".format(
         task_name, from_name, to_name,
@@ -475,6 +492,21 @@ def menu_create_task():
 def _task_keys_ok(t):
     """任务字典是否含列表展示必需的键（name/from/to）。"""
     return isinstance(t, dict) and "name" in t and "from" in t and "to" in t
+
+
+def _task_operable(t):
+    """任务条目是否可被操作/查状态（dict + 有 name + name 可哈希）。
+
+    Task 97a/b：_task_keys_ok 只保证展示所需的键存在；eng.task_status 内部
+    用 name 做状态字典的键，不可哈希的 name（如手改成 list）会 TypeError。
+    """
+    if not isinstance(t, dict) or "name" not in t:
+        return False
+    try:
+        hash(t["name"])
+    except TypeError:
+        return False
+    return True
 
 
 def _join_str_list(raw):
@@ -513,6 +545,14 @@ def menu_task_list():
                   "（配置损坏，请检查 config.json）。".format(i, "/".join(missing)))
             print("  {0:<3}{1}".format(i, "（配置损坏）"))
             continue
+        if not _task_operable(t):
+            # Task 97b：name 不可哈希（如手改成 list）——下面的
+            # eng.task_status(t) 内部 .get(name) 会 TypeError；记警告后
+            # 跳过该条展示，不崩菜单（_task_keys_ok 只查键存在，挡不住）。
+            print("  [警告] 第 {0} 个任务的名称字段不可用"
+                  "（配置损坏），已跳过显示（请检查 config.json）。".format(i))
+            print("  {0:<3}{1}".format(i, "（配置损坏）"))
+            continue
         # Task 88a：trains/seat_types 非 list（如手改成 int/字符串）时
         # "/".join 会 TypeError 或逐字符拆——记警告后用占位显示，不崩菜单
         #（与 Task 83 的 from/to 非 str 口径一致）。
@@ -535,10 +575,15 @@ def menu_task_list():
             route = "（配置损坏）"
         else:
             route = (from_name + "-" + to_name)[:14]
-        name_disp = t.get("name")
-        if not isinstance(name_disp, str):
-            # 同行同类崩溃防护：name 非 str（如手改成数字）时 (name or "")[:26]
-            # 同样 TypeError；静默转空串（原 None 行为不变），不崩菜单。
+        name_raw = t.get("name")
+        if isinstance(name_raw, str):
+            name_disp = name_raw
+        else:
+            # Task 97b：name 非字符串（如手改成数字/列表）时记警告后用占位
+            # 显示；不可哈希的 name 还会让下面的状态查询 TypeError，一并跳过
+            #（旧代码对 list 直接 TypeError 崩菜单）。
+            print("  [警告] 第 {0} 个任务的名称字段形状非法"
+                  "（配置损坏），已用占位显示。".format(i))
             name_disp = ""
         print("  {0:<3}{1:<26}{2:<14}{3:<20}{4:<14}{5:<14}{6:<8}{7}".format(
             i, name_disp[:26],
@@ -548,18 +593,24 @@ def menu_task_list():
             (seats_txt if seats_txt is not None else "（配置损坏）")[:14],
             t.get("priority", 5),
             engine_mod.STATUS_LABELS.get(status, status)))
-        msg = (eng.state["tasks"].get(t["name"], {}).get("message", ""))
+        msg = (eng.state["tasks"].get(name_raw, {}).get("message", "")
+               if isinstance(name_raw, str) else "")
         if msg:
             print("      └ {0}".format(msg[:80]))
     print("-" * 110)
     # 缺键的坏任务无有效 name，task_status(t) 会 KeyError：展示循环已跳过，
     # 此处同样过滤，不让坏任务崩掉菜单尾部的轮询估算（Task 67）。
+    # Task 97b：name 不可哈希（如手改成 list）时 task_status 内部
+    # .get(name) 同样 TypeError，一并过滤。
     running = [t for t in tasks
-               if _task_keys_ok(t) and eng.task_status(t) == "monitoring"]
+               if _task_keys_ok(t) and _task_operable(t)
+               and eng.task_status(t) == "monitoring"]
     if running:
         print("  监控中任务轮询间隔估算（基准 %ss，自适应）:" % eng.base_interval)
         for t in running:
-            print("    {0:<26} 约 {1:.0f}s".format(t["name"][:26], eng.task_interval(t)))
+            nm = t["name"]
+            nm = nm if isinstance(nm, str) else ""
+            print("    {0:<26} 约 {1:.0f}s".format(nm[:26], eng.task_interval(t)))
 
 
 # ----------------------------- 菜单 3：任务操作 -----------------------------
@@ -579,6 +630,13 @@ def menu_task_ops():
         return
     idx = int(raw) - 1
     task = tasks[idx]
+    if not _task_operable(task):
+        # 坏任务条目（非 dict / 缺 name / name 不可哈希）：展示侧 Task 67
+        # 已跳过显示，此处选中后 eng.task_status(task) 内 task["name"] 会
+        # KeyError、不可哈希的 name 会 TypeError——记警告后返回，不崩（Task 97a）。
+        print("  [警告] 第 {0} 个任务条目已损坏，无法操作"
+              "（请检查 config.json）。".format(idx + 1))
+        return
     eng = fresh_engine()
     status = eng.task_status(task)
     print("\n  任务：{0}（当前状态：{1}）".format(task["name"],
@@ -678,8 +736,14 @@ def menu_passengers():
             id_type = read("  证件类型代码（回车=1 二代身份证）：", "1")
             id_no = read("  证件号码：", "") or ""
             mobile = read("  手机号（可空）：", "") or ""
-            is_default = ask_yes_no("  设为默认乘车人？", "n")
-            is_adult = ask_yes_no("  是否成人？", "y")
+            try:
+                is_default = ask_yes_no("  设为默认乘车人？", "n")
+                is_adult = ask_yes_no("  是否成人？", "y")
+            except KeyboardInterrupt:
+                # Ctrl+C/EOF：取消本次添加，回到乘车人管理菜单
+                #（旧代码抛回主菜单，违背 Task 83b 回子菜单裁决；Task 97d）。
+                print("  已取消添加。")
+                continue
             passengers.append({
                 "name": name, "id_type_code": id_type or "1", "id_no": id_no,
                 "mobile": mobile, "is_default": is_default, "is_adult": is_adult,
@@ -701,9 +765,15 @@ def menu_passengers():
                 name = read("  姓名（%s）：" % p.get("name"), p.get("name")) or p.get("name")
                 id_no = read("  证件号码（保持不填=不变）：", "") or p.get("id_no")
                 mobile = read("  手机号：", p.get("mobile")) or p.get("mobile")
-                is_default = ask_yes_no(
-                    "  设为默认乘车人？(当前：%s)" % ("是" if p.get("is_default") else "否"),
-                    "y" if p.get("is_default") else "n")
+                try:
+                    is_default = ask_yes_no(
+                        "  设为默认乘车人？(当前：%s)" % ("是" if p.get("is_default") else "否"),
+                        "y" if p.get("is_default") else "n")
+                except KeyboardInterrupt:
+                    # Ctrl+C/EOF：取消本次编辑，回到乘车人管理菜单
+                    #（Task 83b 口径；Task 97d）。
+                    print("  已取消。")
+                    continue
                 p.update({"name": name, "id_no": id_no, "mobile": mobile,
                           "is_default": is_default})
                 ok, passengers, pax_stamp = _save_passengers_or_refresh(passengers, pax_stamp)
@@ -719,7 +789,14 @@ def menu_passengers():
                 print("  已取消。")
                 continue
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
-                if ask_yes_no("  确认删除该乘车人？", "n"):
+                try:
+                    confirm_del = ask_yes_no("  确认删除该乘车人？", "n")
+                except KeyboardInterrupt:
+                    # Ctrl+C/EOF：取消删除，回到乘车人管理菜单
+                    #（Task 83b 口径；Task 97d）。
+                    print("  已取消。")
+                    continue
+                if confirm_del:
                     del passengers[int(raw) - 1]
                     ok, passengers, pax_stamp = _save_passengers_or_refresh(passengers, pax_stamp)
                     if ok:
@@ -808,14 +885,26 @@ def menu_notify():
     print("  当前：enabled=%s host=%s port=%s user=%s" % (
         email.get("enabled"), email.get("smtp_host"), email.get("smtp_port"),
         email.get("username")))
-    email["smtp_host"] = read("  SMTP 服务器（回车=%s）：" % email.get("smtp_host", "smtp.qq.com")) \
-        or email.get("smtp_host", "smtp.qq.com")
+    smtp_host = read("  SMTP 服务器（回车=%s）：" % email.get("smtp_host", "smtp.qq.com"))
+    if smtp_host is None:
+        # Ctrl+C/EOF：取消本次修改（旧代码 `None or 旧值` 把中断消化为
+        # "保留旧值"，用户无法区分取消与保留；Task 97e）。
+        print("  已取消修改。")
+        raise KeyboardInterrupt
+    email["smtp_host"] = smtp_host or email.get("smtp_host", "smtp.qq.com")
     port = read("  端口（回车=%s）：" % email.get("smtp_port", 465), str(email.get("smtp_port", 465)))
     if port is None:
         # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
         raise KeyboardInterrupt
     email["smtp_port"] = int(port) if port.isdigit() else 465
-    email["username"] = read("  发件邮箱：", email.get("username")) or email.get("username")
+    username = read("  发件邮箱：", email.get("username") or "")
+    if username is None:
+        # Ctrl+C/EOF：取消本次修改（同上，不消化为"保留旧值"；Task 97e）。
+        # 注：默认用 `or ""` 而非 None，使 None 唯一对应中断
+        #（read 空输入+None 默认也会返回 None，无法区分）。
+        print("  已取消修改。")
+        raise KeyboardInterrupt
+    email["username"] = username or email.get("username")
     old_pw = email.get("password") or ""
     # Task 66: 已加密存储时不展示密文长度（会误导用户以为密码有那么长），只提示已设置
     if isinstance(old_pw, str):
@@ -841,12 +930,27 @@ def menu_notify():
     pw_to_store = new_pw or old_pw
     email["password"] = notify_mod.protect_secret(pw_to_store) \
         if isinstance(pw_to_store, str) else pw_to_store
-    email["from"] = read("  发件人地址（回车=发件邮箱）：", "") or email.get("username")
+    from_addr = read("  发件人地址（回车=发件邮箱）：", "")
+    if from_addr is None:
+        # Ctrl+C/EOF：取消本次修改（同上，不消化为"保留旧值"；Task 97e）。
+        print("  已取消修改。")
+        raise KeyboardInterrupt
+    email["from"] = from_addr or email.get("username")
     to_val = email.get("to")
     # Task 92b: 字符串是运行时合法形态（notify._normalize_recipients 显式支持
     # str）——按单个收件人处理，绝不逐字符 join（",".join("a@b.com") 会拆成
     # 单个字符并回写污染配置，一次常规菜单访问即静默摧毁通知配置）。
-    to_default = to_val if isinstance(to_val, str) else ",".join(to_val or [])
+    if isinstance(to_val, str):
+        to_default = to_val
+    elif to_val is None:
+        to_default = ""
+    elif isinstance(to_val, (list, tuple)) and all(isinstance(x, str) for x in to_val):
+        to_default = ",".join(to_val)
+    else:
+        # 脏数据（如手改 "to": 123）：记警告后按空收件人处理，不让
+        # ",".join 的 TypeError 崩掉菜单（Task 92 评审确认真实；Task 97h）。
+        print("  [警告] 收件人配置形状非法（期望为字符串/字符串列表），已按空处理。")
+        to_default = ""
     to_raw = read("  收件人（多个用逗号分隔）：", to_default)
     if to_raw is None:
         # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
@@ -918,6 +1022,11 @@ def menu_quick_check():
     if not to_name:
         return
     date = read("  日期（YYYY-MM-DD，回车=今天）：", datetime.date.today().isoformat())
+    if date is None:
+        # Ctrl+C/EOF：取消查询（旧代码把 None 传给 query_tickets 发起真实
+        # 网络查询；Task 97g）。
+        print("  已取消查询。")
+        return
     try:
         rows = ticket.query_tickets(name2code[from_name], name2code[to_name], date)
     except Exception as e:
