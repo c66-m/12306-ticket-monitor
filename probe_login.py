@@ -83,7 +83,8 @@ def banner(title):
 
 
 _PII_VALUE_RE = re.compile(
-    r'("(?:passenger_name|passenger_id_no|mobile_no|id_no|user_name|name)"'
+    r'("(?:passenger_name|passenger_id_no|mobile_no|id_no|user_name|username|name|'
+    r'phone_no|email|address|born_date)"'
     r"\s*:\s*\""
     r')(?:[^"\\]|\\.)*(")')
 
@@ -92,12 +93,22 @@ def _mask_pii(text):
     """脱敏：把已知 PII 字段的值替换为 ***。
 
     probe 的诊断价值在"字段结构/接口是否变更"，不在真实姓名/证件号；
-    打印前把 passenger_name / passenger_id_no / mobile_no 等字段值抹掉，
-    字段名与 JSON 结构保留，仍可判断接口变更（Task 65a）。
+    打印前把 passenger_name / passenger_id_no / mobile_no / phone_no /
+    email / address / born_date 等字段值抹掉，
+    字段名与 JSON 结构保留，仍可判断接口变更（Task 65a，Task 78b 补全字段）。
     """
     if not text:
         return text
     return _PII_VALUE_RE.sub(r"\1***\2", text)
+
+
+def _mask_scalar(value):
+    """单个标量值脱敏：有值则记为 ***，无值（None/空串）原样返回。
+
+    用于非 JSON 文本里的显式打印（如 step5 的 username），与 _mask_pii
+    的"值抹掉、结构保留"口径一致（Task 78c）。
+    """
+    return "***" if value else value
 
 
 def show(resp, limit=300, mask_pii=False):
@@ -203,6 +214,13 @@ def step3_create_qr():
         print("\n  [失败] 返回不是 JSON。接口可能已变更，上面原始响应就是证据。")
         return None
 
+    # Task 78d: r.json() 成功但返回非 dict（null/数组）时 data.get 会抛
+    # AttributeError —— try 只包住了 r.json() 调用，这里显式拦截。
+    if not isinstance(data, dict):
+        print("\n  [失败] 返回非 JSON 对象（{0}），接口可能已变更，上面原始响应就是证据。".format(
+            type(data).__name__))
+        return None
+
     uuid = data.get("uuid")
     image_b64 = data.get("image")
 
@@ -234,15 +252,20 @@ def _confirm_qr_refresh():
     """二维码过期后是否重新申请：交互式询问用户。
 
     本脚本本就是交互式运行的（用户要在终端前扫码），input() 不会悬空；
-    stdin 不可用（EOFError，非交互/管道环境）时回退到自动刷新（旧行为），
-    避免在无人值守时卡死（Task 65b）。
+    stdin 不可用（EOFError，非交互/管道环境）或被关闭（OSError，如 <&-）
+    时回退到自动刷新（旧行为），避免在无人值守时卡死（Task 65b，Task 78e）。
     """
     try:
         ans = input("  二维码已过期，是否重新申请一张？(Y/n，直接回车=是) ").strip().lower()
-    except EOFError:
+    except (EOFError, OSError):
         print("  （非交互环境，自动刷新）")
         return True
     return ans in ("", "y", "yes")
+
+
+# 扫码已确认（code==2）但响应里没有 uamtk：不是"没扫码"，是会话换取前置失败。
+# 用哨兵与"超时/用户取消"（None）区分，main() 据此给出不误导的结论（Task 78f）。
+SCAN_CONFIRMED_NO_UAMTK = object()
 
 
 def step4_poll_qr(uuid):
@@ -251,43 +274,54 @@ def step4_poll_qr(uuid):
     deadline = time.time() + POLL_TIMEOUT_SEC
     last_msg = None
 
-    while time.time() < deadline:
-        try:
-            r = SESSION.post(url, data={"uuid": uuid, "appid": "otn"}, timeout=10)
-            data = r.json()
-        except Exception as e:
-            print("    [异常] {0}: {1}".format(type(e).__name__, e))
+    # Task 78g: 轮询是 180s 长等待，Ctrl+C 应优雅退出（Task 28 口径），
+    # 而不是把 traceback 抛给用户。内层 except Exception 抓不到
+    # KeyboardInterrupt（BaseException），它会穿透到这里被捕获。
+    try:
+        while time.time() < deadline:
+            try:
+                r = SESSION.post(url, data={"uuid": uuid, "appid": "otn"}, timeout=10)
+                data = r.json()
+            except Exception as e:
+                print("    [异常] {0}: {1}".format(type(e).__name__, e))
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            code = data.get("result_code")
+            msg = data.get("result_message")
+
+            if msg != last_msg:
+                print("    result_code={0}  result_message={1}".format(code, msg))
+                last_msg = msg
+
+            # 2 = 已确认登录，响应里会带 uamtk
+            if code == 2:
+                uamtk = data.get("uamtk")
+                if not uamtk:
+                    print("\n  [失败] 已扫码但会话换取失败：checkqr 返回 code=2 却没有 uamtk。")
+                    return SCAN_CONFIRMED_NO_UAMTK
+                print("\n  [成功] 二维码已确认，uamtk = {0}".format(uamtk))
+                return uamtk
+            # 3 = 二维码过期 —— 刷新前先问用户：旧码可能正在被扫，
+            # 静默作废会让用户扫一张死码（Task 65b）
+            if code == 3:
+                print("\n  [过期] 二维码已过期。")
+                if not _confirm_qr_refresh():
+                    print("  已取消刷新，退出扫码等待。")
+                    return None
+                print("  正在重新申请...")
+                uuid = create_qr_raw()
+                if not uuid:
+                    print("  [失败] 刷新二维码失败，终止。")
+                    return None
+                print("  新二维码已覆盖保存到：" + QR_IMAGE_PATH + "（请扫最新这一张）")
+                last_msg = None
+                continue
+
             time.sleep(POLL_INTERVAL_SEC)
-            continue
-
-        code = data.get("result_code")
-        msg = data.get("result_message")
-
-        if msg != last_msg:
-            print("    result_code={0}  result_message={1}".format(code, msg))
-            last_msg = msg
-
-        # 2 = 已确认登录，响应里会带 uamtk
-        if code == 2:
-            print("\n  [成功] 二维码已确认，uamtk = {0}".format(data.get("uamtk")))
-            return data.get("uamtk")
-        # 3 = 二维码过期 —— 刷新前先问用户：旧码可能正在被扫，
-        # 静默作废会让用户扫一张死码（Task 65b）
-        if code == 3:
-            print("\n  [过期] 二维码已过期。")
-            if not _confirm_qr_refresh():
-                print("  已取消刷新，退出扫码等待。")
-                return None
-            print("  正在重新申请...")
-            uuid = create_qr_raw()
-            if not uuid:
-                print("  [失败] 刷新二维码失败，终止。")
-                return None
-            print("  新二维码已覆盖保存到：" + QR_IMAGE_PATH + "（请扫最新这一张）")
-            last_msg = None
-            continue
-
-        time.sleep(POLL_INTERVAL_SEC)
+    except KeyboardInterrupt:
+        print("\n  [中断] 用户取消扫码等待（Ctrl+C），退出。")
+        return None
 
     print("\n  [超时] 未在 {0}s 内完成扫码。".format(POLL_TIMEOUT_SEC))
     return None
@@ -303,7 +337,8 @@ def step5_finish_login(uamtk):
             data={"appid": "otn"},
             timeout=10,
         )
-        show(r)
+        # 需登录接口的响应先脱敏再打印（Task 65a 口径，Task 78c 补 step5）
+        show(r, mask_pii=True)
         tk = None
         try:
             tk = r.json().get("newapptk")
@@ -326,11 +361,13 @@ def step5_finish_login(uamtk):
             data={"tk": tk},
             timeout=10,
         )
-        show(r2)
+        show(r2, mask_pii=True)
         try:
             j = r2.json()
+            # uamauthclient 返回的 username 常为真实姓名，打印前脱敏（Task 78c；
+            # 含 Task 65 reviewer 的 minor follow-up）。
             print("\n  登录返回：result_code={0}  username={1}".format(
-                j.get("result_code"), j.get("username")))
+                j.get("result_code"), _mask_scalar(j.get("username"))))
             return j.get("result_code") == 0
         except Exception:
             return False
@@ -418,6 +455,12 @@ def main():
         return
 
     uamtk = step4_poll_qr(uuid)
+    if uamtk is SCAN_CONFIRMED_NO_UAMTK:
+        # Task 78f: 已扫码但响应缺 uamtk —— 不是"没扫码"，不误报。
+        banner("结论")
+        print("  未完成登录：已扫码但会话换取失败（checkqr 未返回 uamtk），不是没扫码。")
+        print("  当前 Cookie（仅展示，不落盘）：" + ", ".join(c.name for c in SESSION.cookies))
+        return
     if not uamtk:
         banner("结论")
         print("  未完成登录。若是超时，说明只是没扫码；若是过期/报错，请把输出发出来。")
@@ -428,7 +471,12 @@ def main():
 
     logged_in = step5_finish_login(uamtk)
     session_ok = step6_verify_session()
-    step7_save_cookies()
+    # Task 78a: 登录失败（logged_in=False）不写盘 —— 登录前的 Cookie
+    # （仅 JSESSIONID）无诊断价值，且会覆盖此前成功探测的有效会话。
+    if logged_in:
+        step7_save_cookies()
+    else:
+        print("  登录失败，本次不保存 Cookie（保留旧 probe_cookies.json）。")
 
     banner("结论")
     if logged_in and session_ok:

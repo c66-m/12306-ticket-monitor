@@ -3446,6 +3446,173 @@ class TestProbeSessionHeuristic(unittest.TestCase):
                                          status=500))
 
 
+class TestTask78ProbeLogin(unittest.TestCase):
+    """Task 78: probe_login P3 bundle（a–g）。
+
+    (a) step5 登录失败仍无条件写盘 → logged_in=False 时不写盘
+    (b) _PII_VALUE_RE 补全 phone_no/email/address/born_date
+    (c) step5 的 show() 加 mask_pii=True；username 打印脱敏
+    (d) step3_create_qr 非 dict JSON 不抛 AttributeError
+    (e) _confirm_qr_refresh 捕获 OSError 回退自动刷新
+    (f) code==2 缺 uamtk → 明确报错"已扫码但会话换取失败"，不误报没扫码
+    (g) step4 轮询 Ctrl+C 优雅退出（Task 28 口径）
+    """
+
+    # ---- (a) 登录失败不写盘 ----
+
+    def _run_main_with_login(self, logged_in):
+        for p in (
+            mock.patch.object(probe_login, "step1_connectivity"),
+            mock.patch.object(probe_login, "step2_bootstrap_cookies"),
+            mock.patch.object(probe_login, "step3_create_qr", return_value="fake-uuid"),
+            mock.patch.object(probe_login, "step4_poll_qr", return_value="fake-uamtk"),
+            mock.patch.object(probe_login, "step5_finish_login", return_value=logged_in),
+            mock.patch.object(probe_login, "step6_verify_session", return_value=False),
+            mock.patch.object(probe_login, "step7_save_cookies"),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        probe_login.main()
+        return probe_login.step7_save_cookies
+
+    def test_step5_failure_does_not_write_cookies(self):
+        # RED on old code: logged_in=False 仍调 step7_save_cookies 写盘
+        save = self._run_main_with_login(False)
+        save.assert_not_called()
+
+    def test_step5_success_still_saves_cookies(self):
+        # pin：登录成功路径仍保存（新旧代码都通过）
+        save = self._run_main_with_login(True)
+        save.assert_called_once()
+
+    # ---- (b) 脱敏字段补全 ----
+
+    def test_mask_pii_covers_new_fields(self):
+        # RED on old code: phone_no/email/address/born_date 明文残留
+        body = ('{"passenger_name":"张三","phone_no":"13800138000",'
+                '"email":"zhangsan@example.com","address":"北京市朝阳区",'
+                '"born_date":"1990-01-01","mobile_no":"13800138000"}')
+        masked = probe_login._mask_pii(body)
+        for secret in ("13800138000", "zhangsan@example.com",
+                       "北京市朝阳区", "1990-01-01", "张三"):
+            self.assertNotIn(secret, masked)
+        # 字段名保留（诊断价值：结构可见）
+        for field in ("phone_no", "email", "address", "born_date"):
+            self.assertIn('"%s"' % field, masked)
+
+    def test_mask_pii_handles_unicode_escapes(self):
+        # RED on old code: \uXXXX 转义值同样明文残留
+        body = r'{"phone_no": "\u0031\u0033\u0038\u0030\u0030\u0031\u0033\u0038\u0030\u0030\u0030"}'
+        masked = probe_login._mask_pii(body)
+        self.assertNotIn("\\u0031", masked)
+        self.assertIn('"phone_no"', masked)
+
+    # ---- (c) step5 脱敏 ----
+
+    def _run_step5(self):
+        auth = _FakeResp('{"newapptk": "tk123"}')
+        uam = _FakeResp('{"result_code": 0, "username": "张三"}')
+        fake = mock.Mock()
+        fake.post.side_effect = [auth, uam]
+        return fake
+
+    def test_step5_show_calls_use_mask_pii(self):
+        # RED on old code: show(r)/show(r2) 未脱敏（mask_pii=False）
+        calls = []
+
+        def fake_show(resp, limit=300, mask_pii=False):
+            calls.append(mask_pii)
+
+        with mock.patch.object(probe_login, "SESSION", self._run_step5()), \
+             mock.patch.object(probe_login, "show", side_effect=fake_show):
+            self.assertTrue(probe_login.step5_finish_login("uamtk-x"))
+        self.assertEqual(calls, [True, True])
+
+    def test_step5_username_print_is_masked(self):
+        # RED on old code: username 明文打印（uamauthclient 的 username 常为真实姓名）
+        with mock.patch.object(probe_login, "SESSION", self._run_step5()), \
+             mock.patch("builtins.print") as mprint:
+            probe_login.step5_finish_login("uamtk-x")
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertNotIn("张三", out)
+
+    # ---- (d) 非 dict JSON ----
+
+    def test_step3_create_qr_non_dict_json_no_crash(self):
+        # RED on old code: data.get → AttributeError 逃出
+        fake = mock.Mock()
+        fake.post.return_value = _FakeResp("null")  # r.json() 成功但返回 None
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint:
+            self.assertIsNone(probe_login.step3_create_qr())
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("非 JSON 对象", out)  # 记 warning，不抛异常
+
+    # ---- (e) OSError 回退 ----
+
+    def test_confirm_qr_refresh_oserror_falls_back_to_auto(self):
+        # RED on old code: OSError(Errno 9) 逃出 → 二维码过期时崩溃
+        with mock.patch("builtins.input",
+                        side_effect=OSError(9, "Bad file descriptor")), \
+             mock.patch("builtins.print") as mprint:
+            self.assertTrue(probe_login._confirm_qr_refresh())
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("自动刷新", out)
+
+    # ---- (f) code==2 缺 uamtk ----
+
+    def _run_step4_code2_no_uamtk(self):
+        fake = mock.Mock()
+        fake.post.return_value = _FakeResp(
+            '{"result_code": 2, "result_message": "已确认", "uamtk": null}')
+        return fake
+
+    def test_step4_poll_qr_code2_without_uamtk_reports_explicit_error(self):
+        # RED on old code: 返回 None，main() 误报"没扫码"
+        with mock.patch.object(probe_login, "SESSION", self._run_step4_code2_no_uamtk()), \
+             mock.patch("builtins.print") as mprint, \
+             mock.patch("time.sleep"):
+            result = probe_login.step4_poll_qr("uuid-x")
+        self.assertIs(result, probe_login.SCAN_CONFIRMED_NO_UAMTK)
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("已扫码但会话换取失败", out)
+
+    def test_main_no_uamtk_does_not_claim_not_scanned(self):
+        # RED on old code: main() 打印"若是超时，说明只是没扫码"误报
+        for p in (
+            mock.patch.object(probe_login, "step1_connectivity"),
+            mock.patch.object(probe_login, "step2_bootstrap_cookies"),
+            mock.patch.object(probe_login, "step3_create_qr", return_value="fake-uuid"),
+            mock.patch.object(probe_login, "step4_poll_qr",
+                              return_value=probe_login.SCAN_CONFIRMED_NO_UAMTK),
+            mock.patch.object(probe_login, "step7_save_cookies"),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        with mock.patch("builtins.print") as mprint:
+            probe_login.main()
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("已扫码但会话换取失败", out)
+        self.assertNotIn("只是没扫码", out)
+        probe_login.step7_save_cookies.assert_not_called()
+
+    # ---- (g) Ctrl+C 优雅退出 ----
+
+    def test_step4_poll_qr_keyboard_interrupt_exits_gracefully(self):
+        # RED on old code: KeyboardInterrupt 逃出 → traceback
+        fake = mock.Mock()
+        fake.post.side_effect = KeyboardInterrupt()
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint:
+            try:
+                result = probe_login.step4_poll_qr("uuid-x")
+            except KeyboardInterrupt:
+                self.fail("KeyboardInterrupt 逃出 step4_poll_qr（应优雅退出）")
+        self.assertIsNone(result)
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("取消", out)
+
+
 class TestLockedRMW(TempDirCase):
     """Task 46 (P2): gui/monitor/launcher 读-改-写统一经 file_lock 原子接口。
 
