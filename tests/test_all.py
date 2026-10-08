@@ -4338,7 +4338,7 @@ class TestTask55AutoFired(TempDirCase):
         app.lc = lc
         app.grabber = None
         app.auto_fired = False
-        app._auto_vfail_warned = False
+        app._auto_vfail_last_msg = None
         app._mp = None
         app._top = mock.Mock()
         logs = []
@@ -4399,7 +4399,7 @@ class TestTask55AutoFired(TempDirCase):
         app, logs = self._make_app(self._invalid_lc())
         app.start_grab(auto=True)
         app._top.bell.reset_mock()
-        app._auto_vfail_warned = False  # 模拟新一轮 armed 会话
+        app._auto_vfail_last_msg = None  # 模拟新一轮 armed 会话
         app._validate(auto=True)
         app._validate(auto=True)
         app._top.bell.assert_called_once()
@@ -6724,7 +6724,7 @@ class TestTask74Launcher(TempDirCase):
         app._top = mock.Mock()
         app.go_btn = mock.Mock()
         app.logq = mock.Mock()
-        app._auto_vfail_warned = False
+        app._auto_vfail_last_msg = None
         return app
 
     # ---- (b) kind_rank 大小写 ----
@@ -6883,6 +6883,53 @@ class TestTask74Launcher(TempDirCase):
             panel._on_window_closed("t2")
         self.assertEqual(panel.tasks[0]["status"], "ok")  # 旧代码：被抹成 idle
         self.assertEqual(panel.tasks[1]["status"], "idle")
+
+    # ---- (g) rework：构造时过滤，self.items 与列表框行号 1:1 ----
+
+    def test_history_pick_aligned_with_junk_in_middle(self):
+        import tkinter as tk
+        from tkinter import ttk
+        good1 = {"from": "北京", "to": "上海", "date": "2026-10-10"}
+        good2 = {"from": "广州", "to": "深圳", "date": "2026-10-11"}
+        picked = []
+        lb = mock.Mock()
+        lb.curselection.return_value = (1,)  # 用户双击显示的第 2 行
+        with mock.patch.object(tk.Toplevel, "__init__", return_value=None), \
+             mock.patch.object(launcher.QueryHistoryDialog, "title"), \
+             mock.patch.object(launcher.QueryHistoryDialog, "geometry"), \
+             mock.patch.object(launcher.QueryHistoryDialog, "transient"), \
+             mock.patch.object(ttk, "Frame", return_value=mock.Mock()), \
+             mock.patch.object(ttk, "Label", return_value=mock.Mock()), \
+             mock.patch.object(ttk, "Scrollbar", return_value=mock.Mock()), \
+             mock.patch.object(tk, "Listbox", return_value=lb):
+            with self.assertLogs(launcher.LOG, level="WARNING"):
+                dlg = launcher.QueryHistoryDialog(
+                    mock.Mock(), [good1, "junk-string", good2], picked.append)
+        dlg.destroy = mock.Mock()  # 无显示环境，_pick 的 destroy 用桩
+        # junk 被过滤：列表框只插入 2 行
+        self.assertEqual(lb.insert.call_count, 2)
+        # 双击显示的第 2 行（索引 1）必须拿到 good2，而不是错位的 "junk-string"
+        dlg._pick()
+        self.assertEqual(picked, [good2])  # 旧代码：picked == ["junk-string"]
+
+    # ---- (d) rework：warn 按失败原因去重，原因变化重新提示 ----
+
+    def test_validate_fail_warn_per_reason(self):
+        app = self._make_app()
+        app._validate_fail("t", "原因A", True)
+        app._validate_fail("t", "原因A", True)   # 同原因 → 不再提示
+        app._validate_fail("t", "原因B", True)   # 原因变化 → 重新提示
+        app._validate_fail("t", "原因B", True)
+        self.assertEqual(app._top.bell.call_count, 2)  # 旧代码：1（原因B 静默）
+        self.assertEqual(app._put_log.call_count, 2)
+
+    def test_validate_fail_warn_resets_after_pass(self):
+        app = self._make_app()
+        app._validate_fail("t", "原因A", True)
+        # 模拟 start_grab(auto=True) 校验通过后的重置：新一轮 armed 会话同原因再报
+        app._auto_vfail_last_msg = None
+        app._validate_fail("t", "原因A", True)
+        self.assertEqual(app._put_log.call_count, 2)
 
 
 if __name__ == "__main__":

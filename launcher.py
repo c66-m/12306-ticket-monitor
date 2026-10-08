@@ -1674,7 +1674,15 @@ class QueryHistoryDialog(tk.Toplevel):
     """历史查询记录：双击一条即填回行程。"""
     def __init__(self, master, items, on_pick):
         super().__init__(master)
-        self.items = list(items)
+        # Task 74g：构造时即过滤掉非 dict 条目（逐条记 warning），保证
+        # self.items 与列表框行号 1:1 对齐；否则 _pick 会按错位索引取错条目。
+        rows = []
+        for it in items:
+            text = _history_item_text(it)
+            if text is None:
+                continue
+            rows.append((it, text))
+        self.items = [it for it, _text in rows]
         self.on_pick = on_pick
         self.title("历史查询记录")
         self.geometry("380x320")
@@ -1688,10 +1696,7 @@ class QueryHistoryDialog(tk.Toplevel):
         self.lb = tk.Listbox(wrap, font=(FONT[0], 10), yscrollcommand=sb.set, activestyle="none")
         sb.pack(side="right", fill="y")
         self.lb.pack(side="left", fill="both", expand=True)
-        for it in self.items:
-            text = _history_item_text(it)
-            if text is None:
-                continue
+        for _it, text in rows:
             self.lb.insert("end", text)
         self.lb.bind("<Double-Button-1>", self._pick)
         self.lb.bind("<Return>", self._pick)
@@ -1892,7 +1897,7 @@ class LauncherApp(tk.Frame):
         self.grabber = None
         self.armed = False
         self.auto_fired = False
-        self._auto_vfail_warned = False
+        self._auto_vfail_last_msg = None
         self.reminded = False
         self.pax_vars = {}
         self.pax_purpose_vars = {}
@@ -2190,7 +2195,7 @@ class LauncherApp(tk.Frame):
         st = parse_dt(self.lc.get("start_time") or "")
         self.armed = bool(st and st > datetime.now())
         self.auto_fired = False
-        self._auto_vfail_warned = False
+        self._auto_vfail_last_msg = None
         self.reminded = False
 
     def _ui_to_lc(self, save=True):
@@ -2845,11 +2850,12 @@ class LauncherApp(tk.Frame):
     def _validate_fail(self, title, msg, auto):
         """校验失败提示：手动弹模态框；自动只 bell+日志（无人值守弹模态会冻住主线程）。"""
         if auto:
-            # Task 55b 配套：校验失败允许下个 _tick 重试；bell 与日志每个 armed 会话
-            # 只记一次（否则 500ms 一次蜂鸣/日志刷屏）。用户修正配置后自动重试仍会生效。
-            if not getattr(self, "_auto_vfail_warned", False):
+            # Task 74d：同一种失败原因每个 armed 会话只 bell+日志一次
+            # （否则 500ms 一次蜂鸣/日志刷屏）；失败原因变化时重新提示，
+            # 保证用户修正第一个问题后，第二个失败原因仍然可见。校验通过后重置。
+            if msg != getattr(self, "_auto_vfail_last_msg", None):
                 self._top.bell()
-                self._auto_vfail_warned = True
+                self._auto_vfail_last_msg = msg
                 self._put_log("[自动开抢] 校验失败：%s（修正配置后将自动重试）" % msg)
             return False
         messagebox.showwarning(title, msg, parent=self._mp)
@@ -2874,7 +2880,7 @@ class LauncherApp(tk.Frame):
             # Task 55b：_validate() 通过之后才置位；失败时保持 False，
             # 下个 _tick 会重试（之前提前置位会缴械整点自动开抢且无重试）。
             self.auto_fired = True
-            self._auto_vfail_warned = False
+            self._auto_vfail_last_msg = None
         try:
             self.grabber = Grabber(dict(self.lc), logq=self.logq)
             self.grabber.start()
@@ -3020,7 +3026,7 @@ class LauncherApp(tk.Frame):
         st = parse_dt(self.start_var.get())
         self.armed = bool(st and st > datetime.now())
         self.auto_fired = False
-        self._auto_vfail_warned = False
+        self._auto_vfail_last_msg = None
         self.reminded = False
 
     def _on_close(self):
