@@ -288,6 +288,13 @@ class MonitorEngine(object):
         self.config_path = config_path or os.path.join(HERE, "config.json")
         with open(self.config_path, encoding="utf-8") as f:
             self.config = json.load(f)
+        if not isinstance(self.config, dict):
+            # Task 91：顶层非 dict（手改误删大括号成 [] 等）——旧代码后续
+            # self.config.get(...) 抛 AttributeError 崩进程；记 error 后用
+            # 空配置继续（Task 68 口径：非法形状用安全默认值，进程不崩）。
+            LOG.error("[配置] %s 顶层不是对象（%s），已按默认配置继续",
+                      self.config_path, type(self.config).__name__)
+            self.config = {}
         try:
             self._config_mtime = os.path.getmtime(self.config_path)
         except OSError:
@@ -556,6 +563,13 @@ class MonitorEngine(object):
             # Task 72：解析失败不消费 mtime——否则本次配置变更永久被忽略，
             # 需再改一次文件才重同步。下次 _sync_config 会重试本次变更。
             LOG.warning("[配置] config.json 重新读取失败：%s", e)
+            return False
+        if not isinstance(new_config, dict):
+            # Task 91：热更新读到顶层非 dict——记 error，保留旧配置继续；
+            # 消费 mtime 避免每次轮询重复报错（修好文件后 mtime 变化会再次同步）。
+            LOG.error("[配置] %s 顶层不是对象（%s），已忽略本次变更",
+                      self.config_path, type(new_config).__name__)
+            self._config_mtime = m
             return False
         self._config_mtime = m
         self.config = new_config

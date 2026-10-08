@@ -9123,6 +9123,81 @@ class TestTask90LauncherPassengerDialogStamp(TempDirCase):
         mb.showinfo.assert_not_called()  # 不显示"已保存"
 
 
+class TestTask91TopLevelConfigShape(TempDirCase):
+    """Task 91：config.json 合法但非对象（手改误删大括号成 []）时，
+    __init__ 与 _sync_config 不得 AttributeError 崩进程/杀线程。
+    """
+
+    def _write_raw(self, text):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return p
+
+    def _write_config(self, obj):
+        obj = dict(obj)
+        obj["state_file"] = os.path.join(self.tmp, "state.json")
+        obj["history_file"] = os.path.join(self.tmp, "order_history.json")
+        return self._write_raw(json.dumps(obj, ensure_ascii=False))
+
+    def _bump_mtime(self, p, delta=2.0):
+        st = os.stat(p)
+        os.utime(p, (st.st_atime, st.st_mtime + delta))
+
+    def _make_engine(self, cfg_path):
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            return engine_mod.MonitorEngine(config_path=cfg_path,
+                                            setup_logging=False)
+
+    def test_init_with_list_config_does_not_crash(self):
+        # RED on old code: self.config.get("state_file", ...) 抛 AttributeError
+        p = self._write_raw("[]")
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            e = self._make_engine(p)
+        self.assertEqual(e.config, {})
+        self.assertEqual(e.tasks, [])
+        self.assertEqual(e.base_interval, 45)
+        self.assertTrue(any("顶层不是对象" in m for m in logs.output),
+                        "error 日志必须明确指出配置顶层形状错误（与缺文件可区分）")
+
+    def test_init_with_null_config_does_not_crash(self):
+        # "null" 也是合法 JSON 非对象
+        p = self._write_raw("null")
+        e = self._make_engine(p)
+        self.assertEqual(e.config, {})
+
+    def test_sync_config_with_list_config_keeps_old(self):
+        # RED on old code: _sync_config 内 self.config.get 抛 AttributeError
+        p = self._write_config({"tasks": [], "poll_interval_seconds": 45})
+        e = self._make_engine(p)
+        old_config = e.config
+        self._write_raw("[]")
+        self._bump_mtime(p)
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            changed = e._sync_config()
+        self.assertFalse(changed)
+        self.assertIs(e.config, old_config)  # 保留旧配置
+        self.assertTrue(any("顶层不是对象" in m for m in logs.output))
+        # mtime 已消费：再次调用不再重复报错
+        with self.assertNoLogs("monitor", level="ERROR"):
+            self.assertFalse(e._sync_config())
+
+    def test_sync_config_recovers_after_fix(self):
+        # 修好文件后 mtime 变化 → 正常同步
+        p = self._write_config({"tasks": [], "poll_interval_seconds": 45})
+        e = self._make_engine(p)
+        self._write_raw("[]")
+        self._bump_mtime(p)
+        e._sync_config()
+        self._write_config({"tasks": [], "poll_interval_seconds": 60})
+        self._bump_mtime(p)
+        changed = e._sync_config()
+        self.assertTrue(changed)
+        self.assertEqual(e.base_interval, 60)
+        self.assertEqual(e.config["poll_interval_seconds"], 60)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
