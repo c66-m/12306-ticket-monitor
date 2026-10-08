@@ -363,13 +363,27 @@ def _display_trains(raw):
     return _normalize_trains(raw, lambda *a: None)
 
 
-def _save_passengers_or_warn(passengers, parent):
+def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
     """保存乘车人；磁盘盒子不可解密被拒写（return False）时弹 error 并返回 False。
 
     Task 84(d)：与 gui._save_passengers_or_warn 同口径。调用方在 False 时不得
-    显示成功、不得刷新列表。抛出的异常仍由调用方 try/except 处理。"""
-    if passengers_mod.save_passengers(passengers):
+    显示成功、不得刷新列表。抛出的异常仍由调用方 try/except 处理。
+
+    Task 90：expect_stamp 传入时做乐观并发检查（与 gui Task 89c 同口径）；
+    编辑期间被外部修改导致放弃保存时弹 warning（不覆盖对方修改），返回 False。
+    不传 expect_stamp 时保持 Task 84 行为（直接写）。
+    """
+    if passengers_mod.save_passengers(passengers, expect_stamp=expect_stamp):
         return True
+    if expect_stamp is not passengers_mod._STAMP_UNSET \
+            and passengers_mod.passengers_stamp() != expect_stamp:
+        # 乐观并发放弃：save_passengers 已在锁内检出指纹变化并打印警告；
+        # 这里再给一次明确提示（不静默），调用方负责重载最新数据。
+        messagebox.showwarning("保存已放弃",
+                               "乘车人数据在您编辑期间被其他程序修改，本次保存已放弃，\n"
+                               "未覆盖对方的修改。请基于最新数据重新操作。",
+                               parent=parent)
+        return False
     messagebox.showerror("保存失败",
                          "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
                          "已拒绝覆盖以保护原数据。\n"
@@ -3378,6 +3392,9 @@ class PassengerDialog(tk.Toplevel):
         except Exception as e:
             self.plist = []
             messagebox.showwarning("读取失败", "乘车人数据读取失败：%s" % e, parent=self)
+        # Task 90：记下 load 时的字节指纹，供保存时做乐观并发检查
+        #（本对话框打开期间若被外部修改，保存时警告并放弃，不静默覆写）。
+        self._pax_stamp = passengers_mod.passengers_stamp()
 
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
@@ -3449,6 +3466,29 @@ class PassengerDialog(tk.Toplevel):
                 self.default_var.set(bool(p.get("is_default")))
                 return
 
+    def _refresh_plist(self):
+        """重载最新乘车人数据并更新指纹/下拉框（Task 90：乐观并发放弃后调用）。"""
+        self.plist = passengers_mod.load_passengers()
+        self._pax_stamp = passengers_mod.passengers_stamp()
+        self.pick.configure(values=[p.get("name") or "" for p in self.plist])
+
+    def _save_passengers_or_refresh(self, parent):
+        """保存 self.plist（Task 90：与 gui.PassengerDialog._save_passengers_or_refresh
+        同口径的乐观并发检查）。
+
+        成功 → (True, "ok")。指纹变化（本对话框打开期间被外部修改）→
+        重载最新数据+警告，返回 (False, "stale")，调用方放弃本次保存
+        （表单保留用户输入，用户基于最新数据重做）。不可解密盒子/
+        锁超时 → error，返回 (False, "refused")（不重载，不丢内存数据）。
+        """
+        if _save_passengers_or_warn(self.plist, parent, self._pax_stamp):
+            return True, "ok"
+        if passengers_mod.passengers_stamp() != self._pax_stamp:
+            # 外部写入导致放弃：重载最新数据+新指纹。
+            self._refresh_plist()
+            return False, "stale"
+        return False, "refused"
+
     def _delete(self):
         name = self.pick.get().strip()
         if not name:
@@ -3458,7 +3498,9 @@ class PassengerDialog(tk.Toplevel):
         self.plist = [p for p in self.plist if (p.get("name") or "") != name]
         try:
             # Task 84d：拒写（False）弹 error，不刷新列表、不显示成功
-            if not _save_passengers_or_warn(self.plist, self):
+            # Task 90：指纹变化→警告并放弃（重载最新数据，用户重做）
+            ok, _ = self._save_passengers_or_refresh(self)
+            if not ok:
                 return
         except Exception as e:
             messagebox.showerror("保存失败", str(e), parent=self)
@@ -3494,7 +3536,9 @@ class PassengerDialog(tk.Toplevel):
             self.plist.append(rec)
         try:
             # Task 84d：拒写（False）弹 error，不显示"已保存"
-            if not _save_passengers_or_warn(self.plist, self):
+            # Task 90：指纹变化→警告并放弃（重载最新数据，表单保留输入，用户重做）
+            ok, _ = self._save_passengers_or_refresh(self)
+            if not ok:
                 return
         except Exception as e:
             messagebox.showerror("保存失败", "加密保存失败：%s" % e, parent=self)

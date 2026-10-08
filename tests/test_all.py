@@ -8990,6 +8990,139 @@ class TestTask89GuiLeftovers(TempDirCase):
         self.assertEqual(dlg._pax_stamp, "s1")
 
 
+class TestTask90LauncherPassengerDialogStamp(TempDirCase):
+    """Task 90：launcher.PassengerDialog 指纹缺口（Task 89 评审确认真实）。
+
+    与 gui.PassengerDialog 的 Task 89c 同类：跨进程锁（Task 88d）已保证
+    写原子性，但 load→弹窗思考→save 窗口内被外部写入会静默覆写。
+    改后：保存加乐观并发检查（Task 87/88d/89c 同口径）——指纹变化→
+    警告并放弃（重载最新数据，用户重做）；不可解密盒子/锁超时→error。
+    """
+
+    def _make_dialog(self):
+        dlg = object.__new__(launcher.PassengerDialog)
+        dlg.plist = [{"name": "A"}]
+        dlg._pax_stamp = "old-stamp"
+        dlg.pick = mock.Mock()
+        return dlg
+
+    def test_save_passengers_or_warn_accepts_expect_stamp(self):
+        # 旧代码：_save_passengers_or_warn(passengers, parent) 无 expect_stamp
+        # 参数（TypeError）；且指纹不透传 → 思考窗口内外部写入被静默覆写。
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=True) as m_save, \
+             mock.patch.object(launcher, "messagebox"):
+            ok = launcher._save_passengers_or_warn([{"name": "A"}], None,
+                                                   expect_stamp="s1")
+        self.assertTrue(ok)
+        m_save.assert_called_once_with([{"name": "A"}], expect_stamp="s1")
+
+    def test_save_abandons_on_external_write(self):
+        dlg = self._make_dialog()
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=False) as m_save, \
+             mock.patch.object(launcher.passengers_mod, "passengers_stamp",
+                               return_value="new-stamp"), \
+             mock.patch.object(launcher, "messagebox") as mb, \
+             mock.patch.object(launcher.PassengerDialog,
+                               "_refresh_plist") as m_refresh:
+            ok, reason = dlg._save_passengers_or_refresh(None)
+        # 指纹必须透传给共享函数（锁内检查用）
+        m_save.assert_called_once_with(dlg.plist, expect_stamp="old-stamp")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "stale")
+        mb.showwarning.assert_called_once()  # 明确警告，不静默
+        mb.showerror.assert_not_called()
+        m_refresh.assert_called_once()  # 重载最新数据，用户重做
+
+    def test_save_refusal_shows_error_not_warning(self):
+        dlg = self._make_dialog()
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=False), \
+             mock.patch.object(launcher.passengers_mod, "passengers_stamp",
+                               return_value="old-stamp"), \
+             mock.patch.object(launcher, "messagebox") as mb, \
+             mock.patch.object(launcher.PassengerDialog,
+                               "_refresh_plist") as m_refresh:
+            ok, reason = dlg._save_passengers_or_refresh(None)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "refused")
+        mb.showerror.assert_called_once()  # 不可解密盒子走 error（Task 80 口径）
+        mb.showwarning.assert_not_called()
+        m_refresh.assert_not_called()  # 拒写不重载，不丢内存数据
+
+    def test_save_success(self):
+        dlg = self._make_dialog()
+        with mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=True) as m_save, \
+             mock.patch.object(launcher, "messagebox") as mb:
+            ok, reason = dlg._save_passengers_or_refresh(None)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+        m_save.assert_called_once_with(dlg.plist, expect_stamp="old-stamp")
+        mb.showwarning.assert_not_called()
+        mb.showerror.assert_not_called()
+
+    def test_init_takes_stamp_wiring(self):
+        # 对话框打开时记下 load 的字节指纹（旧代码无此行）
+        import inspect
+        src = inspect.getsource(launcher.PassengerDialog.__init__)
+        self.assertIn("self._pax_stamp = passengers_mod.passengers_stamp()", src)
+
+    def test_delete_goes_through_stamp_check(self):
+        # _delete 走指纹：外部写入→放弃删除，不静默覆写、不通知已保存
+        dlg = self._make_dialog()
+        dlg.pick.get.return_value = "A"
+        with mock.patch.object(launcher, "messagebox") as mb, \
+             mock.patch.object(launcher, "_save_passengers_or_warn",
+                               return_value=True), \
+             mock.patch.object(launcher.PassengerDialog,
+                               "_save_passengers_or_refresh",
+                               create=True,
+                               return_value=(False, "stale")) as m_s, \
+             mock.patch.object(launcher.PassengerDialog, "_refresh_plist",
+                               create=True) as m_refresh, \
+             mock.patch.object(dlg, "_notify_saved") as m_notify:
+            mb.askyesno.return_value = True
+            dlg._delete()
+        m_s.assert_called_once_with(dlg)
+        # _refresh_plist 的调用发生在真实的 _save_passengers_or_refresh 内部，
+        # 已由 test_save_abandons_on_external_write 覆盖
+        m_notify.assert_not_called()  # 未保存成功，不通知
+
+    def test_save_wiring_abandons_on_stale(self):
+        # _save 走指纹：外部写入→放弃保存，不显示"已保存"、不通知
+        dlg = self._make_dialog()
+        dlg.name_var = mock.Mock()
+        dlg.name_var.get.return_value = "B"
+        dlg.id_var = mock.Mock()
+        dlg.id_var.get.return_value = "123"
+        dlg.mob_var = mock.Mock()
+        dlg.mob_var.get.return_value = ""
+        dlg.type_var = mock.Mock()
+        dlg.type_var.get.return_value = "二代身份证"
+        dlg.adult_var = mock.Mock()
+        dlg.adult_var.get.return_value = True
+        dlg.default_var = mock.Mock()
+        dlg.default_var.get.return_value = False
+        with mock.patch.object(launcher, "messagebox") as mb, \
+             mock.patch.object(launcher, "_save_passengers_or_warn",
+                               return_value=True), \
+             mock.patch.object(launcher.PassengerDialog,
+                               "_save_passengers_or_refresh",
+                               create=True,
+                               return_value=(False, "stale")) as m_s, \
+             mock.patch.object(launcher.PassengerDialog, "_refresh_plist",
+                               create=True) as m_refresh, \
+             mock.patch.object(dlg, "_notify_saved") as m_notify:
+            dlg._save()
+        m_s.assert_called_once_with(dlg)
+        # _refresh_plist 的调用发生在真实的 _save_passengers_or_refresh 内部，
+        # 已由 test_save_abandons_on_external_write 覆盖
+        m_notify.assert_not_called()
+        mb.showinfo.assert_not_called()  # 不显示"已保存"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
