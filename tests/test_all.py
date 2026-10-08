@@ -10981,6 +10981,152 @@ class TestTask103LauncherGuiP3(TempDirCase):
             self.assertEqual(json.load(f), {"a": 1, "b": 2})
 
 
+class TestTask104LoadSanitize(TempDirCase):
+    """Task 104：入口一次性 sanitize（load_grab_tasks / load_launcher_config）。
+
+    Task 96(c)(d) 只修了展示侧；_find/_new_task/_delete_task/_upsert_task/
+    _on_window_closed（及 _current_preset/_save_preset/删除预设）全对原始条目
+    调 t.get(...)，脏条目仍崩；_on_window_closed 在 _on_close 的 finally 块内，
+    抛异常则 destroy 被跳过→僵尸窗口。改后在加载入口剔除非 dict 条目。
+    无 Tk 真机，全部 mock/桩测试（沿 Task 96 口径）。
+    """
+
+    def _write(self, name, obj):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        return path
+
+    def _make_panel(self, tasks):
+        panel = object.__new__(launcher.TaskManagerPanel)
+        panel.tasks = tasks
+        panel._windows = {}
+        panel._refresh_list = mock.Mock()
+        panel._put_log = mock.Mock()
+        return panel
+
+    # ---- (1) grab_tasks 入口 sanitize ----
+
+    def test_grab_tasks_load_drops_non_dict(self):
+        # 改前：load_grab_tasks 原样返回脏条目，后续 t.get(...) 全崩。
+        path = self._write("grab_tasks.json", {"tasks": [
+            {"id": "a", "name": "A"}, "junk", 123, None, {"id": "b"}]})
+        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
+             mock.patch.object(launcher, "log") as mlog:
+            tasks = launcher.load_grab_tasks()
+        self.assertEqual([t.get("id") for t in tasks], ["a", "b"])
+        warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
+        self.assertTrue(warns, "应记 warning")
+
+    def test_find_safe_after_sanitized_load(self):
+        # 改前：_find 遍历到 "junk" 时 t.get 抛 AttributeError。
+        path = self._write("grab_tasks.json", {"tasks": [
+            {"id": "a", "name": "A"}, "junk", None]})
+        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
+             mock.patch.object(launcher, "log"):
+            panel = self._make_panel(launcher.load_grab_tasks())
+        self.assertEqual(panel._find("a")["name"], "A")
+        self.assertIsNone(panel._find("zzz"))  # 改前在此抛 AttributeError
+
+    def test_on_window_closed_safe_and_destroy_reached(self):
+        # 改前：_on_window_closed 在 finally 块内抛 AttributeError，
+        # 则 _on_close 的 self.destroy() 被跳过→僵尸窗口。
+        path = self._write("grab_tasks.json", {"tasks": [
+            {"id": "a", "name": "A", "status": "idle"}, "junk", None]})
+        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
+             mock.patch.object(launcher, "log"), \
+             mock.patch.object(launcher, "save_grab_tasks") as sg:
+            panel = self._make_panel(launcher.load_grab_tasks())
+            # 模拟 GrabTaskWindow._on_close 的 finally 段：
+            destroyed = []
+            try:
+                pass
+            finally:
+                panel._on_window_closed("a")  # 改前在此抛 AttributeError
+                destroyed.append(True)        # = self.destroy() 被执行
+        self.assertEqual(destroyed, [True])
+        sg.assert_called_once()
+
+    # ---- (2) launcher_config presets 入口 sanitize（Task 103 评审扩展） ----
+
+    def test_launcher_config_load_drops_non_dict_presets(self):
+        # 改前：lc["presets"] 原样保留脏条目，_current_preset/_save_preset/
+        # 删除路径调 p.get(...) 抛 AttributeError（Task 96d 只修了展示侧）。
+        cfg = self._write("launcher_config.json",
+                          {"presets": [{"name": "p1"}, "junk", 42, None]})
+        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(launcher, "log") as mlog:
+            lc = launcher.load_launcher_config()
+        self.assertEqual(lc["presets"], [{"name": "p1"}])
+        warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
+        self.assertTrue(warns, "应记 warning")
+
+    def test_launcher_config_non_list_presets_becomes_empty(self):
+        # presets 本体非 list（如手改成字符串）：_save_preset 的推导式
+        # 同样会 p.get 崩；入口统一按空处理。
+        cfg = self._write("launcher_config.json", {"presets": "oops"})
+        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(launcher, "log") as mlog:
+            lc = launcher.load_launcher_config()
+        self.assertEqual(lc["presets"], [])
+        warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
+        self.assertTrue(warns, "应记 warning")
+
+    def test_current_preset_safe_after_sanitized_load(self):
+        # 改前：_current_preset 遍历到 "junk" 时 p.get 抛 AttributeError。
+        # （用不存在的名字，迫使遍历走完整个列表。）
+        cfg = self._write("launcher_config.json",
+                          {"presets": [{"name": "p1"}, "junk"]})
+        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(launcher, "log"):
+            lc = launcher.load_launcher_config()
+        app = object.__new__(launcher.LauncherApp)
+        app.lc = lc
+        cb = mock.Mock()
+        cb.get.return_value = "zzz"  # 不存在，迫使遍历经过脏条目
+        app.preset_cb = cb
+        self.assertIsNone(app._current_preset())  # 改前在此抛 AttributeError
+
+    def test_save_preset_safe_after_sanitized_load(self):
+        # 改前：_save_preset 的去重推导式在 "junk".get 处抛 AttributeError。
+        cfg = self._write("launcher_config.json",
+                          {"presets": [{"name": "p1"}, "junk", 42]})
+        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(launcher, "log"):
+            lc = launcher.load_launcher_config()
+        app = object.__new__(launcher.LauncherApp)
+        app.lc = lc
+        app._ui_to_lc = mock.Mock()
+        app._save_cfg = mock.Mock()
+        app._put_log = mock.Mock()
+        cb = mock.Mock()
+        cb.get.return_value = "p1"
+        app.preset_cb = cb
+        app._mp = mock.Mock()
+        with mock.patch.object(launcher.simpledialog, "askstring",
+                               return_value="np"):
+            app._save_preset()  # 改前在此抛 AttributeError
+        saved = app._save_cfg.call_args[0][0]
+        self.assertTrue(all(isinstance(p, dict) for p in saved["presets"]))
+
+    # ---- 正向对照：干净文件不受影响 ----
+
+    def test_clean_files_unchanged_no_warnings(self):
+        gt = self._write("grab_tasks.json",
+                         {"tasks": [{"id": "a", "name": "A"}]})
+        cfg = self._write("launcher_config.json",
+                          {"presets": [{"name": "p1"}]})
+        with mock.patch.object(launcher, "GRAB_TASKS_PATH", gt), \
+             mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(launcher, "log") as mlog:
+            tasks = launcher.load_grab_tasks()
+            lc = launcher.load_launcher_config()
+        self.assertEqual(tasks, [{"id": "a", "name": "A"}])
+        self.assertEqual(lc["presets"], [{"name": "p1"}])
+        warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
+        self.assertEqual(warns, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

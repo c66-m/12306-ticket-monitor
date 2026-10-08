@@ -245,6 +245,20 @@ def load_launcher_config():
                         lc[k] = v
         except Exception as e:
             log("[错误] launcher_config.json 读取失败：%s，使用默认配置" % e)
+    # Task 104 扩展：presets 在加载入口一次性 sanitize（非 dict 条目记 warning
+    # 后剔除；本体非 list 则按空处理）。Task 96d 只修了展示侧；_current_preset/
+    # _save_preset/删除路径都对原始条目调 .get，脏条目 → AttributeError。
+    # 后续 _save_preset/_delete_preset 写回的是已清理列表，文件自然被治愈。
+    presets = lc.get("presets")
+    if not isinstance(presets, list):
+        log("[警告] launcher_config.json presets 非 list，已按空处理：%r" % (presets,))
+        lc["presets"] = []
+    else:
+        clean = [p for p in presets if isinstance(p, dict)]
+        if len(clean) != len(presets):
+            log("[警告] launcher_config.json presets 存在非 dict 条目，已剔除 %d 个"
+                % (len(presets) - len(clean),))
+        lc["presets"] = clean
     return lc
 
 
@@ -265,7 +279,19 @@ def load_grab_tasks():
             with open(GRAB_TASKS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and isinstance(data.get("tasks"), list):
-                return data["tasks"]
+                # Task 104：入口一次性 sanitize——非 dict 条目记 warning 后剔除。
+                # （Task 96c 只修了展示侧 _add_row；_find/_new_task/_delete_task/
+                # _upsert_task/_on_window_closed 全对原始条目调 t.get(...)，
+                # 脏条目仍会崩；_on_window_closed 在 _on_close 的 finally 块内，
+                # 抛异常则 destroy 被跳过→僵尸窗口。逐处加守卫不如入口一次清理；
+                # 后续 save_grab_tasks 写回的是已清理列表，文件自然被治愈。）
+                clean = []
+                for t in data["tasks"]:
+                    if isinstance(t, dict):
+                        clean.append(t)
+                    else:
+                        log("[警告] grab_tasks.json 存在非 dict 条目，已剔除：%r" % (t,))
+                return clean
         except Exception as e:
             log("[错误] grab_tasks.json 读取失败：%s" % e)
     return []
