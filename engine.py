@@ -303,8 +303,17 @@ class MonitorEngine(object):
     def __init__(self, config_path=None, setup_logging=True):
         """setup_logging=False 时由调用方（如 GUI）自行接管日志处理器。"""
         self.config_path = config_path or os.path.join(HERE, "config.json")
-        with open(self.config_path, encoding="utf-8") as f:
-            self.config = json.load(f)
+        try:
+            with open(self.config_path, encoding="utf-8") as f:
+                self.config = json.load(f)
+        except FileNotFoundError:
+            # Task 102：缺 config 文件（python engine.py 裸跑且无配置文件）——
+            # 旧代码抛裸 FileNotFoundError 崩进程；记 error 后用空配置继续
+            # （Task 91 同口径：进程不崩；修好文件后 _sync_config 自动恢复，
+            #  mtime 从 None 变为有效值即触发同步）。
+            LOG.error("[配置] %s 不存在，已按默认配置继续",
+                      self.config_path)
+            self.config = {}
         if not isinstance(self.config, dict):
             # Task 91：顶层非 dict（手改误删大括号成 [] 等）——旧代码后续
             # self.config.get(...) 抛 AttributeError 崩进程；记 error 后用

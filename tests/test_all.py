@@ -9243,6 +9243,51 @@ class TestTask91TopLevelConfigShape(TempDirCase):
         self.assertEqual(e.config["poll_interval_seconds"], 60)
 
 
+class TestTask102EngineMissingConfig(TempDirCase):
+    """Task 102：engine __init__ 缺 config.json 文件时，不得抛裸
+    FileNotFoundError 崩进程；记 error 后用安全默认值继续（Task 91 同口径）。
+    """
+
+    def _make_engine(self, cfg_path):
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            # state/history 路径随 config 走；缺 config 时回退到 HERE——测试
+            # 中把 HERE 指到 tmp，避免 __init__ 的 _save_state 碰真实文件。
+            with mock.patch.object(engine_mod, "HERE", self.tmp):
+                return engine_mod.MonitorEngine(config_path=cfg_path,
+                                                setup_logging=False)
+
+    def _missing_path(self):
+        return os.path.join(self.tmp, "no-such-config.json")
+
+    def test_init_missing_config_does_not_crash(self):
+        # RED on old code: open() 抛 FileNotFoundError 崩进程
+        p = self._missing_path()
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            e = self._make_engine(p)
+        self.assertEqual(e.config, {})
+        self.assertEqual(e.tasks, [])
+        self.assertEqual(e.base_interval, 45)
+        self.assertTrue(any("不存在" in m for m in logs.output),
+                        "error 日志必须明确指出配置文件缺失（与 Task 91 的"
+                        "“顶层不是对象”可区分），并带出完整路径")
+
+    def test_init_missing_config_recovers_when_file_appears(self):
+        # 缺文件启动后，用户补上 config.json → _sync_config 自动恢复
+        p = self._missing_path()
+        e = self._make_engine(p)
+        self.assertEqual(e.tasks, [])
+        cfg = {"tasks": [{"name": "T1"}],
+               "poll_interval_seconds": 45,
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "history_file": os.path.join(self.tmp, "order_history.json")}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        changed = e._sync_config()
+        self.assertTrue(changed)
+        self.assertEqual([t["name"] for t in e.tasks], ["T1"])
+
+
 class TestTask92MonitorP2(TempDirCase):
     """Task 92 (P2): (a) 损坏的 config.json → load_config 友好降级，
     save/update 路径绝不覆写损坏文件；(b) menu_notify 字符串型 "to"
