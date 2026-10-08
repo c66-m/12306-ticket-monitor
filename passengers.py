@@ -30,6 +30,7 @@
 import base64
 import json
 import logging
+import time
 
 import appcommon
 import os
@@ -176,23 +177,113 @@ def unprotect_secret(text):
     return text or ""
 
 
-def _get_fernet():
-    """返回 (fernet 实例, key_path)。cryptography 未安装时返回 (None, None)。"""
+def _fernet_key_path():
+    return os.path.join(HERE, ".passengers_key")
+
+
+def _read_valid_fernet_key(key_path):
+    """读取并校验 Fernet 密钥。缺失抛 FileNotFoundError，非法抛 ValueError。
+
+    末尾空白（换行符等）会被 strip——合法密钥本身不含空白，strip 只救
+    "编辑器顺手加了换行"这类小损坏，不会把真损坏洗成合法。"""
+    from cryptography.fernet import Fernet
+    with open(key_path, "rb") as f:
+        key = f.read().strip()
+    Fernet(key)  # 非法密钥（半截/损坏）抛 ValueError
+    return key
+
+
+def _read_key_with_retry(key_path, tries=60, interval=0.02):
+    """读回已存在的密钥；ValueError（半截/损坏）短暂重试，缺失直接抛。
+
+    防"并发写一半时的半截读"：写方（O_EXCL 创建后写 44 字节）是微秒级，
+    重试只为跨过这个窗口；稳定损坏由调用方走自愈，不在这里误判。"""
+    last = None
+    for _ in range(tries):
+        try:
+            return _read_valid_fernet_key(key_path)
+        except FileNotFoundError:
+            raise
+        except ValueError as e:
+            last = e
+            time.sleep(interval)
+    raise last
+
+
+def _generate_fernet_key(key_path):
+    """O_EXCL 原子创建密钥文件；返回 key bytes。
+
+    双首跑竞态：恰好一个胜者创建成功；败者（FileExistsError）绝不覆盖，
+    直接读回胜者的密钥（带校验重试，防读到胜者写一半的半截文件）。
+    """
+    from cryptography.fernet import Fernet
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return _read_key_with_retry(key_path)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(Fernet.generate_key())
+    except BaseException:
+        # 创建后写失败：删掉半截文件，避免后人读到坏密钥
+        try:
+            os.unlink(key_path)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(key_path, 0o600)
+    except Exception:
+        pass
+    return _read_valid_fernet_key(key_path)
+
+
+def _heal_corrupt_fernet_key(key_path):
+    """损坏密钥自愈：备份旧文件 → 重新生成 → 明确日志。
+
+    数据代价（必须明确）：旧密钥丢失后，此前用它加密的数据
+    （乘车人证件号/手机号）将永久不可解密——备份仅留证，无法恢复旧数据。
+    自愈只恢复"继续可用"，不恢复旧数据。"""
+    bad = "%s.bad-%s-%d" % (key_path, time.strftime("%Y%m%d-%H%M%S"), os.getpid())
+    try:
+        os.replace(key_path, bad)
+    except OSError as e:
+        raise RuntimeError("Fernet 密钥文件损坏且无法备份（%s），拒绝重建：%s"
+                           % (key_path, e))
+    LOG.error("[安全] Fernet 密钥文件损坏，已备份为 %s 并重新生成；"
+              "此前用旧密钥加密的数据将不可解密", bad)
+    return _generate_fernet_key(key_path)
+
+
+def _get_fernet(create=False):
+    """返回 (fernet 实例, key_path)。
+
+    create=True（加密路径）：缺失则 O_EXCL 原子生成；损坏则备份+重建自愈。
+    create=False（解密路径）：缺失/损坏一律抛明确异常，绝不生成——
+        生成会掩盖"密钥丢失"，让用户拿到误导性的解密失败。
+    cryptography 未安装 → (None, None)（调用方按旧语义处理）。"""
     try:
         from cryptography.fernet import Fernet
     except ImportError:
         return None, None
 
-    key_path = os.path.join(HERE, ".passengers_key")
-    if not os.path.exists(key_path):
-        with open(key_path, "wb") as f:
-            f.write(Fernet.generate_key())
+    key_path = _fernet_key_path()
+    if create:
         try:
-            os.chmod(key_path, 0o600)
-        except Exception:
-            pass
-    with open(key_path, "rb") as f:
-        key = f.read()
+            key = _read_key_with_retry(key_path)
+        except FileNotFoundError:
+            key = _generate_fernet_key(key_path)
+        except ValueError:
+            key = _heal_corrupt_fernet_key(key_path)
+    else:
+        try:
+            key = _read_valid_fernet_key(key_path)
+        except FileNotFoundError:
+            raise RuntimeError("Fernet 密钥文件缺失（%s），无法解密已加密数据；"
+                               "密钥丢失请从备份恢复" % key_path)
+        except ValueError as e:
+            raise RuntimeError("Fernet 密钥文件损坏（%s），无法解密：%s"
+                               % (key_path, e))
     return Fernet(key), key_path
 
 
@@ -205,8 +296,12 @@ def _encrypt(payload_text):
         try:
             return "dpapi", base64.b64encode(_dpapi_protect(raw)).decode("ascii")
         except Exception as e:
-            print("[警告] DPAPI 加密失败（%s），尝试其他方式" % e)
-    fernet, key_path = _get_fernet()
+            # Task 63(a)：DPAPI 降级 Fernet 不再静默——记 error 明确告知。
+            # Fernet 是文件密钥，不具备 DPAPI 的"绑定当前 Windows 用户"
+            # 特性，弱于用户预期，降级必须让用户感知。
+            LOG.error("[安全] DPAPI 加密失败，已降级为 Fernet 本地密钥加密"
+                      "（弱于用户绑定的 DPAPI，请检查 Windows 用户/权限）: %s", e)
+    fernet, key_path = _get_fernet(create=True)
     if fernet is not None:
         return "fernet", fernet.encrypt(raw).decode("ascii")
     print("[警告] 未找到可用加密组件（非 Windows 且未安装 cryptography）。")
@@ -218,7 +313,9 @@ def _decrypt(enc_name, data_text):
     if enc_name == "dpapi":
         return _dpapi_unprotect(base64.b64decode(data_text)).decode("utf-8")
     if enc_name == "fernet":
-        fernet, _ = _get_fernet()
+        # Task 63(b)：解密路径绝不触发密钥"生成"——缺密钥即明确报错。
+        # 旧代码在此生成新密钥，只会把"密钥丢失"掩盖成解密失败。
+        fernet, _ = _get_fernet(create=False)
         if fernet is None:
             raise RuntimeError("密文由 Fernet 加密，但当前环境未安装 cryptography，无法解密")
         return fernet.decrypt(data_text.encode("ascii")).decode("utf-8")

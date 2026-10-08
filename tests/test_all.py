@@ -5197,6 +5197,169 @@ class TestAppcommonFilelockP3(TempDirCase):
         self.assertIs(a, c)
 
 
+
+class TestPassengersP3(TempDirCase):
+    """Task 63: passengers P3（静默降级 / 密钥生成竞态 / 损坏密钥无自愈）。
+
+    本机未安装 cryptography：注入与真实 API 同形的最小 fake
+    cryptography.fernet（generate_key / 构造校验 / encrypt / decrypt），
+    不改变测试环境。DPAPI 的 Windows 真机行为不在本机验证范围。
+    """
+
+    @staticmethod
+    def _install_fake_fernet():
+        import base64, hashlib, hmac, types
+
+        class InvalidToken(Exception):
+            pass
+
+        class Fernet:
+            def __init__(self, key):
+                if isinstance(key, str):
+                    key = key.encode("ascii")
+                try:
+                    raw = base64.urlsafe_b64decode(key)
+                except Exception:
+                    raise ValueError("Fernet key must be 32 url-safe base64-encoded bytes.")
+                if len(raw) != 32:
+                    raise ValueError("Fernet key must be 32 url-safe base64-encoded bytes.")
+                self._key = key
+
+            @staticmethod
+            def generate_key():
+                return base64.urlsafe_b64encode(os.urandom(32))
+
+            def encrypt(self, data):
+                tag = hmac.new(self._key, data, hashlib.sha256).digest()
+                return base64.urlsafe_b64encode(b"\x01" + tag + data)
+
+            def decrypt(self, token):
+                if isinstance(token, str):
+                    token = token.encode("ascii")
+                try:
+                    raw = base64.urlsafe_b64decode(token)
+                except Exception:
+                    raise InvalidToken("bad token")
+                if len(raw) < 33 or raw[0:1] != b"\x01":
+                    raise InvalidToken("bad token")
+                tag, data = raw[1:33], raw[33:]
+                if not hmac.compare_digest(
+                        tag, hmac.new(self._key, data, hashlib.sha256).digest()):
+                    raise InvalidToken("Signature did not match digest.")
+                return data
+
+        fernet_mod = types.ModuleType("cryptography.fernet")
+        fernet_mod.Fernet = Fernet
+        fernet_mod.InvalidToken = InvalidToken
+        crypto_mod = types.ModuleType("cryptography")
+        crypto_mod.fernet = fernet_mod
+        return crypto_mod, fernet_mod
+
+    def setUp(self):
+        super().setUp()
+        crypto_mod, fernet_mod = self._install_fake_fernet()
+        self._saved_crypto = sys.modules.get("cryptography")
+        self._saved_fernet = sys.modules.get("cryptography.fernet")
+        sys.modules["cryptography"] = crypto_mod
+        sys.modules["cryptography.fernet"] = fernet_mod
+        self.addCleanup(self._restore_fernet_modules)
+        self.key_path = os.path.join(self.tmp, ".passengers_key")
+        self._kp_patch = mock.patch.object(
+            pax_mod, "_fernet_key_path", return_value=self.key_path, create=True)
+        self._kp_patch.start()
+        self.addCleanup(self._kp_patch.stop)
+
+    def _restore_fernet_modules(self):
+        for name, saved in (("cryptography", self._saved_crypto),
+                            ("cryptography.fernet", self._saved_fernet)):
+            if saved is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = saved
+
+    # (a) DPAPI 失败降级不再静默
+    def test_encrypt_dpapi_failure_logs_error_and_falls_back(self):
+        with mock.patch.object(pax_mod, "_is_windows", return_value=True), \
+             mock.patch.object(pax_mod, "_dpapi_protect",
+                               side_effect=RuntimeError("DPAPI 坏了")), \
+             self.assertLogs("monitor", level="ERROR") as cm:
+            enc, data = pax_mod._encrypt('{"a": 1}')
+        self.assertEqual(enc, "fernet")
+        self.assertTrue(any("降级" in m for m in cm.output),
+                        "DPAPI 降级必须记 error 日志，不再静默：%s" % cm.output)
+
+    # (b) O_EXCL 原子创建：并发首跑只产生一个密钥
+    def test_concurrent_key_generation_single_winner(self):
+        results = []
+
+        def worker():
+            results.append(pax_mod._generate_fernet_key(self.key_path))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(set(results)), 1, "并发生成必须收敛到同一个密钥")
+        with open(self.key_path, "rb") as f:
+            self.assertEqual(f.read(), results[0])
+        self.assertEqual(os.stat(self.key_path).st_mode & 0o077, 0,
+                         "密钥文件不得组/其他可读")
+
+    def test_generate_never_overwrites_existing_key(self):
+        from cryptography.fernet import Fernet
+        k1 = Fernet.generate_key()
+        with open(self.key_path, "wb") as f:
+            f.write(k1)
+        self.assertEqual(pax_mod._generate_fernet_key(self.key_path), k1)
+        with open(self.key_path, "rb") as f:
+            self.assertEqual(f.read(), k1)
+
+    # (b) 解密路径绝不生成密钥
+    def test_decrypt_path_never_generates_key(self):
+        self.assertFalse(os.path.exists(self.key_path))
+        with self.assertRaises(RuntimeError) as cm:
+            pax_mod._get_fernet(create=False)
+        self.assertIn("缺失", str(cm.exception))
+        self.assertFalse(os.path.exists(self.key_path), "解密路径绝不能生成密钥文件")
+
+    # (c) 损坏密钥在加密路径自愈：备份 + 重建 + 明确日志
+    def test_corrupt_key_heals_on_encrypt_path(self):
+        with open(self.key_path, "wb") as f:
+            f.write(b"this-is-not-a-valid-fernet-key")
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            fernet, path = pax_mod._get_fernet(create=True)
+        self.assertIsNotNone(fernet)
+        bads = [n for n in os.listdir(self.tmp)
+                if n.startswith(".passengers_key.bad-")]
+        self.assertEqual(len(bads), 1, "损坏的旧密钥必须备份留证")
+        from cryptography.fernet import Fernet
+        with open(self.key_path, "rb") as f:
+            Fernet(f.read())  # 新密钥必须合法，不抛异常
+        self.assertTrue(any("备份" in m for m in cm.output))
+
+    # (c) 解密路径损坏密钥：明确报错，不自愈
+    def test_corrupt_key_decrypt_path_raises_without_healing(self):
+        with open(self.key_path, "wb") as f:
+            f.write(b"this-is-not-a-valid-fernet-key")
+        with self.assertRaises(RuntimeError) as cm:
+            pax_mod._get_fernet(create=False)
+        self.assertIn("损坏", str(cm.exception))
+        bads = [n for n in os.listdir(self.tmp) if ".bad-" in n]
+        self.assertEqual(bads, [], "解密路径不得自愈/备份")
+
+    # 端到端：密钥丢失后解密返回 [] 且不重新生成（旧代码会生成新密钥掩盖丢失）
+    def test_key_lost_load_returns_empty_without_regenerating(self):
+        p = os.path.join(self.tmp, "passengers.json")
+        self.assertTrue(pax_mod.save_passengers([{"name": "张三", "id_no": "x"}], p))
+        self.assertTrue(os.path.exists(self.key_path))
+        os.remove(self.key_path)  # 模拟密钥丢失
+        back = pax_mod.load_passengers(p)
+        self.assertEqual(back, [])
+        self.assertFalse(os.path.exists(self.key_path), "解密路径绝不能重新生成密钥")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
