@@ -1139,16 +1139,21 @@ _STATION_INDEX = None
 
 
 def get_station_index():
-    """惰性加载车站全量索引（首次从 station_name.js 下载后缓存到 station_index.json）。"""
+    """惰性加载车站全量索引（首次从 station_name.js 下载后缓存到 station_index.json）。
+
+    Task 101b：加载失败不永久缓存——失败时保持 _STATION_INDEX 为 None，下次调用
+    重试（网络恢复后本会话车站搜索自动恢复）；失败期间返回 []，调用方可直接迭代。
+    """
     global _STATION_INDEX
     if _STATION_INDEX is None:
         try:
             _STATION_INDEX = ticket.load_station_index()
             log("[车站] 车站索引就绪：%d 个车站" % len(_STATION_INDEX))
         except Exception as e:
-            log("[提醒] 车站拼音索引加载失败（%s），本次只按站名匹配" % e)
-            _STATION_INDEX = []
-    return _STATION_INDEX
+            # 旧文案"只按站名匹配"不属实：索引为空时搜索无候选，并非降级为站名匹配
+            log("[提醒] 车站索引加载失败（%s）：车站搜索暂不可用，可手打站名/电报码继续"
+                % e)
+    return _STATION_INDEX or []
 
 
 _FW_TRANS = {0x3000: 0x20}
@@ -1246,8 +1251,11 @@ def save_station_kinds():
         data = dict(_station_kinds)
     if not data:
         return
+    # Task 101a：tmp 文件名带线程后缀（Task 62 口径）——主线程（查询后被动学习）
+    # 与后台探测线程并发写同一 tmp 会交错损坏缓存文件；各自独立 tmp +
+    # os.replace 原子换名，写坏只影响自己那份（快照拷贝自带锁内一致性）。
+    tmp = "%s.tmp%d" % (STATION_KIND_PATH, threading.get_ident())
     try:
-        tmp = STATION_KIND_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
         os.replace(tmp, STATION_KIND_PATH)

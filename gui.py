@@ -168,6 +168,27 @@ def load_state():
         os.path.join(HERE, config.get("state_file", "state.json")))
 
 
+def _state_tasks_dict():
+    """读 state.json 的 tasks 节：顶层非 dict 或 tasks 节非 dict 时记警告并返回 {}。
+
+    Task 101f：state.json 为 [] 等非对象形状时，旧代码 load_state().get("tasks")
+    直接抛 AttributeError，导致"启动监控"/"编辑任务"对话框打不开。"""
+    try:
+        state = load_state()
+    except Exception as e:
+        LOG.warning("state.json 读取失败（%s），已按空状态处理", e)
+        return {}
+    if not isinstance(state, dict):
+        LOG.warning("state.json 顶层不是对象（%s），已按空状态处理",
+                    type(state).__name__)
+        return {}
+    tasks = state.get("tasks", {})
+    if not isinstance(tasks, dict):
+        LOG.warning("state.json 的 tasks 节不是对象，已按空处理")
+        return {}
+    return tasks
+
+
 def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
     config = load_config()
@@ -2284,7 +2305,7 @@ class StartMonitorDialog(tk.Toplevel):
         self.task_rows.pack(fill="both", expand=True, padx=14)
 
         config = load_config()
-        state = load_state().get("tasks", {})
+        state = _state_tasks_dict()
         self.vars = {}
         tasks = config.get("tasks") or []
         if not tasks:
@@ -2671,7 +2692,7 @@ class TaskPage(ttk.Frame):
         if task is None:
             return
         # 实时从 state.json 读取最新状态，避免使用过期缓存导致误判
-        fresh = load_state().get("tasks", {}).get(task.get("name"), {}).get(
+        fresh = _state_tasks_dict().get(task.get("name"), {}).get(
             "status", "paused")
         if fresh != "paused":
             messagebox.showwarning("提示",

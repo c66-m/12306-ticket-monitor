@@ -516,11 +516,22 @@ def select_passengers(all_passengers, wanted_names):
     if wanted_names:
         # 按 wanted_names 的顺序挑选，保持用户指定的组合顺序
         picked = []
+        missing = []
         for name in wanted_names:
             for p in all_passengers:
                 if p["name"] == name:
                     picked.append(p)
                     break
+            else:
+                missing.append(name)
+        if missing:
+            # Task 101e：零命中/部分命中不再静默回退——点名未命中的姓名并明确
+            # 告知回退行为（误人下单风险，必须让用户看见）
+            LOG.warning("[乘车人] 点名的 %s 未在账号乘车人中找到（%s），已回退为%s",
+                        "、".join(missing),
+                        "部分命中" if picked else "零命中",
+                        "命中的 %d 位乘车人" % len(picked) if picked
+                        else "账号全体成人乘车人")
         if picked:
             return picked
     return [p for p in all_passengers if p.get("is_adult", True) and p.get("id_no")]

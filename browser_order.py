@@ -55,6 +55,39 @@ def _log(msg):
     sys.stdout.flush()
 
 
+# Task 101h：_log 的 PII 脱敏（与 Task 61/65a/84c 同口径）——用户名/乘车人姓名
+# 不再明文进控制台日志。只用于日志路径，不碰下单逻辑与取证结构。
+def _mask_name(n):
+    """单个姓名打码（与 launcher._mask_one_name 同口径）：保留首字其余打码。"""
+    n = (n or "").strip()
+    if not n:
+        return ""
+    return n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*"
+
+
+def _mask_scalar(value):
+    """单个标量值脱敏（与 probe_login._mask_scalar 同口径）：有值记为 ***。"""
+    return "***" if value else value
+
+
+def _mask_ticket_names(tickets):
+    """limit_tickets 取证 JSON：只脱敏 name 字段，席别/票种等结构保留。"""
+    out = []
+    for t in tickets or []:
+        t = dict(t)
+        if t.get("name"):
+            t["name"] = _mask_name(t["name"])
+        out.append(t)
+    return out
+
+
+def _mask_text_names(text, names):
+    """自由文本里的已知姓名替换为脱敏形（核对窗原文取证用）。"""
+    for n in sorted((n for n in names or [] if n), key=len, reverse=True):
+        text = (text or "").replace(n, _mask_name(n))
+    return text
+
+
 # 同一时刻只允许一个浏览器实例占用 profile。Playwright 的持久化 profile 是独占的：
 # 引擎会话体检 / 弹窗刷新 / 侧边栏刷新 / 重新登录 并发时会互相把对方挤掉，
 # 症状是浏览器 exitCode=21 启动即退、报 "browser has been closed"。
@@ -512,7 +545,7 @@ def login(timeout_sec=300, stop_event=None):
                     break
         if ok:
             save_state(ctx)
-            _log("[成功] 已登录：%s" % who)
+            _log("[成功] 已登录：%s" % _mask_scalar(who))
             _log("[提示] 会话已保存到 %s，之后无需重复登录。" % STATE_PATH)
             ctx.close()
             return True
@@ -730,9 +763,12 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
         t_last[0] = now
 
     if warm is not None and not warm.usable():
-        # 预热现场已失效（页面被关 / 跨了线程），先释放它占着的锁再冷启动
+        # Task 101g：已在 @_exclusive 锁内——不能调完整 close()（会释放装饰器
+        # 仍需要的 profile/线程锁并清零 depth，本次下单后半程失去互斥）。
+        # 预热等待拿锁期间现场失效（页面被关等）的亚毫秒竞速走这里：只关浏览器
+        # 资源，锁的释放留给外层调用方的 finally 做完整 close()。
         try:
-            warm.close()
+            warm.close(release_locks=False)
         except Exception:
             pass
         warm = None
@@ -757,7 +793,7 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     return (False,
                             "浏览器会话不可用（%s）。请先运行：python browser_order.py login" % who,
                             None)
-                _log("  [浏览器] 会话有效：%s" % who)
+                _log("  [浏览器] 会话有效：%s" % _mask_scalar(who))
             else:
                 # Task 95：会话有效性已在 order_via_browser（锁外）复验，
                 # 这里跳过的是开窗口与完整导航（warm.refresh 只做一次重查）。
@@ -898,7 +934,7 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 return (False,
                         "乘车人 %s 勾选未生效（可能未核验/证件过期）。已中止，未提交订单"
                         % "、".join(bad_names), None)
-            _log("  [浏览器] 乘车人：%s" % "、".join(picked))
+            _log("  [浏览器] 乘车人：%s" % "、".join(_mask_name(n) for n in picked))
             mark("passenger")
 
             if alias_name:
@@ -965,7 +1001,7 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 """() => (window.limit_tickets || []).map(t => ({
                      name: t.name, seat: t.seat_type, ticket_type: t.ticket_type
                    }))""")
-            _log("  [浏览器] 内部状态 limit_tickets = %s" % json.dumps(tickets, ensure_ascii=False))
+            _log("  [浏览器] 内部状态 limit_tickets = %s" % json.dumps(_mask_ticket_names(tickets), ensure_ascii=False))
             seats_now = [t.get("seat") for t in tickets]
             if seats_now:
                 if any(s != seat_code for s in seats_now):
@@ -1133,7 +1169,7 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     except Exception:
                         dlg_text = ""
                     if dlg_text:
-                        _log("  [浏览器] 核对窗原文：%s" % dlg_text)
+                        _log("  [浏览器] 核对窗原文：%s" % _mask_text_names(dlg_text, picked))
                         # Task 70c：记录核对窗显示的席别（取证）。此前 dlg_seat
                         # 从未被赋值，结果页的席别警告与 extra["seat_in_dialog"]
                         # 是死代码；现在正确赋值。
@@ -1500,21 +1536,30 @@ class WarmSession:
         """重新导航到列表页并查询：下单前取最新余票 / 失败后回到列表页。"""
         _goto_and_query(self._page, info, self.date, want_hit=True, timeout=20000)
 
-    def close(self):
-        if self._closed:
+    def close(self, release_locks=True):
+        """关闭预热现场。
+
+        release_locks=False：只关闭浏览器资源（ctx/page），不释放 profile/线程锁、
+        不碰 depth——供已在 @_exclusive 锁内的调用点（_order_impl 的 stale-warm
+        处理，Task 101g）使用：完整 close() 会释放装饰器仍需要的互斥并清零 depth，
+        本次下单后半程失去 profile 互斥。锁的释放留给外层调用方的 finally
+        做完整 close()（launcher 抢票主循环的 finally 即如此）。
+        """
+        if not self._closed:
+            self._closed = True
+            try:
+                if self._ctx is not None:
+                    save_state(self._ctx)
+                    self._ctx.close()
+            except Exception:
+                pass
+            try:
+                if self._p is not None:
+                    self._p.stop()
+            except Exception:
+                pass
+        if not release_locks:
             return
-        self._closed = True
-        try:
-            if self._ctx is not None:
-                save_state(self._ctx)
-                self._ctx.close()
-        except Exception:
-            pass
-        try:
-            if self._p is not None:
-                self._p.stop()
-        except Exception:
-            pass
         # Task 85d：owner-aware——无论哪条线程执行 close()，都清理 owner 线程
         # 的 depth 记录。跨线程 close 后 owner 的 depth 若残留 1，其后续
         # exclusive() 会走重入捷径跳过跨进程文件锁（P2）。owner 存活且仍持有

@@ -1576,7 +1576,14 @@ class TestConfigKeys(TempDirCase):
         code_keys = (self._scan(r"(?<![\w.])config\.get\(\s*['\"](\w+)[\"']")
                      | self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']", others)
                      | self._scan(r"self\.config\.get\(\s*['\"](\w+)[\"']")
-                     | self._scan(r"(?<![\w.])config\[['\"](\w+)[\"']"))
+                     | self._scan(r"(?<![\w.])config\[['\"](\w+)[\"']")
+                     # Task 101c：补 2 类漏报形态——json.load(f).get("k")
+                     # （capture_session 读 config.json）、config/cfg.setdefault("k"）
+                     # （读兼写，键仍须文档化）
+                     | self._scan(r"json\.load\(\w+\)\.get\(\s*['\"](\w+)[\"']")
+                     | self._scan(r"(?<![\w.])config\.setdefault\(\s*['\"](\w+)[\"']")
+                     | self._scan(r"(?<![\w.])cfg\.setdefault\(\s*['\"](\w+)[\"']",
+                                   others))
         self.assertTrue(code_keys <= config_keys.CONFIG_KEYS,
                         sorted(code_keys - config_keys.CONFIG_KEYS))
         self.assertTrue(config_keys.CONFIG_KEYS <= set(live),
@@ -1590,7 +1597,11 @@ class TestConfigKeys(TempDirCase):
         import config_keys
         reads = (self._scan(r"(?<![\w.])email\.get\(\s*['\"](\w+)[\"']")
                  | self._scan(r"(?<![\w.])email\[['\"](\w+)[\"']")
-                 | self._scan(r"self\.email\.get\(\s*['\"](\w+)[\"']"))
+                 | self._scan(r"self\.email\.get\(\s*['\"](\w+)[\"']")
+                 # Task 101c：notify.email 子字典的别名变量（engine.py email_cfg /
+                 # launcher.py nc），读的仍是 email 叶键
+                 | self._scan(r"(?<![\w.])email_cfg\.get\(\s*['\"](\w+)[\"']")
+                 | self._scan(r"(?<![\w.])nc\.get\(\s*['\"](\w+)[\"']"))
         # notify.py 内 send_email/_safe_port 的 cfg 形参即 email 字典；
         # __main__ 块的 cfg["notify"] 读的是顶层 config，需排除。
         notify_cfg = (self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']", ["notify.py"])
@@ -1615,12 +1626,46 @@ class TestConfigKeys(TempDirCase):
             os.unlink(path)
         self.assertEqual(found, {"ghost_key"})
 
+    def test_scan_catches_task101_shapes(self):
+        # Task 101c：5 类曾漏报的形态必须被新正则扫到（合成固件）。
+        import tempfile
+        src = ('a = email_cfg.get("ghost_a")\n'
+               'b = nc.get("ghost_b")\n'
+               'c = json.load(f).get("ghost_c")\n'
+               'd = config.setdefault("ghost_d", {})\n'
+               'e = lc["ghost_e"]\n'
+               'f = self.lc["ghost_f"]\n')
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                          delete=False) as f:
+            f.write(src)
+            path = f.name
+        try:
+            s = self._scan
+            self.assertEqual(s(r"(?<![\w.])email_cfg\.get\(\s*['\"](\w+)[\"']",
+                              [path]), {"ghost_a"})
+            self.assertEqual(s(r"(?<![\w.])nc\.get\(\s*['\"](\w+)[\"']",
+                              [path]), {"ghost_b"})
+            self.assertEqual(s(r"json\.load\(\w+\)\.get\(\s*['\"](\w+)[\"']",
+                              [path]), {"ghost_c"})
+            self.assertEqual(s(r"(?<![\w.])config\.setdefault\(\s*['\"](\w+)[\"']",
+                              [path]), {"ghost_d"})
+            self.assertEqual(s(r"(?<![\w.])lc\[['\"](\w+)[\"']", [path]),
+                             {"ghost_e"})
+            self.assertEqual(s(r"self\.lc\[['\"](\w+)[\"']", [path]),
+                             {"ghost_f"})
+        finally:
+            os.unlink(path)
+
     def test_launcher_example_covers_code_reads(self):
         import config_keys
         live = json.load(open(os.path.join(HERE, "launcher_config.example.json"),
                               encoding="utf-8"))
         code_keys = (self._scan(r"(?<![\w.])lc\.get\(\s*['\"](\w+)[\"']")
-                     | self._scan(r"(?<![\w.])self\.lc\.get\(\s*['\"](\w+)[\"']"))
+                     | self._scan(r"(?<![\w.])self\.lc\.get\(\s*['\"](\w+)[\"']")
+                     # Task 101c：lc["k"] / self.lc["k"] 下标形态（含写入点；
+                     # 写进去的键同样必须文档化，故一并纳入）
+                     | self._scan(r"(?<![\w.])lc\[['\"](\w+)[\"']")
+                     | self._scan(r"self\.lc\[['\"](\w+)[\"']"))
         allowed = config_keys.LAUNCHER_CONFIG_KEYS | config_keys.LAUNCHER_TASK_EXTRA_KEYS
         self.assertTrue(code_keys <= allowed,
                         sorted(code_keys - allowed))
@@ -10430,6 +10475,195 @@ class TestTask100NotifyPassengersP3(TempDirCase):
         self.assertEqual(pax_mod.unprotect_secret("legacy"), "legacy")
         self.assertEqual(pax_mod.unprotect_secret(""), "")
         self.assertEqual(pax_mod.unprotect_secret(None), "")
+
+
+class TestTask101CrossModuleP3(TempDirCase):
+    """Task 101：跨模块 P3 bundle（8 子项）——每项改前精确失败、改后通过。"""
+
+    # ---- (a) save_station_kinds 并发写：tmp 文件名必须带线程后缀 ----
+    def test_a_tmp_unique_per_thread(self):
+        import launcher
+        real_path = launcher.STATION_KIND_PATH
+        real_kinds = launcher._station_kinds
+        launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
+        launcher._station_kinds = {"AAA": "高铁"}
+        self.addCleanup(setattr, launcher, "STATION_KIND_PATH", real_path)
+        self.addCleanup(setattr, launcher, "_station_kinds", real_kinds)
+        srcs = []
+        with mock.patch("os.replace") as m_replace:
+            m_replace.side_effect = lambda s, d: srcs.append(s)
+            ts = [threading.Thread(target=launcher.save_station_kinds)
+                  for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(len(srcs), 2)
+        self.assertEqual(
+            len(set(srcs)), 2,
+            "两线程复用同一 tmp 路径，并发写会交错损坏：%r" % (srcs,))
+
+    # ---- (b) get_station_index：加载失败不永久缓存，下次重试；日志文案属实 ----
+    def test_b_failed_load_not_cached(self):
+        import launcher
+        launcher._STATION_INDEX = None
+        self.addCleanup(setattr, launcher, "_STATION_INDEX", None)
+        with mock.patch.object(ticket, "load_station_index",
+                               side_effect=RuntimeError("net down")) as m_load:
+            with mock.patch.object(launcher, "log") as m_log:
+                self.assertEqual(launcher.get_station_index(), [])
+                self.assertEqual(launcher.get_station_index(), [])
+        self.assertEqual(m_load.call_count, 2, "加载失败被永久缓存，网络恢复后仍无结果")
+        self.assertIsNone(launcher._STATION_INDEX)
+        logged = " ".join(str(c) for c in m_log.call_args_list)
+        self.assertNotIn("只按站名匹配", logged, "失败时索引为空，'只按站名匹配'不属实")
+
+    def test_b_success_still_cached(self):
+        import launcher
+        launcher._STATION_INDEX = None
+        self.addCleanup(setattr, launcher, "_STATION_INDEX", None)
+        st = [{"name": "北京", "code": "BJP", "py": "beijing", "spy": "bj"}]
+        with mock.patch.object(ticket, "load_station_index",
+                               return_value=st) as m_load:
+            with mock.patch.object(launcher, "log"):
+                self.assertEqual(launcher.get_station_index(), st)
+                self.assertEqual(launcher.get_station_index(), st)
+        self.assertEqual(m_load.call_count, 1)
+
+    # ---- (d) 未知席别码 warn-once 去重 ----
+    def _isolate_seen_codes(self):
+        seen_before = set(ticket._SEEN_UNKNOWN_SEAT_CODES)
+
+        def _restore():
+            ticket._SEEN_UNKNOWN_SEAT_CODES.clear()
+            ticket._SEEN_UNKNOWN_SEAT_CODES.update(seen_before)
+        self.addCleanup(_restore)
+        ticket._SEEN_UNKNOWN_SEAT_CODES.clear()
+
+    def test_d_unknown_seat_code_warn_once(self):
+        self._isolate_seen_codes()
+        with mock.patch.object(ticket.LOG, "warning") as mw:
+            ticket._split_seat_codes("Q")
+        self.assertEqual(mw.call_count, 1)
+        with mock.patch.object(ticket.LOG, "warning") as mw2:
+            ticket._split_seat_codes("Q")
+        self.assertEqual(mw2.call_count, 0, "未知席别码每轮重复打 warning，日志刷屏")
+
+    def test_d_known_codes_no_warning(self):
+        self._isolate_seen_codes()
+        with mock.patch.object(ticket.LOG, "warning") as mw:
+            names = ticket._split_seat_codes("OQ")
+        mw.assert_called_once()  # 只有 Q 触发一次
+        self.assertIn("二等座", names)
+
+    # ---- (e) 点名乘车人零命中/部分命中：记 warning，不静默回退 ----
+    def test_e_partial_match_warns_names_missing(self):
+        allp = [{"name": "张三", "is_adult": True, "id_no": "1"},
+                {"name": "李四", "is_adult": True, "id_no": "2"}]
+        with mock.patch.object(order_mod.LOG, "warning") as mw:
+            picked = order_mod.select_passengers(allp, ["张三", "王五"])
+        self.assertEqual([p["name"] for p in picked], ["张三"])
+        self.assertTrue(mw.called, "部分命中静默回退，未告警")
+        self.assertIn("王五", str(mw.call_args), "警告必须点名未命中的乘车人")
+
+    def test_e_zero_match_warns_and_falls_back(self):
+        allp = [{"name": "张三", "is_adult": True, "id_no": "1"}]
+        with mock.patch.object(order_mod.LOG, "warning") as mw:
+            picked = order_mod.select_passengers(allp, ["王五"])
+        self.assertEqual([p["name"] for p in picked], ["张三"])  # 回退全体成人
+        self.assertTrue(mw.called, "零命中静默回退全体成人，未告警")
+        self.assertIn("王五", str(mw.call_args))
+
+    def test_e_full_match_no_warning(self):
+        allp = [{"name": "张三", "is_adult": True, "id_no": "1"}]
+        with mock.patch.object(order_mod.LOG, "warning") as mw:
+            picked = order_mod.select_passengers(allp, ["张三"])
+        self.assertEqual([p["name"] for p in picked], ["张三"])
+        mw.assert_not_called()
+
+    # ---- (f) gui 非 dict state：友好处理，不打不开对话框 ----
+    def test_f_nondict_state_safe(self):
+        with mock.patch.object(gui, "load_state", return_value=[]):
+            with mock.patch.object(gui.LOG, "warning") as mw:
+                self.assertEqual(gui._state_tasks_dict(), {})
+        self.assertTrue(mw.called, "非 dict state 应记警告")
+
+    def test_f_nondict_tasks_section_safe(self):
+        with mock.patch.object(gui, "load_state",
+                               return_value={"tasks": ["x"]}):
+            with mock.patch.object(gui.LOG, "warning"):
+                self.assertEqual(gui._state_tasks_dict(), {})
+
+    def test_f_dict_state_passthrough(self):
+        st = {"tasks": {"t1": {"status": "paused"}}}
+        with mock.patch.object(gui, "load_state", return_value=st):
+            self.assertEqual(gui._state_tasks_dict(), {"t1": {"status": "paused"}})
+
+    # ---- (g) 锁内 stale-warm 关闭：不释放装饰器持有的锁 ----
+    def _fake_warm(self):
+        import browser_order as bo
+        ws = bo.WarmSession.__new__(bo.WarmSession)
+        ws._closed = False
+        ws._ctx = mock.Mock()
+        ws._p = mock.Mock()
+        ws._file_locked = True
+        ws._local_locked = True
+        ws._owner = threading.get_ident()
+        ws._owner_thread = threading.current_thread()
+        return ws
+
+    def test_g_close_keep_locks(self):
+        import browser_order as bo
+        ws = self._fake_warm()
+        with mock.patch("browser_order._PROFILE_LOCK") as m_pl, \
+                mock.patch("browser_order._BROWSER_LOCK") as m_bl:
+            ws.close(release_locks=False)
+        ws._ctx.close.assert_called_once()  # 浏览器资源照关
+        ws._p.stop.assert_called_once()
+        self.assertTrue(ws._file_locked, "锁标记不应被清除")
+        self.assertTrue(ws._local_locked, "锁标记不应被清除")
+        m_pl.release.assert_not_called()
+        m_bl.release.assert_not_called()
+
+    def test_g_full_close_still_releases(self):
+        import browser_order as bo
+        ws = self._fake_warm()
+        with mock.patch("browser_order._PROFILE_LOCK") as m_pl, \
+                mock.patch("browser_order._BROWSER_LOCK") as m_bl, \
+                mock.patch("browser_order._get_depth", return_value=1), \
+                mock.patch("browser_order._set_depth") as m_sd:
+            ws.close()
+        m_pl.release.assert_called_once()
+        m_bl.release.assert_called_once()
+        m_sd.assert_called_with(0, ws._owner_thread)
+        self.assertFalse(ws._file_locked)
+        self.assertFalse(ws._local_locked)
+
+    # ---- (h) browser_order._log PII 脱敏 ----
+    def test_h_mask_helpers(self):
+        import browser_order as bo
+        self.assertEqual(bo._mask_name("张三"), "张*")
+        self.assertEqual(bo._mask_name("李"), "*")
+        self.assertEqual(bo._mask_name(""), "")
+        self.assertEqual(bo._mask_scalar("zhangsan"), "***")
+        self.assertEqual(bo._mask_scalar(""), "")
+        self.assertIsNone(bo._mask_scalar(None))
+
+    def test_h_mask_ticket_names(self):
+        import browser_order as bo
+        tickets = [{"name": "张三", "seat": "O", "ticket_type": "1"},
+                   {"name": "李四", "seat": "M", "ticket_type": "1"}]
+        masked = bo._mask_ticket_names(tickets)
+        self.assertEqual([t["name"] for t in masked], ["张*", "李*"])
+        self.assertEqual([t["seat"] for t in masked], ["O", "M"])  # 非 PII 保留
+        self.assertEqual(tickets[0]["name"], "张三")  # 不污染原数据
+
+    def test_h_mask_text_names(self):
+        import browser_order as bo
+        out = bo._mask_text_names("乘车人：张三，李四", ["张三", "李四"])
+        self.assertNotIn("张三", out)
+        self.assertNotIn("李四", out)
+        self.assertIn("张*", out)
 
 
 if __name__ == "__main__":

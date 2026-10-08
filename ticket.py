@@ -647,12 +647,16 @@ def train_seat_kind(train_code):
     return c[0] if c[:1] in ("G", "D", "C") else "普速"
 
 
+# Task 101d：未知席别码 warn-once 去重（12306 新增席别码时 7×24 轮询不再刷屏）
+_SEEN_UNKNOWN_SEAT_CODES = set()
+
+
 def _split_seat_codes(codes):
     """p35 席别码串 → 席别名列表（按码表 longest-match 解析）。
 
     官方码表含多字符码（如 "WZ"）；逐字符遍历在官方新增多字符码时会错位
     （"WZ" 只是碰巧对：'W'→无座、'Z' 被静默跳过）。未知码记 warning 后
-    跳过一位，不静默。"""
+    跳过一位，不静默；同一未知码只告警一次（Task 101d）。"""
     s = str(codes or "").upper()
     names = []
     keys = sorted(SEAT_CODE_NAMES_ALL, key=len, reverse=True)
@@ -666,7 +670,9 @@ def _split_seat_codes(codes):
                 i += len(k)
                 break
         else:
-            LOG.warning("[余票] 未知席别码 %r（码串 %r），已跳过", s[i:i + 4], s)
+            if s[i] not in _SEEN_UNKNOWN_SEAT_CODES:
+                _SEEN_UNKNOWN_SEAT_CODES.add(s[i])
+                LOG.warning("[余票] 未知席别码 %r（码串 %r），已跳过", s[i:i + 4], s)
             i += 1
     return names
 
