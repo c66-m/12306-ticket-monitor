@@ -1636,6 +1636,23 @@ class QuickMonitorDialog(tk.Toplevel):
 
 # ----------------------------- 乘车人管理 -----------------------------
 
+def _save_passengers_or_warn(passengers, parent):
+    """保存乘车人；磁盘盒子不可解密被拒写时弹 error 提示并返回 False。
+
+    Task 80(b)：save_passengers 的拒写（return False）原来三处裸调无人处理，
+    GUI 会显示"完成"/刷新列表，但磁盘未写，重启后修改丢失。此处失败弹
+    error（与 save_passengers 内的 LOG.error 口径一致），调用方不再显示
+    "完成"、不再刷新列表。"""
+    if passengers_mod.save_passengers(passengers):
+        return True
+    messagebox.showerror("保存失败",
+                         "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
+                         "已拒绝覆盖以保护原数据。\n"
+                         "请在原机器解密后迁移，或使用 --force 放弃旧数据。",
+                         parent=parent)
+    return False
+
+
 class PassengerDialog(tk.Toplevel):
     def __init__(self, master, on_changed=None):
         super().__init__(master)
@@ -1731,7 +1748,8 @@ class PassengerDialog(tk.Toplevel):
                 self.passengers.append(data)
             else:
                 self.passengers[index].update(data)
-            passengers_mod.save_passengers(self.passengers)
+            if not _save_passengers_or_warn(self.passengers, dlg):
+                return
             self.refresh()
             if self.on_changed:
                 self.on_changed()
@@ -1750,7 +1768,8 @@ class PassengerDialog(tk.Toplevel):
         if messagebox.askyesno("确认", "确定删除乘车人「%s」？" % self.passengers[idx].get("name"),
                                parent=self):
             del self.passengers[idx]
-            passengers_mod.save_passengers(self.passengers)
+            if not _save_passengers_or_warn(self.passengers, self):
+                return
             self.refresh()
 
     def set_default(self):
@@ -1761,7 +1780,8 @@ class PassengerDialog(tk.Toplevel):
         for p in self.passengers:
             p["is_default"] = False
         self.passengers[idx]["is_default"] = True
-        passengers_mod.save_passengers(self.passengers)
+        if not _save_passengers_or_warn(self.passengers, self):
+            return
         self.refresh()
         messagebox.showinfo("完成", "已将「%s」设为默认乘车人" % self.passengers[idx].get("name"),
                             parent=self)

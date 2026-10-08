@@ -141,6 +141,29 @@ def _dpapi_unprotect(blob):
 _DPAPI_PREFIX = "dpapi1:"
 
 
+def _looks_like_encrypted_blob(text):
+    """启发式：text 是否像 protect_secret 加密分支产出的值。
+
+    加密分支只产出 "dpapi1:" + 标准 base64（b64encode），故哨兵后为
+    严格 base64 时视为已加密（原样返回，避免二次包裹）。
+    字面以哨兵开头、但其后非 base64 的，不可能是加密输出 → 一定是
+    与哨兵字面冲突的明文（Task 80d），走加密分支把它真正加密，
+    unprotect 解密后可完整还原。
+    残留（已文档化，概率可忽略）：字面 "dpapi1:"+严格 base64 的明文
+    仍会被当成密文；其读取失败走 SecretDecryptError 诚实报错，不静默错密。
+    """
+    if not text.startswith(_DPAPI_PREFIX):
+        return False
+    rest = text[len(_DPAPI_PREFIX):]
+    if not rest:
+        return False
+    try:
+        base64.b64decode(rest.encode("ascii"), validate=True)
+        return True
+    except Exception:
+        return False
+
+
 class SecretDecryptError(Exception):
     """敏感串解密失败：数据损坏，或密文属于其他 Windows 用户。"""
 
@@ -150,8 +173,10 @@ def protect_secret(text):
 
     返回带 "dpapi1:" 前缀的密文；非 Windows / 加密失败时原样返回明文
     （保持向后兼容）并记 error 日志显式告警——不再静默降级。
-    已加密的原样返回，避免二次包裹。"""
-    if not text or text.startswith(_DPAPI_PREFIX):
+    已加密的原样返回，避免二次包裹（Task 80d：用"哨兵+严格 base64"
+    的结构启发式识别已加密值；字面冲突的明文会被真正加密，可还原）。
+    """
+    if not text or _looks_like_encrypted_blob(text):
         return text
     try:
         blob = _dpapi_protect(text.encode("utf-8"))
@@ -304,8 +329,11 @@ def _encrypt(payload_text):
     fernet, key_path = _get_fernet(create=True)
     if fernet is not None:
         return "fernet", fernet.encrypt(raw).decode("ascii")
-    print("[警告] 未找到可用加密组件（非 Windows 且未安装 cryptography）。")
-    print("        乘车人信息将以【明文】保存到 passengers.json，请勿在公共电脑上使用。")
+    # Task 80(c)：明文回退不再 print（Task 63 reviewer 已确认 print 在 GUI 下
+    # 直接消失）——改记 error 日志（三路可见：控制台/文件/GUI 日志面板），
+    # 明确告知用户"未加密保存"。
+    LOG.error("[安全] 未找到可用加密组件（非 Windows 且未安装 cryptography）。"
+              "乘车人信息将以【明文】保存，请勿在公共电脑上使用。")
     return "none", payload_text
 
 

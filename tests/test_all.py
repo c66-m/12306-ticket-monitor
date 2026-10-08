@@ -1549,10 +1549,17 @@ class TestAppCommon(TempDirCase):
 class TestConfigKeys(TempDirCase):
     """配置键防漂移：代码读取的键必须都在 example 模板里文档化。"""
 
-    def _scan(self, pattern):
+    # 产品代码文件全集（Task 80a：旧版只扫 6 个文件，有盲区）。
+    # 测试文件本身不扫，避免测试固件里的字符串污染扫描。
+    _PRODUCT_FILES = ["appcommon.py", "browser_order.py", "capture_session.py",
+                      "config_keys.py", "engine.py", "filelock.py", "gui.py",
+                      "launcher.py", "logutil.py", "monitor.py", "notify.py",
+                      "order.py", "passengers.py", "probe_login.py",
+                      "station_db.py", "ticket.py"]
+
+    def _scan(self, pattern, files=None):
         keys = set()
-        for f in ["launcher.py", "gui.py", "engine.py", "order.py",
-                  "browser_order.py", "monitor.py"]:
+        for f in files or self._PRODUCT_FILES:
             for m in re.finditer(pattern, open(f, encoding="utf-8").read()):
                 keys.add(m.group(1))
         return keys
@@ -1561,14 +1568,51 @@ class TestConfigKeys(TempDirCase):
         import config_keys
         live = json.load(open(os.path.join(HERE, "config.example.json"),
                               encoding="utf-8"))
+        # Task 80a：补 self.config.get( 与 config["x"] 下标形态；
+        # cfg.get( 在 notify.py 里读的是 email 字典而非顶层 config，
+        # 故顶层断言排除 notify.py（email 键由下面的反向断言覆盖）。
+        others = [f for f in self._PRODUCT_FILES if f != "notify.py"]
         code_keys = (self._scan(r"(?<![\w.])config\.get\(\s*['\"](\w+)[\"']")
-                     | self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']"))
+                     | self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']", others)
+                     | self._scan(r"self\.config\.get\(\s*['\"](\w+)[\"']")
+                     | self._scan(r"(?<![\w.])config\[['\"](\w+)[\"']"))
         self.assertTrue(code_keys <= config_keys.CONFIG_KEYS,
                         sorted(code_keys - config_keys.CONFIG_KEYS))
         self.assertTrue(config_keys.CONFIG_KEYS <= set(live),
                         sorted(config_keys.CONFIG_KEYS - set(live)))
         email = live.get("notify", {}).get("email", {})
         self.assertTrue(config_keys.NOTIFY_EMAIL_KEYS <= set(email))
+
+    def test_notify_email_keys_covers_code_reads(self):
+        # Task 80a 新增反向断言：代码实际读取的 email 键 ⊆ NOTIFY_EMAIL_KEYS。
+        # 旧版只有"集合 ⊆ 模板"方向，代码新增读取键时不报警。
+        import config_keys
+        reads = (self._scan(r"(?<![\w.])email\.get\(\s*['\"](\w+)[\"']")
+                 | self._scan(r"(?<![\w.])email\[['\"](\w+)[\"']")
+                 | self._scan(r"self\.email\.get\(\s*['\"](\w+)[\"']"))
+        # notify.py 内 send_email/_safe_port 的 cfg 形参即 email 字典；
+        # __main__ 块的 cfg["notify"] 读的是顶层 config，需排除。
+        notify_cfg = (self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']", ["notify.py"])
+                      | {k for k in self._scan(r"(?<![\w.])cfg\[['\"](\w+)[\"']",
+                                               ["notify.py"])
+                         if k != "notify"})
+        reads |= notify_cfg
+        self.assertTrue(reads <= config_keys.NOTIFY_EMAIL_KEYS,
+                        sorted(reads - config_keys.NOTIFY_EMAIL_KEYS))
+
+    def test_scan_catches_subscript_shape(self):
+        # 合成固件：下标形态 config["x"] 必须被扫描到（旧 _scan 只有
+        # config.get(/cfg.get( 两种形态，会漏掉它）。
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                          delete=False) as f:
+            f.write('x = config["ghost_key"]\n')
+            path = f.name
+        try:
+            found = self._scan(r"(?<![\w.])config\[['\"](\w+)[\"']", [path])
+        finally:
+            os.unlink(path)
+        self.assertEqual(found, {"ghost_key"})
 
     def test_launcher_example_covers_code_reads(self):
         import config_keys
@@ -7719,6 +7763,82 @@ class TestTask77Order(unittest.TestCase):
         # 旧代码：打印完整订单号原文
         self.assertNotIn("E1234567890", out)
         self.assertIn("E123****7890", out)
+
+
+class TestTask80GuiPassengersSave(TempDirCase):
+    """Task 80(b)：save_passengers 拒写（return False）必须被 GUI 处理。
+
+    旧代码三处裸调：磁盘盒子不可解密时显示"完成"/刷新列表，但磁盘未写，
+    重启后修改丢失。helper 失败时弹 error（与 LOG.error 口径一致）。"""
+
+    def test_save_failure_shows_error_not_done(self):
+        with mock.patch.object(gui.passengers_mod, "save_passengers",
+                               return_value=False), \
+             mock.patch.object(gui, "messagebox") as mb:
+            ok = gui._save_passengers_or_warn([], parent=None)
+        self.assertFalse(ok)
+        mb.showerror.assert_called_once()
+        # 绝不能弹"完成"
+        mb.showinfo.assert_not_called()
+
+    def test_save_success_no_popup(self):
+        with mock.patch.object(gui.passengers_mod, "save_passengers",
+                               return_value=True), \
+             mock.patch.object(gui, "messagebox") as mb:
+            ok = gui._save_passengers_or_warn([], parent=None)
+        self.assertTrue(ok)
+        mb.showerror.assert_not_called()
+        mb.showinfo.assert_not_called()
+
+
+class TestTask80PassengersCrypto(TempDirCase):
+    """Task 80(c)(d)：passengers 加密回退与哨兵。"""
+
+    # ---- (c) cryptography 缺失的明文回退必须记 error（三路可见），不再 print ----
+
+    def test_encrypt_no_crypto_fallback_logs_error(self):
+        # 旧代码此处 print（GUI 下直接消失），用户无感知地明文保存证件号/手机号
+        with mock.patch.object(pax_mod, "_is_windows", return_value=False), \
+             mock.patch.object(pax_mod, "_get_fernet",
+                               return_value=(None, None)), \
+             self.assertLogs("monitor", level="ERROR") as cm:
+            enc, data = pax_mod._encrypt('{"a": 1}')
+        self.assertEqual(enc, "none")
+        self.assertEqual(data, '{"a": 1}')
+        self.assertTrue(any("明文" in m for m in cm.output),
+                        "明文回退必须记 error 日志（三路可见）：%s" % cm.output)
+
+    # ---- (d) dpapi1: 哨兵冲突：字面以哨兵开头的明文必须被真正加密 ----
+
+    def test_protect_secret_colliding_prefix_gets_encrypted(self):
+        # 旧代码：text.startswith("dpapi1:") 直接原样返回，明文存盘后
+        # unprotect 误判为密文 → SecretDecryptError。必须真正加密并可还原。
+        fake_blob = lambda b: b"ENCRYPTED:" + b
+        with mock.patch.object(pax_mod, "_dpapi_protect",
+                               side_effect=fake_blob):
+            enc = pax_mod.protect_secret("dpapi1:my-password")
+        self.assertTrue(enc.startswith("dpapi1:"))
+        self.assertNotEqual(enc, "dpapi1:my-password")  # 旧代码此处直接返回原文
+        # 加密输出可被 unprotect 完整还原
+        with mock.patch.object(pax_mod, "_dpapi_unprotect",
+                               side_effect=lambda b: b[len(b"ENCRYPTED:"):]):
+            self.assertEqual(pax_mod.unprotect_secret(enc), "dpapi1:my-password")
+
+    def test_protect_secret_encrypted_value_passthrough(self):
+        # 真密文（哨兵 + 合法 base64）必须原样返回，避免二次包裹
+        blob = "dpapi1:" + __import__("base64").b64encode(b"ENCRYPTED:x").decode()
+        with mock.patch.object(pax_mod, "_dpapi_protect",
+                               side_effect=AssertionError("must not re-encrypt")):
+            self.assertEqual(pax_mod.protect_secret(blob), blob)
+
+    def test_protect_secret_base64_collision_residual(self):
+        # 残留（已文档化）：字面 "dpapi1:"+严格 base64 的明文仍会被当成密文；
+        # 读取失败必须诚实抛 SecretDecryptError，不静默错密。
+        self.assertEqual(pax_mod.protect_secret("dpapi1:QUJD"), "dpapi1:QUJD")
+        with mock.patch.object(pax_mod, "_dpapi_unprotect",
+                               side_effect=RuntimeError("not our blob")):
+            with self.assertRaises(pax_mod.SecretDecryptError):
+                pax_mod.unprotect_secret("dpapi1:QUJD")
 
 
 if __name__ == "__main__":
