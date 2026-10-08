@@ -344,7 +344,14 @@ def menu_create_task():
     base_name = "{0}-{1} {2} {3}".format(from_name, to_name,
                                          "/".join(trains) if trains else "全部车次",
                                          "/".join(seat_types))
-    task_name = read("  任务名称（回车=自动生成）：", base_name) or base_name
+    task_name = read("  任务名称（回车=自动生成）：", base_name)
+    if task_name is None:
+        # Ctrl+C/EOF：取消创建任务，不落盘
+        #（旧代码 `read(...) or base_name` 把 None 当回车消化，
+        #  静默建出自动名任务并落盘，Task 83）。
+        print("\n  已取消创建任务。")
+        return
+    task_name = task_name or base_name  # 回车=自动生成（read 默认值本就是 base_name，此处兜底）
 
     task = {
         "name": task_name,
@@ -407,9 +414,24 @@ def menu_task_list():
         status = eng.task_status(t)
         dates_disp = (dates[0] + ("..." if len(dates) > 1 else "")) \
             if dates else "（未配置日期）"
+        # 发/到站非字符串（手改 config.json）：记警告后用占位显示，
+        # 不让 (t["from"] + "-" + t["to"]) 的 TypeError 崩掉菜单（Task 83）。
+        from_name = t.get("from")
+        to_name = t.get("to")
+        if not isinstance(from_name, str) or not isinstance(to_name, str):
+            print("  [警告] 第 {0} 个任务的发/到站字段非字符串"
+                  "（配置损坏），已用占位显示。".format(i))
+            route = "（配置损坏）"
+        else:
+            route = (from_name + "-" + to_name)[:14]
+        name_disp = t.get("name")
+        if not isinstance(name_disp, str):
+            # 同行同类崩溃防护：name 非 str（如手改成数字）时 (name or "")[:26]
+            # 同样 TypeError；静默转空串（原 None 行为不变），不崩菜单。
+            name_disp = ""
         print("  {0:<3}{1:<26}{2:<14}{3:<20}{4:<14}{5:<14}{6:<8}{7}".format(
-            i, (t.get("name") or "")[:26],
-            (t["from"] + "-" + t["to"])[:14],
+            i, name_disp[:26],
+            route,
             dates_disp[:20],
             ("/".join(t.get("trains") or []) or "全部")[:14],
             ("/".join(t.get("seat_types") or []))[:14],
@@ -512,6 +534,11 @@ def menu_passengers():
                 if p.get("mobile") else "未填"))
         print("  1. 添加乘车人   2. 编辑   3. 删除   4. 设为默认乘车人   0. 返回")
         op = read("  选择操作：", "")
+        if op is None:
+            # stdin EOF/中断：打印提示并退出该菜单，不紧循环重打菜单
+            #（旧代码 None 不匹配任何分支 → 死循环刷屏，Task 83）。
+            print("\n  检测到输入结束，已退出乘车人管理。")
+            return
         if op == "0" or op == "":
             return
         if op == "1":
@@ -541,8 +568,10 @@ def menu_passengers():
         elif op == "2":
             raw = read("  编辑第几位：", "")
             if raw is None:
-                # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
-                raise KeyboardInterrupt
+                # Ctrl+C/EOF：取消本次操作，回到乘车人管理菜单
+                #（与 op1 口径统一；旧代码 raise KeyboardInterrupt 回主菜单，Task 83）。
+                print("  已取消。")
+                continue
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 p = passengers[int(raw) - 1]
                 name = read("  姓名（%s）：" % p.get("name"), p.get("name")) or p.get("name")
@@ -558,8 +587,10 @@ def menu_passengers():
         elif op == "3":
             raw = read("  删除第几位：", "")
             if raw is None:
-                # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
-                raise KeyboardInterrupt
+                # Ctrl+C/EOF：取消本次操作，回到乘车人管理菜单
+                #（与 op1 口径统一；旧代码 raise KeyboardInterrupt 回主菜单，Task 83）。
+                print("  已取消。")
+                continue
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 if ask_yes_no("  确认删除该乘车人？", "n"):
                     del passengers[int(raw) - 1]
@@ -568,8 +599,10 @@ def menu_passengers():
         elif op == "4":
             raw = read("  设为默认的第几位：", "")
             if raw is None:
-                # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
-                raise KeyboardInterrupt
+                # Ctrl+C/EOF：取消本次操作，回到乘车人管理菜单
+                #（与 op1 口径统一；旧代码 raise KeyboardInterrupt 回主菜单，Task 83）。
+                print("  已取消。")
+                continue
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 for p in passengers:
                     p["is_default"] = False

@@ -1939,7 +1939,8 @@ class TestMonitorInterruptRound2(TempDirCase):
 class TestMonitorInterruptRound3(TempDirCase):
     """Task 28 round 3 (P1): menu_passengers 编辑/删除/设默认的序号输入
     在 Ctrl+C/EOF（read 返回 None）时 None.isdigit() 抛 AttributeError
-    打 traceback。应抛 KeyboardInterrupt，由 main_menu 接住。"""
+    打 traceback。Task 83(b) 起：取消本次操作，回到乘车人子菜单
+    （与 op1 口径统一），不再 raise KeyboardInterrupt 回主菜单。"""
 
     SAMPLE = [{"name": "张三", "id_type_code": "1", "id_no": "110101199001011234",
                "mobile": "13800138000", "is_default": False, "is_adult": True}]
@@ -1950,23 +1951,30 @@ class TestMonitorInterruptRound3(TempDirCase):
         pm.load_passengers.return_value = [dict(self.SAMPLE[0])]
         pm.ID_TYPE_NAMES = {"1": "二代身份证"}
         with mock.patch.object(monitor_mod, "passengers_mod", pm), \
-             mock.patch.object(monitor_mod, "read", side_effect=list(reads)):
-            monitor_mod.menu_passengers()
+             mock.patch.object(monitor_mod, "read", side_effect=list(reads)), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_passengers()  # 不得抛 KeyboardInterrupt
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        return pm, printed
 
-    def test_edit_index_none_raises_keyboard_interrupt(self):
-        # "2" 进编辑分支，"编辑第几位"时 Ctrl+C：旧代码 None.isdigit() 抛 AttributeError
-        with self.assertRaises(KeyboardInterrupt):
-            self._run_menu(["2", None])
+    def test_edit_index_none_cancels_to_submenu(self):
+        # Task 83(b)："2" 进编辑分支，"编辑第几位"时 Ctrl+C/EOF →
+        # 取消本次操作回到子菜单，不抛 KeyboardInterrupt，不落盘。
+        pm, printed = self._run_menu(["2", None, "0"])
+        self.assertIn("已取消", printed)
+        pm.save_passengers.assert_not_called()
 
-    def test_delete_index_none_raises_keyboard_interrupt(self):
-        # "3" 进删除分支：旧代码同上
-        with self.assertRaises(KeyboardInterrupt):
-            self._run_menu(["3", None])
+    def test_delete_index_none_cancels_to_submenu(self):
+        # Task 83(b)："3" 进删除分支：同上。
+        pm, printed = self._run_menu(["3", None, "0"])
+        self.assertIn("已取消", printed)
+        pm.save_passengers.assert_not_called()
 
-    def test_setdefault_index_none_raises_keyboard_interrupt(self):
-        # "4" 进设默认分支：旧代码同上
-        with self.assertRaises(KeyboardInterrupt):
-            self._run_menu(["4", None])
+    def test_setdefault_index_none_cancels_to_submenu(self):
+        # Task 83(b)："4" 进设默认分支：同上。
+        pm, printed = self._run_menu(["4", None, "0"])
+        self.assertIn("已取消", printed)
+        pm.save_passengers.assert_not_called()
 
     def test_menu_passengers_quit_unchanged(self):
         # 回归 pin：正常退出路径不变（旧代码即通过）
@@ -6987,6 +6995,134 @@ class TestTask73MonitorCreateCancel(TempDirCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["trains"], [])
         self.assertEqual(tasks[0]["passenger_names"], ["张三"])
+
+
+class TestTask83MonitorMenuRobustness(TempDirCase):
+    """Task 83 (P2/P3): monitor 菜单健壮性 bundle——
+    (a) menu_passengers 顶部 op 提示处 stdin EOF 紧循环重打菜单；
+    (b) 同菜单 op2/3/4 的 Ctrl+C/EOF raise 回主菜单，与 op1 的 continue
+        回子菜单口径不一致；
+    (c) menu_task_list 的 from/to 非字符串 → TypeError 崩菜单；
+    (d) menu_create_task 任务名处 Ctrl+C/EOF → `or base_name` 静默落盘
+        自动名任务（Task 67/73 同类 P2）。"""
+
+    @staticmethod
+    def _printed(mprint):
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    def test_passengers_eof_at_op_prompt_exits_menu(self):
+        # (a) 旧代码：read()→None 不匹配任何分支 → 紧循环重打菜单刷屏。
+        import monitor as monitor_mod
+        import passengers as passengers_mod
+        with mock.patch.object(passengers_mod, "load_passengers",
+                               return_value=[]), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=[None, "0"]) as mread, \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_passengers()  # 旧代码会循环第二次才退出
+        printed = self._printed(mprint)
+        self.assertIn("输入结束", printed)
+        self.assertEqual(mread.call_count, 1)  # 只读一次：无紧循环
+
+    def test_passengers_inner_ctrl_c_returns_to_submenu(self):
+        # (b) 旧代码 op2/3/4 的 raw is None → raise KeyboardInterrupt
+        #（回主菜单），与 op1 的 continue（回子菜单）口径不一致。
+        import monitor as monitor_mod
+        import passengers as passengers_mod
+        for op in ("2", "3", "4"):
+            raised = None
+            with mock.patch.object(passengers_mod, "load_passengers",
+                                   return_value=[]), \
+                 mock.patch.object(monitor_mod, "read",
+                                   side_effect=[op, None, "0"]), \
+                 mock.patch("builtins.print") as mprint:
+                try:
+                    monitor_mod.menu_passengers()
+                except KeyboardInterrupt:
+                    raised = True
+            self.assertIsNone(raised, "op=%s 不应抛回主菜单" % op)
+            self.assertIn("已取消", self._printed(mprint))
+
+    @staticmethod
+    def _mock_engine():
+        eng = mock.MagicMock()
+        eng.task_status.side_effect = lambda t: t["name"]
+        eng.state = {"tasks": {}}
+        eng.base_interval = 300
+        return eng
+
+    def test_task_list_non_str_from_to_no_crash(self):
+        # (c) 旧代码 (t["from"] + "-" + t["to"]) 对 int 抛 TypeError 崩菜单。
+        import monitor as monitor_mod
+        tasks = [{"name": "t1", "from": 123, "to": "上海", "dates": []}]
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(monitor_mod, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_task_list()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertIn("配置损坏", printed)
+        self.assertNotIn("Traceback", printed)
+
+    GOOD = {"name": "张三", "id_type_code": "1", "id_no": "110101199001011234",
+            "mobile": "13800138000", "is_default": True, "is_adult": True}
+
+    def _run_create_task(self, reads, passengers=None):
+        import monitor as monitor_mod
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = [dict(p) for p in (passengers or [])]
+        pm.default_names.return_value = ["张三"]
+        saved_cfg = {}
+        printed = []
+        raised = None
+        # reads 消费顺序：车次选择 / 乘车人选择 / 优先级 / 自动下单 /
+        #                下单后停止 / 任务名 / 是否立即启动
+        try:
+            with mock.patch.object(monitor_mod, "passengers_mod", pm), \
+                 mock.patch.object(monitor_mod, "pick_station",
+                                   side_effect=["北京", "上海"]), \
+                 mock.patch.object(monitor_mod, "input_dates",
+                                   return_value=(["2026-10-09"], [])), \
+                 mock.patch.object(monitor_mod, "ticket") as mock_ticket, \
+                 mock.patch.object(monitor_mod, "pick_multi",
+                                   return_value=["二等座"]), \
+                 mock.patch.object(monitor_mod, "read",
+                                   side_effect=list(reads)), \
+                 mock.patch.object(monitor_mod, "load_config",
+                                   return_value={}), \
+                 mock.patch.object(monitor_mod, "update_config_locked",
+                                   side_effect=lambda mut: saved_cfg.update(
+                                       _capture_mut(mut))), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a: printed.append(
+                                " ".join(map(str, a)))):
+                mock_ticket.load_station_map.return_value = (
+                    {"北京": "BJP", "上海": "SHH"},
+                    {"BJP": "北京", "SHH": "上海"})
+                mock_ticket.query_tickets.side_effect = Exception("offline")
+                monitor_mod.menu_create_task()
+        except KeyboardInterrupt as e:
+            raised = e
+        return saved_cfg.get("tasks", []), printed, raised
+
+    def test_task_name_ctrl_c_cancels_no_silent_create(self):
+        # (d) 旧代码 task_name = read(...) or base_name：None→base_name，
+        # 用户取消却静默落盘自动名任务。
+        tasks, printed, raised = self._run_create_task(
+            ["", "", "5", "y", "y", None, "n"], passengers=[self.GOOD])
+        self.assertIsNone(raised)
+        self.assertEqual(tasks, [])
+        self.assertIn("已取消", " ".join(printed))
+
+    def test_task_name_enter_still_creates(self):
+        # 回归 pin：真正的回车（""）仍用自动名正常建任务。
+        tasks, printed, raised = self._run_create_task(
+            ["", "", "5", "y", "y", "", "n"], passengers=[self.GOOD])
+        self.assertIsNone(raised)
+        self.assertEqual(len(tasks), 1)
+        self.assertTrue(tasks[0]["name"])
 
 
 class TestTask74Launcher(TempDirCase):
