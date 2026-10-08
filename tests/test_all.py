@@ -5009,6 +5009,30 @@ class TestMonitorLogP3(TempDirCase):
         self.assertIn("张*", logged)
         self.assertIn("E123****6789", logged)
 
+    def test_startup_recovery_log_desensitized(self):
+        # (d) 启动恢复 run() 的 [订单恢复] LOG 不得含全订单号。
+        e = make_engine(self.tmp)
+        e.check_session_if_needed = lambda: None
+        stop = threading.Event()
+        stop.set()
+        odb = {"orders": {"2026-10-10|G1": {
+            "order_no": "E123456789", "train": "G1", "date": "2026-10-10",
+            "seat": "硬座", "passengers": ["张三"],
+            "classify": "unpaid"}}}
+        with mock.patch.object(engine_mod, "LOG") as m_log, \
+                mock.patch.object(engine_mod.appcommon, "load_orders",
+                                  return_value=odb), \
+                mock.patch.object(engine_mod.order_mod,
+                                  "classify_order_status",
+                                  return_value=("unpaid", "E123456789",
+                                                "未完成/未支付")), \
+                mock.patch.object(engine_mod.appcommon, "upsert_order"):
+            e.run(stop_event=stop)
+        logged = " ".join(str(c.args) for c in m_log.info.call_args_list)
+        self.assertIn("[订单恢复]", logged)
+        self.assertNotIn("E123456789", logged)
+        self.assertIn("E123****6789", logged)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

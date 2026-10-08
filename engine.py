@@ -1065,7 +1065,8 @@ class MonitorEngine(object):
                 if rec.get("classify") != "unpaid":
                     continue
                 LOG.info("[订单恢复] 待支付订单 %s %s %s(订单号 %s)——重新核验官方状态",
-                         rec.get("train"), rec.get("date"), rec.get("seat"), rec.get("order_no"))
+                         rec.get("train"), rec.get("date"), rec.get("seat"),
+                         _mask_order_no(rec.get("order_no") or ""))
                 cls, ono, raw = order_mod.classify_order_status(
                     rec.get("date"), rec.get("train"), rec.get("passengers"))
                 rec.update({"classify": cls, "official_status": raw,
