@@ -1508,13 +1508,13 @@ class TestStateStore(TempDirCase):
     def test_read_state_or_none_shapes(self):
         import appcommon
         p = os.path.join(self.tmp, "state.json")
-        self.assertEqual(appcommon.read_state_or_none(p), ({}, None))   # 不存在
+        self.assertEqual(appcommon.read_state_or_none(p), ({}, None, None))   # 不存在
         json.dump({"tasks": {}}, open(p, "w", encoding="utf-8"))
-        st, err = appcommon.read_state_or_none(p)
+        st, err, _fp = appcommon.read_state_or_none(p)
         self.assertIsNone(err)
         self.assertEqual(st, {"tasks": {}})
         open(p, "w", encoding="utf-8").write("{corrupt")
-        st2, err2 = appcommon.read_state_or_none(p)
+        st2, err2, _fp2 = appcommon.read_state_or_none(p)
         self.assertIsNone(st2)
         self.assertIsInstance(err2, ValueError)
 
@@ -1545,7 +1545,7 @@ class TestStateStore(TempDirCase):
             try:
                 for n in range(30):
                     for _ in range(20):          # 撞锁=本轮跳过重读(生产语义)
-                        st, err = appcommon.read_state_or_none(p)
+                        st, err, _fp = appcommon.read_state_or_none(p)
                         if err is None or not isinstance(
                                 err, PermissionError):
                             break
@@ -1563,7 +1563,7 @@ class TestStateStore(TempDirCase):
         def gui_like(i):
             try:
                 for n in range(30):
-                    st, _ = appcommon.read_state_or_none(p)
+                    st, _, _ = appcommon.read_state_or_none(p)
                     st = st or {}
                     st.setdefault("tasks", {})["g%d" % i] = n
                     appcommon.write_state(p, st, tmp_kind="guisave")
@@ -1573,7 +1573,7 @@ class TestStateStore(TempDirCase):
         def launcher_like(i):
             try:
                 for n in range(30):
-                    st, _ = appcommon.read_state_or_none(p)
+                    st, _, _ = appcommon.read_state_or_none(p)
                     st = st or {}
                     st.setdefault("tasks", {})["l%d" % i] = n
                     appcommon.write_state(p, st, tmp_kind="launcher")
@@ -2731,7 +2731,8 @@ class TestLoadStateErrorSplit(TempDirCase):
         old = {"dedup": {"k": 1}, "tasks": {}, "retry": {}}
         e, sp = self._engine_with_state(old)
         with mock.patch.object(appcommon, "read_state_or_none",
-                               return_value=(None, PermissionError("被占用"))), \
+                               return_value=(None, PermissionError("被占用"),
+                                             None)), \
              mock.patch.object(appcommon, "quarantine_corrupt") as m_q:
             got = e._load_state()
         m_q.assert_not_called()
@@ -2746,7 +2747,8 @@ class TestLoadStateErrorSplit(TempDirCase):
         old = {"dedup": {"k": 2}, "tasks": {}, "retry": {}}
         e, sp = self._engine_with_state(old)
         with mock.patch.object(appcommon, "read_state_or_none",
-                               return_value=(None, OSError("I/O error"))), \
+                               return_value=(None, OSError("I/O error"),
+                                             None)), \
              mock.patch.object(appcommon, "quarantine_corrupt") as m_q:
             got = e._load_state()
         m_q.assert_not_called()
@@ -2759,7 +2761,7 @@ class TestLoadStateErrorSplit(TempDirCase):
         e, sp = self._engine_with_state(old)
         err = json.JSONDecodeError("Expecting value", "{corrupt", 0)
         with mock.patch.object(appcommon, "read_state_or_none",
-                               return_value=(None, err)), \
+                               return_value=(None, err, None)), \
              mock.patch.object(appcommon, "quarantine_corrupt",
                                return_value=sp + ".bad-1") as m_q:
             got = e._load_state()
@@ -5151,7 +5153,7 @@ class TestAppcommonFilelockP3(TempDirCase):
         p = os.path.join(self.tmp, "state.json")
         with open(p, "w", encoding="utf-8") as f:
             f.write("[1, 2, 3]")
-        state, err = appcommon.read_state_or_none(p)
+        state, err, _fp = appcommon.read_state_or_none(p)
         self.assertIsNone(state)
         # 旧代码：返回 ([1, 2, 3], None)；新口径：ValueError → 隔离（Task 40 划分）
         self.assertIsInstance(err, ValueError)
@@ -6445,6 +6447,142 @@ class TestTask70BrowserOrder(TempDirCase):
         self.assertEqual(
             browser_order._audit_dialog_seat("请确认订单", "二等座", None),
             ("", None))
+
+
+class TestTask72EngineState(TempDirCase):
+    """Task 72: engine P2/P3 bundle —— 指纹 TOCTOU 回归 / _reload_state 静默 /
+    mtime 消费 / 浅拷贝崩 / 墓碑膨胀 / 启动恢复子串误清。"""
+
+    def _write_config(self, eng, tasks):
+        cfg = {"poll_interval_seconds": 45, "min_interval_seconds": 30,
+               "tasks": tasks}
+        with open(eng.config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+
+    # ---- (a) 指纹在读失败瞬间（持锁内）抓取 ----
+
+    def test_read_state_or_none_returns_fingerprint(self):
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        # 不存在 → ({} , None, None)
+        self.assertEqual(appcommon.read_state_or_none(p), ({}, None, None))
+        json.dump({"tasks": {}}, open(p, "w", encoding="utf-8"))
+        st, err, fp = appcommon.read_state_or_none(p)
+        self.assertIsNone(err)
+        self.assertEqual(st, {"tasks": {}})
+        self.assertEqual(fp, appcommon.stat_fingerprint(p))
+        # 损坏 → (None, err, 读失败瞬间的指纹)
+        open(p, "w", encoding="utf-8").write("{corrupt")
+        fp_before = appcommon.stat_fingerprint(p)
+        st2, err2, fp2 = appcommon.read_state_or_none(p)
+        self.assertIsNone(st2)
+        self.assertIsInstance(err2, ValueError)
+        self.assertEqual(fp2, fp_before)
+
+    def test_quarantine_uses_at_read_fingerprint(self):
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        open(p, "w", encoding="utf-8").write("{corrupt")
+        st, err, fp = appcommon.read_state_or_none(p)
+        self.assertIsNotNone(err)
+        # 模拟并发写方在"读失败→隔离决策"间隙写入健康文件
+        json.dump({"dedup": {}, "tasks": {}, "retry": {}},
+                  open(p, "w", encoding="utf-8"))
+        # 读失败瞬间的指纹与新文件不一致 → 必须放弃隔离，健康文件不得被挪走
+        self.assertIsNone(appcommon.quarantine_corrupt(p, fp))
+        self.assertTrue(os.path.exists(p))
+        self.assertEqual(json.load(open(p, encoding="utf-8"))["tasks"], {})
+
+    # ---- (b) _reload_state 损坏不再静默吞 ----
+
+    def test_reload_state_quarantines_corrupt(self):
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {"k": "v"}, "tasks": {}, "retry": {}}
+        open(e.state_path, "w", encoding="utf-8").write("{corrupt")
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            result = e._reload_state()
+        # 不再静默返回 {}：挪档留证 + 醒目告警 + 返回 None（调用方保留旧内存态）
+        self.assertIsNone(result)
+        bads = [f for f in os.listdir(self.tmp)
+                if f.startswith("state.json.bad-")]
+        self.assertEqual(len(bads), 1)
+        self.assertEqual(e.state["dedup"], {"k": "v"})
+        out = "\n".join(cm.output)
+        self.assertIn("state.json", out)
+
+    # ---- (c) _sync_config 解析失败不消费 mtime ----
+
+    def test_sync_config_does_not_consume_mtime_on_failure(self):
+        e = make_engine(self.tmp)
+        open(e.config_path, "w", encoding="utf-8").write("{corrupt")
+        mtime = os.path.getmtime(e.config_path)
+        self.assertFalse(e._sync_config())
+        # 原地修好配置但 mtime 不变（同秒内修复/utime 回拨）：必须能重试同步
+        with open(e.config_path, "w", encoding="utf-8") as f:
+            json.dump({"poll_interval_seconds": 45, "tasks": []}, f)
+        os.utime(e.config_path, (mtime, mtime))
+        self.assertTrue(e._sync_config())
+        self.assertEqual(e.config["poll_interval_seconds"], 45)
+
+    # ---- (d) _save_state 序列化竞态不逃出 ----
+
+    def test_save_state_survives_serialize_race(self):
+        import appcommon
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {"k": "v"}, "tasks": {}, "retry": {}}
+        with mock.patch.object(appcommon, "atomic_write_json",
+                               side_effect=RuntimeError(
+                                   "dictionary changed size during iteration")):
+            # GUI 线程在序列化期间改嵌套 dict：绝不能逃出主循环
+            result = e._save_state()
+        self.assertEqual(result["dedup"], {"k": "v"})
+
+    def test_save_state_survives_deepcopy_race(self):
+        e = make_engine(self.tmp)
+        e.state = {"dedup": {"k": "v"}, "tasks": {}, "retry": {}}
+        with mock.patch.object(engine_mod.copy, "deepcopy",
+                               side_effect=RuntimeError("changed size")):
+            # 3 次重试耗尽 + 兜底浅拷贝同样撞上并发修改：仍不抛
+            result = e._save_state()
+        self.assertEqual(result["dedup"], {"k": "v"})
+
+    # ---- (e) 孤儿 state 条目清理 + 墓碑上限 ----
+
+    def test_sync_config_prunes_orphan_state_tasks(self):
+        e = make_engine(self.tmp)
+        e.state["tasks"]["ghost"] = {"status": "monitoring"}
+        e.state["tasks"]["keep"] = {"status": "paused"}
+        self._write_config(e, [task_of("keep")])
+        self.assertTrue(e._sync_config())
+        self.assertNotIn("ghost", e.state["tasks"])
+        self.assertIn("keep", e.state["tasks"])
+
+    def test_tombstone_capped(self):
+        e = make_engine(self.tmp)
+        e._deleted_names = {"t%d" % i for i in range(600)}
+        self._write_config(e, [])
+        e._sync_config()
+        self.assertLessEqual(len(e._deleted_names), 500)
+
+    # ---- (f) 启动恢复精确键匹配 ----
+
+    def test_cancelled_dedup_keys_exact_match(self):
+        keys = ["BJ|SH|2026-10-10|G1|硬座|*",
+                "BJ|SH|2026-10-10|G101|硬座|*",
+                "BJ|SH|2026-10-11|G1|硬座|*"]
+        got = engine_mod.MonitorEngine._cancelled_dedup_keys(
+            {"date": "2026-10-10", "train": "G1"}, keys)
+        # "G1" 绝不能误清同日 "G101"
+        self.assertEqual(got, ["BJ|SH|2026-10-10|G1|硬座|*"])
+
+    def test_cancelled_dedup_keys_missing_fields(self):
+        keys = ["BJ|SH|2026-10-10|G1|硬座|*"]
+        # 缺 date/train → 返回 [] 而不是 TypeError 中止整体恢复
+        self.assertEqual(
+            engine_mod.MonitorEngine._cancelled_dedup_keys(
+                {"date": None, "train": "G1"}, keys), [])
+        self.assertEqual(
+            engine_mod.MonitorEngine._cancelled_dedup_keys({}, keys), [])
 
 
 if __name__ == "__main__":

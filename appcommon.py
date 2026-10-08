@@ -149,13 +149,16 @@ def sweep_stale_tmp(path, max_age_seconds=_TMP_SWEEP_MAX_AGE):
 # 调用方；这里只统一「读（含坏档检测）+ 坏档时间戳挪档 + 原子写」的机械层。
 
 def read_state_or_none(path):
-    """读 state.json。返回 (state, error)：
-    (dict, None) = 正常；(None, OSError) = 瞬时占用/读失败（文件本身大概率健康，
-    调用方不得隔离，应跳过本次加载、稍后重试）；(None, 其他 Exception) = 内容损坏
+    """读 state.json。返回 (state, error, fingerprint)：
+    (dict, None, fp) = 正常；(None, OSError, fp) = 瞬时占用/读失败（文件本身大概率健康，
+    调用方不得隔离，应跳过本次加载、稍后重试）；(None, 其他 Exception, fp) = 内容损坏
     （如 JSON 解析失败，或合法 JSON 但不是对象——如数组，调用方可隔离留证）；
-    ({}, None) = 不存在。"""
+    ({}, None, None) = 不存在。
+    fingerprint 是本次读取结束瞬间抓取的文件指纹：调用方在持锁内调用本函数，
+    该指纹即为"读失败瞬间"指纹，供 quarantine_corrupt 做 TOCTOU 守卫
+    （Task 72：杜绝"释放锁后现抓指纹"架空守卫的回归）。"""
     if not os.path.exists(path):
-        return {}, None
+        return {}, None, None
     # 读句柄持有可能与写方的 os.replace 撞车（Windows 对正被打开的目标执行
     # replace 报拒绝访问），短暂退避重试——只影响撞上的那一瞬
     for i in range(5):
@@ -164,20 +167,22 @@ def read_state_or_none(path):
                 data = json.load(f)
         except PermissionError:
             if i == 4:
-                return None, PermissionError("读 %s 被占用（重试后仍失败）" % path)
+                return (None,
+                        PermissionError("读 %s 被占用（重试后仍失败）" % path),
+                        stat_fingerprint(path))
             time.sleep(0.1)
             continue
         except Exception as e:
-            return None, e
+            return None, e, stat_fingerprint(path)
         if not isinstance(data, dict):
             # 合法 JSON 但不是对象（如数组）：后续 state.items() 会抛
             # AttributeError；按"内容损坏"口径返回 ValueError，让调用方
             # 走隔离留证（Task 40 的错误类型划分：ValueError 系 → 隔离）。
             return None, ValueError(
                 "%s 内容不是 JSON 对象（是 %s），视为损坏"
-                % (path, type(data).__name__))
-        return data, None
-    return None, RuntimeError("unreachable")
+                % (path, type(data).__name__)), stat_fingerprint(path)
+        return data, None, stat_fingerprint(path)
+    return None, RuntimeError("unreachable"), stat_fingerprint(path)
 
 
 def stat_fingerprint(path):

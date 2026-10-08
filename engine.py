@@ -357,7 +357,8 @@ class MonitorEngine(object):
         lock_timeout = False
         try:
             with filelock.file_lock(self.state_path + ".lock"):
-                state, err = appcommon.read_state_or_none(self.state_path)
+                state, err, read_fp = appcommon.read_state_or_none(
+                    self.state_path)
         except TimeoutError as e:
             # 锁争用超时（另一进程长时间持有写锁）：与瞬时占用（Task 40）同口径——
             # 本次跳过加载，不挪档、不重建、不落盘；_sync_state 会在文件变化后重载。
@@ -381,10 +382,11 @@ class MonitorEngine(object):
                 # 读不出来 ≠ 空状态：挪档留证（时间戳名，见 appcommon.quarantine_corrupt），
                 # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
                 # 重复下单——必须醒目提示去核对在途行程。
-                # 传入读失败瞬间的指纹：若另一进程在此期间已写入健康文件，
-                # quarantine 会放弃隔离，避免误伤（Task 33 TOCTOU 守卫）。
-                bad = appcommon.quarantine_corrupt(
-                    self.state_path, appcommon.stat_fingerprint(self.state_path))
+                # 传入读失败瞬间（持锁内，由 read_state_or_none 在读取结束时抓取）
+                # 的指纹：若另一进程在此期间已写入健康文件，quarantine 会放弃
+                # 隔离，避免误伤（Task 33 TOCTOU 守卫；Task 72 修复"释放锁后现
+                # 抓指纹"架空守卫的回归）。
+                bad = appcommon.quarantine_corrupt(self.state_path, read_fp)
                 if bad is None:
                     # 挪不动（如杀毒软件占用）：本次不落盘，免得下面的
                     # _save_state 把仅存的坏档覆盖掉
@@ -442,12 +444,27 @@ class MonitorEngine(object):
                         except RuntimeError:  # 字典/集合并发修改导致的迭代异常
                             time.sleep(0.02)
                     if snapshot is None:
-                        snapshot = copy.deepcopy(dict(state))
+                        # Task 72：兜底浅拷贝仍可能撞上并发修改 → 捕获后告警
+                        # 并跳过本次落盘（内存态保留完好，下次 _save_state 重试），
+                        # 绝不能让 RuntimeError 逃出主循环杀死引擎。
+                        try:
+                            snapshot = copy.deepcopy(dict(state))
+                        except RuntimeError as e:
+                            LOG.error("state.json 快照失败（并发修改），"
+                                      "本次跳过落盘: %s", e)
+                            return self.state
                     # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
                     # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
                     # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
-                    appcommon.atomic_write_json(self.state_path, snapshot,
-                                                fallback_direct=True)
+                    try:
+                        appcommon.atomic_write_json(self.state_path, snapshot,
+                                                    fallback_direct=True)
+                    except RuntimeError as e:
+                        # Task 72：序列化期间被并发修改（防御性：快照本已是独立
+                        # 深拷贝，正常到不了；若到，同样跳过落盘不逃出主循环）
+                        LOG.error("state.json 序列化期间被并发修改，"
+                                  "本次跳过落盘: %s", e)
+                        return self.state
             except TimeoutError as e:
                 # 锁争用超时：本次跳过落盘，内存态保留完好，下次 _save_state
                 # 重试。绝不能让异常杀死引擎监控线程（→ 漏单）。
@@ -464,22 +481,43 @@ class MonitorEngine(object):
         """仅重新读取 state.json（供运行中的引擎同步外部修改，不触发写入）。
 
         锁争用超时返回 None：调用方保留旧状态、稍后重试；绝不能回退成 {}
-        覆盖内存里的防重记录。"""
-        state = {}
-        if os.path.exists(self.state_path):
+        覆盖内存里的防重记录。
+        内容损坏同样返回 None（Task 72）：先挪档留证 + 醒目告警（与 _load_state
+        同级），绝不静默吞成 {}——否则 _sync_state 会用空状态覆盖内存态，
+        随后 _save_state 经合并把空 dedup 写回磁盘，永久丢失防重记录。"""
+        if not os.path.exists(self.state_path):
+            state = {}
+        else:
             try:
                 # 与 _load_state 同理：读与写侧持同一把 file_lock，
                 # 避免撞上 _save_state fallback_direct 直写的撕裂文件
                 # → json 误判损坏 → self.state = {} → 空状态被落盘丢防重。
                 with filelock.file_lock(self.state_path + ".lock"):
-                    with open(self.state_path, encoding="utf-8") as f:
-                        state = json.load(f)
+                    state, err, read_fp = appcommon.read_state_or_none(
+                        self.state_path)
             except TimeoutError as e:
                 LOG.warning("state.json 锁争用超时，本次跳过重载，稍后重试: %s",
                             e)
                 return None
-            except Exception:
-                state = {}
+            if err is not None:
+                if isinstance(err, OSError):
+                    # 瞬时占用（另一进程正在写）：本次跳过重载，不挪档；
+                    # _sync_state 会在文件变化后重试（Task 40 口径）。
+                    LOG.warning("state.json 被占用，本次跳过重载，稍后重试: %s",
+                                err)
+                    return None
+                LOG.warning("state.json 重载失败: %s", err)
+                # 读不出来 ≠ 空状态：挪档留证（时间戳名），保留旧内存态。
+                # 传入读失败瞬间（持锁内）的指纹，避免误伤健康文件。
+                bad = appcommon.quarantine_corrupt(self.state_path, read_fp)
+                if bad is None:
+                    LOG.warning("坏档挪移失败（文件被占用？），保留旧内存态以保防重记录")
+                else:
+                    LOG.warning(
+                        "坏档已挪为 %s，保留旧内存态。其它任务的运行状态与"
+                        "防重记录都在坏档里——请尽快到 12306「未支付订单」"
+                        "核对在途行程，避免重复下单", bad)
+                return None
         state.setdefault("dedup", {})
         state.setdefault("tasks", {})
         state.setdefault("retry", {})
@@ -508,13 +546,16 @@ class MonitorEngine(object):
             return False
         if m == getattr(self, "_config_mtime", None):
             return False
-        self._config_mtime = m
         try:
             with open(self.config_path, encoding="utf-8") as f:
-                self.config = json.load(f)
+                new_config = json.load(f)
         except Exception as e:
+            # Task 72：解析失败不消费 mtime——否则本次配置变更永久被忽略，
+            # 需再改一次文件才重同步。下次 _sync_config 会重试本次变更。
             LOG.warning("[配置] config.json 重新读取失败：%s", e)
             return False
+        self._config_mtime = m
+        self.config = new_config
         self.base_interval = _safe_config_int(
             self.config.get("poll_interval_seconds", 45), 45,
             "poll_interval_seconds")
@@ -522,13 +563,30 @@ class MonitorEngine(object):
                                 _safe_config_int(
                                     self.config.get("min_interval_seconds", 30),
                                     30, "min_interval_seconds"))
-        self.tasks = _sanitize_tasks(self.config.get("tasks"))
+        raw_tasks = self.config.get("tasks")
+        self.tasks = _sanitize_tasks(raw_tasks)
+        current_names = {t.get("name") or "" for t in self.tasks}
+        # Task 72：清孤儿 state 条目——config 已无此任务，state 残留不再需要，
+        # 否则 state.json 缓慢膨胀（删任务只清内存条目时亦然）。
+        # 形状损坏的 tasks（如手误写成 dict）不触发清理：_sanitize_tasks 已记
+        # error 并视为空，此时清条目会误删"修好配置后还会回来"的任务状态。
+        state_tasks = (self.state.get("tasks")
+                       if isinstance(self.state, dict) else None)
+        if isinstance(state_tasks, dict) and (
+                raw_tasks is None or isinstance(raw_tasks, list)):
+            for n in [n for n in state_tasks if n not in current_names]:
+                del state_tasks[n]
         # 同名任务重建后清墓碑：删任务时记的墓碑只拦"已删除"的在途写回，
         # 新任务必须正常轮询
         deleted = getattr(self, "_deleted_names", None)
         if deleted:
-            current_names = {t.get("name") or "" for t in self.tasks}
-            self._deleted_names = {n for n in deleted if n not in current_names}
+            self._deleted_names = {n for n in deleted
+                                   if n not in current_names}
+            # Task 72：墓碑上限防膨胀。只在极端情况下截断（反复删建大量任务）；
+            # 被截掉的墓碑最坏导致一条在途写回短暂复活孤儿条目，下次同步即清。
+            if len(self._deleted_names) > 500:
+                self._deleted_names = set(
+                    list(self._deleted_names)[:500])
         self._ensure_task_names()
         self._resume_or_init_status()  # 仅补缺省状态，不覆盖已有状态
         LOG.info("[配置] 已同步任务列表，共 %d 个任务", len(self.tasks))
@@ -1172,6 +1230,25 @@ class MonitorEngine(object):
             self._last_session_check = now - 900
             LOG.warning("[会话] 登录校验临时失败（非登录失效）：%s；监控继续，5 分钟后自动重试" % who)
 
+    @staticmethod
+    def _cancelled_dedup_keys(rec, dedup_keys):
+        """已取消订单清本地防重：按 dedup 键的日期/车次字段精确匹配。
+
+        键格式为 from|to|date|train|seat|names（见 dedup_key）：取第 3、4 字段
+        与 rec 的 date/train 精确相等比较。Task 72 修复旧的子串匹配——车次
+        "G1" 会误清同日 "G101" 等其它车次的防重记录。
+        rec 缺 date/train 时返回 []（调用方记 warning 跳过该条），绝不抛
+        TypeError 中止整个启动恢复。"""
+        date, train = rec.get("date"), rec.get("train")
+        if not date or not train:
+            return []
+        out = []
+        for k in dedup_keys:
+            parts = k.split("|")
+            if len(parts) >= 4 and parts[2] == date and parts[3] == train:
+                out.append(k)
+        return out
+
     # ----------------------------- 主循环 -----------------------------
 
     def run(self, stop_event=None):
@@ -1196,11 +1273,17 @@ class MonitorEngine(object):
                 appcommon.upsert_order(op, okey, rec)
                 LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
                 if cls == "cancelled":
-                    for dk in [k for k in self.state.get("dedup", {})
-                               if rec.get("date") in k and rec.get("train") in k]:
-                        self.state["dedup"].pop(dk, None)
-                    self._save_state()
-                    LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
+                    # Task 72：精确键匹配清本地防重（旧子串匹配会误清 "G101"）；
+                    # rec 缺 date/train 时记 warning 跳过该条，不中止整体恢复。
+                    if not rec.get("date") or not rec.get("train"):
+                        LOG.warning("[订单恢复] %s 缺少 date/train，跳过本地防重清理",
+                                    okey)
+                    else:
+                        for dk in self._cancelled_dedup_keys(
+                                rec, self.state.get("dedup", {})):
+                            self.state["dedup"].pop(dk, None)
+                        self._save_state()
+                        LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
         except Exception as e:
             LOG.warning("[订单恢复] 未完成订单上下文恢复失败(不影响监控): %s", e)
         active_tasks = [t for t in self.tasks
