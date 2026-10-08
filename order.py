@@ -134,7 +134,9 @@ def classify_order_status(date, train, passenger_names, session=None):
 
     def _pax_hit(x):
         pax = set(x.get("passengers") or [])
-        return not (passenger_names and pax) or bool(pax & want)
+        # 收紧：全部目标乘车人命中才算命中；空目标集不算命中。
+        # 旧代码任一交集即中、空集恒中 → 误判重复 / 误标本行程。
+        return bool(want) and want <= pax
 
     # 12306 规则:存在任何未完成订单就挡住新下单(不分日期车次)。
     # 先分清挡路的是不是本行程:本行程=unpaid;其它行程=blocked。
@@ -470,6 +472,15 @@ def _normalize_order_item(item, status):
         if sn:
             ticket_status = sn
             break
+    # 席别：tickets[] 里通常带 seat_type_name（中文名，如"硬座"），取第一张
+    # 有效票的。字段名按 12306 queryMyOrder 的 DTO 形状；取不到则为空，
+    # 防重判定时视为未知（不以此收窄），向后兼容。
+    seat_name = ""
+    for t in item.get("tickets") or []:
+        stn = (t.get("seat_type_name") or "").strip()
+        if stn:
+            seat_name = stn
+            break
     # order_date 是下单时刻（"YYYY-MM-DD HH:MM:SS"，北京时间），用于「这笔订单是不是
     # 本次提交生成的」时间戳归因；解析失败则 order_ts=None，归因时走保守分支。
     # 注意：必须用 parse_bj_wall 显式按北京时间解析——time.mktime 按机器本地时区
@@ -486,23 +497,35 @@ def _normalize_order_item(item, status):
         "passengers": passengers,
         "order_time": order_date_raw[:19] if order_date_raw else "",
         "order_ts": order_ts,
+        "seat": seat_name,
     }
 
 
-def _query_my_order(session, query_where, start, end, page_size=8):
+def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25):
     """新版 queryMyOrder（2026-10 实测参数）。query_where: G=未出行, H=历史。
 
     旧参数集（_json_att + 缺 pageIndex/pageSize/query_where/sequeue_train_name）
     会拿到 200 空 body，静默失效；缺了新参数一个都不行。
     注意：H（历史）不接受含今天及未来的日期窗口，会返回空 body；
-    乘车日期已过去的订单用 H 查，未出行的用 G 查。"""
-    data = {"come_from_flag": "my_order", "pageIndex": "0",
-            "pageSize": str(page_size), "query_where": query_where,
-            "queryStartDate": start, "queryEndDate": end,
-            "queryType": "1", "sequeue_train_name": ""}
-    r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrder",
-                     data=data, timeout=15)
-    return ((r.json().get("data") or {}).get("OrderDTODataList") or [])
+    乘车日期已过去的订单用 H 查，未出行的用 G 查。
+
+    翻页：pageIndex 从 0 起逐页拉取，直到某页不足 page_size 条（末页）；
+    max_pages 是防死循环上限（25 页 x 8 条 = 200 条，远超 60 天窗口的
+    实际订单量）。旧代码 pageIndex 恒 "0"，深页订单漏检。
+    """
+    items = []
+    for page in range(max_pages):
+        data = {"come_from_flag": "my_order", "pageIndex": str(page),
+                "pageSize": str(page_size), "query_where": query_where,
+                "queryStartDate": start, "queryEndDate": end,
+                "queryType": "1", "sequeue_train_name": ""}
+        r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrder",
+                         data=data, timeout=15)
+        batch = ((r.json().get("data") or {}).get("OrderDTODataList") or [])
+        items.extend(batch)
+        if len(batch) < page_size:
+            break
+    return items
 
 
 def check_existing_orders(session, target_date):
@@ -553,19 +576,41 @@ def check_existing_orders(session, target_date):
     return orders
 
 
-def find_duplicate(orders, date, train_code, passenger_names):
+def find_duplicate(orders, date, train_code, passenger_names,
+                   from_station=None, to_station=None, seat_name=None):
     """
-    在账号已有订单里查重：同一日期 + 同一车次 + 乘车人有交集 = 重复。
-    若订单解析不出乘车人列表，则保守地只按 日期+车次 判定。
+    在账号已有订单里查重：同一日期 + 同一车次 + 区间一致 + 席别一致 +
+    全部目标乘车人命中 = 重复。
+
+    - 区间/席别：调用方与订单双方都有值时才比对；任一侧缺失不以此为由
+      排除（向后兼容旧数据/旧调用）。
+    - 席别取自订单 tickets[] 的 seat_type_name（best-effort；取不到视为
+      未知，不收窄）。
+    - 订单解析不出乘车人列表：记 warning 后跳过该条，不封锁整条线路
+      （旧代码保守判重，一条畸形记录永久封锁该 date+train 的一切下单）。
+    - 空目标乘车人集不算命中。
     """
+    want = set(passenger_names or [])
     for o in orders:
-        if not o["date"] or not o["train"]:
+        if not o.get("date") or not o.get("train"):
             continue
-        if o["date"] == date and o["train"] == train_code:
-            if not o["passengers"]:
-                return o  # 乘车人解析失败，保守判定为重复
-            if not passenger_names or set(passenger_names) & set(o["passengers"]):
-                return o
+        if o["date"] != date or o["train"] != train_code:
+            continue
+        of, ot = (o.get("from") or ""), (o.get("to") or "")
+        if from_station and of and of != from_station:
+            continue
+        if to_station and ot and ot != to_station:
+            continue
+        o_seat = (o.get("seat") or "").strip()
+        if seat_name and o_seat and o_seat != seat_name.strip():
+            continue
+        pax = o.get("passengers") or []
+        if not pax:
+            LOG.warning("订单 %s 乘车人解析为空，跳过该条防重判定（不封锁线路）",
+                        o.get("order_no") or "?")
+            continue
+        if want and want <= set(pax):
+            return o
     return None
 
 
@@ -799,7 +844,10 @@ def order_ticket(config, task, ticket, seat_name):
     dup = None
     try:
         dup = find_duplicate(existing, date, ticket["train_code"],
-                             [p["name"] for p in picked])
+                             [p["name"] for p in picked],
+                             from_station=ticket.get("from_name"),
+                             to_station=ticket.get("to_name"),
+                             seat_name=seat_name)
     except Exception as e:
         print("    [查重异常] {0}（忽略，继续下单）".format(e))
     if dup:

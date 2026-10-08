@@ -569,10 +569,11 @@ class TestOrder(TempDirCase):
         orders = [{"date": "2026-10-10", "train": "K225", "passengers": ["张三"]}]
         self.assertIsNotNone(order_mod.find_duplicate(orders, "2026-10-10", "K225", ["张三"]))
         self.assertIsNone(order_mod.find_duplicate(orders, "2026-10-11", "K225", ["张三"]))
-        # 乘车人解析失败时保守判重
-        self.assertIsNotNone(order_mod.find_duplicate(
-            [{"date": "2026-10-10", "train": "K225", "passengers": []}],
-            "2026-10-10", "K225", ["张三"]))
+        # 乘车人解析失败时记 warning 后跳过，不再保守判重（Task 59）
+        with self.assertLogs(order_mod.LOG, level="WARNING"):
+            self.assertIsNone(order_mod.find_duplicate(
+                [{"date": "2026-10-10", "train": "K225", "passengers": []}],
+                "2026-10-10", "K225", ["张三"]))
 
     def test_select_passengers(self):
         allp = [{"name": "张三", "is_adult": True, "id_no": "x"},
@@ -4674,6 +4675,138 @@ class TestStationCacheRefresh(TempDirCase):
                               capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
         self.assertEqual(proc.stdout.strip(), "False")  # 改前：True（顶层 import launcher）
+
+
+class TestOrderP3(TempDirCase):
+    """Task 59: order P3 四件套（翻页 / 乘车人匹配 / 防重键 / 畸形订单封锁）。"""
+
+    # -- (a) 翻页 --
+    def test_query_my_order_paginates_all_pages(self):
+        p0 = [{"i": i} for i in range(8)]
+        p1 = [{"i": i} for i in range(3)]
+
+        class _Resp(object):
+            def __init__(self, payload):
+                self._p = payload
+
+            def json(self):
+                return self._p
+
+        class _Sess(object):
+            def __init__(self, pages):
+                self.pages = pages
+                self.posts = []
+
+            def post(self, url, data=None, timeout=None):
+                self.posts.append(dict(data or {}))
+                idx = int((data or {}).get("pageIndex", "0"))
+                items = self.pages[idx] if idx < len(self.pages) else []
+                return _Resp({"data": {"OrderDTODataList": items}})
+
+        sess = _Sess([p0, p1])
+        out = order_mod._query_my_order(sess, "G", "2026-08-01", "2026-10-01")
+        self.assertEqual(len(out), 11)  # 旧代码：只拿第 0 页 8 条
+        self.assertEqual([p.get("pageIndex") for p in sess.posts], ["0", "1"])
+
+    def test_query_my_order_page_cap(self):
+        # 30 个满页 → 最多查 max_pages=25 页（200 条），不死循环
+        class _Resp(object):
+            def json(self):
+                return {"data": {"OrderDTODataList": [{"i": 1}] * 8}}
+
+        class _Sess(object):
+            def __init__(self):
+                self.n = 0
+
+            def post(self, url, data=None, timeout=None):
+                self.n += 1
+                return _Resp()
+
+        sess = _Sess()
+        out = order_mod._query_my_order(sess, "G", "2026-08-01", "2026-10-01")
+        self.assertEqual(sess.n, 25)
+        self.assertEqual(len(out), 200)
+
+    # -- (b) 乘车人匹配收紧 --
+    def test_find_duplicate_requires_all_target_passengers(self):
+        orders = [{"date": "2026-10-10", "train": "K225",
+                   "passengers": ["张三"]}]
+        # 旧代码：任一交集即中 → not None；新：目标须全部命中 → None
+        self.assertIsNone(order_mod.find_duplicate(
+            orders, "2026-10-10", "K225", ["张三", "李四"]))
+        # 全部命中仍判重（诚实 pin）
+        self.assertIsNotNone(order_mod.find_duplicate(
+            orders, "2026-10-10", "K225", ["张三"]))
+
+    def test_find_duplicate_empty_targets_not_hit(self):
+        orders = [{"date": "2026-10-10", "train": "K225",
+                   "passengers": ["张三"]}]
+        # 旧代码：空名集算命中 → not None；新：空集不算命中 → None
+        self.assertIsNone(order_mod.find_duplicate(
+            orders, "2026-10-10", "K225", []))
+
+    def test_pax_hit_tightened_in_classify(self):
+        unpaid = {"order_no": "E1", "train": "G101", "date": "2026-10-10",
+                  "passengers": ["张三"], "_no_complete": True,
+                  "status": "未完成/未支付"}
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=[unpaid]):
+            cls, _ono, _raw = order_mod.classify_order_status(
+                "2026-10-10", "G101", ["张三", "李四"], session=object())
+            # 旧代码：部分交集即 "unpaid"；新：收紧后归为 blocked（仍挡单）
+            self.assertEqual(cls, "blocked")
+            cls2, _o2, _r2 = order_mod.classify_order_status(
+                "2026-10-10", "G101", ["张三"], session=object())
+            self.assertEqual(cls2, "unpaid")  # 全部命中仍是本行程（诚实 pin）
+
+    # -- (c) 防重键加 from/to/席别 --
+    def test_find_duplicate_from_to_narrows(self):
+        orders = [{"date": "2026-10-10", "train": "G101",
+                   "from": "北京", "to": "南京", "passengers": ["张三"]}]
+        # 旧代码：只看 date+train → not None（误拦）；新：区间不同 → None
+        self.assertIsNone(order_mod.find_duplicate(
+            orders, "2026-10-10", "G101", ["张三"],
+            from_station="北京", to_station="上海"))
+        # 区间相同仍判重（诚实 pin）
+        self.assertIsNotNone(order_mod.find_duplicate(
+            orders, "2026-10-10", "G101", ["张三"],
+            from_station="北京", to_station="南京"))
+        # 任一侧缺 from/to 时不以此为由排除（向后兼容旧 fixture）
+        self.assertIsNotNone(order_mod.find_duplicate(
+            [{"date": "2026-10-10", "train": "G101",
+              "passengers": ["张三"]}],
+            "2026-10-10", "G101", ["张三"],
+            from_station="北京", to_station="上海"))
+
+    def test_find_duplicate_seat_narrows(self):
+        item = {
+            "sequence_no": "E123", "train_code_page": "G101",
+            "from_station_name_page": "北京", "to_station_name_page": "上海",
+            "start_train_date_page": "2026-10-10 08:00:00",
+            "passengerDTOList": [{"passenger_name": "张三"}],
+            "tickets": [{"ticket_status_name": "已支付",
+                         "seat_type_name": "硬座"}],
+            "order_date": "2026-10-01 10:00:00",
+        }
+        norm = order_mod._normalize_order_item(item, "x")
+        self.assertEqual(norm.get("seat"), "硬座")
+        # 席别不同 → 不判重（旧代码无席别概念 → 误拦）
+        self.assertIsNone(order_mod.find_duplicate(
+            [norm], "2026-10-10", "G101", ["张三"],
+            from_station="北京", to_station="上海", seat_name="二等座"))
+        # 席别相同 → 判重
+        self.assertIsNotNone(order_mod.find_duplicate(
+            [norm], "2026-10-10", "G101", ["张三"],
+            from_station="北京", to_station="上海", seat_name="硬座"))
+
+    # -- (d) 畸形订单跳过不封锁 --
+    def test_find_duplicate_malformed_skipped_with_warning(self):
+        orders = [{"date": "2026-10-10", "train": "K225",
+                   "passengers": [], "order_no": "E999"}]
+        # 旧代码：保守判重 → not None（永久封锁）；新：warning 后跳过 → None
+        with self.assertLogs(order_mod.LOG, level="WARNING"):
+            self.assertIsNone(order_mod.find_duplicate(
+                orders, "2026-10-10", "K225", ["张三"]))
 
 
 if __name__ == "__main__":
