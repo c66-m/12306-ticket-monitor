@@ -213,8 +213,13 @@ def quarantine_corrupt(path, expected_fingerprint=None):
             LOG.warning("[数据] %s 自读失败后已被改写，放弃隔离以免误伤健康文件",
                         path)
             return None
-    bad = "{0}.bad-{1}".format(
+    base = "{0}.bad-{1}".format(
         path, datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    bad = base
+    n = 1
+    while os.path.exists(bad):   # Windows 时钟粒度 ~15ms:同微秒会重名,计数保唯一
+        bad = "%s-%d" % (base, n)
+        n += 1
     try:
         os.replace(path, bad)
     except OSError:
