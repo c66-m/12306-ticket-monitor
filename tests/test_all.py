@@ -662,23 +662,104 @@ class TestLogutil(TempDirCase):
         # 那天之后两个日志就落进同一个文件，用例必然失败（曾经如此）
         d1 = real.today()
         d2 = real.fromordinal(d1.toordinal() + 1)
-
-        class FakeDate:
-            _d = d1
-            @classmethod
-            def today(cls):
-                return cls._d
-        logutil.datetime.date = FakeDate
-        try:
+        # 切分走 _beijing_today()（Task 79b）：用 holder  patch 该 seam，
+        # 无论 emit/_open 内部调几次都稳定。
+        holder = {"d": d1}
+        with mock.patch.object(logutil, "_beijing_today",
+                               side_effect=lambda: holder["d"]):
             lg.info("day1")
-            FakeDate._d = d2
+            holder["d"] = d2
             lg.info("day2")
-        finally:
-            logutil.datetime.date = real
-            h.close()
+        h.close()
         files = sorted(os.listdir(self.tmp))
         self.assertEqual(files, ["test_%s.log" % d1.strftime("%Y%m%d"),
                                  "test_%s.log" % d2.strftime("%Y%m%d")])
+
+
+class TestTask79Logutil(TempDirCase):
+    """Task 79: logutil P3（close 持锁 / 北京时间切分 / close 后 emit /
+    retention<=0 / 注释）。(e) 为纯注释修正，无测试。"""
+
+    def _rec(self, msg="x"):
+        return logging.LogRecord("t79", logging.INFO, __file__, 1,
+                                 msg, None, None)
+
+    # (a) close() 必须持 handler 锁（与 stdlib Handler.close() 同序），
+    # 否则与并发 emit 交错时会写到已关闭文件。
+    def test_close_holds_handler_lock(self):
+        h = logutil.DayFileHandler(self.tmp, "t")
+        h.emit(self._rec())
+        acquired = []
+        orig = h.acquire
+
+        def spy():
+            acquired.append(True)
+            return orig()
+
+        h.acquire = spy
+        h.close()
+        self.assertTrue(acquired, "close() 未持 handler 锁")
+
+    # (c) close() 后 emit 不得静默重开文件，应走 handleError
+    #（与 FileHandler 口径一致）。
+    def test_emit_after_close_goes_to_handle_error(self):
+        h = logutil.DayFileHandler(self.tmp, "t")
+        h.emit(self._rec("one"))
+        h.close()
+        created = [f for f in os.listdir(self.tmp) if f.startswith("t_")]
+        self.assertEqual(len(created), 1)
+        os.remove(os.path.join(self.tmp, created[0]))
+        with mock.patch.object(h, "handleError") as mh:
+            h.emit(self._rec("two"))
+        self.assertTrue(mh.called, "close 后 emit 应走 handleError")
+        self.assertEqual(
+            [f for f in os.listdir(self.tmp) if f.startswith("t_")], [],
+            "close 后 emit 静默重开了日志文件")
+
+    # (b) 文件名切分必须用北京时间，而不是机器本地时区。
+    def test_open_uses_beijing_today(self):
+        import datetime as dt
+        fake = dt.date(2031, 12, 25)
+        with mock.patch.object(logutil, "_beijing_today", return_value=fake):
+            h = logutil.DayFileHandler(self.tmp, "t")
+            try:
+                h.emit(self._rec())
+            finally:
+                h.close()
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp, "t_20311225.log")),
+            "文件名未使用北京时间日期")
+
+    # (b) 北京时间 helper 本体：UTC+8（与 order._beijing_tz 同语义）。
+    def test_beijing_tz_is_utc_plus_8(self):
+        import datetime as dt
+        off = logutil._beijing_tz().utcoffset(dt.datetime(2026, 1, 1))
+        self.assertEqual(off, dt.timedelta(hours=8))
+
+    # (d) retention_days<=0 视为禁用清理：旧文件也不删。
+    def test_retention_zero_disables_pruning(self):
+        import datetime as dt
+        h = logutil.DayFileHandler(self.tmp, "t", retention_days=0)
+        today = dt.date.today().strftime("%Y%m%d")
+        keep_today = os.path.join(self.tmp, "t_%s.log" % today)
+        keep_old = os.path.join(self.tmp, "t_20000101.log")
+        open(keep_today, "w").write("today")
+        open(keep_old, "w").write("old")
+        h._prune_old_logs(dt.date.today())
+        self.assertTrue(os.path.exists(keep_old),
+                        "retention_days=0 应禁用清理")
+        self.assertTrue(os.path.exists(keep_today))
+
+    # (d) retention_days<0 时 cutoff 落在未来：绝不能删当天文件。
+    def test_retention_negative_keeps_today_file(self):
+        import datetime as dt
+        h = logutil.DayFileHandler(self.tmp, "t", retention_days=-1)
+        today = dt.date.today().strftime("%Y%m%d")
+        keep_today = os.path.join(self.tmp, "t_%s.log" % today)
+        open(keep_today, "w").write("today")
+        h._prune_old_logs(dt.date.today())
+        self.assertTrue(os.path.exists(keep_today),
+                        "retention_days<0 删除了当天文件")
 
 
 class TestPassengers(TempDirCase):
