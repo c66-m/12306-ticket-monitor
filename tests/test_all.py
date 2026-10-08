@@ -9288,6 +9288,67 @@ class TestTask102EngineMissingConfig(TempDirCase):
         self.assertEqual([t["name"] for t in e.tasks], ["T1"])
 
 
+class TestTask105EngineInvalidJsonConfig(TempDirCase):
+    """Task 105 (P1)：engine __init__ 读到"文件存在但内容非法 JSON"
+    时，不得抛裸 JSONDecodeError 崩进程；记 error 后用安全默认值继续
+    （Task 91/102 同口径；_sync_config 已有 Task 72 降级，冷启动漏了）。
+    """
+
+    def _make_engine(self, cfg_path):
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            # state/history 路径随 config 走；HERE 指到 tmp，避免 __init__
+            # 的 _save_state 碰真实文件（与 Task 102 测试同脚手架）。
+            with mock.patch.object(engine_mod, "HERE", self.tmp):
+                return engine_mod.MonitorEngine(config_path=cfg_path,
+                                                setup_logging=False)
+
+    def _invalid_path(self):
+        p = os.path.join(self.tmp, "bad-config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{not valid json!!!")
+        return p
+
+    def test_init_invalid_json_does_not_crash(self):
+        # RED on old code: json.load 抛 JSONDecodeError 崩进程
+        p = self._invalid_path()
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            e = self._make_engine(p)
+        self.assertEqual(e.config, {})
+        self.assertEqual(e.tasks, [])
+        self.assertEqual(e.base_interval, 45)
+        self.assertTrue(any("合法 JSON" in m for m in logs.output),
+                        "error 日志必须明确指出内容不是合法 JSON（与 Task 91 的"
+                        "“顶层不是对象”、Task 102 的“不存在”可区分），并带出完整路径")
+
+    def test_init_invalid_json_keeps_valid_mtime_for_recovery(self):
+        # 文件存在 → _config_mtime 必须取到有效值；用户修好文件后
+        # mtime 变化 → _sync_config 自动恢复（Task 91/102 同机制）
+        p = self._invalid_path()
+        e = self._make_engine(p)
+        self.assertIsNotNone(e._config_mtime)
+        cfg = {"tasks": [{"name": "T1"}],
+               "poll_interval_seconds": 45,
+               "state_file": os.path.join(self.tmp, "state.json"),
+               "history_file": os.path.join(self.tmp, "order_history.json")}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        # 确保 mtime 变化（文件系统时间粒度可能粗）
+        st = os.stat(p)
+        os.utime(p, (st.st_mtime + 5, st.st_mtime + 5))
+        changed = e._sync_config()
+        self.assertTrue(changed)
+        self.assertEqual([t["name"] for t in e.tasks], ["T1"])
+
+    def test_init_missing_config_still_works(self):
+        # 回归 pin：Task 102 的缺文件行为不变（"不存在"文案 + 默认值）
+        p = os.path.join(self.tmp, "no-such-config.json")
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            e = self._make_engine(p)
+        self.assertEqual(e.config, {})
+        self.assertTrue(any("不存在" in m for m in logs.output))
+
+
 class TestTask92MonitorP2(TempDirCase):
     """Task 92 (P2): (a) 损坏的 config.json → load_config 友好降级，
     save/update 路径绝不覆写损坏文件；(b) menu_notify 字符串型 "to"

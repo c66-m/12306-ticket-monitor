@@ -314,6 +314,15 @@ class MonitorEngine(object):
             LOG.error("[配置] %s 不存在，已按默认配置继续",
                       self.config_path)
             self.config = {}
+        except json.JSONDecodeError:
+            # Task 105：文件存在但内容非法 JSON——旧代码抛裸 JSONDecodeError
+            # 崩进程（Task 91 同 P1 类；第三轮重扫和 Task 91 两次漏网，只覆盖
+            # "合法 JSON 但非对象"）；记 error 后用空配置继续。文件存在故
+            # _config_mtime 取有效值，修好文件后 mtime 变化 → _sync_config
+            # 自动恢复（Task 91/102 同机制；_sync_config 已有 Task 72 降级）。
+            LOG.error("[配置] %s 内容不是合法 JSON，已按默认配置继续",
+                      self.config_path)
+            self.config = {}
         if not isinstance(self.config, dict):
             # Task 91：顶层非 dict（手改误删大括号成 [] 等）——旧代码后续
             # self.config.get(...) 抛 AttributeError 崩进程；记 error 后用
