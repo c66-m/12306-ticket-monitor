@@ -579,7 +579,7 @@ QUERY_URLS = (
 
 
 def query_tickets(from_code, to_code, date, purpose="ADULT"):
-    """查询某天某区间余票，返回按车次分组的字典。免登录。
+    """查询某天某区间余票，返回余票结果列表（官方 result 数组）。免登录。
     purpose: ADULT=成人票, 0X00=学生票"""
     s = get_session()
     params = {

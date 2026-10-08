@@ -287,6 +287,15 @@ def step4_poll_qr(uuid):
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
+            # Task 86a: r.json() 成功但返回非 dict（数组/字符串/null）时
+            # data.get 会抛 AttributeError —— 按 Task 78d 口径显式拦截，
+            # 记警告后跳过本轮继续轮询（瞬时异常），不崩。
+            if not isinstance(data, dict):
+                print("    [警告] 轮询返回非 JSON 对象（{0}），跳过本轮。".format(
+                    type(data).__name__))
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
             code = data.get("result_code")
             msg = data.get("result_message")
 

@@ -8460,6 +8460,94 @@ class TestTask85OrderBrowserOrder(TempDirCase):
         self.assertEqual(browser_order._get_depth(me), 0)
 
 
+class TestTask86ProbeLoginP2P3(unittest.TestCase):
+    """Task 86: probe_login/ticket/monitor P2/P3 bundle。
+
+    (a) step4_poll_qr 对非 dict JSON（数组/字符串/null）不再抛 AttributeError：
+        记警告后跳过本轮继续轮询（Task 78d 同类口径）。
+    (b) step5 的 username 打印脱敏 + 两处 show(r) 走 mask_pii=True
+        —— Task 78c 已落实（含 Task 65 reviewer 的 minor follow-up），
+        由 TestTask78 的 test_step5_show_calls_use_mask_pii /
+        test_step5_username_print_is_masked 钉住，本处不加重复测试。
+    (c) ticket.query_tickets docstring「返回字典」→ 实际返回 list，修正文档。
+    (d) monitor.menu_notify 的授权码走 protect_secret 加密存储
+        —— Task 66 已落实，本处加接线 pin 测试防回归。
+    """
+
+    # ---- (a) step4 轮询非 dict JSON ----
+
+    def _run_step4_non_dict(self, body):
+        fake = mock.Mock()
+        fake.post.side_effect = [
+            _FakeResp(body),          # r.json() 成功但返回非 dict
+            KeyboardInterrupt(),      # 退出轮询（外层优雅捕获）
+        ]
+        return fake
+
+    def test_step4_poll_qr_array_json_skipped_no_crash(self):
+        # RED on old code: data.get → AttributeError 逃出 step4_poll_qr
+        with mock.patch.object(probe_login, "SESSION",
+                               self._run_step4_non_dict('["a","b"]')), \
+             mock.patch("builtins.print") as mprint, \
+             mock.patch("time.sleep"):
+            result = probe_login.step4_poll_qr("uuid-x")
+        self.assertIsNone(result)
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("非 JSON 对象", out)
+
+    def test_step4_poll_qr_null_json_skipped_no_crash(self):
+        # RED on old code: data=None → data.get 抛 AttributeError
+        with mock.patch.object(probe_login, "SESSION",
+                               self._run_step4_non_dict("null")), \
+             mock.patch("builtins.print") as mprint, \
+             mock.patch("time.sleep"):
+            result = probe_login.step4_poll_qr("uuid-x")
+        self.assertIsNone(result)
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("非 JSON 对象", out)
+
+    # ---- (c) query_tickets docstring ----
+
+    def test_query_tickets_docstring_says_list(self):
+        # RED on old code: docstring 写「返回按车次分组的字典」，实际返回 list
+        doc = ticket.query_tickets.__doc__ or ""
+        self.assertNotIn("字典", doc)
+        self.assertIn("列表", doc)
+
+    def test_query_tickets_returns_list(self):
+        # 行为 pin：query_tickets 实际返回 result 列表（与修正后的 docstring 一致）
+        payload = {"httpstatus": 200, "data": {"result": ["G101|...|..."]}}
+        fake_resp = mock.Mock()
+        fake_resp.json.return_value = payload
+        fake_resp.raise_for_status.return_value = None
+        fake_sess = mock.Mock()
+        fake_sess.get.return_value = fake_resp
+        with mock.patch.object(ticket, "get_session", return_value=fake_sess):
+            result = ticket.query_tickets("BJP", "SHH", "2026-10-09")
+        self.assertIsInstance(result, list)
+        self.assertEqual(result, ["G101|...|..."])
+
+    # ---- (d) menu_notify 授权码加密接线 pin ----
+
+    def test_menu_notify_routes_password_through_protect_secret(self):
+        # pin（防回归）：menu_notify 存授权码必须经过 protect_secret。
+        # RED on pre-Task-66 code: protect_secret 根本未被调用。
+        import monitor as monitor_mod
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "465", "", "", "", "n"]), \
+             mock.patch("getpass.getpass", return_value="new-auth-code"), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c: saved.update(c)), \
+             mock.patch.object(monitor_mod.notify_mod, "protect_secret",
+                               wraps=monitor_mod.notify_mod.protect_secret) as ps:
+            monitor_mod.menu_notify()
+        ps.assert_called_once_with("new-auth-code")
+        self.assertEqual(saved["notify"]["email"]["password"],
+                         monitor_mod.notify_mod.protect_secret("new-auth-code"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
