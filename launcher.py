@@ -571,9 +571,12 @@ class Grabber(threading.Thread):
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
         trains = _normalize_trains(lc.get("trains"), log)
-        seats = [s for s in (lc.get("seat_types") or []) if s]
+        # Task 106：展示用归一化——裸字符串按单个席别（旧代码逐字符拆后
+        # s in SEAT_NAME_TO_CODE 恒失败 → 明确失败；与 572 行 trains 同口径）。
+        seats = [s for s in _display_seat_types(lc.get("seat_types")) if s]
         pri_raw = lc.get("seat_priority") or ""
-        names = [n for n in (lc.get("passenger_names") or []) if n]
+        # Task 106：同上——裸字符串按单个姓名，绝不逐字符拆。
+        names = [n for n in _display_seat_types(lc.get("passenger_names")) if n]
 
         if not (from_ and to_ and date):
             self.result = (False, "请先填好出发站 / 到达站 / 日期")
@@ -2322,8 +2325,10 @@ class LauncherApp(tk.Frame):
         self.date_var.set(lc.get("date") or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
         self.date_to_var.set(lc.get("date_to") or "")
         # 票种不再全局设置：_refresh_pax() 里按每个乘车人各自的保存值建下拉
+        # Task 106：展示用归一化——裸字符串按单个席别精确匹配（旧代码
+        # s in (裸字符串 or []) 走子串检查，"软卧" in "高级软卧" → True 误勾选）。
         for s, v in self.seat_vars.items():
-            v.set(s in (lc.get("seat_types") or []))
+            v.set(s in _display_seat_types(lc.get("seat_types")))
         self.seat_pri_var.set(str(lc.get("seat_priority") or ""))
         self.start_var.set(lc.get("start_time") or "")
         # Task 96d：launcher_config.json 脏值不崩任务窗口（Task 68 同类，
@@ -3141,8 +3146,9 @@ class LauncherApp(tk.Frame):
         self.from_ent.set(p.get("from") or "")
         self.to_ent.set(p.get("to") or "")
         self.trains_var.set(",".join(_display_trains(p.get("trains"))))
+        # Task 106：同 2326——裸字符串按单个席别精确匹配，杜绝子串误判。
         for s, v in self.seat_vars.items():
-            v.set(s in (p.get("seat_types") or []))
+            v.set(s in _display_seat_types(p.get("seat_types")))
         self.seat_pri_var.set(str(p.get("seat_priority") or ""))
         self.date_var.set(p.get("date") or "")
         self._put_log("[运行] 已载入常用行程「%s」" % p.get("name"))
@@ -3310,7 +3316,8 @@ class NewMonitorTaskDialog(tk.Toplevel):
         self.seat_pri_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 4))
         self.seat_pri_var.trace_add("write", self._mp_seat_pri_change)
         for i, s in enumerate(MONITOR_SEAT_CHOICES):
-            v = tk.BooleanVar(value=s in (self.app.lc.get("seat_types") or []))
+            # Task 106：同 2326——裸字符串按单个席别精确匹配，杜绝子串误判。
+            v = tk.BooleanVar(value=s in _display_seat_types(self.app.lc.get("seat_types")))
             self.seat_vars[s] = v
             ttk.Checkbutton(sf, text=s, variable=v).grid(
                 row=i // 3 + 2, column=i % 3, sticky="w", padx=(0, 8))
@@ -3370,8 +3377,9 @@ class NewMonitorTaskDialog(tk.Toplevel):
         self.to_cb.set(self.app.to_ent.get())
         self.trains_var.set(self.app.trains_var.get())
         self.date_var.set(self.app.date_var.get())
+        # Task 106：同 2326——裸字符串按单个席别精确匹配，杜绝子串误判。
         for s, v in self.seat_vars.items():
-            v.set(s in (self.app.lc.get("seat_types") or []))
+            v.set(s in _display_seat_types(self.app.lc.get("seat_types")))
 
     def _parse_dates(self):
         raw = self.date_var.get().strip()

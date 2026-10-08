@@ -2889,7 +2889,9 @@ class TaskEditDialog(tk.Toplevel):
             label = "{0}{1}".format(p.get("name"), "（默认）" if p.get("is_default") else "")
             self.psg_list.insert("end", label)
             self.psg_items.append(p.get("name"))
-        for n in (task.get("passenger_names") or []):
+        # Task 106：展示用归一化——裸字符串按单个姓名处理（旧代码逐字符拆后
+        # n in self.psg_items 恒失败 → 已存乘车人显示为未选中）。
+        for n in _display_seat_types(task.get("passenger_names")):
             if n in self.psg_items:
                 self.psg_list.selection_set(self.psg_items.index(n))
 

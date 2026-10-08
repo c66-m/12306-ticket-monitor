@@ -11127,6 +11127,172 @@ class TestTask104LoadSanitize(TempDirCase):
         self.assertEqual(warns, [])
 
 
+class TestTask106BareStringHardening(TempDirCase):
+    """Task 106：bare-string 相邻硬化（Task 103 评审确认，P3 bundle）。
+
+    1. gui.py:2892 任务对话框 passenger_names 展示逐字符拆 → 预选静默为空
+    2. launcher.py:2326/3145/3313/3374 `s in (X.get("seat_types") or [])`
+       裸字符串变子串检查（"软卧" in "高级软卧" → True 误勾选）
+    3. launcher.py:573-574 Grabber._run seats/names 迭代原始 lc.get（防御性）
+
+    改后：全部用已建立的 _display_seat_types 做单行应用（Task 103 同口径）。
+    无 Tk 真机：dialog 内联点（2892/3313）用调用点契约测试（沿 Task 103c 口径）；
+    可直接调用的方法（_load_preset/_import_from_main/_sync_from_lc/_run）
+    用 object.__new__ + mock 做真实方法测试。
+    """
+
+    def _seat_var_mocks(self, choices=("软卧", "高级软卧", "硬卧")):
+        set_values = {}
+        seat_vars = {}
+        for s in choices:
+            m = mock.Mock()
+            m.set.side_effect = lambda v, s=s: set_values.__setitem__(s, v)
+            seat_vars[s] = m
+        return seat_vars, set_values
+
+    # ---- (2a) launcher.py:3145 _load_preset（直接方法测试） ----
+
+    def _load_preset_app(self, seat_types):
+        app = object.__new__(launcher.LauncherApp)
+        app.from_ent = mock.Mock()
+        app.to_ent = mock.Mock()
+        app.trains_var = mock.Mock()
+        app.seat_pri_var = mock.Mock()
+        app.date_var = mock.Mock()
+        app._put_log = mock.Mock()
+        app.seat_vars, set_values = self._seat_var_mocks()
+        app._current_preset = mock.Mock(
+            return_value={"name": "p1", "seat_types": seat_types})
+        return app, set_values
+
+    def test_3145_load_preset_dirty_string_no_substring(self):
+        # P3：preset["seat_types"] 为裸字符串 "高级软卧" 时，旧代码
+        # s in ("高级软卧" or []) 走子串检查 → "软卧" 被误勾选。
+        app, set_values = self._load_preset_app("高级软卧")
+        app._load_preset()
+        self.assertFalse(set_values["软卧"],
+                         "子串误判：'软卧' 不应被 '高级软卧' 误勾选")
+        self.assertTrue(set_values["高级软卧"])
+        self.assertFalse(set_values["硬卧"])
+
+    def test_3145_load_preset_clean_list_unchanged(self):
+        # 正向对照：干净 list 形状预选行为不变（精确匹配）。
+        app, set_values = self._load_preset_app(["软卧"])
+        app._load_preset()
+        self.assertTrue(set_values["软卧"])
+        self.assertFalse(set_values["高级软卧"])
+        self.assertFalse(set_values["硬卧"])
+
+    # ---- (2b) launcher.py:3374 _import_from_main（直接方法测试） ----
+
+    def test_3374_import_from_main_dirty_string_no_substring(self):
+        # P3：app.lc["seat_types"] 为裸字符串 "高级软卧" 时同上子串误判。
+        dlg = object.__new__(launcher.NewMonitorTaskDialog)
+        app = mock.Mock()
+        app.lc = {"seat_types": "高级软卧"}
+        app.from_ent.get.return_value = "北京"
+        app.to_ent.get.return_value = "上海"
+        app.trains_var.get.return_value = "G101"
+        app.date_var.get.return_value = "2026-10-10"
+        dlg.app = app
+        dlg.from_cb = mock.Mock()
+        dlg.to_cb = mock.Mock()
+        dlg.trains_var = mock.Mock()
+        dlg.date_var = mock.Mock()
+        dlg.seat_vars, set_values = self._seat_var_mocks()
+        dlg._import_from_main()
+        self.assertFalse(set_values["软卧"],
+                         "子串误判：'软卧' 不应被 '高级软卧' 误勾选")
+        self.assertTrue(set_values["高级软卧"])
+        self.assertFalse(set_values["硬卧"])
+
+    # ---- (2c) launcher.py:2326 _sync_from_lc（直接方法测试） ----
+
+    def test_2326_sync_from_lc_dirty_string_no_substring(self):
+        # P3：lc["seat_types"] 为裸字符串 "高级软卧" 时同上子串误判。
+        app = object.__new__(launcher.LauncherApp)
+        app.lc = {"seat_types": "高级软卧"}
+        app.from_ent = mock.Mock()
+        app.to_ent = mock.Mock()
+        for attr in ("trains_var", "date_var", "date_to_var", "seat_pri_var",
+                     "start_var", "remind_var", "warm_var"):
+            setattr(app, attr, mock.Mock())
+        app.remind_var.get.return_value = "10"
+        app.warm_var.get.return_value = "10"
+        app.seat_vars, set_values = self._seat_var_mocks()
+        app._put_log = mock.Mock()
+        app.preset_cb = mock.Mock()
+        app._refresh_pax = mock.Mock()
+        app._save_cfg = mock.Mock()
+        with mock.patch.object(launcher, "merge_trains_from_monitor",
+                               return_value=False):
+            app._sync_from_lc()
+        self.assertFalse(set_values["软卧"],
+                         "子串误判：'软卧' 不应被 '高级软卧' 误勾选")
+        self.assertTrue(set_values["高级软卧"])
+        self.assertFalse(set_values["硬卧"])
+
+    # ---- (3) launcher.py:573-574 Grabber._run（直接方法测试） ----
+
+    def test_grabber_run_dirty_seat_types_single_not_char_split(self):
+        # P3（防御性）：lc["seat_types"] 为裸字符串 "二等座" 时，旧代码
+        # [s for s in ("二等座" or [])] 逐字符拆成 ["二","等","座"] →
+        # 全部无法下单 → (False, "勾选的席别都无法自动下单")。
+        # 改后按单个席别处理，通过席别检查，继续走到车站校验
+        # （此处 mock 断网，直接返回车站加载失败）。
+        grabber = object.__new__(launcher.Grabber)
+        grabber.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+                      "trains": ["G101"], "seat_types": "二等座",
+                      "seat_priority": "", "passenger_names": ["张三"]}
+        grabber._log = mock.Mock()
+        grabber.result = None
+        with mock.patch.object(launcher.ticket, "load_station_map",
+                               side_effect=Exception("offline")):
+            grabber._run()
+        self.assertEqual(grabber.result,
+                         (False, "车站数据加载失败（网络异常），请联网后重试"))
+
+    def test_grabber_run_clean_seat_types_unchanged(self):
+        # 正向对照：干净 list 形状行为不变（同样走到车站校验）。
+        grabber = object.__new__(launcher.Grabber)
+        grabber.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+                      "trains": ["G101"], "seat_types": ["二等座"],
+                      "seat_priority": "", "passenger_names": ["张三"]}
+        grabber._log = mock.Mock()
+        grabber.result = None
+        with mock.patch.object(launcher.ticket, "load_station_map",
+                               side_effect=Exception("offline")):
+            grabber._run()
+        self.assertEqual(grabber.result,
+                         (False, "车站数据加载失败（网络异常），请联网后重试"))
+
+    # ---- (1) gui.py:2892 调用点契约（dialog 内联，沿 Task 103c 口径） ----
+
+    def test_gui_2892_passenger_names_dirty_string_preselects(self):
+        # P3：task["passenger_names"] 为裸字符串 "张三" 时，旧表达式
+        # for n in ("张三" or []) 逐字符迭代 → "张" in psg_items 永假 →
+        # 预选静默为空。调用点改后表达式应正确预选。
+        task = {"passenger_names": "张三"}
+        psg_items = ["张三", "李四"]
+        selected = [n for n in gui._display_seat_types(task.get("passenger_names"))
+                    if n in psg_items]
+        self.assertEqual(selected, ["张三"])
+        # 正向对照：干净 list 行为不变。
+        task2 = {"passenger_names": ["张三", "李四"]}
+        selected2 = [n for n in gui._display_seat_types(task2.get("passenger_names"))
+                     if n in psg_items]
+        self.assertEqual(selected2, ["张三", "李四"])
+
+    def test_display_helper_passenger_names_contract(self):
+        # 2892/576 调用点依赖的契约：_display_seat_types 用于 passenger_names
+        # 时，裸字符串按单个姓名处理（中文名不 strip/upper，与席别同口径）。
+        self.assertEqual(gui._display_seat_types("张三"), ["张三"])
+        self.assertEqual(launcher._display_seat_types("张三"), ["张三"])
+        self.assertEqual(launcher._display_seat_types(["张三", "李四"]),
+                         ["张三", "李四"])
+        self.assertEqual(launcher._display_seat_types(None), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
