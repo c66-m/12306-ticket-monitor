@@ -2448,7 +2448,8 @@ class TestQuarantineAbandonReread(TempDirCase):
         self.assertEqual(self._bad_files(p), [])
 
     def test_abandon_reread_failure_falls_back_safely(self):
-        # 放弃隔离后重读仍失败（文件被删）：不崩、不循环，回退空数据继续
+        # 放弃隔离后重读仍失败（文件被删）：不崩、不循环；放弃本次追加并记
+        # error，不用空数据覆写（Task 81c；旧行为会建出 [G9] 覆盖并发写入）。
         import appcommon
         orig = appcommon.quarantine_corrupt
 
@@ -2459,9 +2460,9 @@ class TestQuarantineAbandonReread(TempDirCase):
         p = os.path.join(self.tmp, "order_history.json")
         self._write(p, "{CORRUPT")
         with mock.patch.object(appcommon, "quarantine_corrupt", sneaky_delete):
-            appcommon.append_history(p, {"train": "G9"})
-        with open(p, encoding="utf-8") as f:
-            self.assertEqual(json.load(f), [{"train": "G9"}])
+            with self.assertLogs("monitor", level="ERROR"):
+                appcommon.append_history(p, {"train": "G9"})
+        self.assertFalse(os.path.exists(p), "重读失败不得覆写")
         p2 = os.path.join(self.tmp, "orders.json")
         self._write(p2, "{CORRUPT")
         with mock.patch.object(appcommon, "quarantine_corrupt", sneaky_delete):
@@ -2963,12 +2964,14 @@ class TestHistoryAppendConcurrency(TempDirCase):
         self.assertFalse(hasattr(engine_mod.MonitorEngine, "_append_history"))
 
     def test_append_history_holds_file_lock(self):
-        # 整个读-改-写包在 filelock.file_lock(path) 内：持锁时另一线程追加必须等待
+        # 整个读-改-写包在 filelock.file_lock(path + ".lock") 内（Task 81a：
+        # sidecar 锁文件，与 engine/gui/monitor/launcher 的约定一致）：
+        # 持锁时另一线程追加必须等待
         import appcommon, filelock, time
         p = os.path.join(self.tmp, "order_history.json")
         appcommon.append_history(p, {"n": 0})
         acquired = []
-        with filelock.file_lock(p):
+        with filelock.file_lock(p + ".lock"):
             t = threading.Thread(
                 target=lambda: (appcommon.append_history(p, {"n": 1}),
                                 acquired.append(True)))
@@ -7839,6 +7842,164 @@ class TestTask80PassengersCrypto(TempDirCase):
                                side_effect=RuntimeError("not our blob")):
             with self.assertRaises(pax_mod.SecretDecryptError):
                 pax_mod.unprotect_secret("dpapi1:QUJD")
+
+
+class TestTask81FilelockAppcommon(TempDirCase):
+    """Task 81: filelock + appcommon P3 bundle（a–f）。"""
+
+    def _bad_files(self, path):
+        import glob
+        return glob.glob(path + ".bad-*")
+
+    # ---- (a) 首跑加锁不建空数据文件、不误隔离 ----
+    def test_append_history_first_run_no_spurious_quarantine(self):
+        p = os.path.join(self.tmp, "order_history.json")
+        rec = {"train": "G1"}
+        with self.assertNoLogs("monitor", level="ERROR"):
+            appcommon.append_history(p, rec)
+        self.assertEqual(self._bad_files(p), [],
+                         "首跑加锁不应建出空数据文件并误隔离")
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [rec])
+        # sidecar 锁文件可以存在（与 engine/gui/monitor/launcher 的
+        # file_lock(path + ".lock") 约定一致），但数据文件语义必须干净
+        self.assertFalse(os.path.exists(p + ".bad-dummy"))
+
+    # ---- (b) 挪移失败：跳过本次写入，证据保留原地 ----
+    def _flaky_replace_once(self):
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("busy")  # 隔离挪移瞬间被占用
+            return real_replace(src, dst)  # 之后句柄释放，写盘能成功
+        return flaky
+
+    def test_append_history_move_failed_skips_write_preserves_evidence(self):
+        p = os.path.join(self.tmp, "order_history.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{CORRUPT")
+        with mock.patch.object(appcommon.os, "replace",
+                               self._flaky_replace_once()):
+            with self.assertLogs("monitor", level="ERROR") as logs:
+                appcommon.append_history(p, {"train": "G2"})
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{CORRUPT",
+                             "证据必须保留原地，不得被单条记录覆写")
+        self.assertIn("证据保留原地", "\n".join(logs.output))
+
+    def test_upsert_order_move_failed_skips_write_preserves_evidence(self):
+        p = os.path.join(self.tmp, "orders.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{CORRUPT")
+        with mock.patch.object(appcommon.os, "replace",
+                               self._flaky_replace_once()):
+            with self.assertLogs("monitor", level="ERROR"):
+                appcommon.upsert_order(p, "K1", {"order_no": "E1"})
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{CORRUPT",
+                             "证据必须保留原地，不得被空库+新记录覆写")
+
+    # ---- (c) 放弃隔离后重读仍失败：放弃本次追加，不覆写 ----
+    def test_append_history_abandon_reread_failure_skips_not_overwrites(self):
+        p = os.path.join(self.tmp, "order_history.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{CORRUPT")
+        orig = appcommon.quarantine_corrupt
+
+        def sneaky_delete(path, fp=None):
+            os.remove(path)  # 读失败与隔离之间文件被删 → 放弃隔离 → 重读失败
+            return orig(path, fp)
+
+        with mock.patch.object(appcommon, "quarantine_corrupt", sneaky_delete):
+            with self.assertLogs("monitor", level="ERROR") as logs:
+                appcommon.append_history(p, {"train": "G9"})
+        self.assertFalse(os.path.exists(p),
+                         "重读失败不得用空数据+新记录覆写（可能存在的健康写入）")
+        self.assertIn("重读", "\n".join(logs.output))
+
+    def test_upsert_order_abandon_reread_failure_skips_not_overwrites(self):
+        p = os.path.join(self.tmp, "orders.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{CORRUPT")
+        orig = appcommon.quarantine_corrupt
+
+        def sneaky_delete(path, fp=None):
+            os.remove(path)
+            return orig(path, fp)
+
+        with mock.patch.object(appcommon, "quarantine_corrupt", sneaky_delete):
+            with self.assertLogs("monitor", level="ERROR"):
+                appcommon.upsert_order(p, "K1", {"order_no": "E1"})
+        self.assertFalse(os.path.exists(p),
+                         "重读失败不得用空库+新记录覆写")
+
+    # ---- (d) upsert_order 用跨进程 file_lock ----
+    def test_upsert_order_uses_cross_process_file_lock(self):
+        p = os.path.join(self.tmp, "orders.json")
+        seen = []
+        orig = filelock.file_lock
+
+        @contextlib.contextmanager
+        def spy(path, timeout=10.0):
+            seen.append(path)
+            with orig(path, timeout=timeout) as lk:
+                yield lk
+
+        with mock.patch.object(filelock, "file_lock", spy):
+            appcommon.upsert_order(p, "K1", {"order_no": "E1"})
+        self.assertEqual(seen, [p + ".lock"],
+                         "upsert_order 必须用跨进程 file_lock 包住读-改-写")
+        with open(p, encoding="utf-8") as f:
+            self.assertIn("K1", json.load(f)["orders"])
+
+    def test_upsert_order_lock_timeout_skips_gracefully(self):
+        p = os.path.join(self.tmp, "orders.json")
+
+        def boom(path, timeout=10.0):
+            raise TimeoutError("busy")
+
+        with mock.patch.object(filelock, "file_lock", boom):
+            with self.assertLogs("monitor", level="WARNING"):
+                appcommon.upsert_order(p, "K1", {"order_no": "E1"})  # 不抛
+        self.assertFalse(os.path.exists(p))
+
+    # ---- (e) sweep 正则收紧：用户备份不误删，真 tmp 仍清理 ----
+    def test_sweep_stale_tmp_keeps_user_bak_files(self):
+        p = os.path.join(self.tmp, "state.json")
+        bak = p + ".bak2024-01"  # 用户自建备份：字母+数字-数字形态
+        with open(bak, "w", encoding="utf-8") as f:
+            f.write("keep")
+        stale_kinds = []
+        for kind in ("tmp", "launcher", "guisave", "monsave"):
+            q = p + ".%s12345-67890" % kind
+            with open(q, "w", encoding="utf-8") as f:
+                f.write("{}")
+            stale_kinds.append(q)
+        old = time.time() - 7200
+        os.utime(bak, (old, old))
+        for q in stale_kinds:
+            os.utime(q, (old, old))
+        appcommon.sweep_stale_tmp(p)
+        self.assertTrue(os.path.exists(bak), "用户备份文件不得被误删")
+        for q in stale_kinds:
+            self.assertFalse(os.path.exists(q), "真正的 tmp 残留仍应清理: %s" % q)
+
+    # ---- (f) parse_date_range 非 str 输入抛 ValueError ----
+    def test_parse_date_range_non_str_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            appcommon.parse_date_range(20261007)
+        with self.assertRaises(ValueError):
+            appcommon.parse_date_range("2026-10-01", 20261007)
+        with self.assertRaises(ValueError):
+            appcommon.parse_date_range(["2026-10-01"])
+        # 合法输入不受影响；None 仍走原空值路径（ValueError）
+        self.assertEqual(appcommon.parse_date_range("2026-10-01"),
+                         (["2026-10-01"], []))
+        with self.assertRaises(ValueError):
+            appcommon.parse_date_range(None)
 
 
 if __name__ == "__main__":

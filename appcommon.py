@@ -31,6 +31,9 @@ def parse_date_range(raw_from, raw_to=None, max_span_days=MAX_DATE_SPAN_DAYS):
       - raw_to 为 None：raw_from 内允许「a~b」连写，无 ~ 即单日。
     返回 ISO 字符串；date_range 为 [起, 止] 或空列表。
     """
+    for v in (raw_from, raw_to):
+        if v is not None and not isinstance(v, str):
+            raise ValueError("日期格式应为 YYYY-MM-DD（如 2026-10-07）")
     if raw_to is None:
         raw = (raw_from or "").strip()
         if "~" in raw:
@@ -112,17 +115,20 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
 
 
 _TMP_SWEEP_MAX_AGE = 3600  # 残留 tmp 超过 1 小时才删：其它进程正在写的 tmp 一定是新鲜的
+# atomic_write_json 实际使用过的 tmp_kind 全集（Task 81e）：清理正则只认
+# 这些 kind，形如 state.json.bak2024-01 的用户自建文件绝不误删。
+_TMP_SWEEP_KINDS = ("tmp", "launcher", "guisave", "monsave")
 
 
 def sweep_stale_tmp(path, max_age_seconds=_TMP_SWEEP_MAX_AGE):
-    """清理 path 的残留 tmp 文件（{path}.<kind><pid>-<tid> 形态，kind 如
-    tmp/launcher/guisave/monsave）。
+    """清理 path 的残留 tmp 文件（{path}.<kind><pid>-<tid> 形态，kind 取自
+    _TMP_SWEEP_KINDS）。
 
     只删 mtime 超过 max_age_seconds 的——其它进程正在写的 tmp 一定是新鲜的，
     绝不误删。返回删除数量。"""
     d = os.path.dirname(os.path.abspath(path)) or "."
     pat = re.compile(re.escape(os.path.basename(path))
-                     + r"\.[A-Za-z]*\d+-\d+$")
+                     + r"\.(?:%s)\d+-\d+$" % "|".join(_TMP_SWEEP_KINDS))
     now = time.time()
     try:
         names = os.listdir(d)
@@ -232,25 +238,29 @@ def _quarantine_decision(path, fp):
 
 
 def _read_history_list(path):
-    """重读一次历史文件；失败/形状非法返回 []（不抛异常、不循环）。"""
+    """重读一次历史文件；失败/形状非法返回 None（不抛异常、不循环）。
+
+    调用方须处理 None：不得用空列表覆写（可能存在的健康文件）。"""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return []
-    return data if isinstance(data, list) else []
+        return None
+    return data if isinstance(data, list) else None
 
 
 def _read_orders_db(path):
-    """重读一次 orders.json；失败/形状非法返回空库（不抛异常、不循环）。"""
+    """重读一次 orders.json；失败/形状非法返回 None（不抛异常、不循环）。
+
+    调用方须处理 None：不得用空库覆写（可能存在的健康文件）。"""
     try:
         with open(path, encoding="utf-8") as f:
             db = json.load(f)
     except Exception:
-        return {"orders": {}}
+        return None
     if isinstance(db, dict) and isinstance(db.get("orders"), dict):
         return db
-    return {"orders": {}}
+    return None
 
 
 def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
@@ -261,15 +271,18 @@ def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
 
 def append_history(path, record, keep=500):
     """追加一条购票历史(跨 engine/launcher 两个进程的写方),原子写、封顶 keep 条。
-    整个读-改-写包在 filelock.file_lock(path) 内：同一把锁串行化所有写方
+    整个读-改-写包在 filelock.file_lock(path + ".lock") 内：sidecar 锁文件，
+    不直接打开数据文件加锁（Task 81a：首跑时加锁不再建出空数据文件，避免
+    空文件被误判损坏隔离）。同一把锁串行化所有写方
     （Windows 用 msvcrt 字节锁；Linux/macOS 用 fcntl 跨进程锁）。
     锁争用超时（TimeoutError）时本条记录跳过并记 warning，不抛异常。
     文件损坏/形状非法时时间戳挪档留证（quarantine_corrupt）+ LOG.error，
     再追加新记录——不再静默清空整份历史。
     若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据继续，
-    绝不用过期空读数覆盖健康文件。"""
+    绝不用过期空读数覆盖健康文件；重读仍失败则放弃本次追加并记 error。
+    若隔离挪移失败（证据保留原地），跳过本次写入，绝不覆写证据。"""
     try:
-        with filelock.file_lock(path):
+        with filelock.file_lock(path + ".lock"):
             history = []
             if os.path.exists(path):
                 try:
@@ -285,10 +298,14 @@ def append_history(path, record, keep=500):
                     elif decision == "abandoned":
                         LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
                         history = _read_history_list(path)
+                        if history is None:
+                            LOG.error("[数据] order_history.json 放弃隔离后重读仍失败，"
+                                      "放弃本次追加以免覆盖健康文件")
+                            return
                     else:
-                        LOG.error("[数据] order_history.json 损坏，隔离挪移失败，证据保留原地（%s）；新记录继续追加",
-                                  e)
-                        history = []
+                        LOG.error("[数据] order_history.json 损坏，隔离挪移失败，证据保留原地（%s）；"
+                                  "跳过本次追加", e)
+                        return
                 else:
                     if not isinstance(history, list):
                         decision, bad = _quarantine_decision(path,
@@ -300,9 +317,14 @@ def append_history(path, record, keep=500):
                         elif decision == "abandoned":
                             LOG.warning("[数据] order_history.json 自读取后已被改写，放弃隔离；重读最新内容继续")
                             history = _read_history_list(path)
+                            if history is None:
+                                LOG.error("[数据] order_history.json 放弃隔离后重读仍失败，"
+                                          "放弃本次追加以免覆盖健康文件")
+                                return
                         else:
-                            LOG.error("[数据] order_history.json 结构非法，隔离挪移失败，证据保留原地；新记录继续追加")
-                            history = []
+                            LOG.error("[数据] order_history.json 结构非法，隔离挪移失败，"
+                                      "证据保留原地；跳过本次追加")
+                            return
             history.append(record)
             atomic_write_json(path, history[-keep:])
     except TimeoutError as e:
@@ -314,13 +336,14 @@ def append_history(path, record, keep=500):
 _ORDERS_LOCK = threading.Lock()
 
 
-def load_orders(path):
-    """orders.json → {"orders": {key: rec}}；缺失返回空库；损坏/形状非法则
-    时间戳挪档留证（quarantine_corrupt）+ LOG.error，再返回空库——不再静默。
-    若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据返回，
-    绝不用过期空库覆盖健康文件（upsert_order 随后会落盘）。"""
+def _load_orders_impl(path):
+    """内部实现：返回 (db, write_ok)。
+
+    write_ok=False 表示"证据保留原地"（隔离挪移失败）或"放弃隔离后重读仍
+    失败"——调用方（upsert_order）必须跳过本次写入，绝不能用空库覆写。
+    纯读调用方请用 load_orders（契约不变：永远返回 dict）。"""
     if not os.path.exists(path):
-        return {"orders": {}}
+        return {"orders": {}}, True
     try:
         with open(path, encoding="utf-8") as f:
             db = json.load(f)
@@ -328,32 +351,67 @@ def load_orders(path):
         decision, bad = _quarantine_decision(path, stat_fingerprint(path))
         if decision == "quarantined":
             LOG.error("[数据] orders.json 损坏，已隔离留证：%s（%s）；返回空库", bad, e)
-            return {"orders": {}}
+            return {"orders": {}}, True
         if decision == "abandoned":
+            fresh = _read_orders_db(path)
+            if fresh is None:
+                LOG.error("[数据] orders.json 放弃隔离后重读仍失败，返回空库；"
+                          "写方不得覆写")
+                return {"orders": {}}, False
             LOG.warning("[数据] orders.json 自读取后已被改写，放弃隔离；重读最新内容继续")
-            return _read_orders_db(path)
+            return fresh, True
         LOG.error("[数据] orders.json 损坏，隔离挪移失败，证据保留原地（%s）；返回空库", e)
-        return {"orders": {}}
+        return {"orders": {}}, False
     if isinstance(db, dict) and isinstance(db.get("orders"), dict):
-        return db
+        return db, True
     decision, bad = _quarantine_decision(path, stat_fingerprint(path))
     if decision == "quarantined":
         LOG.error("[数据] orders.json 结构非法，已隔离留证：%s；返回空库", bad)
-        return {"orders": {}}
+        return {"orders": {}}, True
     if decision == "abandoned":
+        fresh = _read_orders_db(path)
+        if fresh is None:
+            LOG.error("[数据] orders.json 放弃隔离后重读仍失败，返回空库；"
+                      "写方不得覆写")
+            return {"orders": {}}, False
         LOG.warning("[数据] orders.json 自读取后已被改写，放弃隔离；重读最新内容继续")
-        return _read_orders_db(path)
+        return fresh, True
     LOG.error("[数据] orders.json 结构非法，隔离挪移失败，证据保留原地；返回空库")
-    return {"orders": {}}
+    return {"orders": {}}, False
+
+
+def load_orders(path):
+    """orders.json → {"orders": {key: rec}}；缺失返回空库；损坏/形状非法则
+    时间戳挪档留证（quarantine_corrupt）+ LOG.error，再返回空库——不再静默。
+    若隔离因"文件自读取后被改写"而放弃，则重读一次用新鲜数据返回，
+    绝不用过期空库覆盖健康文件（upsert_order 随后会落盘）。"""
+    db, _ = _load_orders_impl(path)
+    return db
 
 
 def upsert_order(path, key, rec):
-    """登记/更新一条订单记录(锁 + 原子写)。"""
-    with _ORDERS_LOCK:
-        db = load_orders(path)
-        rec = dict(rec)
-        rec.setdefault("first_seen", rec.get("last_check") or
-                       time.strftime("%Y-%m-%d %H:%M:%S"))
-        rec["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        db["orders"][key] = rec
-        atomic_write_json(path, db)
+    """登记/更新一条订单记录(进程内锁 + 跨进程文件锁 + 原子写)。
+
+    跨进程锁与 append_history 同口径（sidecar path + ".lock" 文件）：
+    launcher 内嵌引擎线程与独立运行的 monitor.py 引擎是两个进程、
+    写同一 orders.json，读-改-写必须串行化，否则丢对方订单记录。
+    锁顺序恒为 _ORDERS_LOCK → file_lock（_ORDERS_LOCK 仅本函数持有，
+    无逆序路径，不存在锁顺序反转）。
+    证据保留原地 / 重读失败时跳过本次写入；锁争用超时跳过并记 warning。"""
+    try:
+        with _ORDERS_LOCK:
+            with filelock.file_lock(path + ".lock"):
+                db, write_ok = _load_orders_impl(path)
+                if not write_ok:
+                    LOG.error("[数据] orders.json 证据保留原地或重读失败，"
+                              "跳过本次订单登记以免覆盖")
+                    return
+                rec = dict(rec)
+                rec.setdefault("first_seen", rec.get("last_check") or
+                               time.strftime("%Y-%m-%d %H:%M:%S"))
+                rec["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                db["orders"][key] = rec
+                atomic_write_json(path, db)
+    except TimeoutError as e:
+        LOG.warning("[数据] orders.json 锁争用超时，本条订单记录跳过: %s", e)
+        return
