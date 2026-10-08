@@ -224,6 +224,19 @@ def update_config_locked(mutator):
                     parent=None)
                 raise RuntimeError(
                     "config.json 已损坏：本次保存已取消，旧文件未被覆盖")
+            if not isinstance(config, dict):
+                # Task 103d：合法 JSON 但非 dict（如手改的 []）——写侧同样友好
+                # 拒绝（与解析失败同口径）：记 warning + 弹 error，不抛裸 TypeError；
+                # 拒绝点在 mutator 之前，无任何写入，旧文件不丢。
+                LOG.warning("config.json 内容非 dict（%s），拒绝覆盖写入：%s",
+                            type(config).__name__, CONFIG_PATH)
+                messagebox.showerror(
+                    "配置损坏",
+                    "config.json 内容不是对象，本次保存已取消（旧文件未被覆盖）。\n"
+                    "请手动修复该文件，或备份后删除让程序重建。",
+                    parent=None)
+                raise RuntimeError(
+                    "config.json 内容非 dict：本次保存已取消，旧文件未被覆盖")
             result = mutator(config)
             # Task 66: config.json 含密钥，落盘 0600
             appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
@@ -337,6 +350,18 @@ def _display_trains(raw):
         raw = []
     return [t.strip().upper() for t in raw
             if isinstance(t, str) and t.strip()]
+
+
+def _display_seat_types(raw):
+    """展示用席别归一化（Task 103c）：裸字符串（如 "二等座"）按单个席别处理，
+    绝不逐字符拆；非法形状视为空。与 _display_trains 同口径（不记日志——
+    展示/对话框路径高频调用；真正的配置形状警告由引擎侧负责）。注：席别为
+    中文名，不做 strip/upper（与 engine.normalize_seat_types 一致）。"""
+    if isinstance(raw, str):
+        return [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [s for s in raw if isinstance(s, str)]
 
 
 def _build_edited_task(task, *, from_name, to_name, dates, date_range, trains,
@@ -2847,7 +2872,9 @@ class TaskEditDialog(tk.Toplevel):
         self.seat_list.pack(fill="x")
         for s in SEAT_CHOICES:
             self.seat_list.insert("end", s)
-        for s in (task.get("seat_types") or []):
+        # Task 103c：展示用归一化——裸字符串按单个席别（旧代码逐字符拆后
+        # s in SEAT_CHOICES 恒失败 → 已存席别显示为未选中）。
+        for s in _display_seat_types(task.get("seat_types")):
             if s in SEAT_CHOICES:
                 self.seat_list.selection_set(SEAT_CHOICES.index(s))
 

@@ -10711,6 +10711,149 @@ class TestTask101CrossModuleP3(TempDirCase):
         self.assertIn("张*", out)
 
 
+class TestTask103LauncherGuiP3(TempDirCase):
+    """Task 103：launcher/gui P2/P3（a preset 写回污染 / b 席别默认值展示 /
+    c 成员检查 / d update_config_locked 写侧非 dict 拒绝）。
+
+    无 Tk 真机，全部 mock/桩测试（沿 Task 96/101 口径）。
+    """
+
+    # ---- (a) _save_preset 写回前归一化（P2） ----
+
+    def _make_preset_app(self, trains, seat_types):
+        app = object.__new__(launcher.LauncherApp)
+        app.lc = {"from": "北京", "to": "上海",
+                  "trains": trains, "seat_types": seat_types,
+                  "presets": []}
+        # _ui_to_lc 置空：只测写回点本身（entry 组装 + _save_cfg），
+        # 模拟 lc 在写回时仍为脏值（手改配置/任务模式嵌入等）。
+        app._ui_to_lc = mock.Mock()
+        app._save_cfg = mock.Mock()
+        app._put_log = mock.Mock()
+        app._mp = mock.Mock()
+        app.preset_cb = mock.Mock()
+        app.preset_cb.get.return_value = ""
+        return app
+
+    def _saved_preset_entry(self, app):
+        saved_lc = app._save_cfg.call_args[0][0]
+        self.assertEqual(len(saved_lc["presets"]), 1)
+        return saved_lc["presets"][0]
+
+    def test_a_save_preset_dirty_trains_single_not_char_split(self):
+        # P2：lc["trains"] 为裸字符串 "G101" 时，旧代码 list(...) 逐字符拆成
+        # ["G","1","0","1"] 并写回 preset → 配置污染（Task 89a 同类）。
+        app = self._make_preset_app("G101", ["二等座"])
+        with mock.patch.object(launcher.simpledialog, "askstring",
+                               return_value="京沪测试"):
+            app._save_preset()
+        entry = self._saved_preset_entry(app)
+        self.assertEqual(entry["trains"], ["G101"])
+
+    def test_a_save_preset_dirty_seat_types_single_not_char_split(self):
+        # P2：lc["seat_types"] 为裸字符串 "二等座" 时，旧代码逐字符拆成
+        # ["二","等","座"] 并写回 preset → 配置污染。
+        app = self._make_preset_app(["G101"], "二等座")
+        with mock.patch.object(launcher.simpledialog, "askstring",
+                               return_value="京沪测试"):
+            app._save_preset()
+        entry = self._saved_preset_entry(app)
+        self.assertEqual(entry["seat_types"], ["二等座"])
+
+    def test_a_save_preset_clean_lists_unchanged(self):
+        # 正向对照：干净 list 形状写回前后一致（归一化幂等，不改变正常行为）。
+        app = self._make_preset_app(["G101", "G103"], ["二等座", "一等座"])
+        with mock.patch.object(launcher.simpledialog, "askstring",
+                               return_value="京沪测试"):
+            app._save_preset()
+        entry = self._saved_preset_entry(app)
+        self.assertEqual(entry["trains"], ["G101", "G103"])
+        self.assertEqual(entry["seat_types"], ["二等座", "一等座"])
+
+    # ---- (b) _rebuild_seats 席别默认值展示（P3） ----
+
+    def test_b_display_seat_types_unit(self):
+        # 裸字符串按单个席别，不逐字符拆；非法形状视为空。
+        self.assertEqual(launcher._display_seat_types("二等座"), ["二等座"])
+        self.assertEqual(launcher._display_seat_types(["一等座"]), ["一等座"])
+        self.assertEqual(launcher._display_seat_types(None), [])
+        self.assertEqual(launcher._display_seat_types(123), [])
+
+    def test_b_rebuild_seats_dirty_seat_types_default_checked(self):
+        # P3：lc["seat_types"] 为裸字符串 "二等座" 时，旧代码
+        # set("二等座") → {"二","等","座"}，default 匹配恒失败 → 回退勾选
+        # names[0]（展示错误）。改后应勾选"二等座"。
+        app = object.__new__(launcher.LauncherApp)
+        app.lc = {"seat_types": "二等座"}
+        app.seat_vars = {}
+        app.seat_box = mock.Mock()
+        app.seat_box.winfo_children.return_value = []
+        app.sf = mock.Mock()
+        app._put_log = mock.Mock()
+        bool_values = {}
+
+        def fake_boolvar(value=False):
+            m = mock.Mock()
+            m.get.return_value = value
+            bool_values.setdefault("last", []).append(value)
+            return m
+
+        with mock.patch.object(launcher.tk, "BooleanVar",
+                               side_effect=fake_boolvar), \
+             mock.patch.object(launcher.ttk, "Checkbutton"), \
+             mock.patch.object(launcher.ttk, "Label"):
+            app._rebuild_seats()
+        self.assertIn("二等座", app.seat_vars)
+        self.assertTrue(app.seat_vars["二等座"].get(),
+                        "脏字符串席别应按单个席别勾选，而非回退到首个席别")
+
+    # ---- (c) gui 任务对话框席别预选成员检查（P3） ----
+
+    def test_c_display_seat_types_unit(self):
+        # 裸字符串按单个席别，不逐字符拆；非法形状视为空。
+        self.assertEqual(gui._display_seat_types("二等座"), ["二等座"])
+        self.assertEqual(gui._display_seat_types(["一等座"]), ["一等座"])
+        self.assertEqual(gui._display_seat_types(None), [])
+        self.assertEqual(gui._display_seat_types(123), [])
+
+    # ---- (d) update_config_locked 写侧拒绝非 dict（P3） ----
+
+    def _patch_gui_config(self, content):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(content)
+        p = mock.patch.object(gui, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
+        return cfg
+
+    def test_d_update_config_locked_rejects_non_dict(self):
+        # P3：config.json 内容为 []（合法 JSON 但非 dict）时，旧代码
+        # mutator([]) 抛裸 TypeError（Tk console）。改后：warning + error
+        # 弹窗 + 友好 RuntimeError，mutator 不执行，文件不被覆盖。
+        cfg = self._patch_gui_config("[]")
+        calls = []
+
+        def mutator(config):
+            calls.append(config)
+            config["x"] = 1
+
+        with mock.patch.object(gui, "messagebox") as mb:
+            with self.assertRaises(RuntimeError):
+                gui.update_config_locked(mutator)
+        self.assertEqual(calls, [], "非 dict 时 mutator 不得执行")
+        mb.showerror.assert_called_once()
+        with open(cfg, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "[]", "旧文件不得被覆盖")
+
+    def test_d_update_config_locked_dict_still_works(self):
+        # 正向对照：dict 配置写侧流程不变。
+        cfg = self._patch_gui_config('{"a": 1}')
+        gui.update_config_locked(lambda c: c.update({"b": 2}))
+        with open(cfg, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"a": 1, "b": 2})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -363,6 +363,29 @@ def _display_trains(raw):
     return _normalize_trains(raw, lambda *a: None)
 
 
+def _normalize_seat_types(raw, warn):
+    """seat_types 字段归一化（Task 103a；与 engine.normalize_seat_types 同口径）：
+    裸字符串（如漏写方括号的 "二等座"）按单个席别处理并记警告，绝不逐字符拆
+    （旧代码 list("二等座") 会拆成 ['二','等','座'] 写回污染配置 → 漏单类）；
+    形状非法记警告后忽略；非字符串条目跳过（席别为中文名，不做 strip/upper）。"""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        warn("[提醒] seat_types 为字符串，已按单个席别处理：%s" % raw)
+        return [raw]
+    if not isinstance(raw, (list, tuple)):
+        warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))
+        return []
+    return [s for s in raw if isinstance(s, str)]
+
+
+def _display_seat_types(raw):
+    """展示用席别归一化（Task 103b）：与 _display_trains 同口径（字符串按单个
+    席别、绝不逐字符拆），但不打日志——展示路径可能高频刷新，畸形值的警告由
+    数据消费路径（engine/launcher 运行链）负责；这里只解决展示。"""
+    return _normalize_seat_types(raw, lambda *a: None)
+
+
 def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
     """保存乘车人；磁盘盒子不可解密被拒写（return False）时弹 error 并返回 False。
 
@@ -2453,7 +2476,9 @@ class LauncherApp(tk.Frame):
             ttk.Label(self.seat_box, text="（该车次暂无可购席别）",
                       foreground="#6e7781").grid(row=0, column=0, sticky="w")
             return
-        default = set(self.lc.get("seat_types") or [])
+        # Task 103b：展示用归一化——裸字符串按单个席别（旧代码 set("二等座")
+        # → {"二","等","座"}，default 匹配恒失败 → 错误回退勾选首个席别）。
+        default = set(_display_seat_types(self.lc.get("seat_types")))
         chosen = [s for s in names if s in keep] or [s for s in names if s in default] or [names[0]]
         for i, s in enumerate(names):
             v = tk.BooleanVar(value=s in chosen)
@@ -3106,8 +3131,12 @@ class LauncherApp(tk.Frame):
             "name": name.strip(),
             "from": self.lc.get("from"),
             "to": self.lc.get("to"),
-            "trains": list(self.lc.get("trains") or []),
-            "seat_types": list(self.lc.get("seat_types") or []),
+            # Task 103a：写回前归一化——裸字符串按单值处理，绝不 list() 逐字符拆
+            # （旧代码 list("G101") → ["G","1","0","1"] 写回污染 preset 配置，
+            # 与 Task 89a 同污染类）；干净 list 归一化幂等。
+            "trains": _normalize_trains(self.lc.get("trains"), self._put_log),
+            "seat_types": _normalize_seat_types(self.lc.get("seat_types"),
+                                                self._put_log),
             "seat_priority": self.lc.get("seat_priority") or "",
             "date": self.lc.get("date") or "",
         }
