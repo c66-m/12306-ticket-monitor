@@ -572,6 +572,21 @@ def _goto_and_query(page, info, date, want_hit=True, timeout=20000, wait_code=No
         return False
 
 
+def _cls_has(cls_text, name):
+    """className 精确 token 匹配（Task 65g）。
+
+    确认按钮的启用态类名是 btn92s、禁用态是 btn92；倒计时中的按钮类名可能
+    以 btn92s 为子串（如 btn92s-countdown）——旧代码 `"btn92s" in cls` 子串
+    匹配会误点倒计时中的按钮。这里按空白切分后精确匹配独立 token。
+    className 在 SVG 元素上可能是对象，做 str 兜底。
+    """
+    if not cls_text:
+        return False
+    text = cls_text if isinstance(cls_text, str) else str(
+        getattr(cls_text, "baseVal", cls_text))
+    return name in text.split()
+
+
 def _slide_up(page):
     """当前页面是否有可见的滑块验证框。返回非空列表表示有（取证用）。"""
     try:
@@ -1015,7 +1030,9 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 except Exception:
                     pass
                 st = _qr_state()
-                if st["found"] and st["shown"] and "btn92s" in st["cls"]:
+                # Task 65g：精确匹配启用态类名 btn92s（独立 token），不用子串——
+                # 倒计时中的按钮类名可能含 btn92s 子串，子串匹配会误点
+                if st["found"] and st["shown"] and _cls_has(st["cls"], "btn92s"):
                     # 点确认前先把 12306 自己渲染的核对窗原文抄下来：它是服务端下发
                     # 的载荷，若与我们所选席别不一致，只有日志里留了原文才能对账。
                     try:
@@ -1220,6 +1237,46 @@ def order_via_browser(info, seat_name, seat_code, passenger_names, date,
     return ok, msg, extra
 
 
+def _recover_browser_lock(owner_thread, probe_timeout=5):
+    """WarmSession 跨线程收尾时进程内浏览器锁的恢复路径（Task 65h）。
+
+    背景：threading.RLock 只能由持锁线程 release；close() 若在非创建线程被
+    调用，旧代码只打一条警告就把 _local_locked 置 False——锁实际仍被（可能已
+    死的）持锁线程占着，本进程后续所有 exclusive() 永久超时。
+
+    恢复步骤：
+    1. 短超时探针：锁若当前可获取，说明并未泄漏（或已被释放），拿走再释放
+       即可，无需重建；
+    2. 超时仍拿不到：只有当持锁线程已死才重建 _BROWSER_LOCK。本模块所有调用
+       方都经模块全局名引用它，重建后新的 acquire 走新锁；旧锁由已死线程持
+       有、永不可再释放，重建是唯一的出路；
+    3. 持锁线程仍存活：不重建（会破坏它后续的正常释放），记 error 返回 False，
+       调用方应提示用户重启该程序。
+
+    返回 True 表示锁已不再泄漏（可正常释放或已重建）。
+    """
+    global _BROWSER_LOCK
+    lock = _BROWSER_LOCK
+    try:
+        if lock.acquire(timeout=probe_timeout):
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+            return True
+    except Exception:
+        pass
+    if owner_thread is not None and owner_thread.is_alive():
+        _log("[错误] WarmSession 由非创建线程收尾，持锁线程仍存活："
+             "进程内浏览器锁无法安全释放，本进程后续 exclusive() 可能超时"
+             "——建议重启该程序")
+        return False
+    _log("[错误] WarmSession 由非创建线程收尾且持锁线程已退出："
+         "强制重建进程内浏览器锁（旧锁由已死线程持有，永不可释放）")
+    _BROWSER_LOCK = threading.RLock()
+    return True
+
+
 class WarmSession:
     """开抢前预热好的「下单现场」：浏览器已开、已登录、车票页条件已填、查询已发。
 
@@ -1239,6 +1296,8 @@ class WarmSession:
         self._local_locked = False
         self._file_locked = False
         self._owner = threading.get_ident()
+        # Task 65h：持锁线程对象（非 ident，避免 ident 被系统回收复用导致误判）
+        self._owner_thread = threading.current_thread()
         self._timeout = timeout
         self._stop_event = stop_event
         self.error = None
@@ -1336,9 +1395,9 @@ class WarmSession:
             if self._owner == threading.get_ident():
                 _BROWSER_LOCK.release()
             else:
-                # RLock 只能由持锁线程释放：跨线程收尾放不掉进程内锁，只能明示
-                _log("[警告] WarmSession 由非创建线程收尾，进程内浏览器锁未能释放，"
-                     "本进程后续 exclusive() 可能超时——建议重启该程序")
+                # Task 65h：RLock 只能由持锁线程释放；跨线程收尾走
+                # "超时检测 + 强制恢复"路径，不再永久泄漏
+                _recover_browser_lock(self._owner_thread)
             self._local_locked = False
 
 

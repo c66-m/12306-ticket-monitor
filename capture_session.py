@@ -13,6 +13,9 @@
     2. python capture_session.py
     3. 在弹出的 Edge 窗口里完成登录（用户名密码 + 滑块，或 App 扫码）
     4. 看到"已保存 N 个 Cookie"即成功，之后可关闭窗口
+
+出口约定（Task 65c）：唯一的成败出口是「退出码」——0=成功，1=失败。
+子进程调用方只看 returncode；在进程内调用 main() 时看它的 int 返回值。
 """
 
 import appcommon
@@ -42,7 +45,42 @@ def _order_mode():
         return "http"
 
 
+def _goto_login_page(page):
+    """打开登录页：失败给友好提示并返回 False（Task 65e）。"""
+    try:
+        page.goto(LOGIN_URL)
+        return True
+    except Exception as e:
+        print("[失败] 打不开 12306 登录页：{0}".format(e))
+        print("       请检查网络连接 / 代理设置后重试。")
+        return False
+
+
+def _final_verify(page):
+    """最终验证：拉取需登录接口，当且仅当拿到登录态数据返回 True。
+
+    通过才允许保存 Cookie（Task 65d）：校验失败就存盘会把"未登录"的
+    Cookie 写进 session_cookies.json，下次下单直接判"未登录"还查不出原因。
+    """
+    try:
+        page.goto(CHECK_URL)
+        time.sleep(2)
+        body = page.content()
+    except Exception as e:
+        print("[警告] 最终验证请求失败：{0}".format(e))
+        return False
+    return "user_name" in body
+
+
 def main():
+    """抓取会话并保存 Cookie。
+
+    出口约定（Task 65c）：唯一的成败出口是「退出码」——0=成功，1=失败。
+    直接运行时 __main__ 会 sys.exit(main())；子进程调用方
+    （gui._relogin_ok_via_script / monitor.menu_session）只看 returncode；
+    若在进程内调用 main()，同样看它的 int 返回值——main() 内部不再 sys.exit，
+    避免 import 后调用时 SystemExit 炸掉调用方进程。
+    """
     # 浏览器下单模式的会话活在 .browser_profile 里，本脚本那套 session_cookies.json
     # 已经用不上了。要是还照旧开一个独立的临时浏览器，就会和 browser_order 抢
     # 同一个 profile：两个窗口你开我关，用户看到的就是"网页一直在开启关闭"。
@@ -50,13 +88,13 @@ def main():
         print("[提示] 当前是浏览器下单模式，转交 browser_order 登录（会话存进 .browser_profile）")
         sys.path.insert(0, HERE)
         import browser_order
-        sys.exit(0 if browser_order.login() else 1)
+        return 0 if browser_order.login() else 1
 
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         print("[FATAL] 缺少 playwright，请先执行：pip install playwright")
-        sys.exit(1)
+        return 1
 
     print("正在启动 Edge（channel=msedge）打开 12306 登录页...")
     print("请在弹出的浏览器窗口里登录。脚本会自动检测登录状态。")
@@ -71,7 +109,9 @@ def main():
             viewport={"width": 1280, "height": 800},
         )
         page = context.new_page()
-        page.goto(LOGIN_URL)
+        if not _goto_login_page(page):
+            browser.close()
+            return 1
 
         # 轮询判断：登录成功后 Cookie 里会出现 tk / RAIL_EXPIRATION 等关键字段
         deadline = time.time() + MAX_WAIT_SEC
@@ -91,20 +131,17 @@ def main():
         if not logged_in:
             print("\n[失败] 未检测到登录状态（{0}s 超时）。窗口已自动关闭，请重试。".format(MAX_WAIT_SEC))
             browser.close()
-            sys.exit(1)
+            return 1
 
-        print("\n[成功] 检测到已登录，正在拉取乘车人信息做最终验证...")
-        page.goto(CHECK_URL)
-        time.sleep(2)
-        body = page.content()
-        if "user_name" not in body and "登录" in body[:2000]:
-            print("[警告] 登录状态可能失效，但 cookie 仍将保存，下单时会再校验。")
-        try:
-            page.goto("https://kyfw.12306.cn/otn/passengers/query?pageIndex=1&pageSize=10")
-            time.sleep(2)
-            body = page.content()
-        except Exception:
-            pass
+        # 最终验证：通过才存 Cookie、才打印成功（Task 65d）。
+        # 旧代码这里先打印"[成功]"、校验失败也照存——存的是未登录态 Cookie。
+        print("\n[验证] 已检测到登录 Cookie，正在拉取需登录接口做最终验证...")
+        if not _final_verify(page):
+            print("[失败] 最终验证未通过：没取到登录态数据，Cookie 不保存。")
+            print("       请确认浏览器里确实已登录成功后重试。")
+            browser.close()
+            return 1
+        print("[成功] 最终验证通过。")
 
         cookies = context.cookies()
         cookie_dict = {}
@@ -131,8 +168,8 @@ def main():
         browser.close()
         print("\n[完成] 已保存 {0} 个 Cookie 到 {1}".format(len(cookie_dict), COOKIE_PATH))
         print("之后直接运行：python monitor.py")
-        sys.exit(0)
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -32,6 +32,7 @@
 import base64
 import json
 import os
+import re
 import sys
 import time
 
@@ -81,8 +82,30 @@ def banner(title):
     print("=" * 64)
 
 
-def show(resp, limit=300):
-    """打印一次响应的关键信息 + 原始内容片段（截断）。"""
+_PII_VALUE_RE = re.compile(
+    r'("(?:passenger_name|passenger_id_no|mobile_no|id_no|user_name|name)"'
+    r"\s*:\s*\""
+    r')(?:[^"\\]|\\.)*(")')
+
+
+def _mask_pii(text):
+    """脱敏：把已知 PII 字段的值替换为 ***。
+
+    probe 的诊断价值在"字段结构/接口是否变更"，不在真实姓名/证件号；
+    打印前把 passenger_name / passenger_id_no / mobile_no 等字段值抹掉，
+    字段名与 JSON 结构保留，仍可判断接口变更（Task 65a）。
+    """
+    if not text:
+        return text
+    return _PII_VALUE_RE.sub(r"\1***\2", text)
+
+
+def show(resp, limit=300, mask_pii=False):
+    """打印一次响应的关键信息 + 原始内容片段（截断）。
+
+    mask_pii=True 时先对 body 做 PII 脱敏再打印（需登录接口的响应用它，
+    Task 65a）；连通性/二维码等匿名探测保持原样。
+    """
     if resp is None:
         print("    [无响应]")
         return
@@ -93,6 +116,8 @@ def show(resp, limit=300):
         ctype=resp.headers.get("Content-Type", "-"),
     ))
     body = resp.text.strip().replace("\n", " ")
+    if mask_pii:
+        body = _mask_pii(body)
     if len(body) > limit:
         body = body[:limit] + " ...(已截断)"
     print("    body: " + (body if body else "<空>"))
@@ -205,6 +230,21 @@ def step3_create_qr():
 
 # ----------------------------- STEP 4：轮询扫码状态 -----------------------------
 
+def _confirm_qr_refresh():
+    """二维码过期后是否重新申请：交互式询问用户。
+
+    本脚本本就是交互式运行的（用户要在终端前扫码），input() 不会悬空；
+    stdin 不可用（EOFError，非交互/管道环境）时回退到自动刷新（旧行为），
+    避免在无人值守时卡死（Task 65b）。
+    """
+    try:
+        ans = input("  二维码已过期，是否重新申请一张？(Y/n，直接回车=是) ").strip().lower()
+    except EOFError:
+        print("  （非交互环境，自动刷新）")
+        return True
+    return ans in ("", "y", "yes")
+
+
 def step4_poll_qr(uuid):
     banner("STEP 4  轮询扫码状态（请现在去扫码，最长等待 {0}s）".format(POLL_TIMEOUT_SEC))
     url = "https://kyfw.12306.cn/passport/web/checkqr"
@@ -231,9 +271,14 @@ def step4_poll_qr(uuid):
         if code == 2:
             print("\n  [成功] 二维码已确认，uamtk = {0}".format(data.get("uamtk")))
             return data.get("uamtk")
-        # 3 = 二维码过期 —— 自动刷新，避免用户还没扫就失效
+        # 3 = 二维码过期 —— 刷新前先问用户：旧码可能正在被扫，
+        # 静默作废会让用户扫一张死码（Task 65b）
         if code == 3:
-            print("\n  [刷新] 二维码已过期，正在重新申请...")
+            print("\n  [过期] 二维码已过期。")
+            if not _confirm_qr_refresh():
+                print("  已取消刷新，退出扫码等待。")
+                return None
+            print("  正在重新申请...")
             uuid = create_qr_raw()
             if not uuid:
                 print("  [失败] 刷新二维码失败，终止。")
@@ -331,7 +376,8 @@ def step6_verify_session():
                 r = SESSION.get(url, timeout=10)
             else:
                 r = SESSION.post(url, data=payload, timeout=10)
-            show(r)
+            # 需登录接口的响应先脱敏再打印（Task 65a）
+            show(r, mask_pii=True)
             if _session_looks_valid(r):
                 ok = True
         except Exception as e:

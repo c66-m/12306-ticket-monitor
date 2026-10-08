@@ -73,6 +73,16 @@ LOG_COLOR = {
 LOGQ = queue.Queue()
 
 
+def _is_soft_fail(msg):
+    """瞬时繁忙/排队类软失败判定（Task 65i）。
+
+    这类错误是 12306 侧的瞬时拥塞，不是"下单逻辑失败"：不计入 fail_streak
+    （"同一目标连续失败 N 次自动停止"守卫本意只拦硬失败）。busy_n 继续驱动
+    退避（3s→30s 封顶）；持续繁忙会一直重试直到用户停止——抢票本意如此。
+    """
+    return any(k in (msg or "") for k in ("系统繁忙", "网络异常", "排队"))
+
+
 class _QHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -769,18 +779,22 @@ class Grabber(threading.Thread):
                         if self.stop_event.wait(3):
                             break
                         continue
-                    target = (info["train_code"], seat)
-                    if target == last_target:
-                        fail_streak += 1
-                    else:
-                        last_target, fail_streak = target, 1
-                    if any(k in msg for k in ("系统繁忙", "网络异常", "排队")):
+                    if _is_soft_fail(msg):
+                        # Task 65i：瞬时繁忙/排队是软失败，不计入 fail_streak——
+                        # 连续 5 次 busy（~45s）就触发"连续失败已自动停止"是 bug。
+                        # busy_n 仍驱动退避（3s→30s 封顶）；持续繁忙一直重试，
+                        # 直到用户停止（stop_event）。
                         busy_n += 1
                         wait_s = min(30, 3 * busy_n)
                         log("[错误] 下单遇系统繁忙：%s（%d 秒后重试，累计 %d 次）" % (msg, wait_s, busy_n))
                         if self.stop_event.wait(wait_s):
                             break
                         continue
+                    target = (info["train_code"], seat)
+                    if target == last_target:
+                        fail_streak += 1
+                    else:
+                        last_target, fail_streak = target, 1
                     busy_n = 0  # 非繁忙类失败：退避计数复位，别一直卡在 30 秒档
                     log("[错误] 下单未成功：%s（同目标第 %d 次失败）" % (msg, fail_streak))
                     if fail_streak >= MAX_ORDER_FAILS:

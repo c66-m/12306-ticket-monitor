@@ -5445,6 +5445,204 @@ class TestTicketP3(TempDirCase):
         self.assertEqual(kinds["XXX"], "待识别")
 
 
+class TestTask65InteractionLoginChain(TempDirCase):
+    """Task 65: 交互与登录链 P3 bundle（a–i）。
+
+    (a) probe 打印原始乘车人响应 → 姓名/证件号进控制台 → 脱敏打印
+    (b) 二维码过期静默刷新 → 刷新前先问用户
+    (c) capture_session 出口约定统一为退出码（文档注明）
+    (d) 最终校验通过后才存 cookie、才打印成功
+    (e) page.goto 加 try 给友好提示
+    (f) gui warn 重登 http 路径与 Task 53 口径统一（等退出码、写回 UI）
+    (g) 确认按钮类名精确匹配（防子串误点倒计时按钮）
+    (h) WarmSession.close 跨线程锁泄漏 → 超时检测 + 强制恢复
+    (i) launcher 繁忙/排队类软失败不计入 fail_streak
+    """
+
+    # ---- (a) PII 脱敏打印 ----
+
+    def test_mask_pii_hides_passenger_fields(self):
+        body = ('{"status":true,"data":{"datas":['
+                '{"passenger_name":"张三","passenger_id_no":"110101199001011234",'
+                '"mobile_no":"13800138000"}]}}')
+        masked = probe_login._mask_pii(body)
+        self.assertNotIn("张三", masked)
+        self.assertNotIn("110101199001011234", masked)
+        self.assertNotIn("13800138000", masked)
+        # 诊断价值保留：字段结构还在
+        self.assertIn("passenger_name", masked)
+        self.assertIn("passenger_id_no", masked)
+
+    def test_show_with_mask_pii_option(self):
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.elapsed.total_seconds.return_value = 12.0
+        resp.content = b"x"
+        resp.headers = {"Content-Type": "application/json"}
+        resp.text = '{"passenger_id_no":"110101199001011234"}'
+        with mock.patch("builtins.print") as mprint:
+            probe_login.show(resp, mask_pii=True)
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertNotIn("110101199001011234", out)
+
+    # ---- (b) 二维码过期刷新前确认 ----
+
+    def test_confirm_qr_refresh_answers(self):
+        with mock.patch("builtins.input", return_value="y"):
+            self.assertTrue(probe_login._confirm_qr_refresh())
+        with mock.patch("builtins.input", return_value="n"):
+            self.assertFalse(probe_login._confirm_qr_refresh())
+        with mock.patch("builtins.input", return_value=""):
+            self.assertTrue(probe_login._confirm_qr_refresh())  # 回车=默认是
+        with mock.patch("builtins.input", side_effect=EOFError):
+            # 非交互环境（stdin 关闭）：回退到自动刷新（旧行为），不卡死
+            self.assertTrue(probe_login._confirm_qr_refresh())
+
+    def test_qr_expiry_asks_before_refresh(self):
+        # code==3 时必须先问用户；用户拒绝 → 不刷新、直接返回 None
+        r3 = mock.Mock()
+        r3.json.return_value = {"result_code": 3, "result_message": "expired"}
+        with mock.patch.object(probe_login.SESSION, "post", return_value=r3), \
+             mock.patch.object(probe_login, "create_qr_raw",
+                               return_value=None) as mkr, \
+             mock.patch("builtins.input", return_value="n"):
+            self.assertIsNone(probe_login.step4_poll_qr("uuid-old"))
+        mkr.assert_not_called()  # 旧代码：静默刷新（mkr 会被调用）→ 本断言变红
+
+    def test_qr_expiry_confirmed_then_refreshes(self):
+        r3 = mock.Mock()
+        r3.json.return_value = {"result_code": 3, "result_message": "expired"}
+        with mock.patch.object(probe_login.SESSION, "post", return_value=r3), \
+             mock.patch.object(probe_login, "create_qr_raw",
+                               return_value=None) as mkr, \
+             mock.patch("builtins.input", return_value="y"):
+            self.assertIsNone(probe_login.step4_poll_qr("uuid-old"))
+        mkr.assert_called_once()
+
+    # ---- (c) 出口约定：退出码 ----
+
+    def test_capture_session_main_returns_exit_code(self):
+        import capture_session
+        with mock.patch.object(capture_session, "_order_mode",
+                               return_value="browser"), \
+             mock.patch("browser_order.login", return_value=True):
+            self.assertEqual(capture_session.main(), 0)
+        with mock.patch.object(capture_session, "_order_mode",
+                               return_value="browser"), \
+             mock.patch("browser_order.login", return_value=False):
+            self.assertEqual(capture_session.main(), 1)
+        # 旧代码 main() 内 sys.exit → 这里抛 SystemExit → 变红
+        self.assertIn("退出码", capture_session.main.__doc__)
+
+    # ---- (d) 最终校验门控 ----
+
+    def test_final_verify_predicate(self):
+        import capture_session
+        ok_page = mock.Mock()
+        ok_page.content.return_value = '{"status":true,"data":{"user_name":"t"}}'
+        self.assertTrue(capture_session._final_verify(ok_page))
+        bad_page = mock.Mock()
+        bad_page.content.return_value = "<html>请先登录</html>"
+        self.assertFalse(capture_session._final_verify(bad_page))
+        err_page = mock.Mock()
+        err_page.goto.side_effect = RuntimeError("net down")
+        self.assertFalse(capture_session._final_verify(err_page))
+
+    # ---- (e) goto 友好提示 ----
+
+    def test_goto_login_page_failure_friendly(self):
+        import capture_session
+        page = mock.Mock()
+        page.goto.side_effect = RuntimeError("timeout")
+        with mock.patch("builtins.print") as mprint:
+            self.assertFalse(capture_session._goto_login_page(page))
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("登录页", out)
+        self.assertTrue(capture_session._goto_login_page(mock.Mock()))
+
+    # ---- (f) warn 重登 http 路径统一 ----
+
+    def test_warn_relogin_http_waits_and_writes_back(self):
+        app = object.__new__(gui.MonitorApp)
+        app.root = mock.Mock()
+        app._after_warn_relogin = mock.Mock()
+        with mock.patch.object(gui, "_relogin_ok_via_script",
+                               return_value=True) as mok, \
+             mock.patch.object(gui.subprocess, "Popen",
+                               side_effect=AssertionError("must not Popen")):
+            app._warn_relogin_http()  # 旧代码无此方法 → AttributeError 变红
+            root, cb, _a, _b = gui._RESULT_QUEUE.get(timeout=10)
+        mok.assert_called_once()
+        self.assertIn("capture_session.py", mok.call_args.args[0])
+        cb(None, None)
+        app._after_warn_relogin.assert_called_once_with(True)
+
+    # ---- (g) 类名精确匹配 ----
+
+    def test_cls_exact_match_btn92s(self):
+        self.assertTrue(browser_order._cls_has("btn92s", "btn92s"))
+        self.assertTrue(browser_order._cls_has("btn92s countdown", "btn92s"))
+        # 子串陷阱：倒计时态类名含 btn92s 子串但不是独立 token
+        self.assertFalse(browser_order._cls_has("btn92s-countdown", "btn92s"))
+        self.assertFalse(browser_order._cls_has("xbtn92s", "btn92s"))
+        self.assertFalse(browser_order._cls_has("btn92", "btn92s"))
+        self.assertFalse(browser_order._cls_has("", "btn92s"))
+        self.assertFalse(browser_order._cls_has(None, "btn92s"))
+
+    # ---- (h) 跨线程锁泄漏恢复 ----
+
+    def test_recover_browser_lock_dead_owner(self):
+        lock_before = browser_order._BROWSER_LOCK
+
+        def _hold_and_die():
+            browser_order._BROWSER_LOCK.acquire()
+            # 线程直接退出：RLock 永不可释放（旧 close() 只打警告，永久泄漏）
+
+        t = threading.Thread(target=_hold_and_die)
+        t.start()
+        t.join()
+        with mock.patch("builtins.print"):
+            ok = browser_order._recover_browser_lock(t, probe_timeout=0.2)
+        self.assertTrue(ok)
+        self.assertIsNot(browser_order._BROWSER_LOCK, lock_before)
+        # 新锁可用：泄漏已恢复
+        self.assertTrue(browser_order._BROWSER_LOCK.acquire(blocking=False))
+        browser_order._BROWSER_LOCK.release()
+
+    def test_recover_browser_lock_live_owner_not_rebuilt(self):
+        lock_before = browser_order._BROWSER_LOCK
+        release_ev = threading.Event()
+        held_ev = threading.Event()
+
+        def _hold():
+            browser_order._BROWSER_LOCK.acquire()
+            held_ev.set()
+            release_ev.wait(10)
+            browser_order._BROWSER_LOCK.release()
+
+        t = threading.Thread(target=_hold)
+        t.start()
+        self.assertTrue(held_ev.wait(5))
+        try:
+            with mock.patch("builtins.print"):
+                ok = browser_order._recover_browser_lock(t, probe_timeout=0.2)
+            # 持锁线程仍存活：不重建（会破坏其正常释放），如实返回 False
+            self.assertFalse(ok)
+            self.assertIs(browser_order._BROWSER_LOCK, lock_before)
+        finally:
+            release_ev.set()
+            t.join()
+
+    # ---- (i) 软失败不计入 fail_streak ----
+
+    def test_is_soft_fail(self):
+        self.assertTrue(launcher._is_soft_fail("系统繁忙，请稍后再试"))
+        self.assertTrue(launcher._is_soft_fail("网络异常"))
+        self.assertTrue(launcher._is_soft_fail("当前排队人数较多，请等待"))
+        self.assertFalse(launcher._is_soft_fail("余票不足"))
+        self.assertFalse(launcher._is_soft_fail(""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

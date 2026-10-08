@@ -3247,8 +3247,21 @@ class MonitorApp:
 
                 threading.Thread(target=_relogin, daemon=True).start()
             else:
-                subprocess.Popen(
-                    [sys.executable, os.path.join(HERE, "capture_session.py")], cwd=HERE)
+                # Task 65f：与 Task 53（_relogin_ok_via_script）口径统一——
+                # 等子进程退出码判定成败，再把结果写回 UI 状态。
+                # 不能阻塞 Tk 主循环，所以放后台线程；结果经 _RESULT_QUEUE
+                # 回到主线程执行 _after_warn_relogin（与 browser 分支同路）。
+                self._warn_relogin_http()
+
+    def _warn_relogin_http(self):
+        """http 模式弹窗重登：等 capture_session.py 退出码判成败，再写回 UI。"""
+        def _run():
+            ok = _relogin_ok_via_script(os.path.join(HERE, "capture_session.py"))
+            _RESULT_QUEUE.put((self.root,
+                               lambda _r, _e: self._after_warn_relogin(ok),
+                               None, None))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _after_warn_relogin(self, ok):
         """弹窗触发的重登结束后立刻恢复界面登录态并复查。"""
