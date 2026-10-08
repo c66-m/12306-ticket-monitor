@@ -19,6 +19,7 @@
 
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import subprocess
@@ -62,6 +63,24 @@ def load_config():
         return {}
 
 
+# 乐观并发检查的哨兵：save_config 的 expect_stamp 取此值表示"不检查"
+#（旧调用方式）；None 是合法指纹，表示"load 时文件不存在"。
+_STAMP_UNSET = object()
+
+
+def _config_stamp():
+    """config.json 当前内容的字节指纹（sha256 十六进制）。
+
+    文件不存在或不可读时返回 None。用字节哈希而非 mtime：他进程重写
+    相同内容不误报；任何字节变化必检出。
+    """
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def _lock_timeout_abort():
     """file_lock 锁争用超时的统一出口：打印明确提示、记日志，再上抛友好异常。
 
@@ -71,12 +90,26 @@ def _lock_timeout_abort():
     raise TimeoutError("文件被占用，稍后重试")
 
 
-def save_config(config):
+def save_config(config, expect_stamp=_STAMP_UNSET):
+    """原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）。
+
+    expect_stamp 为 _config_stamp() 在 load 后取到的指纹时做乐观并发检查
+    （Task 87）：在锁内重读当前指纹，不一致说明用户交互期间有外部写入——
+    打印警告并返回 False（放弃本次保存，不静默覆写对方的修改）；一致则
+    写入并返回 True。不传 expect_stamp 时保持旧行为（直接写，返回 True）。
+    """
     # 原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）
     # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
+            if expect_stamp is not _STAMP_UNSET \
+                    and _config_stamp() != expect_stamp:
+                # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
+                print("  检测到 config.json 在编辑期间被其他程序修改，"
+                      "本次保存已放弃（未覆盖对方的修改），请重新进入菜单操作。")
+                return False
             appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
+            return True
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -455,6 +488,9 @@ def menu_task_list():
 
 def menu_task_ops():
     config = load_config()
+    # Task 87：load 后立即取指纹；删除保存时若指纹变化说明交互期间有
+    # 外部写入，save_config 会警告并放弃（不静默覆写对方修改）。
+    stamp = _config_stamp()
     tasks = config.get("tasks") or []
     if not tasks:
         print("\n  暂无任务。")
@@ -491,7 +527,10 @@ def menu_task_ops():
     elif op == "5":
         if ask_yes_no("  确认从配置中删除任务「%s」？" % task["name"], "n"):
             del config["tasks"][idx]
-            save_config(config)
+            if not save_config(config, expect_stamp=stamp):
+                # Task 87：外部写入优先，放弃本次删除（任务仍在配置中，
+                # 故也不清 state，避免配置与状态不一致）。
+                return
             # 同步清 state 条目（加锁），与 Task 53 gui 侧口径一致：
             # 只删 config 会留下 state 僵尸数据，同名重建继承陈旧状态/防重。
             # monitor CLI 无 live engine（fresh_engine 每次新建实例），故直接
@@ -665,6 +704,9 @@ def menu_history():
 
 def menu_notify():
     config = load_config()
+    # Task 87：load 后立即取指纹；保存时若指纹变化说明交互期间有外部写入，
+    # save_config 会警告并放弃（不静默覆写对方修改）。
+    stamp = _config_stamp()
     email = config.setdefault("notify", {}).setdefault("email", {
         "enabled": True, "smtp_host": "smtp.qq.com", "smtp_port": 465,
         "username": "", "password": "", "from": "", "to": []})
@@ -711,7 +753,9 @@ def menu_notify():
         # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
         raise KeyboardInterrupt
     email["to"] = [x.strip() for x in to_raw.replace("，", ",").split(",") if x.strip()]
-    save_config(config)
+    if not save_config(config, expect_stamp=stamp):
+        # Task 87：外部写入优先，放弃本次保存（不打印"已保存"）。
+        return
     print("  已保存。")
     if ask_yes_no("  是否发送测试邮件验证？", "y"):
         ok, msg = notify_mod.send_email(email, "测试邮件：12306 监控系统",

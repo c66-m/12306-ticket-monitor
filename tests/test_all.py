@@ -1927,7 +1927,7 @@ class TestMonitorInterruptRound2(TempDirCase):
                  "", "587", "u@x.com", "", "a@x.com", "n"]), \
              mock.patch("getpass.getpass", return_value="pw"), \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)), \
+                               side_effect=lambda c, **k: saved.update(c)), \
              mock.patch.object(notify_mod, "protect_secret",
                                side_effect=lambda t: t):
             monitor_mod.menu_notify()
@@ -3876,7 +3876,7 @@ class TestTask50MonitorSecretsAndEmptyDates(TempDirCase):
              mock.patch.object(monitor_mod, "read", side_effect=reads), \
              mock.patch("getpass.getpass", return_value=getpass_ret) as gp, \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)):
+                               side_effect=lambda c, **k: saved.update(c)):
             monitor_mod.menu_notify()
         return saved, gp
 
@@ -3900,7 +3900,7 @@ class TestTask50MonitorSecretsAndEmptyDates(TempDirCase):
                                side_effect=["", "465", "", "", "", "n"]), \
              mock.patch("getpass.getpass", return_value=""), \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)):
+                               side_effect=lambda c, **k: saved.update(c)):
             monitor_mod.menu_notify()
         self.assertEqual(saved["notify"]["email"]["password"], "keepme")
 
@@ -6028,7 +6028,7 @@ class TestTask66SmtpPasswordEncryption(TempDirCase):
              mock.patch.object(monitor_mod, "read", side_effect=read_seq), \
              mock.patch("getpass.getpass", return_value=pw_input), \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)), \
+                               side_effect=lambda c, **k: saved.update(c)), \
              mock.patch.object(notify_mod, "protect_secret",
                                side_effect=protect_fake) as ps:
             monitor_mod.menu_notify()
@@ -6087,7 +6087,7 @@ class TestTask66SmtpPasswordEncryption(TempDirCase):
                                side_effect=["", "465", "", "", "", "n"]), \
              mock.patch("getpass.getpass", return_value=""), \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)), \
+                               side_effect=lambda c, **k: saved.update(c)), \
              mock.patch.object(notify_mod, "protect_secret",
                                side_effect=AssertionError("must not be called")):
             monitor_mod.menu_notify()
@@ -8539,7 +8539,7 @@ class TestTask86ProbeLoginP2P3(unittest.TestCase):
                                side_effect=["", "465", "", "", "", "n"]), \
              mock.patch("getpass.getpass", return_value="new-auth-code"), \
              mock.patch.object(monitor_mod, "save_config",
-                               side_effect=lambda c: saved.update(c)), \
+                               side_effect=lambda c, **k: saved.update(c)), \
              mock.patch.object(monitor_mod.notify_mod, "protect_secret",
                                wraps=monitor_mod.notify_mod.protect_secret) as ps:
             monitor_mod.menu_notify()
@@ -8548,7 +8548,182 @@ class TestTask86ProbeLoginP2P3(unittest.TestCase):
                          monitor_mod.notify_mod.protect_secret("new-auth-code"))
 
 
+class TestTask87StaleReadDegradation(TempDirCase):
+    """Task 87 (P3): 交互式菜单 load→输入→save 的 stale-read —— 乐观并发降级。
+
+    写侧已有 Task 46 的跨进程锁，但用户思考期间他进程的写入会被本次 save
+    静默覆写。改后：save_config(config, expect_stamp) 在锁内重读字节指纹，
+    不一致 → 打印警告并返回 False（放弃本次保存，不覆写对方修改）。
+    """
+
+    def _patch_cfg(self, monitor_mod):
+        cfg = os.path.join(self.tmp, "config.json")
+        p = mock.patch.object(monitor_mod, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
+        return cfg
+
+    def _write(self, cfg, obj):
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def _read(self, cfg):
+        with open(cfg, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _printed(self, mprint):
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    def test_external_write_abandons_save(self):
+        # RED on old code: save_config 无 expect_stamp 参数（TypeError）；
+        # 且旧行为会静默覆写外部写入（数据丢失）。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        self._write(cfg, {"tasks": []})
+        config = monitor_mod.load_config()
+        stamp = monitor_mod._config_stamp()
+        # 用户思考期间：另一进程写入 config.json
+        self._write(cfg, {"tasks": [{"name": "ext"}]})
+        with mock.patch("builtins.print") as mprint:
+            ok = monitor_mod.save_config({"tasks": []}, expect_stamp=stamp)
+        self.assertFalse(ok)
+        self.assertEqual(self._read(cfg), {"tasks": [{"name": "ext"}]})
+        self.assertIn("已放弃", self._printed(mprint))
+
+    def test_unchanged_writes_ok(self):
+        # 回归 pin：无外部写入时正常落盘（旧代码即通过）。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        self._write(cfg, {"tasks": []})
+        stamp = monitor_mod._config_stamp()
+        with mock.patch("builtins.print") as mprint:
+            ok = monitor_mod.save_config({"tasks": [{"name": "t1"}]},
+                                         expect_stamp=stamp)
+        self.assertTrue(ok)
+        self.assertEqual(self._read(cfg)["tasks"], [{"name": "t1"}])
+        self.assertNotIn("已放弃", self._printed(mprint))
+
+    def test_identical_rewrite_no_false_positive(self):
+        # 他进程重写了完全相同的字节 → 指纹一致 → 不误报放弃。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        raw = b'{"tasks": []}'
+        with open(cfg, "wb") as f:
+            f.write(raw)
+        stamp = monitor_mod._config_stamp()
+        with open(cfg, "wb") as f:
+            f.write(raw)  # 外部相同内容重写
+        ok = monitor_mod.save_config({"tasks": [{"name": "t1"}]},
+                                     expect_stamp=stamp)
+        self.assertTrue(ok)
+        self.assertEqual(self._read(cfg)["tasks"], [{"name": "t1"}])
+
+    def test_first_run_no_file_writes_ok(self):
+        # 首跑无 config.json：stamp 为 None，保存应正常建文件。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        with mock.patch("builtins.print"):
+            config = monitor_mod.load_config()
+        stamp = monitor_mod._config_stamp()
+        self.assertIsNone(stamp)
+        ok = monitor_mod.save_config({"tasks": []}, expect_stamp=stamp)
+        self.assertTrue(ok)
+        self.assertEqual(self._read(cfg), {"tasks": []})
+
+    def test_external_create_abandons(self):
+        # 首跑无文件，但思考期间他进程创建了 config.json → 放弃，不覆写。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        with mock.patch("builtins.print"):
+            config = monitor_mod.load_config()
+        stamp = monitor_mod._config_stamp()
+        self.assertIsNone(stamp)
+        self._write(cfg, {"tasks": [{"name": "ext"}]})
+        with mock.patch("builtins.print") as mprint:
+            ok = monitor_mod.save_config({"tasks": []}, expect_stamp=stamp)
+        self.assertFalse(ok)
+        self.assertEqual(self._read(cfg)["tasks"], [{"name": "ext"}])
+        self.assertIn("已放弃", self._printed(mprint))
+
+    def test_legacy_call_still_writes(self):
+        # 回归 pin：不传 expect_stamp 保持旧行为（直接写，旧代码即通过）。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        self._write(cfg, {"tasks": [{"name": "ext"}]})
+        ok = monitor_mod.save_config({"tasks": []})
+        self.assertTrue(ok)
+        self.assertEqual(self._read(cfg), {"tasks": []})
+
+    def test_menu_task_ops_delete_abandons_on_stale(self):
+        # 接线 pin：删除任务时思考期间有外部写入 → 放弃保存，
+        # 外部任务不丢失，且不同步清 state（任务实际未删）。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        self._write(cfg, {"tasks": [{"name": "t1", "from": "A", "to": "B",
+                                     "dates": [], "trains": [],
+                                     "seat_types": [], "priority": 5,
+                                     "passenger_names": []}]})
+        eng = mock.MagicMock()
+        eng.task_status.return_value = "monitoring"
+        eng.task_interval.return_value = 60
+        eng.base_interval = 60
+        reads = iter(["1", "5"])
+        external = {}
+        def fake_read(prompt, default=""):
+            v = next(reads)
+            if "选择操作" in prompt:
+                # 用户思考期间：另一进程新增任务并落盘
+                self._write(cfg, {"tasks": [{"name": "t1"},
+                                            {"name": "t2-ext"}]})
+                with open(cfg, "rb") as f:
+                    external["bytes"] = f.read()
+            return v
+        with mock.patch.object(monitor_mod, "fresh_engine",
+                               return_value=eng), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=fake_read), \
+             mock.patch.object(monitor_mod, "ask_yes_no",
+                               return_value=True), \
+             mock.patch.object(monitor_mod, "_clear_task_state") as mclear, \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_task_ops()
+        with open(cfg, "rb") as f:
+            self.assertEqual(f.read(), external["bytes"])
+        self.assertEqual([t["name"] for t in self._read(cfg)["tasks"]],
+                         ["t1", "t2-ext"])
+        mclear.assert_not_called()
+        self.assertIn("已放弃", self._printed(mprint))
+
+    def test_menu_notify_abandons_on_stale(self):
+        # 接线 pin：通知设置交互期间有外部写入 → 放弃保存，不打印"已保存"。
+        import monitor as monitor_mod
+        cfg = self._patch_cfg(monitor_mod)
+        self._write(cfg, {"notify": {"email": {"username": "ext@x.com"}}})
+        # 第 6 个 read 供旧代码的"是否发送测试邮件"提示（新代码放弃保存后直接返回，用不到）
+        reads = iter(["", "465", "", "", "", "n"])
+        external = {}
+        def fake_read(prompt, default=""):
+            v = next(reads)
+            if "收件人" in prompt:
+                self._write(cfg, {"notify": {"email": {"username":
+                                                       "changed@x.com"}}})
+                with open(cfg, "rb") as f:
+                    external["bytes"] = f.read()
+            return v
+        with mock.patch.object(monitor_mod, "read",
+                               side_effect=fake_read), \
+             mock.patch("getpass.getpass", return_value=""), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_notify()
+        with open(cfg, "rb") as f:
+            self.assertEqual(f.read(), external["bytes"])
+        printed = self._printed(mprint)
+        self.assertIn("已放弃", printed)
+        self.assertNotIn("已保存", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
