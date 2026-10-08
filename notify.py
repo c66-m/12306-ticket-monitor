@@ -80,10 +80,15 @@ def send_email(cfg, subject, body):
         user = cfg["username"]
         from_addr = cfg["from"]
         to_addrs = _normalize_recipients(cfg.get("to"), user)
+        raw_pwd = cfg["password"]
     except KeyError as e:
         return False, "邮件配置缺少字段: {0}".format(e)
+    if not isinstance(raw_pwd, str):
+        # Task 71：手改配置把 password 写成非字符串（如数字）时，
+        # secret_of 会 AttributeError 逃出 (ok,msg) 契约——如实报错。
+        return False, "邮件配置 password 非法（应为字符串）: {0!r}".format(raw_pwd)
     try:
-        pwd = secret_of(cfg["password"])  # 兼容明文与 DPAPI 密文两种存储
+        pwd = secret_of(raw_pwd)  # 兼容明文与 DPAPI 密文两种存储
     except SecretDecryptError as e:
         # Task 60b：解密失败如实报错，不拿空密码去登录误报 535
         return False, "邮箱授权码解密失败: {0}".format(e)

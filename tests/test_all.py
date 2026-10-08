@@ -4904,6 +4904,65 @@ class TestNotifyP3(TempDirCase):
         m.assert_called_once_with("y")
 
 
+class TestTask71NotifyPasswordGuards(TempDirCase):
+    """Task 71: 缺 password 键（Task 60 回归）与非字符串 password（Task 66
+    reviewer 相邻缺口）都必须返回 (False, …) 诚实错误，不得抛异常破坏
+    (ok, msg) 不抛异常契约。"""
+
+    def _email_cfg(self, **over):
+        cfg = {"enabled": True, "smtp_host": "smtp.example.com",
+               "smtp_port": 465, "username": "u", "password": "p",
+               "from": "u@example.com", "to": ["u@example.com"]}
+        cfg.update(over)
+        return cfg
+
+    def test_missing_password_key_returns_false(self):
+        # Task 60 回归：缺 "password" 键时抛裸 KeyError 杀死 monitor CLI
+        cfg = self._email_cfg()
+        del cfg["password"]
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(cfg, "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("缺少字段", msg)
+        self.assertIn("password", msg)
+        m_ssl.assert_not_called()  # 不得发起 SMTP 连接
+
+    def test_missing_password_key_message_matches_old_format(self):
+        # 恢复 Task 60 之前的确切文案格式："邮件配置缺少字段: 'password'"
+        cfg = self._email_cfg()
+        del cfg["password"]
+        ok, msg = notify_mod.send_email(cfg, "s", "b")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "邮件配置缺少字段: 'password'")
+
+    def test_non_string_password_returns_false(self):
+        # Task 66 reviewer 相邻缺口：手改配置把 password 写成数字，
+        # secret_of(12345) 会 AttributeError 逃出 (ok,msg) 契约
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(self._email_cfg(password=12345), "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("password", msg)
+        m_ssl.assert_not_called()
+
+    def test_decrypt_failure_still_honest(self):
+        # 回归 pin：Task 60 的 SecretDecryptError 诚实报错路径不受影响
+        with mock.patch.object(pax_mod, "_dpapi_unprotect",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(
+                self._email_cfg(password="dpapi1:AAAA"), "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("解密失败", msg)
+        m_ssl.assert_not_called()
+
+    def test_valid_password_still_sends(self):
+        # 回归 pin：合法字符串密码行为不变
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(self._email_cfg(), "s", "b")
+        self.assertTrue(ok, msg)
+        m_ssl.assert_called_once()
+
+
 class TestMonitorLogP3(TempDirCase):
     """Task 61 (P3): monitor 缺 default / 删任务僵尸 / 日志留存+flush / PII 脱敏。"""
 
