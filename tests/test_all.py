@@ -5749,6 +5749,100 @@ class TestTask66SmtpPasswordEncryption(TempDirCase):
                          stat_mod.S_IMODE(os.stat(ref).st_mode))
 
 
+class TestTask67MonitorMenuRobustness(TempDirCase):
+    """Task 67 (P1/P3): (a) menu_task_list 缺键任务不崩菜单；
+    (b) 添加乘车人姓名处 Ctrl+C/EOF 取消本次添加；
+    (c) menu_history 非 list/条目非 dict 不崩。"""
+
+    @staticmethod
+    def _mock_engine():
+        eng = mock.MagicMock()
+        # 还原真实 task_status 的键访问语义：缺 name 即抛 KeyError
+        eng.task_status.side_effect = lambda t: t["name"]
+        eng.state = {"tasks": {}}
+        eng.base_interval = 300
+        return eng
+
+    def _run_task_list(self, tasks):
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(monitor_mod, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_task_list()  # 不得抛 KeyError
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    def test_task_missing_name_no_crash(self):
+        # 旧代码 eng.task_status(t) 内 task["name"] 抛 KeyError，菜单崩溃。
+        printed = self._run_task_list(
+            [{"from": "北京", "to": "上海", "dates": []}])
+        self.assertIn("配置损坏", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_task_missing_from_to_no_crash(self):
+        # 旧代码 t["from"] 直接索引抛 KeyError。
+        printed = self._run_task_list([{"name": "t1", "dates": []}])
+        self.assertIn("配置损坏", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_task_list_mixed_valid_and_damaged(self):
+        # 混合：好任务正常显示，坏任务占位跳过，整体不崩。
+        tasks = [
+            {"name": "t1", "from": "北京", "to": "上海",
+             "dates": ["2099-01-01"], "trains": [], "seat_types": [],
+             "priority": 5},
+            {"from": "北京", "to": "上海", "dates": []},
+        ]
+        printed = self._run_task_list(tasks)
+        self.assertIn("2099-01-01", printed)
+        self.assertIn("配置损坏", printed)
+
+    def test_add_passenger_ctrl_c_cancels(self):
+        # 旧代码：姓名处 Ctrl+C/EOF → read()→None → "姓名不能为空" → 无法取消添加。
+        import monitor as monitor_mod
+        import passengers as passengers_mod
+        with mock.patch.object(passengers_mod, "load_passengers",
+                               return_value=[]), \
+             mock.patch.object(passengers_mod, "save_passengers") as msave, \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["1", None, "0"]), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_passengers()  # 不得死循环
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        self.assertIn("已取消", printed)
+        self.assertNotIn("姓名不能为空", printed)
+        msave.assert_not_called()
+
+    def _run_history(self, payload):
+        import monitor as monitor_mod
+        path = os.path.join(self.tmp, "order_history.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"history_file": path}), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_history()  # 不得抛 TypeError/AttributeError
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    def test_history_non_list_no_crash(self):
+        # 旧代码 history[-50:] 对 dict 抛 TypeError。
+        printed = self._run_history({"a": 1})
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_history_non_dict_entry_no_crash(self):
+        # 旧代码 r.get 对字符串条目抛 AttributeError。
+        printed = self._run_history([
+            "notadict",
+            {"time": "t", "task": "t1", "date": "2099-01-01", "train": "G1",
+             "from": "北京", "to": "上海", "seat": "二等座",
+             "passengers": ["张三"]}])
+        self.assertIn("警告", printed)
+        self.assertIn("张三", printed)
+        self.assertNotIn("Traceback", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

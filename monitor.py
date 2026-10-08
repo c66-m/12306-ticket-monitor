@@ -366,6 +366,11 @@ def menu_create_task():
 
 # ----------------------------- 菜单 2：任务列表 -----------------------------
 
+def _task_keys_ok(t):
+    """任务字典是否含列表展示必需的键（name/from/to）。"""
+    return isinstance(t, dict) and "name" in t and "from" in t and "to" in t
+
+
 def menu_task_list():
     config = load_config()
     tasks = config.get("tasks") or []
@@ -379,6 +384,15 @@ def menu_task_list():
         "#", "任务", "区间", "日期", "车次", "席别", "优先级", "状态"))
     print("-" * 110)
     for i, t in enumerate(tasks, 1):
+        if not _task_keys_ok(t):
+            # 缺键任务（手改/合并 config.json 致坏）：记警告后跳过该条，
+            # 展示"配置损坏"占位，绝不让单个坏任务崩掉整个菜单（Task 67）。
+            missing = [k for k in ("name", "from", "to")
+                       if not isinstance(t, dict) or k not in t]
+            print("  [警告] 第 {0} 个任务缺少字段 {1}，已跳过显示"
+                  "（配置损坏，请检查 config.json）。".format(i, "/".join(missing)))
+            print("  {0:<3}{1}".format(i, "（配置损坏）"))
+            continue
         dates = engine_mod.expand_dates(t)
         status = eng.task_status(t)
         dates_disp = (dates[0] + ("..." if len(dates) > 1 else "")) \
@@ -395,7 +409,10 @@ def menu_task_list():
         if msg:
             print("      └ {0}".format(msg[:80]))
     print("-" * 110)
-    running = [t for t in tasks if eng.task_status(t) == "monitoring"]
+    # 缺键的坏任务无有效 name，task_status(t) 会 KeyError：展示循环已跳过，
+    # 此处同样过滤，不让坏任务崩掉菜单尾部的轮询估算（Task 67）。
+    running = [t for t in tasks
+               if _task_keys_ok(t) and eng.task_status(t) == "monitoring"]
     if running:
         print("  监控中任务轮询间隔估算（基准 %ss，自适应）:" % eng.base_interval)
         for t in running:
@@ -489,6 +506,11 @@ def menu_passengers():
             return
         if op == "1":
             name = read("  姓名：", "")
+            if name is None:
+                # Ctrl+C/EOF：取消本次添加，回到乘车人管理菜单，不死循环
+                #（旧代码把 None 当空名，"姓名不能为空"后用户无法取消添加）。
+                print("  已取消添加。")
+                continue
             if not name:
                 print("  姓名不能为空。")
                 continue
@@ -560,11 +582,21 @@ def menu_history():
     except Exception as e:
         print("  读取历史失败：%s" % e)
         return
+    if not isinstance(history, list):
+        # 合法 JSON 但非列表（如手改成 dict）：记警告后按空历史展示，
+        # 不让 history[-50:] 的 TypeError 崩掉菜单（Task 67）。
+        print("  [警告] 购票历史文件格式损坏（期望为列表），已按空历史展示。")
+        history = []
     print("\n===== 购票历史与通知记录（共 %d 条） =====" % len(history))
     label = {"success": "下单成功", "dup": "防重跳过", "failed": "下单失败",
              "hit_no_order": "命中未下单"}
     dropped_names = 0
+    dropped_records = 0
     for r in reversed(history[-50:]):
+        if not isinstance(r, dict):
+            # 条目非 dict（如手改成字符串数组）：记数后跳过该条，不崩（Task 67）。
+            dropped_records += 1
+            continue
         print("-" * 100)
         print("  {0}  {1}".format(r.get("time"), r.get("task", "")))
         raw_names = r.get("passengers") or []
@@ -581,6 +613,8 @@ def menu_history():
             print("  通知:{0}".format(r["notify"]))
     if dropped_names:
         print("  [警告] 历史记录中有 {0} 条姓名为空的乘车人，已跳过显示。".format(dropped_names))
+    if dropped_records:
+        print("  [警告] 历史记录中有 {0} 条格式损坏的记录，已跳过显示。".format(dropped_records))
     print("-" * 100)
 
 
