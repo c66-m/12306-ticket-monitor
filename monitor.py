@@ -51,16 +51,40 @@ def fresh_engine():
     return engine_mod.MonitorEngine()
 
 
+# Task 92a: load_config 发现的损坏文件指纹。save_config /
+# update_config_locked 在锁内发现指纹未变时绝不覆写该文件（证据保留）。
+# 每次 load_config 入口复位；None 表示"未损坏"（含首跑无文件）。
+_DAMAGED_STAMP = None
+
+
 def load_config():
+    global _DAMAGED_STAMP
+    _DAMAGED_STAMP = None
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except FileNotFoundError:
         # 首跑无配置文件：不打 traceback，给友好引导后返回空配置。
-        # 全部 6 处调用方均已按空配置降级（.get/.setdefault），菜单[1]仍可创建
+        # 各调用方均已按空配置降级（.get/.setdefault），菜单[1]仍可创建
         # 首个任务并落盘——此处若 sys.exit 会把首个任务创建流程一并杀死，故不退出。
         print("  未找到 config.json，请先在菜单 [1] 创建任务。")
         return {}
+    except (OSError, ValueError) as e:
+        # Task 92a: 损坏的 config.json（非法 JSON/非 UTF-8/读取失败；
+        # JSONDecodeError 与 UnicodeDecodeError 均为 ValueError 子类）。
+        # 记错后降级为空配置：菜单可用、不 traceback；记录损坏指纹，
+        # save_config / update_config_locked 绝不覆写该文件（证据保留）。
+        print("  [警告] config.json 已损坏（%s），已降级为空配置运行；"
+              "本次不会覆盖原文件，请修复或删除它后再操作。" % e)
+        _DAMAGED_STAMP = _config_stamp()
+        return {}
+    if not isinstance(cfg, dict):
+        # Task 92a: 顶层非对象（如手改成列表/字符串）——与非法 JSON 同等处理。
+        print("  [警告] config.json 顶层不是对象，已降级为空配置运行；"
+              "本次不会覆盖原文件，请修复或删除它后再操作。")
+        _DAMAGED_STAMP = _config_stamp()
+        return {}
+    return cfg
 
 
 # 乐观并发检查的哨兵：save_config 的 expect_stamp 取此值表示"不检查"
@@ -97,11 +121,20 @@ def save_config(config, expect_stamp=_STAMP_UNSET):
     （Task 87）：在锁内重读当前指纹，不一致说明用户交互期间有外部写入——
     打印警告并返回 False（放弃本次保存，不静默覆写对方的修改）；一致则
     写入并返回 True。不传 expect_stamp 时保持旧行为（直接写，返回 True）。
+    Task 92a：若 load_config 判定 config.json 已损坏且损坏文件仍在原地，
+    无论 expect_stamp 为何都拒绝写入并返回 False（证据保留）。
     """
     # 原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）
     # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
+            if _DAMAGED_STAMP is not None and _config_stamp() == _DAMAGED_STAMP:
+                # Task 92a: load 时发现的损坏文件仍在原地——绝不覆写证据，
+                # 放弃本次保存（若文件已被外部修复，指纹变化会落到下面的
+                # Task 87 分支，同样安全放弃）。
+                print("  [警告] config.json 已损坏，本次未覆盖原文件；"
+                      "请先修复或删除它后再保存。")
+                return False
             if expect_stamp is not _STAMP_UNSET \
                     and _config_stamp() != expect_stamp:
                 # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
@@ -117,17 +150,23 @@ def save_config(config, expect_stamp=_STAMP_UNSET):
 def update_config_locked(mutator):
     """config.json 读-改-写原子接口：整包在 file_lock 内，与 launcher/gui 互斥。
 
-    mutator(config) 就地修改读到的 dict；返回其返回值。
+    mutator(config) 就地修改读到的 dict。写入成功返回 True；若 load 时发现
+    config.json 已损坏（Task 92a），为保留证据放弃本次写入并返回 False，
+    调用方不得再打印"成功"类提示。
     注意：不要在 mutator 里做交互式输入——锁内长时间占用会堵住 launcher
     的下单写路径；交互式菜单仍用 load_config/save_config（写侧已加锁）。
     """
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
             config = load_config()
-            result = mutator(config)
+            if _DAMAGED_STAMP is not None:
+                # Task 92a: 损坏的 config.json——绝不覆写证据，放弃本次写入。
+                # load_config 已打印警告；调用方据 False 收敛后续流程。
+                return False
+            mutator(config)
             # Task 66: config.json 含密钥，落盘 0600
             appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
-            return result
+            return True
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -416,7 +455,9 @@ def menu_create_task():
         "notify_channels": ["email"],
     }
 
-    update_config_locked(lambda config: config.setdefault("tasks", []).append(task))
+    if not update_config_locked(lambda config: config.setdefault("tasks", []).append(task)):
+        # Task 92a: config.json 损坏，拒绝覆写——任务未创建（警告已由 load_config 打印）。
+        return
     print("\n  [完成] 任务「{0}」已创建：{1}->{2} 日期 {3} 席别 {4} 乘车人 {5}".format(
         task_name, from_name, to_name,
         dates[0] if dates else "~".join(date_range),
@@ -801,7 +842,12 @@ def menu_notify():
     email["password"] = notify_mod.protect_secret(pw_to_store) \
         if isinstance(pw_to_store, str) else pw_to_store
     email["from"] = read("  发件人地址（回车=发件邮箱）：", "") or email.get("username")
-    to_raw = read("  收件人（多个用逗号分隔）：", ",".join(email.get("to") or []))
+    to_val = email.get("to")
+    # Task 92b: 字符串是运行时合法形态（notify._normalize_recipients 显式支持
+    # str）——按单个收件人处理，绝不逐字符 join（",".join("a@b.com") 会拆成
+    # 单个字符并回写污染配置，一次常规菜单访问即静默摧毁通知配置）。
+    to_default = to_val if isinstance(to_val, str) else ",".join(to_val or [])
+    to_raw = read("  收件人（多个用逗号分隔）：", to_default)
     if to_raw is None:
         # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
         raise KeyboardInterrupt

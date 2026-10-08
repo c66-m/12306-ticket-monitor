@@ -9198,6 +9198,115 @@ class TestTask91TopLevelConfigShape(TempDirCase):
         self.assertEqual(e.config["poll_interval_seconds"], 60)
 
 
+class TestTask92MonitorP2(TempDirCase):
+    """Task 92 (P2): (a) 损坏的 config.json → load_config 友好降级，
+    save/update 路径绝不覆写损坏文件；(b) menu_notify 字符串型 "to"
+    按单收件人处理，不逐字符拆、不污染回写。"""
+
+    def _mod(self):
+        import monitor as monitor_mod
+        return monitor_mod
+
+    def _write_raw(self, data):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def _read_raw(self, p):
+        with open(p, "rb") as f:
+            return f.read()
+
+    # ---- (a) 损坏配置 ----
+
+    def test_load_config_illegal_json_returns_empty(self):
+        m = self._mod()
+        p = self._write_raw(b"{not json!!!")
+        with mock.patch.object(m, "CONFIG_PATH", p):
+            self.assertEqual(m.load_config(), {})  # 旧代码抛 JSONDecodeError
+
+    def test_load_config_non_utf8_returns_empty(self):
+        m = self._mod()
+        p = self._write_raw(b"\xff\xfe\x00bad-bytes")
+        with mock.patch.object(m, "CONFIG_PATH", p):
+            self.assertEqual(m.load_config(), {})  # 旧代码抛 UnicodeDecodeError
+
+    def test_load_config_non_dict_root_returns_empty(self):
+        m = self._mod()
+        p = self._write_raw(b'["not", "a", "dict"]')
+        with mock.patch.object(m, "CONFIG_PATH", p):
+            self.assertEqual(m.load_config(), {})  # 旧代码原样返回 list
+
+    def test_damaged_config_save_refuses_and_preserves(self):
+        m = self._mod()
+        p = self._write_raw(b"{damaged")
+        with mock.patch.object(m, "CONFIG_PATH", p):
+            cfg = m.load_config()
+            cfg["injected"] = True
+            self.assertFalse(m.save_config(cfg))  # 旧代码返回 True 并覆写
+            self.assertEqual(self._read_raw(p), b"{damaged")
+
+    def test_damaged_config_update_locked_refuses_and_preserves(self):
+        m = self._mod()
+        p = self._write_raw(b"{damaged")
+        with mock.patch.object(m, "CONFIG_PATH", p):
+            ok = m.update_config_locked(lambda c: c.update(injected=True))
+            self.assertIs(ok, False)  # 旧代码返回 None 并覆写
+            self.assertEqual(self._read_raw(p), b"{damaged")
+
+    def test_first_run_save_still_works(self):
+        # 首跑（无文件）流程不受损坏降级影响：可创建并落盘（回归 pin）。
+        m = self._mod()
+        p = os.path.join(self.tmp, "config.json")
+        with mock.patch.object(m, "CONFIG_PATH", p):
+            self.assertEqual(m.load_config(), {})
+            self.assertTrue(m.save_config({"tasks": []}))
+            with open(p, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"tasks": []})
+
+    # ---- (b) menu_notify 字符串 "to" ----
+
+    def _run_menu_notify_enter_through(self, m, p, email_cfg):
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"notify": {"email": email_cfg}}, f)
+        calls = []
+
+        def fake_read(prompt, default=""):
+            calls.append((prompt, default))
+            return default
+
+        with mock.patch.object(m, "CONFIG_PATH", p), \
+             mock.patch.object(m, "read", side_effect=fake_read), \
+             mock.patch("getpass.getpass", return_value=""), \
+             mock.patch.object(m, "ask_yes_no", return_value=False):
+            m.menu_notify()
+        with open(p, encoding="utf-8") as f:
+            saved = json.load(f)
+        return saved["notify"]["email"], calls
+
+    def test_menu_notify_string_to_single_recipient(self):
+        m = self._mod()
+        p = os.path.join(self.tmp, "config.json")
+        email, calls = self._run_menu_notify_enter_through(
+            m, p, {"to": "a@b.com"})
+        to_prompts = [d for pr, d in calls if "收件人" in pr]
+        self.assertEqual(to_prompts, ["a@b.com"])  # 旧代码此处为 "a,@,b,.,c,o,m"
+        self.assertEqual(email["to"], ["a@b.com"])  # 旧代码回写 ['a','@','b','.','c','o','m']
+
+    def test_menu_notify_list_to_roundtrip(self):
+        m = self._mod()
+        p = os.path.join(self.tmp, "config.json")
+        email, _ = self._run_menu_notify_enter_through(
+            m, p, {"to": ["a@b.com", "c@d.com"]})
+        self.assertEqual(email["to"], ["a@b.com", "c@d.com"])  # 回归 pin
+
+    def test_menu_notify_missing_to(self):
+        m = self._mod()
+        p = os.path.join(self.tmp, "config.json")
+        email, _ = self._run_menu_notify_enter_through(m, p, {})
+        self.assertEqual(email["to"], [])  # 回归 pin
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
