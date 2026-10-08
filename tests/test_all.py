@@ -10100,6 +10100,84 @@ class TestTask97MonitorP3(TempDirCase):
         self.assertNotIn("Traceback", printed)
 
 
+class TestTask98ProbeLoginP3(unittest.TestCase):
+    """Task 98: probe_login P3（uamtk 明文打印 / Cookie 明文打印 / probe_cookies.json 权限）。"""
+
+    def _printed(self, mprint):
+        return "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+
+    # ---- (a) step4 uamtk 脱敏 ----
+
+    def test_step4_poll_qr_uamtk_is_masked(self):
+        # RED on old code: uamtk 明文打印（bearer token 比 username 更敏感）
+        fake = mock.Mock()
+        fake.post.return_value = _FakeResp(
+            '{"result_code": 2, "result_message": "已确认", "uamtk": "secret-uamtk-token-xyz"}')
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint, \
+             mock.patch("time.sleep"):
+            result = probe_login.step4_poll_qr("uuid-x")
+        self.assertEqual(result, "secret-uamtk-token-xyz")  # 返回值仍是真 token
+        self.assertNotIn("secret-uamtk-token-xyz", self._printed(mprint))
+
+    # ---- (b) step2 Cookie 值脱敏 ----
+
+    def _run_step2(self):
+        cookie = mock.Mock()
+        cookie.name = "JSESSIONID"
+        cookie.value = "secret-jsessionid-value-12345"
+        fake = mock.Mock()
+        fake.get.return_value = _FakeResp("{}")
+        fake.cookies = [cookie]
+        return fake
+
+    def test_step2_bootstrap_cookies_values_masked(self):
+        # RED on old code: Cookie 值明文打印（每次运行必触发）
+        with mock.patch.object(probe_login, "SESSION", self._run_step2()), \
+             mock.patch("builtins.print") as mprint:
+            probe_login.step2_bootstrap_cookies()
+        out = self._printed(mprint)
+        self.assertNotIn("secret-jsessionid-value-12345", out)
+        self.assertIn("JSESSIONID", out)  # 字段名保留，仍可判断是否拿到
+
+    # ---- (c) probe_cookies.json 0o600 ----
+
+    def _run_step7(self):
+        cookie = mock.Mock()
+        cookie.name = "JSESSIONID"
+        cookie.value = "x"
+        fake = mock.Mock()
+        fake.cookies = [cookie]
+        return fake
+
+    def test_step7_save_cookies_file_is_0600(self):
+        # RED on old code: 默认 umask 落盘，他用户可读
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "probe_cookies.json")
+            with mock.patch.object(probe_login, "SESSION", self._run_step7()), \
+                 mock.patch.object(probe_login, "PROBE_COOKIE_PATH", path), \
+                 mock.patch("builtins.print"):
+                probe_login.step7_save_cookies()
+            mode = os.stat(path).st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+            with open(path, encoding="utf-8") as f:  # 内容不受影响
+                self.assertEqual(json.load(f), {"JSESSIONID": "x"})
+
+    def test_step7_save_cookies_tightens_existing_0644(self):
+        # RED on old code: 已存在的 0644 文件不会被收紧
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "probe_cookies.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{}")
+            os.chmod(path, 0o644)
+            with mock.patch.object(probe_login, "SESSION", self._run_step7()), \
+                 mock.patch.object(probe_login, "PROBE_COOKIE_PATH", path), \
+                 mock.patch("builtins.print"):
+                probe_login.step7_save_cookies()
+            mode = os.stat(path).st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

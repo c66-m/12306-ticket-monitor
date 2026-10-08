@@ -166,7 +166,8 @@ def step2_bootstrap_cookies():
 
     print("\n  当前 Cookie：")
     for c in SESSION.cookies:
-        print("    {0} = {1}".format(c.name, (c.value[:40] + "...") if len(c.value) > 40 else c.value))
+        # Task 98b：Cookie 值脱敏打印（字段名保留，仍可判断是否拿到 JSESSIONID）
+        print("    {0} = {1}".format(c.name, _mask_scalar(c.value)))
 
     if not any(c.name == "JSESSIONID" for c in SESSION.cookies):
         print("\n  [注意] 未拿到 JSESSIONID。后续扫码接口可能失败——请把上面的原始响应发出来。")
@@ -309,7 +310,8 @@ def step4_poll_qr(uuid):
                 if not uamtk:
                     print("\n  [失败] 已扫码但会话换取失败：checkqr 返回 code=2 却没有 uamtk。")
                     return SCAN_CONFIRMED_NO_UAMTK
-                print("\n  [成功] 二维码已确认，uamtk = {0}".format(uamtk))
+                print("\n  [成功] 二维码已确认，uamtk = {0}".format(
+                    _mask_scalar(uamtk)))  # Task 98a：bearer token 脱敏打印
                 return uamtk
             # 3 = 二维码过期 —— 刷新前先问用户：旧码可能正在被扫，
             # 静默作废会让用户扫一张死码（Task 65b）
@@ -437,8 +439,20 @@ def step7_save_cookies():
     banner("STEP 7  保存会话 Cookie（验证持久化）")
     cookies = {c.name: c.value for c in SESSION.cookies}
     try:
-        with open(PROBE_COOKIE_PATH, "w", encoding="utf-8") as f:
+        # Task 98c：落盘 0o600（与 .passengers_key 先例一致）。创建时指定 mode
+        # 防 umask 竞态；写后 chmod 收紧已存在的旧文件。Windows 下 chmod 仅影响只读位。
+        fd = os.open(PROBE_COOKIE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             json.dump(cookies, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(PROBE_COOKIE_PATH, 0o600)
+        except OSError:
+            pass
         print("  已保存 {0} 个 Cookie 到诊断文件：{1}".format(len(cookies), PROBE_COOKIE_PATH))
         print("  （生产 session_cookies.json 未被触碰）")
         print("  Cookie 列表：" + ", ".join(cookies.keys()))
