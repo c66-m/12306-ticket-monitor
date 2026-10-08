@@ -86,13 +86,17 @@ def load_session(cookie_path=None):
 
     s = requests.Session()
     s.headers.update(BASE_HEADERS)
-    for name, val in cookies.items():
+    for key, val in cookies.items():
         if isinstance(val, dict):  # 新格式：带原始作用域
+            # Task 69e：同名多 path 条目以复合键 "name\x1fpath\x1fdomain" 落盘
+            # （分隔符见 capture_session.COOKIE_KEY_SEP，\x1f 不可能出现在 Cookie 名中）；
+            # 无分隔符即旧的纯 name 键，照旧读取。
+            name = key.split("\x1f")[0] if "\x1f" in key else key
             s.cookies.set(name, val.get("value", ""),
                           domain=val.get("domain") or ".12306.cn",
                           path=val.get("path") or "/")
         else:                      # 旧格式：只有值
-            s.cookies.set(name, val, domain=".12306.cn", path="/")
+            s.cookies.set(key, val, domain=".12306.cn", path="/")
     return s
 
 

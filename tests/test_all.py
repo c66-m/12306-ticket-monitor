@@ -5968,6 +5968,249 @@ class TestTask68EngineConfigShapes(TempDirCase):
         self.assertEqual(len(engine_mod.expand_dates(t)), 5)
 
 
+class TestTask69CaptureSession(TempDirCase):
+    """Task 69: capture_session P2/P3 bundle（a–e）。
+
+    (a) COOKIE_PATH 硬编码无视 config 的 session_cookies_file → 从配置读，缺省回退
+    (b) browser 分支无 try/except → 友好失败（Task 65e 口径）
+    (c) p.chromium.launch 无保护 → 友好失败
+    (d) 登录轮询吞浏览器关闭 → is_connected() 早退
+    (e) cookie_dict 以 name 为键，同名多 path 互相覆盖 → 按 (name,path,domain) 区分落盘
+    """
+
+    # ---- (a) COOKIE_PATH 读配置 ----
+
+    def test_cookie_path_from_config(self):
+        import capture_session
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"session_cookies_file": "my_cookies.json"}, f)
+        self.assertEqual(capture_session._cookie_path(cfg),
+                         os.path.join(capture_session.HERE, "my_cookies.json"))
+
+    def test_cookie_path_fallback(self):
+        import capture_session
+        default = os.path.join(capture_session.HERE, "session_cookies.json")
+        # 配置文件不存在 → 回退
+        self.assertEqual(capture_session._cookie_path(os.path.join(self.tmp, "nope.json")),
+                         default)
+        # 配置存在但无该键 → 回退
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"order_mode": "http"}, f)
+        self.assertEqual(capture_session._cookie_path(cfg), default)
+        # 配置损坏 → 回退，不抛异常
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(capture_session._cookie_path(cfg), default)
+
+    def test_cookie_path_non_string_fallback(self):
+        import capture_session
+        default = os.path.join(capture_session.HERE, "session_cookies.json")
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"session_cookies_file": 123}, f)
+        # 非字符串值：回退默认，不抛 TypeError（旧代码此处永不崩）
+        self.assertEqual(capture_session._cookie_path(cfg), default)
+
+    def test_cookie_path_absolute_passthrough(self):
+        import capture_session
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"session_cookies_file": "/tmp/abs_cookies.json"}, f)
+        # 绝对路径：os.path.join(HERE, abs) == abs，与 monitor.py:684 同口径
+        self.assertEqual(capture_session._cookie_path(cfg), "/tmp/abs_cookies.json")
+
+    # ---- (b) browser 分支友好失败 ----
+
+    def test_browser_mode_login_passthrough(self):
+        import capture_session
+        with mock.patch("browser_order.login", return_value=True):
+            self.assertTrue(capture_session._browser_mode_login())
+        with mock.patch("browser_order.login", return_value=False):
+            self.assertFalse(capture_session._browser_mode_login())
+
+    def test_browser_mode_login_exception_friendly(self):
+        import capture_session
+        with mock.patch("browser_order.login",
+                        side_effect=RuntimeError("Edge not found")), \
+             mock.patch("builtins.print") as mprint:
+            self.assertFalse(capture_session._browser_mode_login())
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("[失败]", out)  # 友好提示，而不是把 traceback 抛给调用方
+
+    # ---- (c) launch 友好失败 ----
+
+    def test_launch_browser_success(self):
+        import capture_session
+        p = mock.Mock()
+        self.assertIs(p.chromium.launch.return_value,
+                      capture_session._launch_browser(p))
+
+    def test_launch_browser_failure_friendly(self):
+        import capture_session
+        p = mock.Mock()
+        p.chromium.launch.side_effect = RuntimeError("Executable doesn't exist")
+        with mock.patch("builtins.print") as mprint:
+            self.assertIsNone(capture_session._launch_browser(p))
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("Edge 启动失败", out)
+
+    # ---- (d) 轮询早退 ----
+
+    def test_wait_for_login_detects_tk(self):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = True
+        context = mock.Mock()
+        context.cookies.return_value = [
+            {"name": "JSESSIONID", "value": "x"},
+            {"name": "tkabc", "value": "y"},
+        ]
+        with mock.patch("time.sleep"):
+            st = capture_session._wait_for_login(browser, context, time.time() + 300)
+        self.assertEqual(st, capture_session.LOGIN_OK)
+
+    def test_wait_for_login_browser_closed_early_exit(self):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = False
+        context = mock.Mock()
+        with mock.patch("builtins.print") as mprint:
+            st = capture_session._wait_for_login(browser, context, time.time() + 300)
+        self.assertEqual(st, capture_session.LOGIN_BROWSER_CLOSED)
+        context.cookies.assert_not_called()  # 早退，不再轮询
+        out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+        self.assertIn("已被关闭", out)
+
+    def test_wait_for_login_timeout(self):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = True
+        context = mock.Mock()
+        context.cookies.return_value = [{"name": "JSESSIONID", "value": "x"}]
+        with mock.patch("time.sleep") as msleep:
+            st = capture_session._wait_for_login(browser, context, time.time() - 1)
+        self.assertEqual(st, capture_session.LOGIN_TIMEOUT)
+        msleep.assert_not_called()  # 已超时，直接返回
+
+    def test_wait_for_login_malformed_cookie_entry(self):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = True
+        context = mock.Mock()
+        # 畸形条目（非 dict）：跳过不崩，下一轮继续（旧代码同语义）
+        context.cookies.side_effect = [["not-a-dict"], [{"name": "tk", "value": "t"}]]
+        with mock.patch("time.sleep"):
+            st = capture_session._wait_for_login(browser, context, time.time() + 300)
+        self.assertEqual(st, capture_session.LOGIN_OK)
+
+    # ---- (e) 存储结构：按 (name, path, domain) 区分 ----
+
+    def test_build_cookie_dict_keeps_multi_path(self):
+        import capture_session
+        cookies = [
+            {"name": "JSESSIONID", "value": "AAA", "domain": ".12306.cn", "path": "/otn"},
+            {"name": "JSESSIONID", "value": "BBB", "domain": ".12306.cn", "path": "/passport"},
+            {"name": "tk", "value": "T", "domain": ".kyfw.12306.cn", "path": "/"},
+            {"name": "other", "value": "x", "domain": "example.com", "path": "/"},
+        ]
+        d = capture_session._build_cookie_dict(cookies)
+        # 第三方域被过滤；同名双 path 条目都保留 → 3 条
+        self.assertEqual(len(d), 3)
+        vals = sorted(v["value"] for v in d.values())
+        self.assertEqual(vals, ["AAA", "BBB", "T"])
+
+    def test_build_cookie_dict_single_keeps_plain_key(self):
+        import capture_session
+        d = capture_session._build_cookie_dict([
+            {"name": "tk", "value": "T", "domain": ".kyfw.12306.cn", "path": "/"},
+        ])
+        # 单条目保持纯 name 键：旧文件/旧版本可读
+        self.assertEqual(d, {"tk": {"value": "T", "domain": ".kyfw.12306.cn", "path": "/"}})
+
+    def test_build_cookie_dict_dedup_exact_triple(self):
+        import capture_session
+        d = capture_session._build_cookie_dict([
+            {"name": "tk", "value": "old", "domain": ".12306.cn", "path": "/"},
+            {"name": "tk", "value": "new", "domain": ".12306.cn", "path": "/"},
+        ])
+        self.assertEqual(d["tk"]["value"], "new")
+
+    def test_load_session_reads_composite_keys(self):
+        path = os.path.join(self.tmp, "cookies.json")
+        SEP = "\x1f"
+        data = {
+            "JSESSIONID" + SEP + "/otn" + SEP + ".12306.cn": {"value": "AAA", "domain": ".12306.cn", "path": "/otn"},
+            "JSESSIONID" + SEP + "/passport" + SEP + ".12306.cn": {"value": "BBB", "domain": ".12306.cn", "path": "/passport"},
+            "tk": {"value": "T", "domain": ".kyfw.12306.cn", "path": "/"},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        s = order_mod.load_session(path)
+        got = {}
+        for c in s.cookies:
+            got.setdefault(c.name, {})[c.value] = c.path
+        # 两个同名 Cookie 都被还原，作用域各归其位
+        self.assertEqual(got["JSESSIONID"], {"AAA": "/otn", "BBB": "/passport"})
+        self.assertEqual(got["tk"], {"T": "/"})
+
+    def test_load_session_old_format_unchanged(self):
+        # 回归 pin：纯 name 键旧文件行为不变
+        path = os.path.join(self.tmp, "cookies.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"tk": {"value": "T", "domain": ".kyfw.12306.cn", "path": "/"},
+                       "plain": "v"}, f)
+        s = order_mod.load_session(path)
+        self.assertEqual(s.cookies.get("tk"), "T")
+        self.assertEqual(s.cookies.get("plain"), "v")
+
+    # ---- 端到端：main() 写到配置路径，落盘格式可读 ----
+
+    def _run_main_with_fake_browser(self, cookies, cookie_path):
+        import capture_session
+        browser = mock.MagicMock()
+        browser.is_connected.return_value = True
+        context = mock.MagicMock()
+        context.cookies.return_value = cookies
+        page = mock.MagicMock()
+        page.content.return_value = '{"status":true,"data":{"user_name":"u"}}'
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+        p = mock.MagicMock()
+        p.chromium.launch.return_value = browser
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = p
+        cm.__exit__.return_value = False
+        fake_sync_api = mock.MagicMock()
+        fake_sync_api.sync_playwright.return_value = cm
+        mods = {"playwright": mock.MagicMock(), "playwright.sync_api": fake_sync_api}
+        with mock.patch.dict(sys.modules, mods), \
+             mock.patch.object(capture_session, "_order_mode", return_value="http"), \
+             mock.patch.object(capture_session, "_cookie_path",
+                               return_value=cookie_path), \
+             mock.patch("time.sleep"), \
+             mock.patch("builtins.print"):
+            return capture_session.main()
+
+    def test_main_writes_to_configured_path(self):
+        import capture_session  # noqa: F401 保持引用一致
+        cookie_path = os.path.join(self.tmp, "my_cookies.json")
+        cookies = [
+            {"name": "JSESSIONID", "value": "AAA", "domain": ".12306.cn", "path": "/otn"},
+            {"name": "JSESSIONID", "value": "BBB", "domain": ".12306.cn", "path": "/passport"},
+            {"name": "tk", "value": "T", "domain": ".kyfw.12306.cn", "path": "/"},
+        ]
+        rc = self._run_main_with_fake_browser(cookies, cookie_path)
+        self.assertEqual(rc, 0)
+        # (a) 写到了配置路径
+        self.assertTrue(os.path.exists(cookie_path))
+        # (e) 落盘的双 path 条目可被 load_session 读回
+        s = order_mod.load_session(cookie_path)
+        vals = sorted(c.value for c in s.cookies if c.name == "JSESSIONID")
+        self.assertEqual(vals, ["AAA", "BBB"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
