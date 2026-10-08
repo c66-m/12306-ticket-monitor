@@ -9507,6 +9507,113 @@ class TestTask94GuiStartupRobustness(TempDirCase):
             self.assertEqual(gui.read_history_records(), [])
 
 
+class TestTask95WarmReuseSessionRevalidation(TempDirCase):
+    """Task 95: browser_order P2（warm 复用永不复验会话 → 误导性超时 + 任务自停）。
+
+    改前：warm 复用路径（browser_order.py:758-760）跳过 session_ok；
+    预热等待期（默认 10 分钟）内会话被踢/过期后，每轮 warm.refresh() 在死
+    会话上烧 ~20-30 秒抛误导性 TimeoutError，连续几次后任务被误判自停（漏单）。
+    改后：order_via_browser 在复用前复验会话有效性；失效则关闭预热现场、
+    改走冷启动路径（内含诚实的会话校验与"请先运行 login"指引）。
+    """
+
+    class _LiveWarm:
+        """usable()=True 的假预热现场：记录 close()，暴露 ctx/page 供复验。"""
+        def __init__(self):
+            self.ctx = object()
+            self.page = object()
+            self.closes = 0
+
+        def usable(self):
+            return True
+
+        def close(self):
+            self.closes += 1
+
+        def refresh(self, info):
+            pass
+
+    class _StaleWarm:
+        def __init__(self):
+            self.closes = 0
+
+        def usable(self):
+            return False
+
+        def close(self):
+            self.closes += 1
+
+    def _run(self, warm, session_ok_result=None, session_ok_exc=None):
+        """经 order_via_browser 跑一轮；_order_impl 与 session_ok 均 mock。"""
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        calls = {}
+
+        def fake_impl(*a, **k):
+            calls["warm"] = k.get("warm")
+            return (False, "mock-impl", None)
+
+        def fake_session_ok(ctx, page=None):
+            calls["session_ok"] = (ctx, page)
+            if session_ok_exc is not None:
+                raise session_ok_exc
+            return session_ok_result
+
+        with mock.patch.object(browser_order, "_order_impl", side_effect=fake_impl), \
+             mock.patch.object(browser_order, "session_ok", side_effect=fake_session_ok):
+            ok, msg, extra = browser_order.order_via_browser(
+                info, "二等座", "O", ["张三"], "2026-10-10", warm=warm)
+        return ok, msg, extra, calls
+
+    def test_dead_session_during_warm_wait_closes_warm_and_cold_starts(self):
+        # P2 本体：预热等待期内会话被踢/过期 → 不得把死 warm 传给 _order_impl
+        #（改前行为：warm 原样复用，refresh() 烧 ~30 秒抛误导性 TimeoutError，
+        #  连续几次后任务被误判自停）。
+        warm = self._LiveWarm()
+        ok, msg, extra, calls = self._run(
+            warm, session_ok_result=(False, "接口返回 status=false（会话已失效）"))
+        self.assertIn("session_ok", calls, "warm 复用前必须复验会话有效性")
+        self.assertIs(calls["session_ok"][0], warm.ctx)
+        self.assertIs(calls["session_ok"][1], warm.page)
+        self.assertEqual(warm.closes, 1, "失效会话的预热现场必须被关闭")
+        self.assertIn("warm", calls, "_order_impl 必须被调用（冷启动路径）")
+        self.assertIsNone(calls["warm"], "死会话不得复用：_order_impl 必须走冷启动（warm=None）")
+        self.assertFalse(ok)
+
+    def test_healthy_session_keeps_warm_reuse(self):
+        # 会话健康时复用路径不变：复验通过 → 不关闭、不降级冷启动
+        warm = self._LiveWarm()
+        ok, msg, extra, calls = self._run(warm, session_ok_result=(True, "张三"))
+        self.assertIn("session_ok", calls, "warm 复用前必须复验会话有效性")
+        self.assertEqual(warm.closes, 0, "健康会话不应关闭预热现场")
+        self.assertIs(calls["warm"], warm, "健康会话必须复用 warm（不得冷启动）")
+
+    def test_session_check_exception_closes_warm_and_cold_starts(self):
+        # 校验本身抛异常（如页面结构异常）：按"会话不可信"处理——关闭预热现场
+        # 改走冷启动（冷启动会用新浏览器重新诚实校验），不崩、不复用可疑 warm
+        warm = self._LiveWarm()
+        ok, msg, extra, calls = self._run(warm, session_ok_exc=RuntimeError("boom"))
+        self.assertIn("session_ok", calls)
+        self.assertEqual(warm.closes, 1, "校验异常的 warm 必须被关闭")
+        self.assertIsNone(calls["warm"], "校验异常时不得复用可疑 warm")
+        self.assertFalse(ok)
+
+    def test_stale_warm_keeps_old_path_without_session_check(self):
+        # Task 70a 路径不变：已失效（页面被关/跨线程）的 warm 直接关闭，
+        # 不应再浪费一次会话校验
+        warm = self._StaleWarm()
+        ok, msg, extra, calls = self._run(warm, session_ok_result=(True, "张三"))
+        self.assertNotIn("session_ok", calls, "stale warm 不应触发会话复验")
+        self.assertEqual(warm.closes, 1)
+        self.assertIsNone(calls["warm"])
+
+    def test_no_warm_skips_revalidation(self):
+        # 冷启动路径不受影响：无 warm 时不做复验
+        ok, msg, extra, calls = self._run(None, session_ok_result=(True, "张三"))
+        self.assertNotIn("session_ok", calls, "无 warm 时不应调用会话复验")
+        self.assertIsNone(calls["warm"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

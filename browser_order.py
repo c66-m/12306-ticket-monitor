@@ -757,7 +757,9 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             None)
                 _log("  [浏览器] 会话有效：%s" % who)
             else:
-                _log("  [浏览器] 复用预热现场（跳过开窗口 / 校验 / 导航）")
+                # Task 95：会话有效性已在 order_via_browser（锁外）复验，
+                # 这里跳过的是开窗口与完整导航（warm.refresh 只做一次重查）。
+                _log("  [浏览器] 复用预热现场（会话已复验，跳过开窗口 / 导航）")
             mark("session")
 
             # 1) 填条件 + 2) 查询。冷启动走完整导航；预热路径整页刷新一次
@@ -1307,6 +1309,26 @@ def order_via_browser(info, seat_name, seat_code, passenger_names, date,
             except Exception:
                 pass
             warm = None
+        if warm is not None:
+            # Task 95：warm 复用前复验会话有效性。usable() 只看页面存活，
+            # 看不到预热等待期（默认 10 分钟）内被踢/过期的会话；若直接复用，
+            # warm.refresh() 会在死会话上烧 ~20-30 秒抛误导性 TimeoutError，
+            # 连续几次后任务被误判自停（漏单，P2）。
+            # 会话已失效 → 关闭预热现场，改走冷启动路径（内含诚实的会话校验
+            # 与"请先运行 login"指引），不烧误导性超时、不误判自停。
+            # 复用 warm 自带的 page 做校验（不新开标签页）；校验在进锁前完成，
+            # 与 Task 70a 的"close 必须在装饰器外"同理。
+            try:
+                ok, who = session_ok(warm.ctx, page=warm.page)
+            except Exception as e:
+                ok, who = False, "预热会话校验异常: %s" % str(e)[:100]
+            if not ok:
+                _log("  [浏览器] 预热期会话已失效（%s），关闭预热现场改走冷启动" % who)
+                try:
+                    warm.close()
+                except Exception:
+                    pass
+                warm = None
     except Exception as e:
         return False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
     return _order_via_browser_locked(
