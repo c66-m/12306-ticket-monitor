@@ -7217,6 +7217,262 @@ class TestTask76TicketSession(TempDirCase):
         self.assertIn("UNVERIFIED", src)
 
 
+# ============================ Task 77 ============================
+
+class TestTask77Order(unittest.TestCase):
+    """Task 77: order P2/P3（date 回退误判 / 交集归因 / 改判前席别回归 /
+    alias 丢失 / 时区窗口 / 非 JSON 不重试 / 双查限流 / order_no 脱敏）。"""
+
+    # ---- (a) 缺 start_train_date_page 时 date 留空 ----
+
+    def test_normalize_missing_start_date_leaves_date_empty(self):
+        # 旧代码：date 回退为 order_date（今天）→ find_duplicate 按乘车日期
+        # 永远 miss → 被误判为 blocked"其它行程"。新：留空（无 date 记录被跳过）。
+        item = {"sequence_no": "E1", "train_code_page": "K225",
+                "order_date": "2026-10-08 10:00:00",
+                "passengerDTOList": [{"passenger_name": "张三"}]}
+        got = order_mod._normalize_order_item(item, "未完成/未支付")
+        self.assertEqual(got["date"], "")
+
+    def test_normalize_present_start_date_unchanged(self):
+        # 回归 pin：字段存在时行为不变
+        item = {"sequence_no": "E1", "train_code_page": "K225",
+                "start_train_date_page": "2026-10-10 00:00:00",
+                "order_date": "2026-10-08 10:00:00",
+                "passengerDTOList": [{"passenger_name": "张三"}]}
+        got = order_mod._normalize_order_item(item, "未完成/未支付")
+        self.assertEqual(got["date"], "2026-10-10")
+
+    # ---- (b) find_recent_order 全员命中 ----
+
+    def _ts(self, dt):
+        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+    def test_find_recent_order_requires_all_pax(self):
+        # 旧代码：任一交集即中 → 部分重叠的他人订单被归因成本次提交。
+        # 新：与 Task 59 同口径（全员命中）。
+        not_before = self._ts(datetime.datetime(2026, 10, 8, 10, 0, 0))
+        orders = [{"train": "G101", "date": "2026-10-10",
+                   "passengers": ["张三", "李四"], "order_no": "Epartial",
+                   "order_ts": not_before + 60}]
+        got = order_mod.find_recent_order(orders, "2026-10-10", "G101",
+                                          ["张三", "王五"], not_before)
+        self.assertIsNone(got)
+
+    def test_find_recent_order_all_hit_still_matches(self):
+        # 回归 pin：全员命中仍归因
+        not_before = self._ts(datetime.datetime(2026, 10, 8, 10, 0, 0))
+        orders = [{"train": "G101", "date": "2026-10-10",
+                   "passengers": ["张三", "王五"], "order_no": "Emine",
+                   "order_ts": not_before + 60}]
+        got = order_mod.find_recent_order(orders, "2026-10-10", "G101",
+                                          ["张三", "王五"], not_before)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["order_no"], "Emine")
+
+    # ---- (c) find_duplicate 用改判后席别比对 ----
+
+    def test_find_duplicate_uses_post_regrade_seat(self):
+        # 旧代码：调用方传"无座"（改判前），已存订单 seat 是"二等座"（改判后），
+        # 双侧非空不等即跳过 → 同行程未支付单漏检。新：统一到提交时有效席别。
+        orders = [{"date": "2026-10-10", "train": "G101",
+                   "passengers": ["张三"], "order_no": "E1", "seat": "二等座"}]
+        dup = order_mod.find_duplicate(orders, "2026-10-10", "G101", ["张三"],
+                                       seat_name="无座")
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup["order_no"], "E1")
+
+    def test_find_duplicate_seat_mismatch_still_skipped(self):
+        # 回归 pin：真不一致仍跳过
+        orders = [{"date": "2026-10-10", "train": "G101",
+                   "passengers": ["张三"], "order_no": "E1", "seat": "二等座"}]
+        self.assertIsNone(order_mod.find_duplicate(
+            orders, "2026-10-10", "G101", ["张三"], seat_name="一等座"))
+
+    # ---- (d) HTTP 路径改判后写 alias_seat/selected_seat ----
+
+    def test_order_ticket_http_writes_alias_seat(self):
+        ticket = {"train_code": "G101", "query_date": "2026-10-10",
+                  "from_name": "北京", "to_name": "上海",
+                  "start_time": "08:00", "arrive_time": "12:00",
+                  "train_location": "P3", "secret_str": "x"}
+        task = {"passenger_names": ["张三"]}
+        with mock.patch.object(order_mod, "load_session",
+                               return_value=object()), \
+             mock.patch.object(order_mod, "check_login",
+                               return_value=(True, "u")), \
+             mock.patch.object(order_mod, "submit_with_busy_retry",
+                               return_value=(True, "")), \
+             mock.patch.object(order_mod, "get_init_dc",
+                               return_value=("tok", "left", "key", "")), \
+             mock.patch.object(order_mod, "get_passengers",
+                               return_value=[{"name": "张三", "is_adult": True,
+                                              "id_no": "x", "mobile": ""}]), \
+             mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=[]), \
+             mock.patch.object(order_mod, "check_order_info",
+                               return_value=(True, "")), \
+             mock.patch.object(order_mod, "confirm_with_busy_retry",
+                               return_value=(True, "ok")), \
+             mock.patch.object(order_mod, "fetch_unpaid_order_no",
+                               return_value="E1"):
+            ok, msg, extra = order_mod.order_ticket({}, task, ticket, "无座")
+        self.assertTrue(ok, msg)
+        # 旧代码：extra 无 alias_seat/selected_seat，seat 显示改判前的"无座"
+        self.assertEqual(extra.get("alias_seat"), "二等座")
+        self.assertEqual(extra.get("selected_seat"), "无座")
+
+    # ---- (e) 查询窗口用北京时间 ----
+
+    def test_check_existing_orders_beijing_windows(self):
+        # 机器 TZ=UTC、冻结在 2026-10-08 20:00 UTC（= 北京 2026-10-09 04:00）：
+        # 旧代码窗口按机器本地算 → today="2026-10-08"；新：北京时间 → "2026-10-09"
+        # 注：datetime.now() 的 C 实现不走 Python 层 time.time mock，
+        # 故用 FakeDateTime 冻结 now()。
+        real_dt = datetime.datetime
+        frozen = real_dt(2026, 10, 8, 20, 0, 0,
+                         tzinfo=datetime.timezone.utc)
+
+        class FakeDateTime(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return frozen.replace(tzinfo=None)
+                return frozen.astimezone(tz)
+
+        seen = {}
+
+        def fake_post(url, data=None, timeout=None):
+            # G/H 都 POST 到 queryMyOrder：按 query_where 区分
+            seen[(data or {}).get("query_where")] = dict(data or {})
+            r = mock.MagicMock()
+            if "NoComplete" in url:
+                r.json.return_value = {"data": {"orderDBList": []}}
+            else:
+                r.json.return_value = {"data": {"OrderDTODataList": []}}
+            return r
+
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        try:
+            try:
+                import time as _time
+                _time.tzset()
+            except Exception:
+                pass
+            session = mock.MagicMock()
+            session.post.side_effect = fake_post
+            with mock.patch.object(order_mod.datetime, "datetime", FakeDateTime):
+                order_mod.check_existing_orders(session, "2026-10-09")
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            try:
+                import time as _time2
+                _time2.tzset()
+            except Exception:
+                pass
+        g = seen.get("G", {})
+        self.assertEqual(g.get("queryEndDate"), "2026-10-09")
+        self.assertEqual(g.get("queryStartDate"), "2026-08-10")
+
+    # ---- (f) 非 JSON 响应重试 3 次 ----
+
+    def _non_json_resp(self):
+        r = mock.Mock()
+        r.json.side_effect = ValueError("No JSON object could be decoded")
+        r.text = "<html>waf intercept</html>"
+        return r
+
+    def test_submit_non_json_retries_then_succeeds(self):
+        ok_resp = mock.Mock()
+        ok_resp.json.return_value = {"status": True}
+        session = mock.MagicMock()
+        session.post.side_effect = [self._non_json_resp(),
+                                    self._non_json_resp(), ok_resp]
+        with mock.patch("time.sleep"):
+            ok, msg = order_mod.submit_with_busy_retry(
+                session, {"secret_str": "x"}, "O", "2026-10-10", 3, 0.01)
+        # 旧代码：第 1 次非 JSON 即判失败（post 只调 1 次）
+        self.assertTrue(ok, msg)
+        self.assertEqual(session.post.call_count, 3)
+
+    def test_submit_non_json_gives_up_after_3(self):
+        session = mock.MagicMock()
+        session.post.side_effect = [self._non_json_resp()] * 5
+        with mock.patch("time.sleep"):
+            ok, msg = order_mod.submit_with_busy_retry(
+                session, {"secret_str": "x"}, "O", "2026-10-10", 5, 0.01)
+        self.assertFalse(ok)
+        self.assertEqual(session.post.call_count, 3)
+
+    def test_submit_non_json_tries_one_still_retries_3(self):
+        # 非 JSON 重试独立于 busy 的 tries：tries=1 时仍最多试 3 次，
+        # 而不是只试 1 次就报"连续 1 次系统忙"。
+        session = mock.MagicMock()
+        session.post.side_effect = [self._non_json_resp()] * 5
+        with mock.patch("time.sleep"):
+            ok, msg = order_mod.submit_with_busy_retry(
+                session, {"secret_str": "x"}, "O", "2026-10-10", 1, 0.01)
+        self.assertFalse(ok)
+        self.assertEqual(session.post.call_count, 3)
+        # 失败原因是"非 JSON 响应"类（带原始响应片段），而非"连续 1 次系统忙"
+        self.assertIn("waf intercept", msg)
+
+    def test_confirm_non_json_retries_then_succeeds(self):
+        ok_resp = mock.Mock()
+        ok_resp.json.return_value = {"status": True,
+                                     "data": {"submitStatus": True}}
+        session = mock.MagicMock()
+        session.post.side_effect = [self._non_json_resp(), ok_resp]
+        with mock.patch("time.sleep"):
+            ok, msg = order_mod.confirm_with_busy_retry(
+                session, "tok", "left", "key", "P3", "pts", "old", 3, 0.01)
+        # 旧代码：非 JSON 即判失败不重试
+        self.assertTrue(ok, msg)
+        self.assertEqual(session.post.call_count, 2)
+
+    # ---- (g) classify_with_time 只查一次 ----
+
+    def test_classify_with_time_single_query(self):
+        not_before = self._ts(datetime.datetime(2026, 10, 8, 10, 0, 0))
+        orders = [{"train": "G101", "date": "2026-10-10",
+                   "passengers": ["张三"], "order_no": "Emine",
+                   "order_ts": not_before + 60, "_no_complete": True,
+                   "status": "未完成/未支付"}]
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=orders) as m_q:
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=not_before,
+                session=object())
+        # 旧代码：classify 内查一次 + 归因又查一次 = 2 次
+        self.assertEqual(m_q.call_count, 1)
+        self.assertEqual(cls, "unpaid")
+        self.assertIsNotNone(recent)
+        self.assertEqual(recent["order_no"], "Emine")
+
+    def test_classify_with_time_no_session_error_path(self):
+        # session=None 且无浏览器 state 文件 → error，recent 为 None（旧行为保持）
+        cls, ono, raw, recent = order_mod.classify_with_time(
+            "2026-10-10", "G101", ["张三"], not_before_ts=12345, session=None)
+        self.assertEqual(cls, "error")
+        self.assertIsNone(recent)
+
+    # ---- (h) 畸形订单警告脱敏 ----
+
+    def test_malformed_order_warning_masks_order_no(self):
+        orders = [{"date": "2026-10-10", "train": "K225",
+                   "passengers": [], "order_no": "E1234567890"}]
+        with self.assertLogs(order_mod.LOG, level="WARNING") as cm:
+            order_mod.find_duplicate(orders, "2026-10-10", "K225", ["张三"])
+        out = "\n".join(cm.output)
+        # 旧代码：打印完整订单号原文
+        self.assertNotIn("E1234567890", out)
+        self.assertIn("E123****7890", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

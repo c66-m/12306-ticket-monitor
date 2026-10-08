@@ -32,6 +32,17 @@ import requests
 
 LOG = logging.getLogger(__name__)
 
+
+def _mask_order_no(ono):
+    """订单号脱敏（日志用）：保留前后各 4 位，中间打码；过短则全打码。
+
+    与 engine._mask_order_no 同口径（order.py 不能 import engine，会循环依赖）。
+    """
+    s = str(ono or "")
+    if len(s) <= 8:
+        return "****"
+    return s[:4] + "****" + s[-4:]
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -120,20 +131,13 @@ def save_session(session, cookie_path=None):
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 
 
-def classify_order_status(date, train, passenger_names, session=None):
-    """12306 官方接口订单状态分类(唯一事实来源,只读接口)。
+def _classify_orders(date, train, passenger_names, orders):
+    """纯分类逻辑（不查接口）：对已查到的订单列表做状态分类。
 
-    返回 (分类, 订单号, 原文状态):分类 ∈ paid(已支付)/unpaid(待支付)/
-    cancelled(已取消)/none(未找到)/error(查询失败)。按 车次+乘车日期+
-    乘车人交集 匹配订单。"""
-    try:
-        sess = session or session_from_browser_state()
-    except Exception as e:
-        return "error", "", "官方订单查询失败: %s" % e
-    try:
-        orders = check_existing_orders(sess, date)
-    except Exception as e:
-        return "error", "", "官方订单查询异常: %s" % e
+    返回 (分类, 订单号, 原文状态)，与 classify_order_status 的后三元一致。
+    抽出是为了让 classify_with_time 复用同一次查询结果，避免每次调用
+    打两次官方订单接口（HTTP 量翻倍，频繁回读时易触 12306 限流）。
+    """
     want = set(passenger_names or [])
 
     def _pax_hit(x):
@@ -168,6 +172,23 @@ def classify_order_status(date, train, passenger_names, session=None):
             return "paid", ono, st
         return "unknown", ono, st
     return "none", "", "官方订单列表(未完成+该日历史)中未找到 %s %s" % (train, date)
+
+
+def classify_order_status(date, train, passenger_names, session=None):
+    """12306 官方接口订单状态分类(唯一事实来源,只读接口)。
+
+    返回 (分类, 订单号, 原文状态):分类 ∈ paid(已支付)/unpaid(待支付)/
+    cancelled(已取消)/none(未找到)/error(查询失败)。按 车次+乘车日期+
+    乘车人交集 匹配订单。"""
+    try:
+        sess = session or session_from_browser_state()
+    except Exception as e:
+        return "error", "", "官方订单查询失败: %s" % e
+    try:
+        orders = check_existing_orders(sess, date)
+    except Exception as e:
+        return "error", "", "官方订单查询异常: %s" % e
+    return _classify_orders(date, train, passenger_names, orders)
 
 
 def _beijing_tz():
@@ -216,7 +237,10 @@ def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, 
                 or (o.get("date") or "")[:10] != (date or "")[:10]):
             continue
         pax = set(o.get("passengers") or [])
-        if want and pax and not (pax & want):
+        # 收紧：全部目标乘车人命中才算命中（与 Task 59 的 find_duplicate /
+        # classify 同口径）。旧代码任一交集即中 → 同车次同日期乘车人部分
+        # 重叠的他人订单会被归因成本次提交（通知/历史写入错误订单号）。
+        if want and not (want <= pax):
             continue
         ts = o.get("order_ts")
         if ts is None or ts < lo or ts > hi:
@@ -232,14 +256,24 @@ def classify_with_time(date, train, passenger_names, not_before_ts=None, session
     返回 (cls, order_no, raw, recent)：前三个与 classify_order_status 完全一致，
     recent 是「下单时间落在本次提交窗口内」的订单 dict（cls 为 unpaid 时才可能有值，
     其余情况为 None）。not_before_ts 传 None 时跳过归因，recent 恒为 None。
+
+    只查一次官方订单接口：分类与归因复用同一份订单快照（旧代码查两次，
+    HTTP 量翻倍且两次快照可能不一致）。
     """
-    cls, ono, raw = classify_order_status(date, train, passenger_names, session=session)
+    try:
+        sess = session or session_from_browser_state()
+    except Exception as e:
+        return "error", "", "官方订单查询失败: %s" % e, None
+    try:
+        orders = check_existing_orders(sess, date)
+    except Exception as e:
+        return "error", "", "官方订单查询异常: %s" % e, None
+    cls, ono, raw = _classify_orders(date, train, passenger_names, orders)
     recent = None
     if cls == "unpaid" and not_before_ts is not None:
         try:
-            sess = session or session_from_browser_state()
-            orders = check_existing_orders(sess, date)
-            recent = find_recent_order(orders, date, train, passenger_names, not_before_ts)
+            recent = find_recent_order(orders, date, train, passenger_names,
+                                       not_before_ts)
         except Exception:
             recent = None
     return cls, ono, raw, recent
@@ -345,15 +379,34 @@ def is_busy_error(msg):
     return False
 
 
+def _post_submit_json(session, ticket, seat_code, date, purpose):
+    """submitOrderRequest + JSON 解析，带非 JSON transient 重试（最多 3 次）。
+
+    返回 (d, err)：成功时 d 为响应 dict；网络异常时 err 描述异常（不重试，
+    保持旧行为）；连续 3 次非 JSON（12306 WAF/网关偶发拦截页）时 err 描述
+    最后一次。重试口径与 verify_session 一致。
+    """
+    last_err = ""
+    for _ in range(3):
+        try:
+            resp = submit_order_request(session, ticket, seat_code, date, purpose)
+        except Exception as e:
+            return None, "submitOrderRequest 异常: {0} 原始响应: ".format(e)
+        try:
+            return resp.json(), None
+        except Exception as e:
+            raw = getattr(resp, "text", "") or ""
+            last_err = "submitOrderRequest 异常: {0} 原始响应: {1}".format(e, raw[:300])
+            time.sleep(1.2)
+    return None, last_err
+
+
 def submit_with_busy_retry(session, ticket, seat_code, date, tries, delay, purpose="ADULT"):
     """提交订单请求，遇"系统忙"类错误自动重试（间隔递增）。返回 (ok, msg)。"""
     for attempt in range(1, tries + 1):
-        try:
-            resp = submit_order_request(session, ticket, seat_code, date, purpose)
-            d = resp.json()
-        except Exception as e:
-            raw = getattr(locals().get("resp"), "text", "") or ""
-            return False, "submitOrderRequest 异常: {0} 原始响应: {1}".format(e, raw[:300])
+        d, err = _post_submit_json(session, ticket, seat_code, date, purpose)
+        if d is None:
+            return False, err
         if d.get("status"):
             return True, ""
         msg = str(d.get("validateMessages") or d.get("messages") or "")
@@ -461,6 +514,9 @@ def _normalize_order_item(item, status):
         if name and name not in passengers:
             passengers.append(name)
     start = item.get("start_train_date_page") or ""
+    # date 语义是乘车日期：缺 start_train_date_page 时留空，不回退为下单日期
+    # （旧代码回退今天 → find_duplicate 按乘车日期永远 miss → 被误判为
+    # blocked"其它行程"；留空反而安全，无 date 记录会被各判定跳过）。
 
     def _f(v):
         # 新接口里站名是数组（如 ["长葛"]），老接口是字符串，统一成字符串
@@ -496,7 +552,7 @@ def _normalize_order_item(item, status):
         "train": (item.get("train_code_page") or "").replace(" ", ""),
         "from": _f(item.get("from_station_name_page")),
         "to": _f(item.get("to_station_name_page")),
-        "date": start[:10] if start else order_date_raw[:10],
+        "date": start[:10] if start else "",
         "status": ticket_status or status or item.get("order_status_name_cn") or "",
         "passengers": passengers,
         "order_time": order_date_raw[:19] if order_date_raw else "",
@@ -542,11 +598,14 @@ def check_existing_orders(session, target_date):
     保守处理（如下单入口直接中止本轮），不拿空列表当"无重复"继续下单。
     """
     orders = []
-    today = time.strftime("%Y-%m-%d")
-    t = time.time()
-    yesterday = time.strftime("%Y-%m-%d", time.localtime(t - 86400))
-    back60 = time.strftime("%Y-%m-%d", time.localtime(t - 60 * 86400))
-    ahead60 = time.strftime("%Y-%m-%d", time.localtime(t + 60 * 86400))
+    # 查询窗口按北京时间构造：订单时间戳已按北京时间解析（Task 36），
+    # 机器本地时区非 Asia/Shanghai 时，time.strftime/time.localtime 会让
+    # 窗口整体偏早一天，漏掉北京"今天"下单的已支付单。
+    now_bj = datetime.datetime.now(_BJ_TZ)
+    today = now_bj.strftime("%Y-%m-%d")
+    yesterday = (now_bj - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    back60 = (now_bj - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+    ahead60 = (now_bj + datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     # 未完成订单（未支付）：不分日期车次，12306 规则是任一未完成订单都会挡新单
     try:
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
@@ -580,6 +639,24 @@ def check_existing_orders(session, target_date):
     return orders
 
 
+def _effective_seat_name(seat_name, train_code):
+    """提交时的有效席别名：无座按同价改判（动车组→二等座，普速→硬座），其余原样。
+
+    find_duplicate 的席别比对必须用改判后席别：已存订单的 seat 取自
+    tickets[].seat_type_name，是实际出票席别（改判后）；调用方传的是用户
+    勾选席别（改判前，如"无座"），直接比对会漏检同行程未支付单、
+    防重守卫被放行。
+    """
+    name = (seat_name or "").strip()
+    if not name:
+        return ""
+    try:
+        _code, alias = order_seat_code(name, None, train_code)
+    except Exception:
+        return name
+    return (alias or name).strip()
+
+
 def find_duplicate(orders, date, train_code, passenger_names,
                    from_station=None, to_station=None, seat_name=None):
     """
@@ -589,12 +666,16 @@ def find_duplicate(orders, date, train_code, passenger_names,
     - 区间/席别：调用方与订单双方都有值时才比对；任一侧缺失不以此为由
       排除（向后兼容旧数据/旧调用）。
     - 席别取自订单 tickets[] 的 seat_type_name（best-effort；取不到视为
-      未知，不收窄）。
+      未知，不收窄）；调用方席别先经同价改判换算为提交时有效席别
+      （"无座"→"二等座"/"硬座"），再与订单席别比对。
     - 订单解析不出乘车人列表：记 warning 后跳过该条，不封锁整条线路
       （旧代码保守判重，一条畸形记录永久封锁该 date+train 的一切下单）。
     - 空目标乘车人集不算命中。
     """
     want = set(passenger_names or [])
+    # 席别比对统一到提交时的有效席别：调用方 seat_name 是用户勾选（改判前），
+    # 订单 seat 是实际出票席别（改判后）。_effective_seat_name 做同价改判。
+    want_seat = _effective_seat_name(seat_name, train_code)
     for o in orders:
         if not o.get("date") or not o.get("train"):
             continue
@@ -606,12 +687,12 @@ def find_duplicate(orders, date, train_code, passenger_names,
         if to_station and ot and ot != to_station:
             continue
         o_seat = (o.get("seat") or "").strip()
-        if seat_name and o_seat and o_seat != seat_name.strip():
+        if want_seat and o_seat and o_seat != want_seat:
             continue
         pax = o.get("passengers") or []
         if not pax:
             LOG.warning("订单 %s 乘车人解析为空，跳过该条防重判定（不封锁线路）",
-                        o.get("order_no") or "?")
+                        _mask_order_no(o.get("order_no") or "?"))
             continue
         if want and want <= set(pax):
             return o
@@ -705,6 +786,24 @@ def confirm_order(session, token, left_ticket_str, key_check, train_location,
     return False, "排队未成功: {0}".format(data_)
 
 
+def _confirm_json_with_retry(session, token, left_ticket_str, key_check, train_location,
+                             passenger_ticket_str, old_passenger_str, purpose):
+    """confirmSingleForQueue + 非 JSON transient 重试（最多 3 次）。返回 (ok, msg)。
+
+    非 JSON 响应（12306 WAF/网关偶发拦截页）按 transient 处理，重试口径与
+    verify_session 一致；网络异常直接抛给调用方（保持旧行为）。
+    """
+    ok, msg = False, ""
+    for _ in range(3):
+        ok, msg = confirm_order(session, token, left_ticket_str, key_check,
+                                train_location, passenger_ticket_str,
+                                old_passenger_str, purpose)
+        if ok or not msg.startswith("confirmSingleForQueue 返回非 JSON"):
+            return ok, msg
+        time.sleep(1.2)
+    return ok, msg
+
+
 def confirm_with_busy_retry(session, token, left_ticket_str, key_check, train_location,
                             passenger_ticket_str, old_passenger_str, tries, delay,
                             purpose="ADULT"):
@@ -712,9 +811,10 @@ def confirm_with_busy_retry(session, token, left_ticket_str, key_check, train_lo
     msg = ""
     for attempt in range(1, tries + 1):
         try:
-            ok, msg = confirm_order(session, token, left_ticket_str, key_check,
-                                    train_location, passenger_ticket_str,
-                                    old_passenger_str, purpose)
+            ok, msg = _confirm_json_with_retry(session, token, left_ticket_str,
+                                               key_check, train_location,
+                                               passenger_ticket_str,
+                                               old_passenger_str, purpose)
         except Exception as e:
             return False, "confirmSingleForQueue 异常: {0}".format(e)
         if ok or not is_busy_error(msg) or attempt >= tries:
@@ -728,7 +828,7 @@ def fetch_unpaid_order_no(session, date=None, train_code=None, passenger_names=N
     """尽力获取「本次提交生成」的未完成订单号（失败不影响主流程）。
 
     按 not_before_ts 做下单时间归因：只返回 order_ts 落在本次提交窗口内、且
-    行程（车次 + 日期 + 乘车人交集）匹配的订单。有历史未支付单时不再张冠李戴。
+    行程（车次 + 日期 + 乘车人全员命中）匹配的订单。有历史未支付单时不再张冠李戴。
     未传归因参数时退化为旧行为（取第一笔未完成订单）；归因无匹配时返回 None
     （宁可缺省，不给过期单号）。
     """
@@ -784,7 +884,7 @@ def order_ticket(config, task, ticket, seat_name):
     # 席别同价改判（与 browser_order 同一规则）：网页端不下发「无座」，
     # 勾「无座」按同价席别提交（动车组→二等座，普速→硬座）；
     # HTTP 路径此前漏了这一步，导致无座任务必失败
-    seat_code, _alias_name = order_seat_code(seat_name, None, ticket.get("train_code"))
+    seat_code, alias_name = order_seat_code(seat_name, None, ticket.get("train_code"))
     if not seat_code:
         return False, "未知席别: {0}".format(seat_name), None
 
@@ -888,7 +988,14 @@ def order_ticket(config, task, ticket, seat_name):
              "train": ticket["train_code"], "seat": seat_name,
              "from": ticket["from_name"], "to": ticket["to_name"],
              "start": ticket["start_time"], "arrive": ticket["arrive_time"]}
-    return True, msg3 + (" 订单号: {0}".format(order_no) if order_no else ""), extra
+    msg = msg3 + (" 订单号: {0}".format(order_no) if order_no else "")
+    if alias_name:
+        # 席别同价改判后如实记账（与 browser_order 同口径）：extra 记改判后席别，
+        # 消息里说明勾选席别与实际提交席别，避免显示改判前的"无座"误导用户。
+        extra["alias_seat"] = alias_name
+        extra["selected_seat"] = seat_name
+        msg += "（勾选 %s，同价按 %s 下单）" % (seat_name, alias_name)
+    return True, msg, extra
 
 
 if __name__ == "__main__":
