@@ -6211,6 +6211,183 @@ class TestTask69CaptureSession(TempDirCase):
         self.assertEqual(vals, ["AAA", "BBB"])
 
 
+# ============================ Task 70 ============================
+
+class TestTask70BrowserOrder(TempDirCase):
+    """Task 70: browser_order P2/P3（锁重入捷径 / clicked 未定义 / dlg_seat 死代码）。
+
+    (a) stale warm 的 close() 在 exclusive() 体内释放两把锁并清零 depth →
+        重入 finally 恢复旧 depth 造成"持锁"假象 → 本线程后续 exclusive()
+        永久走重入捷径，跨进程 profile 互斥静默失效（P2）。
+    (b) _order_impl 外层 except 引用 clicked，但它在 try 内才赋值，
+        步骤 1–6.5 抛异常时 UnboundLocalError 掩盖原始错误（P3）。
+    (c) dlg_seat 初始化 "" 后从未被赋值 → 结果页警告与
+        extra["seat_in_dialog"] 是死代码（P3）。
+    """
+
+    # ---------- (a) 锁重入捷径 ----------
+
+    def _manual_lock_state(self):
+        """模拟 warm_up 后的线程状态：手动持有两把锁，depth=1。"""
+        self.assertTrue(browser_order._BROWSER_LOCK.acquire(timeout=5))
+        self.addCleanup(self._safe_release_browser_lock)
+        self.assertTrue(browser_order._PROFILE_LOCK.acquire(timeout=5))
+        self.addCleanup(browser_order._PROFILE_LOCK.release)  # fd None 时是 no-op
+        browser_order._LOCK_LOCAL.depth = 1
+        self.addCleanup(setattr, browser_order._LOCK_LOCAL, "depth", 0)
+
+    @staticmethod
+    def _safe_release_browser_lock():
+        # RLock 重复 release 会抛 RuntimeError：测试的 close() 复刻可能已释放
+        try:
+            browser_order._BROWSER_LOCK.release()
+        except RuntimeError:
+            pass
+
+    class _StaleWarm:
+        """复刻 WarmSession.close() 的同线程 stale 路径（锁语义逐字一致）。"""
+        def __init__(self):
+            self.effective_closes = 0
+            self._closed = False
+
+        def usable(self):
+            return False
+
+        def close(self):
+            if self._closed:
+                return
+            self._closed = True
+            self.effective_closes += 1
+            if getattr(browser_order._LOCK_LOCAL, "depth", 0):
+                browser_order._LOCK_LOCAL.depth = 0
+            browser_order._PROFILE_LOCK.release()
+            browser_order._BROWSER_LOCK.release()
+
+    def test_exclusive_reentrant_finally_keeps_zero_depth(self):
+        # 体内 close() 已清零 depth（锁已释放）：finally 不应"复活"旧 depth
+        browser_order._LOCK_LOCAL.depth = 1
+        self.addCleanup(setattr, browser_order._LOCK_LOCAL, "depth", 0)
+        with browser_order.exclusive(timeout=5):   # 重入分支：depth 1→2
+            browser_order._LOCK_LOCAL.depth = 0   # 模拟 warm.close()
+        self.assertEqual(getattr(browser_order._LOCK_LOCAL, "depth", 0), 0,
+                         "重入 exclusive 的 finally 把已清零的 depth 恢复为旧值，"
+                         "会造成本线程'仍持有锁'的假象（P2）")
+
+    def test_exclusive_reentrant_normal_restore_kept(self):
+        # 回归 pin：正常路径的重入记账不受影响
+        browser_order._LOCK_LOCAL.depth = 1
+        self.addCleanup(setattr, browser_order._LOCK_LOCAL, "depth", 0)
+        with browser_order.exclusive(timeout=5):
+            self.assertEqual(browser_order._LOCK_LOCAL.depth, 2)
+        self.assertEqual(browser_order._LOCK_LOCAL.depth, 1)
+
+    def test_stale_warm_order_then_exclusive_really_locks(self):
+        # P2 端到端：stale warm 下单后，本线程后续 exclusive() 必须真实加锁
+        self._manual_lock_state()
+        warm = self._StaleWarm()
+
+        def fake_impl(*a, **k):
+            # 逐字复刻旧 _order_impl 的 stale 分支（改前代码）
+            w = k.get("warm")
+            if w is not None and not w.usable():
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            return (False, "mock-cold", None)
+
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "_order_impl", side_effect=fake_impl):
+            ok, msg, extra = browser_order.order_via_browser(
+                info, "二等座", "O", ["张三"], "2026-10-10", warm=warm)
+        self.assertEqual(warm.effective_closes, 1, "stale warm 应被关闭一次")
+        self.assertFalse(ok)
+        # 核心断言 1：返回后线程不再"假装持锁"
+        self.assertEqual(getattr(browser_order._LOCK_LOCAL, "depth", 0), 0,
+                         "stale warm close 后 depth 仍为旧值："
+                         "后续 exclusive() 会走重入捷径（P2）")
+        # 核心断言 2：exclusive() 真实持有锁（另一线程拿不到），而非走捷径
+        probe = []
+
+        def other_thread():
+            got = browser_order._BROWSER_LOCK.acquire(timeout=0.5)
+            probe.append(got)
+            if got:
+                browser_order._BROWSER_LOCK.release()
+
+        with browser_order.exclusive(timeout=5):
+            t = threading.Thread(target=other_thread)
+            t.start()
+            t.join()
+        self.assertEqual(probe, [False],
+                         "exclusive() 未真实加锁：走了重入捷径（P2 复现）")
+
+    # ---------- (b) clicked 未定义 ----------
+
+    def _stub_playwright_cold(self):
+        import sys
+        import types as _types
+        pw = _types.ModuleType("playwright")
+        pw_sync = _types.ModuleType("playwright.sync_api")
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = mock.MagicMock()
+        pw_sync.sync_playwright = lambda: cm
+        pw.sync_api = pw_sync
+        mods = {"playwright": pw, "playwright.sync_api": pw_sync}
+        for name, mod in mods.items():
+            sys.modules[name] = mod
+        self.addCleanup(lambda: [sys.modules.pop(n, None) for n in mods])
+
+    def test_early_exception_not_masked_by_unbound_clicked(self):
+        # 步骤 1–6.5（clicked = False 赋值点之前）抛异常：外层 except 必须读到
+        # 已初始化的 clicked=False，走普通失败分支，而非 UnboundLocalError 掩盖原始错误
+        self._stub_playwright_cold()
+        page = mock.MagicMock()
+        ctx = mock.MagicMock()
+        ctx.pages = [page]
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "launch", return_value=ctx), \
+             mock.patch.object(browser_order, "session_ok",
+                               return_value=(True, "mock")), \
+             mock.patch.object(browser_order, "_goto_and_query",
+                               side_effect=RuntimeError("query boom")):
+            ok, msg, extra = browser_order._order_impl(
+                info, "二等座", "O", ["张三"], "2026-10-10")
+        self.assertFalse(ok)
+        self.assertIn("query boom", msg)
+        self.assertNotIn("UnboundLocalError", msg)
+
+    # ---------- (c) dlg_seat 死代码 ----------
+
+    def test_dialog_seat_words(self):
+        self.assertEqual(browser_order._dialog_seat_words("车次 G101 二等座 1 张"),
+                         ["二等座"])
+        self.assertEqual(browser_order._dialog_seat_words("无座改签二等座"),
+                         ["无座", "二等座"])
+        self.assertEqual(browser_order._dialog_seat_words(""), [])
+        self.assertEqual(browser_order._dialog_seat_words(None), [])
+
+    def test_audit_dialog_seat(self):
+        # 显示所选席别：取证记录，不中止
+        self.assertEqual(
+            browser_order._audit_dialog_seat("G101 二等座", "二等座", None),
+            ("二等座", None))
+        # 显示改判席别：取证记录为改判席别，不中止（结果页警告取证用）
+        self.assertEqual(
+            browser_order._audit_dialog_seat("G101 二等座", "无座", "二等座"),
+            ("二等座", None))
+        # 显示无关席别：中止
+        self.assertEqual(
+            browser_order._audit_dialog_seat("G101 硬座", "二等座", None),
+            ("硬座", "硬座"))
+        # 无席别词
+        self.assertEqual(
+            browser_order._audit_dialog_seat("请确认订单", "二等座", None),
+            ("", None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

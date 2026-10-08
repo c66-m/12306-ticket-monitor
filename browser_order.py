@@ -229,7 +229,13 @@ def exclusive(timeout=90):
         try:
             yield
         finally:
-            _LOCK_LOCAL.depth = depth
+            # Task 70a：体内若触发 stale warm 的 close()（见 order_via_browser），
+            # close 已释放两把锁并把 depth 清零；此时若恢复旧 depth，会造成
+            # "本线程仍持有锁"的假象，本线程后续 exclusive() 永久走重入捷径、
+            # 跨进程 profile 互斥静默失效（P2）。depth 为 0 即视为锁已释放，
+            # 不再恢复；正常路径 depth 非零，行为不变。
+            if getattr(_LOCK_LOCAL, "depth", 0):
+                _LOCK_LOCAL.depth = depth
         return
     if not _BROWSER_LOCK.acquire(timeout=timeout):
         raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
@@ -619,6 +625,28 @@ def _wait_slide_gone(page, sec):
     return False
 
 
+# 核对窗席别词表（Task 70c）：与原 _order_impl 内联元组逐字一致，抽出以便复用与单测
+_SEAT_WORDS = ("无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座")
+
+
+def _dialog_seat_words(dlg_text):
+    """核对窗原文里出现的所有席别词（按 _SEAT_WORDS 顺序）；无则 []。"""
+    text = dlg_text or ""
+    return [w for w in _SEAT_WORDS if w in text]
+
+
+def _audit_dialog_seat(dlg_text, seat_name, alias_name):
+    """核对窗席别审计（Task 70c）。返回 (dlg_seat, abort_seat)：
+    - dlg_seat: 原文里出现的第一个席别词，无则 ""（取证用，
+      结果页 extra["seat_in_dialog"]）。
+    - abort_seat: 与所选/改判席别都不符的第一个席别词，无则 None（应中止提交）。
+    """
+    shown = _dialog_seat_words(dlg_text)
+    dlg_seat = shown[0] if shown else ""
+    bad = [w for w in shown if w not in (seat_name, alias_name or "")]
+    return dlg_seat, (bad[0] if bad else None)
+
+
 def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 headless=False, verify_timeout=90, purpose="ADULT", warm=None, tm=None,
                 alias_name=None, purpose_map=None):
@@ -644,6 +672,10 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
 
     tm = tm if tm is not None else {}
     t_last = [time.perf_counter()]
+    # Task 70b：外层 except 会引用 clicked（提交后异常→ambiguous 判定）；
+    # 它在 try 内确认段（:1014）才赋值，步骤 1–6.5 抛异常时此前是
+    # UnboundLocalError 掩盖原始错误。在此预初始化。
+    clicked = False
 
     def mark(name):
         now = time.perf_counter()
@@ -1053,17 +1085,19 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         dlg_text = ""
                     if dlg_text:
                         _log("  [浏览器] 核对窗原文：%s" % dlg_text)
-                        others = [w for w in ("无座", "硬座", "硬卧", "软卧", "二等座",
-                                              "一等座", "商务座")
-                                  if w in dlg_text and w not in (seat_name, alias_name or "")]
-                        if others:
+                        # Task 70c：记录核对窗显示的席别（取证）。此前 dlg_seat
+                        # 从未被赋值，结果页的席别警告与 extra["seat_in_dialog"]
+                        # 是死代码；现在正确赋值。
+                        dlg_seat, abort_seat = _audit_dialog_seat(
+                            dlg_text, seat_name, alias_name)
+                        if abort_seat:
                             # 服务端渲染的核对窗与页面内部状态不一致：按 RULES.md
                             # 的纪律"不一致就中止、不提交"——此前照常提交，可能
                             # 买到与所选不符（更贵）的席别
                             return (False,
                                     "核对窗显示席别 %s，与所选 %s 不一致。已中止，未提交订单（原文：%s）"
-                                    % (others[0], seat_name, dlg_text[:160]),
-                                    {"seat_in_dialog": others[0]})
+                                    % (abort_seat, seat_name, dlg_text[:160]),
+                                    {"seat_in_dialog": abort_seat})
                     page.evaluate(
                         "() => { const e = document.querySelector('#qr_submit_id'); if (e) e.click(); }")
                     _log("  [浏览器] qr_submit 倒计时结束已启用（%.1fs），已点确认" % (
@@ -1204,17 +1238,43 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
         # 回调上，预热路径不关窗、留给 WarmSession 继续用。
 
 
-@_exclusive(lock_timeout=180)
 def order_via_browser(info, seat_name, seat_code, passenger_names, date,
                       headless=False, verify_timeout=90, purpose="ADULT", warm=None,
-                      alias_name=None, purpose_map=None):
+                      alias_name=None, purpose_map=None, **kwargs):
     """用真实浏览器完成一次下单。返回 (ok, msg, extra)。
 
     每次下单都往 logs/order_timing.jsonl 追加一条分阶段耗时（需求 3），
     传 warm=WarmSession 可复用预热现场（需求 2）。
     alias_name: 同价改判目标席别名（勾选无座 → 硬座）；非空时会在 extra 里标注
         alias_seat / selected_seat，方便上层如实记账。
-    purpose_map: {姓名: 票种代码}，按每个乘车人分别对齐成人票 / 学生票。"""
+    purpose_map: {姓名: 票种代码}，按每个乘车人分别对齐成人票 / 学生票。
+
+    Task 70a：stale warm 的 close() 会释放两把锁并把 _LOCK_LOCAL.depth 清零，
+    因此必须在进入 @_exclusive 装饰器之前处理——若在装饰器体内 close，重入
+    分支的 finally 会把 depth 恢复为进入前的值，造成"本线程仍持有锁"的假象，
+    此后本线程的 exclusive() 永久走重入捷径、跨进程 profile 互斥静默失效（P2）。
+    """
+    try:
+        if warm is not None and not warm.usable():
+            # 预热现场已失效（页面被关 / 跨了线程）：先释放它占着的锁再进锁
+            try:
+                warm.close()
+            except Exception:
+                pass
+            warm = None
+    except Exception as e:
+        return False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
+    return _order_via_browser_locked(
+        info, seat_name, seat_code, passenger_names, date,
+        headless=headless, verify_timeout=verify_timeout, purpose=purpose,
+        warm=warm, alias_name=alias_name, purpose_map=purpose_map, **kwargs)
+
+
+@_exclusive(lock_timeout=180)
+def _order_via_browser_locked(info, seat_name, seat_code, passenger_names, date,
+                              headless=False, verify_timeout=90, purpose="ADULT", warm=None,
+                              alias_name=None, purpose_map=None):
+    """order_via_browser 的锁内本体（stale warm 已在外层 wrapper 处理，见上）。"""
     tm = {}
     t0 = time.perf_counter()
     try:
