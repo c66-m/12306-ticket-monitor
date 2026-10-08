@@ -8390,6 +8390,76 @@ class TestTask84LauncherP3(TempDirCase):
         self.assertIn("错误", text)
 
 
+class TestTask85OrderBrowserOrder(TempDirCase):
+    """Task 85: save_session 三元组语义 / 分隔符共享常量 / docstring /
+    warm.close owner-aware。"""
+
+    def test_save_session_preserves_same_name_multi_path(self):
+        # (a) 同名多 path 的 Cookie 不再按 name last-wins 丢数据
+        import requests
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set("JSESSIONID", "AAA", domain=".12306.cn", path="/otn")
+        jar.set("JSESSIONID", "BBB", domain=".12306.cn", path="/passport")
+        sess = requests.Session()
+        sess.cookies = jar
+        p = os.path.join(self.tmp, "session_cookies.json")
+        order_mod.save_session(sess, p)
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 2,
+                         "同名多 path 应落盘 2 条目（三元组键），不是 last-wins 只剩 1 条")
+        self.assertEqual(sorted(v["value"] for v in data.values()), ["AAA", "BBB"])
+        # round-trip：load_session 必须能解析 save_session 写出的三元组键
+        s2 = order_mod.load_session(p)
+        got = {(c.name, c.path, c.value) for c in s2.cookies
+               if c.name == "JSESSIONID"}
+        self.assertEqual(got, {("JSESSIONID", "/otn", "AAA"),
+                               ("JSESSIONID", "/passport", "BBB")})
+
+    def test_cookie_key_sep_is_shared_constant(self):
+        # (b) "\x1f" 字面收敛为共享常量，且与 capture_session 同一对象
+        import capture_session
+        self.assertEqual(order_mod.COOKIE_KEY_SEP, "\x1f")
+        self.assertIs(order_mod.COOKIE_KEY_SEP, capture_session.COOKIE_KEY_SEP)
+
+    def test_classify_docstring_matches_actual_semantics(self):
+        # (c) docstring 不再写"乘车人交集"（实际是目标集 ⊆ 订单乘车人）
+        doc = order_mod.classify_order_status.__doc__ or ""
+        self.assertNotIn("乘车人交集", doc)
+        self.assertIn("blocked", doc)
+
+    def _bare_warm(self, owner_ident, owner_thread):
+        ws = browser_order.WarmSession.__new__(browser_order.WarmSession)
+        ws._closed = False
+        ws._ctx = None
+        ws._p = None
+        ws._file_locked = False
+        ws._local_locked = False
+        ws._owner = owner_ident
+        ws._owner_thread = owner_thread
+        return ws
+
+    def test_warm_close_clears_owner_depth_cross_thread(self):
+        # (d) 非创建线程 close() 也要清理 owner 线程的 depth 记录，
+        # 否则 owner 后续 exclusive() 走重入捷径跳过跨进程文件锁（P2）
+        owner = threading.Thread(name="fake-warm-owner-85d")
+        browser_order._set_depth(1, owner)
+        self.addCleanup(browser_order._set_depth, 0, owner)
+        ws = self._bare_warm(123456789, owner)  # owner ident ≠ 当前线程
+        ws.close()
+        self.assertEqual(browser_order._get_depth(owner), 0,
+                         "跨线程 close() 未清理 owner 线程的 depth=1 残留")
+
+    def test_warm_close_clears_own_depth_same_thread(self):
+        # (d) 同线程 close() 语义不变：depth 清零
+        me = threading.current_thread()
+        browser_order._set_depth(1, me)
+        self.addCleanup(browser_order._set_depth, 0, me)
+        ws = self._bare_warm(threading.get_ident(), me)
+        ws.close()
+        self.assertEqual(browser_order._get_depth(me), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

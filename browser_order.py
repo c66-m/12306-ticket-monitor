@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 
 try:
     import msvcrt  # Windows 文件字节锁：跨进程互斥靠它
@@ -120,7 +121,51 @@ class _ProfileLock:
 
 
 _PROFILE_LOCK = _ProfileLock(_LOCK_PATH)
-_LOCK_LOCAL = threading.local()
+
+
+# Task 85d：depth 记录 owner 可寻址。
+# 背景：原先用 threading.local 存 depth（本线程重入标记）；WarmSession.close()
+# 若在非创建线程被调用（Task 65h 路径），owner 线程的 depth 残留为 1——owner
+# 线程后续 exclusive() 走重入捷径，跳过跨进程文件锁的获取，profile 互斥静默
+# 失效（P2）。threading.local 无法跨线程清理，故 depth 改按 Thread 对象寻址：
+# WeakKeyDictionary 按 Thread 对象存 cell（Thread 对象不复用，无 ident 回收
+# 误判；线程消亡后条目自动清理）。_LOCK_LOCAL 保留为兼容代理，既有读写
+# ._LOCK_LOCAL.depth 的代码/测试语义不变（读写当前线程的 cell）。
+_DEPTH_CELLS = weakref.WeakKeyDictionary()
+_DEPTH_CELLS_GUARD = threading.Lock()
+
+
+def _depth_cell(thread=None):
+    t = thread if thread is not None else threading.current_thread()
+    with _DEPTH_CELLS_GUARD:
+        cell = _DEPTH_CELLS.get(t)
+        if cell is None:
+            cell = [0]
+            _DEPTH_CELLS[t] = cell
+        return cell
+
+
+def _get_depth(thread=None):
+    return _depth_cell(thread)[0]
+
+
+def _set_depth(value, thread=None):
+    _depth_cell(thread)[0] = value
+
+
+class _DepthProxy:
+    """_LOCK_LOCAL 的兼容外形：.depth 读写当前线程的 depth cell。"""
+
+    @property
+    def depth(self):
+        return _get_depth()
+
+    @depth.setter
+    def depth(self, value):
+        _set_depth(value)
+
+
+_LOCK_LOCAL = _DepthProxy()
 
 # 浏览器自动探测顺序：Edge → Chrome → Chromium → Playwright 自带 Chromium(None)。
 # 上一个候选启动失败会在 profile 目录留下 Singleton* 锁，必须先清掉再试下一个。
@@ -222,10 +267,10 @@ def exclusive(timeout=90):
     Playwright 的持久化 profile 是独占的。启动器与监控系统分属不同进程，
     只靠 RLock 挡不住——一边下单、另一边开浏览器体检，会把下单的浏览器掐死，
     报 TargetClosedError: Target page, context or browser has been closed。"""
-    depth = getattr(_LOCK_LOCAL, "depth", 0)
+    depth = _get_depth()
     if depth:
         # 同线程重入：外层已持有两把锁，直接放行（保留 RLock 语义）
-        _LOCK_LOCAL.depth = depth + 1
+        _set_depth(depth + 1)
         try:
             yield
         finally:
@@ -234,19 +279,19 @@ def exclusive(timeout=90):
             # "本线程仍持有锁"的假象，本线程后续 exclusive() 永久走重入捷径、
             # 跨进程 profile 互斥静默失效（P2）。depth 为 0 即视为锁已释放，
             # 不再恢复；正常路径 depth 非零，行为不变。
-            if getattr(_LOCK_LOCAL, "depth", 0):
-                _LOCK_LOCAL.depth = depth
+            if _get_depth():
+                _set_depth(depth)
         return
     if not _BROWSER_LOCK.acquire(timeout=timeout):
         raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
     try:
         if not _PROFILE_LOCK.acquire(timeout=timeout):
             raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），请稍后重试")
-        _LOCK_LOCAL.depth = 1
+        _set_depth(1)
         try:
             yield
         finally:
-            _LOCK_LOCAL.depth = 0
+            _set_depth(0)
             _PROFILE_LOCK.release()
     finally:
         _BROWSER_LOCK.release()
@@ -1392,7 +1437,7 @@ class WarmSession:
             if not _PROFILE_LOCK.acquire(timeout=self._timeout):
                 raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），预热失败")
             self._file_locked = True
-            _LOCK_LOCAL.depth = 1   # 同线程重入标记：order_via_browser 的装饰器会放行
+            _set_depth(1)   # 同线程重入标记：order_via_browser 的装饰器会放行
             if _stopped():
                 raise RuntimeError("预热已手动停止")
             from playwright.sync_api import sync_playwright
@@ -1446,8 +1491,14 @@ class WarmSession:
                 self._p.stop()
         except Exception:
             pass
-        if self._owner == threading.get_ident() and getattr(_LOCK_LOCAL, "depth", 0):
-            _LOCK_LOCAL.depth = 0
+        # Task 85d：owner-aware——无论哪条线程执行 close()，都清理 owner 线程
+        # 的 depth 记录。跨线程 close 后 owner 的 depth 若残留 1，其后续
+        # exclusive() 会走重入捷径跳过跨进程文件锁（P2）。owner 存活且仍持有
+        # _BROWSER_LOCK 时（_recover_browser_lock 返回 False 的路径），depth
+        # 清零使其下次 exclusive() 走正常获取路径：RLock 同线程重入安全，
+        # 文件锁已被本函数释放故可重获，无死锁。
+        if _get_depth(self._owner_thread):
+            _set_depth(0, self._owner_thread)
         if self._file_locked:
             _PROFILE_LOCK.release()
             self._file_locked = False

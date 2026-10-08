@@ -29,6 +29,10 @@ from urllib.parse import unquote, urlencode
 
 import appcommon
 import requests
+# Task 85a/b：复用 capture_session 的 Cookie 序列化规则（复合键分隔符 +
+# _build_cookie_dict），落盘格式单一事实来源；capture_session 只依赖
+# appcommon，无循环导入。
+from capture_session import COOKIE_KEY_SEP, _build_cookie_dict
 
 LOG = logging.getLogger(__name__)
 
@@ -99,10 +103,10 @@ def load_session(cookie_path=None):
     s.headers.update(BASE_HEADERS)
     for key, val in cookies.items():
         if isinstance(val, dict):  # 新格式：带原始作用域
-            # Task 69e：同名多 path 条目以复合键 "name\x1fpath\x1fdomain" 落盘
-            # （分隔符见 capture_session.COOKIE_KEY_SEP，\x1f 不可能出现在 Cookie 名中）；
+            # Task 69e：同名多 path 条目以复合键 "name<SEP>path<SEP>domain" 落盘
+            # （分隔符见 COOKIE_KEY_SEP，\x1f 不可能出现在 Cookie 名中）；
             # 无分隔符即旧的纯 name 键，照旧读取。
-            name = key.split("\x1f")[0] if "\x1f" in key else key
+            name = key.split(COOKIE_KEY_SEP)[0] if COOKIE_KEY_SEP in key else key
             s.cookies.set(name, val.get("value", ""),
                           domain=val.get("domain") or ".12306.cn",
                           path=val.get("path") or "/")
@@ -113,16 +117,18 @@ def load_session(cookie_path=None):
 
 def save_session(session, cookie_path=None):
     """把会话 Cookie 回写文件。12306 会轮换 tk 等关键 Cookie，
-    定期回写可延长会话有效期（避免一直用旧 Cookie 被判定过期）。"""
+    定期回写可延长会话有效期（避免一直用旧 Cookie 被判定过期）。
+
+    Task 85a：与 capture_session._build_cookie_dict 同一序列化规则——同名
+    多 path 按 (name,path,domain) 三元组复合键全部保留，不再按 name
+    last-wins 丢数据；load_session 可解析（round-trip）。"""
     path = cookie_path or os.path.join(HERE, "session_cookies.json")
-    cookies = {}
-    for c in session.cookies:
-        if "12306.cn" in getattr(c, "domain", "") and c.name:
-            cookies[c.name] = {
-                "value": c.value,
-                "domain": c.domain,
-                "path": c.path or "/",
-            }
+    cookies = _build_cookie_dict([
+        {"name": c.name, "value": c.value,
+         "domain": getattr(c, "domain", "") or "",
+         "path": getattr(c, "path", "") or ""}
+        for c in session.cookies
+    ])
     if not cookies:
         return
     appcommon.atomic_write_json(path, cookies)
@@ -178,8 +184,11 @@ def classify_order_status(date, train, passenger_names, session=None):
     """12306 官方接口订单状态分类(唯一事实来源,只读接口)。
 
     返回 (分类, 订单号, 原文状态):分类 ∈ paid(已支付)/unpaid(待支付)/
-    cancelled(已取消)/none(未找到)/error(查询失败)。按 车次+乘车日期+
-    乘车人交集 匹配订单。"""
+    cancelled(已取消)/blocked(被其它行程未完成订单挡路)/unknown(状态不明)/
+    none(未找到)/error(查询失败)。匹配规则：本行程 = 车次相同 + 乘车日期
+    相同 + 目标乘车人全部命中订单乘车人（目标集 ⊆ 订单乘车人；空目标集不算
+    命中；任一交集不算命中）。12306 规则：存在任何未完成订单即挡住新下单，
+    非本行程的未完成订单返回 blocked。只读官方接口，不下单。"""
     try:
         sess = session or session_from_browser_state()
     except Exception as e:
