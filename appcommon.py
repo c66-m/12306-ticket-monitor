@@ -97,6 +97,44 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
         json.dump(obj, f, ensure_ascii=False, indent=2)
     replace_with_retry(tmp, path, tries=replace_tries, delay=replace_delay,
                        fallback_direct=fallback_direct)
+    # 写后兜底清：进程在"写 tmp → replace"之间崩溃会留下残留 tmp 文件，
+    # 下次成功写完顺手清理本路径的过期残留（只删旧文件，不碰它进程正在写的）。
+    try:
+        sweep_stale_tmp(path)
+    except Exception:
+        pass  # 清理是 best-effort，绝不能影响写本身
+
+
+_TMP_SWEEP_MAX_AGE = 3600  # 残留 tmp 超过 1 小时才删：其它进程正在写的 tmp 一定是新鲜的
+
+
+def sweep_stale_tmp(path, max_age_seconds=_TMP_SWEEP_MAX_AGE):
+    """清理 path 的残留 tmp 文件（{path}.<kind><pid>-<tid> 形态，kind 如
+    tmp/launcher/guisave/monsave）。
+
+    只删 mtime 超过 max_age_seconds 的——其它进程正在写的 tmp 一定是新鲜的，
+    绝不误删。返回删除数量。"""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    pat = re.compile(re.escape(os.path.basename(path))
+                     + r"\.[A-Za-z]*\d+-\d+$")
+    now = time.time()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        if not pat.match(name):
+            continue
+        p = os.path.join(d, name)
+        try:
+            if now - os.path.getmtime(p) < max_age_seconds:
+                continue
+            os.remove(p)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 # ----------------------------- state.json 共享 plumbing -----------------------------
@@ -108,7 +146,8 @@ def read_state_or_none(path):
     """读 state.json。返回 (state, error)：
     (dict, None) = 正常；(None, OSError) = 瞬时占用/读失败（文件本身大概率健康，
     调用方不得隔离，应跳过本次加载、稍后重试）；(None, 其他 Exception) = 内容损坏
-    （如 JSON 解析失败，调用方可隔离留证）；({}, None) = 不存在。"""
+    （如 JSON 解析失败，或合法 JSON 但不是对象——如数组，调用方可隔离留证）；
+    ({}, None) = 不存在。"""
     if not os.path.exists(path):
         return {}, None
     # 读句柄持有可能与写方的 os.replace 撞车（Windows 对正被打开的目标执行
@@ -116,13 +155,22 @@ def read_state_or_none(path):
     for i in range(5):
         try:
             with open(path, encoding="utf-8") as f:
-                return json.load(f), None
+                data = json.load(f)
         except PermissionError:
             if i == 4:
                 return None, PermissionError("读 %s 被占用（重试后仍失败）" % path)
             time.sleep(0.1)
+            continue
         except Exception as e:
             return None, e
+        if not isinstance(data, dict):
+            # 合法 JSON 但不是对象（如数组）：后续 state.items() 会抛
+            # AttributeError；按"内容损坏"口径返回 ValueError，让调用方
+            # 走隔离留证（Task 40 的错误类型划分：ValueError 系 → 隔离）。
+            return None, ValueError(
+                "%s 内容不是 JSON 对象（是 %s），视为损坏"
+                % (path, type(data).__name__))
+        return data, None
     return None, RuntimeError("unreachable")
 
 
@@ -137,9 +185,10 @@ def stat_fingerprint(path):
 
 
 def quarantine_corrupt(path, expected_fingerprint=None):
-    """坏档时间戳挪档（state.json → state.json.bad-YYYYmmdd-HHMMSS，反复损坏
-    不互相覆盖）。返回挪档后的路径；None = 挪移失败或放弃隔离（文件被占用、
-    或自读失败后已被另一进程改写——证据保留原地，绝不误伤健康文件）。
+    """坏档时间戳挪档（state.json → state.json.bad-YYYYmmdd-HHMMSS-ffffff，
+    微秒精度，反复损坏不互相覆盖）。返回挪档后的路径；None = 挪移失败或
+    放弃隔离（文件被占用、或自读失败后已被另一进程改写——证据保留原地，
+    绝不误伤健康文件）。
     expected_fingerprint: 读失败瞬间抓取的 stat_fingerprint；挪档前比对当前
     指纹，不一致则记 warning 并放弃隔离。None = 不校验（兼容旧调用）。"""
     if expected_fingerprint is not None:
@@ -147,7 +196,8 @@ def quarantine_corrupt(path, expected_fingerprint=None):
             LOG.warning("[数据] %s 自读失败后已被改写，放弃隔离以免误伤健康文件",
                         path)
             return None
-    bad = "{0}.bad-{1}".format(path, time.strftime("%Y%m%d-%H%M%S"))
+    bad = "{0}.bad-{1}".format(
+        path, datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
     try:
         os.replace(path, bad)
     except OSError:

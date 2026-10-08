@@ -5034,6 +5034,169 @@ class TestMonitorLogP3(TempDirCase):
         self.assertIn("E123****6789", logged)
 
 
+class TestAppcommonFilelockP3(TempDirCase):
+    """Task 62: appcommon/filelock P3 —— 隔离精度 / tmp 残留 / 非 dict JSON /
+    filelock 五处脚枪。"""
+
+    # (a) 隔离时间戳微秒精度：同秒两次损坏不互相覆盖
+    def test_quarantine_same_second_no_overwrite(self):
+        p = os.path.join(self.tmp, "state.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{bad1")
+        bad1 = appcommon.quarantine_corrupt(p)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{bad2")
+        bad2 = appcommon.quarantine_corrupt(p)
+        self.assertIsNotNone(bad1)
+        self.assertIsNotNone(bad2)
+        # 旧代码秒精度：同秒内两次隔离同名，第二次覆盖第一次的证据
+        self.assertNotEqual(bad1, bad2)
+        with open(bad1, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{bad1")
+        with open(bad2, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{bad2")
+
+    # (b) tmp 残留清理：过期残留被清，正在写的（新鲜）不动；覆盖多 tmp_kind
+    def test_atomic_write_sweeps_stale_tmp(self):
+        p = os.path.join(self.tmp, "state.json")
+        stale = p + ".tmp12345-67890"
+        with open(stale, "w", encoding="utf-8") as f:
+            f.write("{}")
+        stale2 = p + ".guisave111-222"  # 其它写方的 kind 也要清
+        with open(stale2, "w", encoding="utf-8") as f:
+            f.write("{}")
+        old = time.time() - 7200
+        os.utime(stale, (old, old))
+        os.utime(stale2, (old, old))
+        fresh = p + ".tmp99999-88888"  # 模拟另一进程正在写
+        with open(fresh, "w", encoding="utf-8") as f:
+            f.write("{}")
+        notmp = p + ".tmp-backup"  # 用户自建文件：形态不对，不动
+        with open(notmp, "w", encoding="utf-8") as f:
+            f.write("keep")
+        os.utime(notmp, (old, old))
+        appcommon.atomic_write_json(p, {"a": 1})
+        # 旧代码：残留 tmp 永不清理
+        self.assertFalse(os.path.exists(stale))
+        self.assertFalse(os.path.exists(stale2))
+        self.assertTrue(os.path.exists(fresh))
+        self.assertTrue(os.path.exists(notmp))
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"a": 1})
+
+    # (c) 合法非 dict JSON 走"内容损坏"口径（隔离），不是"正常"
+    def test_read_state_non_dict_is_corrupt(self):
+        p = os.path.join(self.tmp, "state.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        state, err = appcommon.read_state_or_none(p)
+        self.assertIsNone(state)
+        # 旧代码：返回 ([1, 2, 3], None)；新口径：ValueError → 隔离（Task 40 划分）
+        self.assertIsInstance(err, ValueError)
+        self.assertNotIsInstance(err, OSError)
+
+    def test_load_state_array_quarantines_not_crash(self):
+        p = os.path.join(self.tmp, "state.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        e = make_engine(self.tmp)
+        # 旧代码：_load_state 旧版迁移块 state.items() 抛 AttributeError
+        state = e._load_state()
+        self.assertEqual(state.get("tasks"), {})
+        bads = [f for f in os.listdir(self.tmp)
+                if f.startswith("state.json.bad-")]
+        self.assertTrue(bads)
+
+    # (d1) 线程锁超时生效：旧代码 _tlock.acquire() 无限阻塞，timeout 被静默忽略
+    def test_thread_lock_timeout_effective(self):
+        p = os.path.join(self.tmp, "x.lock")
+        holder = filelock.FileLock(p, timeout=10)
+        holder.acquire()
+        try:
+            errors = []
+
+            def try_acquire():
+                try:
+                    filelock.FileLock(p, timeout=0.5).acquire()
+                except TimeoutError as ex:
+                    errors.append(ex)
+
+            t = threading.Thread(target=try_acquire, daemon=True)
+            t0 = time.monotonic()
+            t.start()
+            t.join(10)
+            dt = time.monotonic() - t0
+            # 旧代码：工作线程在 _tlock 上永久阻塞，join 超时
+            self.assertFalse(t.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertLess(dt, 5)
+        finally:
+            holder.release()
+
+    # (d2) deadline 用 monotonic：墙钟跳变不影响超时判定
+    def test_deadline_uses_monotonic_not_wallclock(self):
+        p = os.path.join(self.tmp, "y.lock")
+        release_evt = threading.Event()
+        ready_evt = threading.Event()
+
+        def hold():
+            with filelock.file_lock(p, timeout=10):
+                ready_evt.set()
+                release_evt.wait(10)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(ready_evt.wait(10))  # holder 已拿到锁
+
+            def boom(*a, **k):
+                raise AssertionError("acquire 不应再读墙钟 time.time()")
+
+            # 旧代码：deadline = time.time() + timeout → 此处直接触发 boom
+            with mock.patch.object(filelock.time, "time", boom):
+                with self.assertRaises(TimeoutError):
+                    with filelock.file_lock(p, timeout=0.5):
+                        pass
+        finally:
+            release_evt.set()
+            t.join(10)
+
+    # (d3) 同线程嵌套重入被支持：旧代码内层空转 timeout 才 TimeoutError
+    def test_same_thread_nested_reentrant(self):
+        p = os.path.join(self.tmp, "z.lock")
+        with filelock.file_lock(p, timeout=1):
+            with filelock.file_lock(p, timeout=1):
+                pass
+        # 完全释放后可重新获取（无泄漏）
+        with filelock.file_lock(p, timeout=1):
+            pass
+
+    # (d4) release 加 acquired 守卫：double-release 不抛 RuntimeError
+    def test_release_without_acquire_no_raise(self):
+        p = os.path.join(self.tmp, "w.lock")
+        lk = filelock.FileLock(p)
+        lk.release()  # 旧代码：RLock.release() 抛 RuntimeError
+        lk.acquire()
+        lk.release()
+        lk.release()  # 旧代码：第二次抛 RuntimeError
+
+    # (d5) _thread_lock 按绝对路径归一化：相对/绝对路径不再绕过互斥
+    def test_thread_lock_key_normalized_abspath(self):
+        p = os.path.join(self.tmp, "v.lock")
+        rel = os.path.relpath(p, self.tmp)
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            a = filelock._thread_lock(rel)
+            b = filelock._thread_lock(p)
+            c = filelock._thread_lock("./" + rel)
+        finally:
+            os.chdir(cwd)
+        # 旧代码：三种写法各一把锁，互斥被绕过
+        self.assertIs(a, b)
+        self.assertIs(a, c)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
