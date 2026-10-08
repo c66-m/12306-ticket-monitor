@@ -117,17 +117,28 @@ _CONFIG_CORRUPT_WARNED = False
 
 
 def load_config():
-    """读 config.json。文件损坏（JSON 解析失败）时记一次 warning 并返回空配置，
-    GUI 按缺省/空配置启动（Task 75a；Task 29 只覆盖了 monitor 侧缺文件）。"""
+    """读 config.json。文件损坏（JSON 解析失败、非 UTF-8 编码）或解析成功但
+    顶层不是 dict 时记一次 error 并返回空配置，GUI 按缺省/空配置启动
+    （Task 75a；Task 29 只覆盖了 monitor 侧缺文件；Task 94a 补 UnicodeDecodeError
+    与非 dict 口径——旧代码只抓 JSONDecodeError，GBK 等非 UTF-8 文件的
+    UnicodeDecodeError 逃出崩启动，[] 等非 dict 则在下游 .get() 处崩）。"""
     global _CONFIG_CORRUPT_WARNED
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         if not _CONFIG_CORRUPT_WARNED:
             _CONFIG_CORRUPT_WARNED = True
-            LOG.warning("config.json JSON 解析失败，将以空配置启动：%s", CONFIG_PATH)
+            LOG.error("config.json JSON 解析失败或非 UTF-8 编码，将以空配置启动：%s",
+                      CONFIG_PATH)
         return {}
+    if not isinstance(data, dict):
+        if not _CONFIG_CORRUPT_WARNED:
+            _CONFIG_CORRUPT_WARNED = True
+            LOG.error("config.json 顶层不是 dict 对象（%s），将以空配置启动：%s",
+                      type(data).__name__, CONFIG_PATH)
+        return {}
+    return data
 
 
 def _lock_timeout_abort():
@@ -1866,14 +1877,20 @@ HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
 
 
 def read_history_records(limit=200):
-    """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表。"""
+    """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
+    顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
+    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
     path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
     try:
         with open(path, encoding="utf-8") as f:
             history = json.load(f)
+        if not isinstance(history, list):
+            LOG.warning("order_history.json 顶层不是列表（%s），按空历史展示：%s",
+                        type(history).__name__, path)
+            return []
+        return list(reversed(history[-limit:]))
     except Exception:
         return []
-    return list(reversed(history[-limit:]))
 
 
 class HistoryDialog(tk.Toplevel):
@@ -3585,15 +3602,17 @@ def _ensure_stdio():
 
 
 def _config_json_corrupt():
-    """config.json 存在但内容不是合法 JSON（Task 75a）。"""
+    """config.json 存在但内容不可用：JSON 解析失败、非 UTF-8 编码，或解析成功
+    但顶层不是 dict（Task 75a；Task 94a 补后两种口径——与 load_config 的降级
+    口径保持一致，否则 main() 的友好提示与实际行为脱节）。"""
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            json.load(f)
-        return False
-    except json.JSONDecodeError:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return True
     except OSError:
         return False
+    return not isinstance(data, dict)
 
 
 def main():
@@ -3607,11 +3626,12 @@ def main():
         return
     root = tk.Tk()
     if _config_json_corrupt():
-        # Task 75a：文件存在但内容损坏——友好提示后按空配置启动
-        # （load_config 会吞掉 JSONDecodeError 返回 {}）。
+        # Task 75a/94a：文件存在但内容损坏——友好提示后按空配置启动
+        # （load_config 会吞掉错误返回 {}，旧文件不被覆写）。
         messagebox.showerror(
             "错误",
-            "config.json 已损坏（JSON 解析失败），将以空配置启动。\n"
+            "config.json 已损坏（JSON 解析失败、非 UTF-8 编码或顶层不是对象），"
+            "将以空配置启动。\n"
             "请检查文件内容并修复，或删除后重建。",
             parent=root)
     MonitorApp(root)

@@ -9390,6 +9390,123 @@ class TestTask93EngineP2(TempDirCase):
             self.assertEqual(n({"name": "T", "seat_types": 123}), [])
 
 
+class TestTask94GuiStartupRobustness(TempDirCase):
+    """Task 94: gui P2 — 非 UTF-8/非 dict config.json 与非 list 订单历史不再崩 GUI 启动。"""
+
+    def _write_bytes(self, name, data):
+        p = os.path.join(self.tmp, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def _write_text(self, name, text):
+        return self._write_bytes(name, text.encode("utf-8"))
+
+    def _reset_corrupt_flag(self):
+        gui._CONFIG_CORRUPT_WARNED = False
+        self.addCleanup(setattr, gui, "_CONFIG_CORRUPT_WARNED", False)
+
+    # ---- (a) load_config：非 UTF-8 编码 ----
+
+    def test_load_config_gbk_bytes_returns_empty(self):
+        # GBK 编码的中文在 UTF-8 下非法：旧代码只抓 JSONDecodeError，
+        # UnicodeDecodeError 逃出崩启动。
+        cfg = self._write_bytes("config.json",
+                                '{"station": "北京西"}'.encode("gbk"))
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg):
+            with self.assertLogs(gui.LOG, level="ERROR") as cm:
+                self.assertEqual(gui.load_config(), {})
+        self.assertTrue(any("UTF-8" in r.getMessage() for r in cm.records),
+                        "必须明确指出编码问题")
+
+    def test_load_config_latin1_bytes_returns_empty(self):
+        # 任意非 UTF-8 编码都不只限 GBK：latin-1 的 0xE9 单字节非法。
+        cfg = self._write_bytes("config.json", '{"a": "\xe9"}'.encode("latin-1"))
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg):
+            self.assertEqual(gui.load_config(), {})
+
+    # ---- (a) load_config：合法但非 dict ----
+
+    def test_load_config_non_dict_list_returns_empty(self):
+        # 合法 JSON 但顶层是 list：旧代码 json.load 成功返回 []，
+        # 下游 load_config().get(...) 抛 AttributeError 崩启动。
+        cfg = self._write_text("config.json", "[]")
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg):
+            with self.assertLogs(gui.LOG, level="ERROR") as cm:
+                self.assertEqual(gui.load_config(), {})
+        self.assertTrue(any("不是" in r.getMessage() and "dict" in r.getMessage()
+                            or "对象" in r.getMessage() for r in cm.records),
+                        "必须明确指出顶层不是对象")
+
+    def test_load_config_valid_dict_unchanged(self):
+        cfg = self._write_text("config.json", '{"a": 1}')
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg):
+            self.assertEqual(gui.load_config(), {"a": 1})
+
+    def test_config_json_corrupt_detects_gbk_and_non_dict(self):
+        self._reset_corrupt_flag()
+        bad_gbk = self._write_bytes("c1.json", '{"x": "中文"}'.encode("gbk"))
+        bad_list = self._write_text("c2.json", "[]")
+        bad_json = self._write_text("c3.json", "{bad json,")
+        good = self._write_text("c4.json", '{"a": 1}')
+        missing = os.path.join(self.tmp, "nope.json")
+        with mock.patch.object(gui, "CONFIG_PATH", bad_gbk):
+            self.assertTrue(gui._config_json_corrupt())
+        with mock.patch.object(gui, "CONFIG_PATH", bad_list):
+            self.assertTrue(gui._config_json_corrupt())
+        with mock.patch.object(gui, "CONFIG_PATH", bad_json):
+            self.assertTrue(gui._config_json_corrupt())
+        with mock.patch.object(gui, "CONFIG_PATH", good):
+            self.assertFalse(gui._config_json_corrupt())
+        with mock.patch.object(gui, "CONFIG_PATH", missing):
+            self.assertFalse(gui._config_json_corrupt())
+
+    # ---- (b) read_history_records：切片在 try 块外 ----
+
+    def _history_cfg(self, history_content):
+        cfg = self._write_text("config.json", '{"history_file": "order_history.json"}')
+        self._write_text("order_history.json", history_content)
+        return cfg
+
+    def test_read_history_records_non_list_dict_returns_empty(self):
+        # 顶层是 dict：history[-limit:] 在 try 外抛 TypeError 崩启动
+        # （HistoryPanel eager 构造）。
+        cfg = self._history_cfg('{"a": 1}')
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp):
+            with self.assertLogs(gui.LOG, level="WARNING") as cm:
+                self.assertEqual(gui.read_history_records(), [])
+        self.assertTrue(any("列表" in r.getMessage() for r in cm.records),
+                        "必须明确指出历史不是列表")
+
+    def test_read_history_records_non_list_number_returns_empty(self):
+        cfg = self._history_cfg('42')
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp):
+            self.assertEqual(gui.read_history_records(), [])
+
+    def test_read_history_records_valid_list_unchanged(self):
+        cfg = self._history_cfg('[{"t": 1}, {"t": 2}, {"t": 3}]')
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp):
+            recs = gui.read_history_records(limit=2)
+        self.assertEqual([r["t"] for r in recs], [3, 2])
+
+    def test_read_history_records_missing_file_returns_empty(self):
+        cfg = self._write_text("config.json", '{"history_file": "order_history.json"}')
+        self._reset_corrupt_flag()
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp):
+            self.assertEqual(gui.read_history_records(), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
