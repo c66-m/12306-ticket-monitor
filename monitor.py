@@ -286,6 +286,11 @@ def menu_create_task():
         print("  " + "-" * 86)
         trains_choice = read("  选择监控车次（多个用逗号分隔，回车=全部车次）：", "")
 
+    if trains_choice is None:
+        # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）。
+        # 旧代码 `if trains_choice else []` 把 None 当"回车=全部车次"消化，
+        # 静默建任务并落盘（Task 73，Task 28 回归）。
+        raise KeyboardInterrupt
     trains = [t.strip().upper() for t in trains_choice.replace("，", ",").split(",")
               if t.strip()] if trains_choice else []
     for t in trains:
@@ -308,6 +313,11 @@ def menu_create_task():
                 i, p.get("name"), mark, p.get("id_type_code", ""),
                 "成人" if p.get("is_adult", True) else "儿童/学生"))
         sel = read("  选择乘车人（多个用逗号分隔，回车=使用默认/全部成人）：", "")
+        if sel is None:
+            # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）。
+            # 旧代码 `if sel:` 把 None 当"回车=默认乘车人"消化，静默建任务
+            # （Task 73，Task 28 回归）。
+            raise KeyboardInterrupt
         if sel:
             for part in sel.replace("，", ",").split(","):
                 part = part.strip()

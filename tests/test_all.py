@@ -6614,6 +6614,79 @@ class TestTask72EngineState(TempDirCase):
             engine_mod.MonitorEngine._cancelled_dedup_keys({}, keys), [])
 
 
+class TestTask73MonitorCreateCancel(TempDirCase):
+    """Task 73 (P2, Task 28 回归): 建任务流程中车次选择、乘车人选择两处
+    Ctrl+C/EOF（read()→None）不得被 `if trains_choice else []` / `if sel:`
+    当作"回车默认"消化（静默建出"全部车次/默认乘车人"任务并落盘），
+    应抛 KeyboardInterrupt 让 main_menu 接住（"已中断，返回主菜单。"），
+    不落盘、不建任务。"""
+
+    GOOD = {"name": "张三", "id_type_code": "1", "id_no": "110101199001011234",
+            "mobile": "13800138000", "is_default": True, "is_adult": True}
+
+    def _run_create_task(self, reads, passengers=None):
+        import monitor as monitor_mod
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = [dict(p) for p in (passengers or [])]
+        pm.default_names.return_value = ["张三"]
+        saved_cfg = {}
+        printed = []
+        raised = None
+        # reads 消费顺序：车次选择 / 乘车人选择 / 优先级 / 自动下单 /
+        #                下单后停止 / 任务名 / 是否立即启动
+        try:
+            with mock.patch.object(monitor_mod, "passengers_mod", pm), \
+                 mock.patch.object(monitor_mod, "pick_station",
+                                   side_effect=["北京", "上海"]), \
+                 mock.patch.object(monitor_mod, "input_dates",
+                                   return_value=(["2026-10-09"], [])), \
+                 mock.patch.object(monitor_mod, "ticket") as mock_ticket, \
+                 mock.patch.object(monitor_mod, "pick_multi",
+                                   return_value=["二等座"]), \
+                 mock.patch.object(monitor_mod, "read",
+                                   side_effect=list(reads)), \
+                 mock.patch.object(monitor_mod, "load_config", return_value={}), \
+                 mock.patch.object(monitor_mod, "update_config_locked",
+                                   side_effect=lambda mut: saved_cfg.update(
+                                       _capture_mut(mut))), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a: printed.append(
+                                " ".join(map(str, a)))):
+                mock_ticket.load_station_map.return_value = (
+                    {"北京": "BJP", "上海": "SHH"},
+                    {"BJP": "北京", "SHH": "上海"})
+                mock_ticket.query_tickets.side_effect = Exception("offline")
+                monitor_mod.menu_create_task()
+        except KeyboardInterrupt as e:
+            raised = e
+        return saved_cfg.get("tasks", []), printed, raised
+
+    def test_trains_choice_ctrl_c_cancels(self):
+        # 车次选择处 Ctrl+C：旧代码把 None 当"回车=全部车次"消化，静默建任务；
+        # 新代码应抛 KeyboardInterrupt（Task 28 约定），不建任务不落盘
+        tasks, printed, raised = self._run_create_task(
+            [None, "", "5", "y", "y", "", "n"])
+        self.assertIsInstance(raised, KeyboardInterrupt)
+        self.assertEqual(tasks, [])
+
+    def test_passenger_sel_ctrl_c_cancels(self):
+        # 乘车人选择处 Ctrl+C：旧代码把 None 当"回车=默认乘车人"消化；
+        # 新代码应抛 KeyboardInterrupt，不建任务不落盘
+        tasks, printed, raised = self._run_create_task(
+            ["", None, "5", "y", "y", "", "n"], passengers=[self.GOOD])
+        self.assertIsInstance(raised, KeyboardInterrupt)
+        self.assertEqual(tasks, [])
+
+    def test_enter_still_means_default(self):
+        # 回归 pin：真正的回车（""）仍表示"全部车次/默认乘车人"，正常建任务
+        tasks, printed, raised = self._run_create_task(
+            ["", "", "5", "y", "y", "", "n"], passengers=[self.GOOD])
+        self.assertIsNone(raised)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["trains"], [])
+        self.assertEqual(tasks[0]["passenger_names"], ["张三"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
