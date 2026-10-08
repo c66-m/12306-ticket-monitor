@@ -48,6 +48,7 @@ import filelock                      # noqa: E402
 import probe_login                   # noqa: E402
 import time                          # noqa: E402
 import contextlib                    # noqa: E402
+import station_db as station_db_mod   # noqa: E402
 
 
 def synthetic_row(train="K225", hard_seat="5", from_c="VNP", to_c="ZAF"):
@@ -8000,6 +8001,93 @@ class TestTask81FilelockAppcommon(TempDirCase):
                          (["2026-10-01"], []))
         with self.assertRaises(ValueError):
             appcommon.parse_date_range(None)
+
+
+class TestTask82StationDbRebuildRefusesZero(TempDirCase):
+    """Task 82 (P3)：get_station_index() 降级为空时 rebuild() 不得静默清零已有库。
+
+    触发：离线/无缓存时跑 `python station_db.py rebuild`。旧行为：直接落盘
+    count=0，覆盖 3404 站的 stations_db.json 且打印误导性"共 0 站"。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._real_db_path = station_db_mod.DB_PATH
+        station_db_mod.DB_PATH = os.path.join(self.tmp, "stations_db.json")
+        self.addCleanup(self._restore_db_path)
+
+    def _restore_db_path(self):
+        station_db_mod.DB_PATH = self._real_db_path
+
+    def _seed_old_db(self, count=3404):
+        with open(station_db_mod.DB_PATH, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "updated": "2026-01-01 00:00:00",
+                       "count": count, "stations": []}, f)
+        with open(station_db_mod.DB_PATH, encoding="utf-8") as f:
+            return f.read()
+
+    def _run_rebuild_empty_index(self, **kwargs):
+        """空索引下跑 rebuild：返回 (ret, stdout)。"""
+        import io
+        with mock.patch.object(launcher, "get_station_index",
+                               return_value=[]), \
+             mock.patch.object(launcher, "load_station_kinds",
+                               return_value={}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ret = station_db_mod.rebuild(**kwargs)
+            return ret, buf.getvalue()
+
+    def test_empty_index_refuses_write_and_keeps_old_db(self):
+        before = self._seed_old_db(count=3404)
+        ret, out = self._run_rebuild_empty_index()
+        self.assertIsNone(ret, "空索引且无 --force 时应返回 None 表示失败")
+        with open(station_db_mod.DB_PATH, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before, "旧库字节级原样保留，不得被清零")
+
+    def test_empty_index_message_is_explicit_failure_not_zero_count(self):
+        self._seed_old_db(count=3404)
+        _, out = self._run_rebuild_empty_index()
+        self.assertNotIn("共 0 站", out, "'共 0 站'是误导信息，不得再出现")
+        self.assertIn("失败", out, "应给出明确的失败提示")
+        self.assertIn("保留", out, "应告知旧库已保留")
+
+    def test_empty_index_no_old_db_creates_nothing(self):
+        self.assertFalse(os.path.exists(station_db_mod.DB_PATH))
+        ret, _ = self._run_rebuild_empty_index()
+        self.assertIsNone(ret)
+        self.assertFalse(os.path.exists(station_db_mod.DB_PATH),
+                         "无旧库时也不得凭空写出 count=0 的空库")
+
+    def test_empty_index_with_force_writes_and_warns(self):
+        self._seed_old_db(count=3404)
+        ret, out = self._run_rebuild_empty_index(force=True)
+        self.assertIsNotNone(ret)
+        self.assertEqual(ret["count"], 0)
+        with open(station_db_mod.DB_PATH, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["count"], 0)
+        self.assertIn("--force", out, "--force 显式覆盖必须有警告/说明")
+        self.assertNotIn("共 0 站（运营中）", out,
+                         "即使强制写入，'共 0 站（运营中）'也是虚假表述")
+
+    def test_normal_index_still_writes(self):
+        import io
+        idx = [{"name": "北京", "code": "BJP", "py": "beijing", "spy": "bj"},
+               {"name": "上海", "code": "SHH", "py": "shanghai", "spy": "sh"}]
+        with mock.patch.object(launcher, "get_station_index",
+                               return_value=idx), \
+             mock.patch.object(launcher, "load_station_kinds",
+                               return_value={"BJP": "高铁"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ret = station_db_mod.rebuild()
+            out = buf.getvalue()
+        self.assertEqual(ret["count"], 2)
+        self.assertEqual(ret["stations"][0]["kind"], "高铁")
+        self.assertEqual(ret["stations"][1]["kind"], "待识别")
+        with open(station_db_mod.DB_PATH, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["count"], 2)
+        self.assertIn("共 2 站", out, "正常重建的输出不得变化")
 
 
 if __name__ == "__main__":
