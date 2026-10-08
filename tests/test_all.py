@@ -8869,6 +8869,127 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
         self.assertNotIn("已添加并加密保存", printed)
 
 
+class TestTask89GuiLeftovers(TempDirCase):
+    """Task 89：gui 残留——编辑对话框写回污染 / 展示字符拆 / PassengerDialog 指纹缺口。
+
+    (a) P2：TaskEditDialog 对字符串 trains（如 "G101"）逐字符拆展示，
+    经逗号回写污染 config（"G101"→["G","1","0","1"]）→ 静默漏单。
+    (b) P3：StartMonitorDialog/TaskPage 任务行展示字符拆（纯展示）。
+    (c) P3：gui.PassengerDialog 无乐观并发指纹，思考窗口内被外部写入会静默覆写。
+    """
+
+    # ---- (a)(b) 展示用车次归一化 helper ----
+
+    def test_display_trains_string_is_single_not_char_split(self):
+        # 旧代码无此 helper（AttributeError）；且旧展示表达式 ",".join("G101")
+        # 会产出 "G,1,0,1"。
+        self.assertEqual(gui._display_trains("G101"), ["G101"])
+        self.assertEqual(gui._display_trains("g101"), ["G101"])  # 与引擎口径一致转大写
+
+    def test_display_trains_list_and_illegal_shapes(self):
+        self.assertEqual(gui._display_trains(["G101", "K225"]), ["G101", "K225"])
+        self.assertEqual(gui._display_trains(None), [])
+        self.assertEqual(gui._display_trains(123), [])
+        self.assertEqual(gui._display_trains(["G101", 123, "  "]), ["G101"])
+
+    def test_trains_roundtrip_no_pollution(self):
+        # 对话框载入→展示→用户未改→保存 的完整链条：字符串/列表/空输入
+        # 都不得污染 config。
+        for raw, expect in [("G101", ["G101"]), (["G101", "K225"], ["G101", "K225"]),
+                            ([], []), (None, [])]:
+            displayed = ",".join(gui._display_trains(raw))
+            # 下行即 TaskEditDialog.save 的解析表达式（逐字）
+            saved = [t.strip() for t in
+                     displayed.replace("，", ",").split(",") if t.strip()]
+            self.assertEqual(saved, expect, "raw=%r" % (raw,))
+        # 旧代码链条：",".join("G101") → "G,1,0,1" → ["G","1","0","1"]（污染）
+        self.assertEqual([t for t in "G,1,0,1".split(",") if t],
+                         ["G", "1", "0", "1"])
+
+    def test_edit_dialog_load_wiring_uses_normalized_trains(self):
+        import inspect
+        src = inspect.getsource(gui.TaskEditDialog.__init__)
+        # 旧代码：",".join(task.get("trains") or []) —— 字符串被逐字符拆
+        self.assertNotIn('",".join(task.get("trains") or [])', src)
+        self.assertIn('_display_trains(task.get("trains"))', src)
+
+    # ---- (b) 任务行展示 ----
+
+    def test_task_row_display_wiring_uses_normalized_trains(self):
+        import inspect
+        src1 = inspect.getsource(gui.StartMonitorDialog.__init__)
+        self.assertNotIn('"/".join(t.get("trains") or [])', src1)
+        self.assertIn('_display_trains(t.get("trains"))', src1)
+        src2 = inspect.getsource(gui.TaskPage.refresh)
+        self.assertNotIn('"/".join(t.get("trains") or [])', src2)
+        self.assertNotIn('"/".join(t.get("seat_types") or [])', src2)
+        self.assertIn('_display_trains(t.get("trains"))', src2)
+        self.assertIn('_display_trains(t.get("seat_types"))', src2)
+
+    # ---- (c) PassengerDialog 乐观并发 ----
+
+    def _make_passenger_dialog(self):
+        dlg = object.__new__(gui.PassengerDialog)
+        dlg.passengers = [{"name": "A"}]
+        dlg._pax_stamp = "old-stamp"
+        return dlg
+
+    def test_passenger_dialog_save_abandons_on_external_write(self):
+        dlg = self._make_passenger_dialog()
+        with mock.patch.object(gui.passengers_mod, "save_passengers",
+                               return_value=False) as m_save, \
+             mock.patch.object(gui.passengers_mod, "passengers_stamp",
+                               return_value="new-stamp"), \
+             mock.patch.object(gui, "messagebox") as mb, \
+             mock.patch.object(gui.PassengerDialog, "refresh") as m_refresh:
+            ok, reason = dlg._save_passengers_or_refresh(None)
+        # 指纹必须透传给共享函数（锁内检查用）
+        m_save.assert_called_once_with(dlg.passengers, expect_stamp="old-stamp")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "stale")
+        mb.showwarning.assert_called_once()  # 明确警告，不静默
+        mb.showerror.assert_not_called()
+        m_refresh.assert_called_once()  # 重载最新数据，用户重做
+
+    def test_passenger_dialog_save_refusal_shows_error_not_warning(self):
+        dlg = self._make_passenger_dialog()
+        with mock.patch.object(gui.passengers_mod, "save_passengers",
+                               return_value=False), \
+             mock.patch.object(gui.passengers_mod, "passengers_stamp",
+                               return_value="old-stamp"), \
+             mock.patch.object(gui, "messagebox") as mb, \
+             mock.patch.object(gui.PassengerDialog, "refresh") as m_refresh:
+            ok, reason = dlg._save_passengers_or_refresh(None)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "refused")
+        mb.showerror.assert_called_once()  # 不可解密盒子走 error（Task 80 口径）
+        mb.showwarning.assert_not_called()
+        m_refresh.assert_not_called()  # 拒写不重载，不丢内存数据
+
+    def test_passenger_dialog_save_success(self):
+        dlg = self._make_passenger_dialog()
+        with mock.patch.object(gui.passengers_mod, "save_passengers",
+                               return_value=True) as m_save, \
+             mock.patch.object(gui, "messagebox") as mb:
+            ok, reason = dlg._save_passengers_or_refresh(None)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+        m_save.assert_called_once_with(dlg.passengers, expect_stamp="old-stamp")
+        mb.showwarning.assert_not_called()
+        mb.showerror.assert_not_called()
+
+    def test_passenger_dialog_refresh_takes_stamp(self):
+        dlg = object.__new__(gui.PassengerDialog)
+        dlg.listbox = mock.Mock()
+        with mock.patch.object(gui.passengers_mod, "load_passengers",
+                               return_value=[{"name": "A"}]), \
+             mock.patch.object(gui.passengers_mod, "passengers_stamp",
+                               return_value="s1"):
+            dlg.refresh()
+        self.assertEqual(dlg.passengers, [{"name": "A"}])
+        self.assertEqual(dlg._pax_stamp, "s1")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -294,6 +294,19 @@ def _resolve_saved_dates(orig_text, non_contig, orig_dates, orig_range, raw_text
     return appcommon.parse_date_range(raw_text)
 
 
+def _display_trains(raw):
+    """展示用车次归一化（Task 89a/b）：与 engine.normalize_trains 同口径
+    （裸字符串如 "G101" 按单个车次处理，绝不逐字符拆；非法形状视为空；
+    条目 strip().upper()），但不记日志——展示/对话框路径高频调用，
+    防刷日志；真正的配置形状警告由引擎侧 Task 68 负责。"""
+    if isinstance(raw, str):
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        raw = []
+    return [t.strip().upper() for t in raw
+            if isinstance(t, str) and t.strip()]
+
+
 def _build_edited_task(task, *, from_name, to_name, dates, date_range, trains,
                        seat_types, passengers, auto_order, stop_after_order,
                        priority, purpose_code):
@@ -1649,15 +1662,29 @@ class QuickMonitorDialog(tk.Toplevel):
 
 # ----------------------------- 乘车人管理 -----------------------------
 
-def _save_passengers_or_warn(passengers, parent):
+def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
     """保存乘车人；磁盘盒子不可解密被拒写时弹 error 提示并返回 False。
 
     Task 80(b)：save_passengers 的拒写（return False）原来三处裸调无人处理，
     GUI 会显示"完成"/刷新列表，但磁盘未写，重启后修改丢失。此处失败弹
     error（与 save_passengers 内的 LOG.error 口径一致），调用方不再显示
-    "完成"、不再刷新列表。"""
-    if passengers_mod.save_passengers(passengers):
+    "完成"、不再刷新列表。
+
+    Task 89(c)：expect_stamp 传入时做乐观并发检查（与 Task 88d/monitor 同口径）；
+    编辑期间被外部修改导致放弃保存时弹 warning（不覆盖对方修改），返回 False。
+    不传 expect_stamp 时保持 Task 80 行为（直接写）。
+    """
+    if passengers_mod.save_passengers(passengers, expect_stamp=expect_stamp):
         return True
+    if expect_stamp is not passengers_mod._STAMP_UNSET \
+            and passengers_mod.passengers_stamp() != expect_stamp:
+        # 乐观并发放弃：save_passengers 已在锁内检出指纹变化并打印警告；
+        # GUI 侧再给一次明确提示（不静默），调用方负责重载最新数据。
+        messagebox.showwarning("保存已放弃",
+                               "乘车人数据在您编辑期间被其他程序修改，本次保存已放弃，\n"
+                               "未覆盖对方的修改。请基于最新数据重新操作。",
+                               parent=parent)
+        return False
     messagebox.showerror("保存失败",
                          "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
                          "已拒绝覆盖以保护原数据。\n"
@@ -1694,6 +1721,9 @@ class PassengerDialog(tk.Toplevel):
 
     def refresh(self):
         self.passengers = passengers_mod.load_passengers()
+        # Task 89c：记下 load 时的字节指纹，供保存时做乐观并发检查
+        #（本对话框打开期间若被外部修改，保存时警告并放弃，不静默覆写）。
+        self._pax_stamp = passengers_mod.passengers_stamp()
         self.listbox.delete(0, "end")
         for p in self.passengers:
             self.listbox.insert("end", "{0}{1}  证件:{2} {3}".format(
@@ -1704,6 +1734,22 @@ class PassengerDialog(tk.Toplevel):
     def selected(self):
         sel = self.listbox.curselection()
         return sel[0] if sel else None
+
+    def _save_passengers_or_refresh(self, parent):
+        """保存 self.passengers（Task 89c：Task 88d 同口径的乐观并发检查）。
+
+        成功 → (True, "ok")。指纹变化（本对话框打开期间被外部修改）→
+        重载最新数据+警告，返回 (False, "stale")，调用方放弃本次保存
+        （编辑子框由调用方关闭，用户基于最新数据重做）。不可解密盒子/
+        锁超时 → error，返回 (False, "refused")（不重载，不丢内存数据）。
+        """
+        if _save_passengers_or_warn(self.passengers, parent, self._pax_stamp):
+            return True, "ok"
+        if passengers_mod.passengers_stamp() != self._pax_stamp:
+            # 外部写入导致放弃：重载最新数据+新指纹。
+            self.refresh()
+            return False, "stale"
+        return False, "refused"
 
     def edit(self, index):
         p = self.passengers[index] if index is not None else None
@@ -1761,7 +1807,11 @@ class PassengerDialog(tk.Toplevel):
                 self.passengers.append(data)
             else:
                 self.passengers[index].update(data)
-            if not _save_passengers_or_warn(self.passengers, dlg):
+            ok, reason = self._save_passengers_or_refresh(dlg)
+            if not ok:
+                if reason == "stale":
+                    # 数据已重载为最新：关闭编辑框，用户基于最新数据重做
+                    dlg.destroy()
                 return
             self.refresh()
             if self.on_changed:
@@ -1781,7 +1831,8 @@ class PassengerDialog(tk.Toplevel):
         if messagebox.askyesno("确认", "确定删除乘车人「%s」？" % self.passengers[idx].get("name"),
                                parent=self):
             del self.passengers[idx]
-            if not _save_passengers_or_warn(self.passengers, self):
+            ok, _ = self._save_passengers_or_refresh(self)
+            if not ok:
                 return
             self.refresh()
 
@@ -1793,7 +1844,8 @@ class PassengerDialog(tk.Toplevel):
         for p in self.passengers:
             p["is_default"] = False
         self.passengers[idx]["is_default"] = True
-        if not _save_passengers_or_warn(self.passengers, self):
+        ok, _ = self._save_passengers_or_refresh(self)
+        if not ok:
             return
         self.refresh()
         messagebox.showinfo("完成", "已将「%s」设为默认乘车人" % self.passengers[idx].get("name"),
@@ -2236,7 +2288,7 @@ class StartMonitorDialog(tk.Toplevel):
             sub = "{0} → {1}   {2}   {3}  优先级 {4}".format(
                 t.get("from", ""), t.get("to", ""),
                 format_dates(t),
-                "/".join(t.get("trains") or []) or "全部车次",
+                "/".join(_display_trains(t.get("trains"))) or "全部车次",
                 t.get("priority", 5))
             tk.Label(info, text=sub, bg=CARD, fg=GRAY, font=(FONT, 9),
                      anchor="w").pack(fill="x")
@@ -2538,8 +2590,8 @@ class TaskPage(ttk.Frame):
                 "● 已启动" if started else "○ 未启动",
                 i, t.get("name", ""), "%s-%s" % (t.get("from", ""), t.get("to", "")),
                 self._cached_format_dates(t),
-                "/".join(t.get("trains") or []) or "全部",
-                "/".join(t.get("seat_types") or []),
+                "/".join(_display_trains(t.get("trains"))) or "全部",
+                "/".join(_display_trains(t.get("seat_types"))),
                 t.get("priority", 5),
                 engine_mod.STATUS_LABELS.get(st, st), msg,
                 "started" if started else "stopped", st))
@@ -2725,7 +2777,8 @@ class TaskEditDialog(tk.Toplevel):
         row.pack(fill="x", pady=6)
         tk.Label(row, text="车次", bg=CARD, fg=GRAY, width=8,
                  anchor="w").pack(side="left")
-        self.trains_var = tk.StringVar(value=",".join(task.get("trains") or []))
+        self.trains_var = tk.StringVar(
+            value=",".join(_display_trains(task.get("trains"))))
         tk.Entry(row, textvariable=self.trains_var, width=30, font=(FONT, 10)).pack(side="left")
         tk.Label(body, text="多个车次用逗号分隔；留空=监控全部车次",
                  bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
