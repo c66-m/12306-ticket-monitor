@@ -323,6 +323,15 @@ class MonitorEngine(object):
             LOG.error("[配置] %s 内容不是合法 JSON，已按默认配置继续",
                       self.config_path)
             self.config = {}
+        except UnicodeDecodeError:
+            # Task 107：文件存在但不是 UTF-8 编码——open(encoding="utf-8")
+            # 抛裸 UnicodeDecodeError 崩进程（Task 91/105 同 P1 类；它是
+            # JSONDecodeError 的 ValueError 兄弟类，两个分支都捕获不到）；
+            # 记 error 后用空配置继续。文件存在故 _config_mtime 取有效值，
+            # 用户转码修复后 mtime 变化 → _sync_config 自动恢复（同机制）。
+            LOG.error("[配置] %s 不是 UTF-8 编码，已按默认配置继续",
+                      self.config_path)
+            self.config = {}
         if not isinstance(self.config, dict):
             # Task 91：顶层非 dict（手改误删大括号成 [] 等）——旧代码后续
             # self.config.get(...) 抛 AttributeError 崩进程；记 error 后用
