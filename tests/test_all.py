@@ -7113,6 +7113,110 @@ class TestTask75Gui(TempDirCase):
         self.assertTrue(any("非 dict" in r.getMessage() for r in cm.records))
 
 
+class TestTask76TicketSession(TempDirCase):
+    """Task 76: ticket P2/P3（_SESSION 永不刷新 / A/I/J 席别未验证）。"""
+
+    def setUp(self):
+        super().setUp()
+        self._old_session = ticket._SESSION
+        self._old_streak = ticket._session_fail_streak
+        self._old_warned = set(ticket._WARNED_UNORDERABLE_SKIPS)
+        ticket._SESSION = None
+        ticket._session_fail_streak = 0
+        ticket._WARNED_UNORDERABLE_SKIPS.clear()
+
+    def tearDown(self):
+        ticket._SESSION = self._old_session
+        ticket._session_fail_streak = self._old_streak
+        ticket._WARNED_UNORDERABLE_SKIPS.clear()
+        ticket._WARNED_UNORDERABLE_SKIPS.update(self._old_warned)
+        super().tearDown()
+
+    @staticmethod
+    def _dead_session():
+        s = mock.Mock()
+        s.get.side_effect = ticket.requests.RequestException("conn reset")
+        return s
+
+    @staticmethod
+    def _live_session(result=None):
+        s = mock.Mock()
+        r = mock.Mock()
+        r.raise_for_status.return_value = None
+        r.json.return_value = {"httpstatus": 200,
+                               "data": {"result": result if result is not None else []}}
+        s.get.return_value = r
+        return s
+
+    def _fail_rounds(self, n, sess):
+        with mock.patch.object(ticket, "get_session", return_value=sess):
+            for _ in range(n):
+                with self.assertRaises(Exception):
+                    ticket.query_tickets("VNP", "ZAF", "2026-10-10")
+
+    def test_consecutive_failures_invalidate_session(self):
+        """(a) 连续 5 次查询失败 → 旧会话被丢弃（懒重建）并记 warning。"""
+        sentinel = self._dead_session()
+        ticket._SESSION = sentinel
+        with self.assertLogs(ticket.LOG, level="WARNING") as cm:
+            self._fail_rounds(5, sentinel)
+        self.assertIsNone(ticket._SESSION)
+        self.assertTrue(any("重建" in r.getMessage() or "会话" in r.getMessage()
+                            for r in cm.records),
+                        "未记录会话重建 warning: %s" % [r.getMessage() for r in cm.records])
+
+    def test_success_resets_streak(self):
+        """(a) 成功一次即清零：4 失败→成功→4 失败，不触发重建。"""
+        sentinel = self._dead_session()
+        ticket._SESSION = sentinel
+        self._fail_rounds(4, sentinel)
+        self.assertEqual(ticket._session_fail_streak, 4)
+        with mock.patch.object(ticket, "get_session",
+                               return_value=self._live_session(["row1"])):
+            self.assertEqual(ticket.query_tickets("VNP", "ZAF", "2026-10-10"), ["row1"])
+        self.assertEqual(ticket._session_fail_streak, 0)
+        self._fail_rounds(4, sentinel)
+        self.assertIs(ticket._SESSION, sentinel)  # 未达 5 次，不丢弃
+
+    def test_rebuild_recovers(self):
+        """(a) 丢弃后下次 get_session 拿到新会话 → 查询恢复。"""
+        ticket._SESSION = self._dead_session()
+        self._fail_rounds(5, ticket._SESSION)
+        self.assertIsNone(ticket._SESSION)
+        live = self._live_session(["row9"])
+        with mock.patch.object(ticket.requests, "Session", return_value=live):
+            s = ticket.get_session()
+            self.assertIs(s, live)
+            rows = ticket.query_tickets("VNP", "ZAF", "2026-10-10")
+        self.assertEqual(rows, ["row9"])
+        self.assertEqual(ticket._session_fail_streak, 0)
+
+    def test_unorderable_skip_logged(self):
+        """(b) 不限席别遇到 A（高级动卧）有票：非静默，warning 说明跳过原因。"""
+        avail = {"高级动卧": "有", "二等座": "有"}
+        with self.assertLogs(ticket.LOG, level="WARNING") as cm:
+            cand = ticket.seat_candidates_for("D123", [], [], avail)
+        self.assertEqual(cand, ["二等座"])
+        msgs = [r.getMessage() for r in cm.records]
+        self.assertTrue(any("高级动卧" in m for m in msgs),
+                        "跳过未明确告知: %s" % msgs)
+
+    def test_unorderable_skip_warn_once(self):
+        """(b) 同（车次，席别）只提示一次，不每轮刷屏。"""
+        avail = {"高级动卧": "有", "二等座": "有"}
+        with self.assertLogs(ticket.LOG, level="WARNING") as cm:
+            ticket.seat_candidates_for("D123", [], [], avail)
+            ticket.seat_candidates_for("D123", [], [], avail)
+        n = sum(1 for r in cm.records if "高级动卧" in r.getMessage())
+        self.assertEqual(n, 1)
+
+    def test_aij_assumption_marked_unverified(self):
+        """(b) 码表处明确标注 A/I/J 不可下单为未验证假设。"""
+        import inspect
+        src = inspect.getsource(ticket)
+        self.assertIn("UNVERIFIED", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

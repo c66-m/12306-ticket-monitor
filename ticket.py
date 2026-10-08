@@ -69,6 +69,9 @@ SEAT_CHOICES = ["商务座", "特等座", "优选一等座", "一等座", "二�
 #   4 软卧 / F 动卧 / 3 硬卧 / 2 软座 / 1 硬座 / WZ 无座
 # 「优选一等座」此前只在勾选列表里、不在码表里 → 勾了会被当「不支持自动下单」跳过，
 # 现已补上（官方 seatTypeForHB 里 GG:"D_优选一等座"，两个来源互证）。
+# ⚠ 未验证假设（UNVERIFIED）：高级动卧(A)/一等卧(I)/二等卧(J)/其他(H)不在下单码表里，
+# 抢票路径按"下单接口不接受这些码"剔除——但该断言未经真实 12306 下单接口验证。
+# 若实际可售，这些席别将永远无法被监控/抢购。改动此处前请先真机验证。
 SEAT_CODE_TO_NAME = {
     "9": "商务座", "P": "特等座", "D": "优选一等座", "M": "一等座", "O": "二等座",
     "6": "高级软卧", "4": "软卧", "F": "动卧", "3": "硬卧",
@@ -232,6 +235,27 @@ def seat_rules_parse(value):
     return {"rules": rules, "bare": bare, "warnings": warnings}
 
 
+_WARNED_UNORDERABLE_SKIPS = set()  # (车次, 席别名)：已提示过"有票但按不可下单跳过"
+
+
+def _warn_unorderable_skipped(train_code, skipped):
+    """不限席别任务遇到有票但不可下单的席别（A/I/J/H）：明确告知跳过原因。
+
+    高级动卧(A)/一等卧(I)/二等卧(J)"不可下单"是未经真实接口验证的假设
+    （见 SEAT_CODE_TO_NAME 处 UNVERIFIED 注释）；用户应知晓这些席别即使有票
+    也不会被抢。同（车次，席别）进程内只提示一次，防每轮刷屏。
+    """
+    for name in skipped:
+        key = (train_code or "", name)
+        if key in _WARNED_UNORDERABLE_SKIPS:
+            continue
+        _WARNED_UNORDERABLE_SKIPS.add(key)
+        LOG.warning("[席别] %s 的「%s」有余票，但按不可下单席别跳过"
+                    "（高级动卧/一等卧/二等卧/其他不在下单码表内；"
+                    "该假设未经真实下单接口验证）",
+                    train_code or "?", name)
+
+
 def seat_candidates_for(train_code, checked, priority, avail=None):
     """某趟车的席别候选 —— 唯一口径，launcher 抢票与 engine 监控共用。
 
@@ -261,6 +285,8 @@ def seat_candidates_for(train_code, checked, priority, avail=None):
             # 稳定排序（贵的在前，无座垫底），不跟随 avail 插入序——避免展示名
             # 抢先/误报「有票」（Task 54）。
             show_order = {n: i for i, n in enumerate(SEAT_SHOW_ORDER)}
+            skipped = sorted({s for s in avail if s not in SEAT_NAME_TO_CODE})
+            _warn_unorderable_skipped(train, skipped)  # Task 76b：非静默，说明跳过原因
             cand = sorted((s for s in avail if s in SEAT_NAME_TO_CODE),
                           key=lambda x: show_order.get(x, 99))
     if avail is not None:
@@ -313,6 +339,14 @@ def seat_priority_feedback(text, checked=None, trains=None):
 _SESSION = None
 _SESSION_LOCK = threading.Lock()  # GUI 多线程会同时首次建会话，防重复初始化
 
+# ---- 查询会话健康跟踪（Task 76a）----
+# _SESSION 进程内永久复用；JSESSIONID 失效后查询持续失败，engine 会按"网络瞬时
+# 异常"无限退避重试同一死会话（7×24 长跑下全部任务永久漏单，只能重启恢复）。
+# 对策：连续失败达阈值即判定会话已死，懒重建（置 None，下次 get_session 新建，
+# 拿新 TCP 连接/JSESSIONID），成功一次即清零。
+_SESSION_MAX_CONSECUTIVE_FAILURES = 5
+_session_fail_streak = 0
+
 
 def get_session():
     """构建并复用基础请求会话（先拿 JSESSIONID）。"""
@@ -325,6 +359,34 @@ def get_session():
                 s.get("https://kyfw.12306.cn/otn/leftTicket/init", timeout=15)
                 _SESSION = s
     return _SESSION
+
+
+def _note_query_success():
+    """一次查询成功：会话健康计数清零。"""
+    global _session_fail_streak
+    with _SESSION_LOCK:
+        _session_fail_streak = 0
+
+
+def _note_query_failure():
+    """一次查询失败（全部端点均失败）：计次；连续达阈值则懒重建会话。
+
+    失败可能是会话已死（JSESSIONID 过期），也可能是 12306 侧全站故障；
+    后者时重建只是多一次 init 请求（无害），恢复后新会话即用。
+    懒重建不主动 close 旧会话：在途的其它线程可能仍持有引用，交由 GC 回收
+    （与既有"会话永不 close"行为一致）。
+    """
+    global _session_fail_streak, _SESSION
+    with _SESSION_LOCK:
+        _session_fail_streak += 1
+        if _session_fail_streak < _SESSION_MAX_CONSECUTIVE_FAILURES:
+            return
+        _session_fail_streak = 0
+        if _SESSION is not None:
+            _SESSION = None
+            LOG.warning("[余票] 查询连续 %d 次失败，会话可能已失效，"
+                        "已丢弃旧会话，下次查询将重建（新 JSESSIONID）",
+                        _SESSION_MAX_CONSECUTIVE_FAILURES)
 
 
 _STATION_CACHE_TTL = 7 * 24 * 3600  # 车站缓存有效期：7 天
@@ -547,9 +609,12 @@ def query_tickets(from_code, to_code, date, purpose="ADULT"):
         if not isinstance(payload, dict):
             last = RuntimeError("查询接口返回无有效数据")
             continue
-        return payload.get("result") or []
+        result = payload.get("result") or []
+        _note_query_success()
+        return result
     if last is None:
         last = RuntimeError("查询接口无可用端点")
+    _note_query_failure()
     raise last
 
 
