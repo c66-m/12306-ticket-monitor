@@ -9307,6 +9307,89 @@ class TestTask92MonitorP2(TempDirCase):
         self.assertEqual(email["to"], [])  # 回归 pin
 
 
+class TestTask93EngineP2(TempDirCase):
+    """Task 93: (a) state.json tasks 节非 dict → 启动崩 / 运行中 _sync_state
+    后线程死亡；(b) seat_types 裸字符串被逐字符拆 → 永久静默漏单。"""
+
+    def _write_config(self, state_obj, tasks=()):
+        sp = os.path.join(self.tmp, "state.json")
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump(state_obj, f, ensure_ascii=False)
+        cfg = {"tasks": list(tasks),
+               "state_file": sp,
+               "history_file": os.path.join(self.tmp, "order_history.json")}
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        return p, sp
+
+    def _make_engine(self, state_obj, tasks=()):
+        cfg_path, sp = self._write_config(state_obj, tasks)
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            eng = engine_mod.MonitorEngine(config_path=cfg_path,
+                                           setup_logging=False)
+        return eng, sp
+
+    # ---- (a) tasks 节非 dict ----
+
+    def test_load_state_tasks_list_degrades_not_crash(self):
+        # 旧代码：_resume_or_init_status 内 self.state["tasks"].setdefault
+        # 直接 AttributeError，启动即崩（config 里有一个任务即触发）
+        with self.assertLogs("monitor", level="ERROR"):
+            eng, sp = self._make_engine({"tasks": [], "dedup": {"k": "v"},
+                                         "retry": {}},
+                                        tasks=[{"name": "T1"}])
+        # 降级为空任务集后，_resume_or_init_status 正常补上 T1 的默认条目
+        self.assertIsInstance(eng.state["tasks"], dict)
+        self.assertEqual(eng.state["tasks"]["T1"]["status"], "paused")
+        self.assertEqual(eng.state["dedup"], {"k": "v"})  # 其它节不受影响
+
+    def test_reload_state_tasks_list_does_not_kill_thread(self):
+        # 运行中外部把 tasks 节写坏：旧代码 _sync_state 重载后
+        # self.state["tasks"] 为 []，下一次 task_status 即 AttributeError
+        # （生产环境=轮询线程死亡）
+        eng, sp = self._make_engine({"tasks": {}, "dedup": {}, "retry": {}})
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [], "dedup": {}, "retry": {}}, f)
+        eng._state_mtime = 0  # 强制 _sync_state 重载
+        with self.assertLogs("monitor", level="ERROR"):
+            eng._sync_state()
+        self.assertIsInstance(eng.state["tasks"], dict)
+        self.assertEqual(eng.task_status({"name": "x"}), "paused")
+
+    # ---- (b) seat_types 裸字符串 ----
+
+    def test_seat_types_string_is_single_not_char_split(self):
+        seats = engine_mod.normalize_seat_types({"name": "T1",
+                                                 "seat_types": "硬座"})
+        self.assertEqual(seats, ["硬座"])  # 旧代码此处为 ["硬", "座"]
+
+    def test_seat_types_string_warns_loudly(self):
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            engine_mod.normalize_seat_types({"name": "T1",
+                                             "seat_types": "硬座"})
+        self.assertTrue(any("seat_types" in m for m in cm.output),
+                        "warning 必须点名 seat_types 字段")
+
+    def test_seat_types_string_survives_availability_intersection(self):
+        # P2 本体：旧代码逐字符拆后与余票求交恒为空 → 任务永久静默漏单
+        seats = engine_mod.normalize_seat_types({"name": "T1",
+                                                 "seat_types": "硬座"})
+        self.assertTrue(set(seats) & {"硬座", "二等座"})
+
+    def test_seat_types_shapes(self):
+        n = engine_mod.normalize_seat_types
+        self.assertEqual(n({"name": "T", "seat_types": ["硬座", "二等座"]}),
+                         ["硬座", "二等座"])  # 正常形状零变化
+        self.assertEqual(n({"name": "T"}), [])
+        self.assertEqual(n({"name": "T", "seat_types": ""}), [])
+        self.assertEqual(n({"name": "T", "seat_types": ["硬座", 123]}),
+                         ["硬座"])
+        with self.assertLogs("monitor", level="WARNING"):
+            self.assertEqual(n({"name": "T", "seat_types": 123}), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

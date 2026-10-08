@@ -193,6 +193,23 @@ def normalize_trains(task):
             if isinstance(t, str) and t.strip()]
 
 
+def normalize_seat_types(task):
+    """seat_types 字段归一化（Task 93b）：裸字符串（如漏写方括号的 "硬座"）
+    按单个席别处理并记警告，绝不逐字符拆（旧代码会拆成 ['硬','座']，
+    ticket.seat_candidates_for 照单返回后与余票求交恒为空 → 任务永久
+    静默漏单）。与 Task 68b 的 trains 口径一致。非字符串条目跳过。"""
+    raw = task.get("seat_types") or []
+    if isinstance(raw, str):
+        LOG.warning("[配置] 任务「%s」的 seat_types 为字符串，已按单个席别处理：%r",
+                    task.get("name"), raw)
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        LOG.warning("[配置] 任务「%s」的 seat_types 形状非法，已忽略：%r",
+                    task.get("name"), raw)
+        raw = []
+    return [s for s in raw if isinstance(s, str)]
+
+
 def expand_dates(task):
     """把 dates + date_range 展开成日期列表（去重保序）。"""
     result = []
@@ -419,8 +436,23 @@ class MonitorEngine(object):
         state.setdefault("dedup", {})
         state.setdefault("tasks", {})
         state.setdefault("retry", {})
+        state = self._sanitize_state_tasks(state)
         if state_ok:
             self._save_state(state)
+        return state
+
+    def _sanitize_state_tasks(self, state):
+        """state.json 节级形状校验（Task 93a）：tasks 节被手改成非 dict
+        （如 []）时，setdefault 只补缺键、损坏形状原样透过 → 后续
+        self.state["tasks"].setdefault(...) 直接 AttributeError：启动崩
+        （__init__→_resume_or_init_status）或运行中 _sync_state 重载后
+        线程死亡。记 error 并按空任务集安全降级，线程不死。
+        _load_state 与 _reload_state 共用（两条独立漏斗）。"""
+        if not isinstance(state.get("tasks"), dict):
+            LOG.error("[状态] %s 的 tasks 节不是对象（%s），已按空任务集降级；"
+                      "请检查文件是否被手改损坏",
+                      self.state_path, type(state.get("tasks")).__name__)
+            state["tasks"] = {}
         return state
 
     def _save_state(self, state=None):
@@ -531,6 +563,7 @@ class MonitorEngine(object):
         state.setdefault("dedup", {})
         state.setdefault("tasks", {})
         state.setdefault("retry", {})
+        state = self._sanitize_state_tasks(state)
         return state
 
     def _sync_state(self):
@@ -811,7 +844,7 @@ class MonitorEngine(object):
             return False, False
 
         trains = normalize_trains(task)
-        seats_want_all = [s for s in (task.get("seat_types") or [])]
+        seats_want_all = normalize_seat_types(task)
         seats_by_date = task.get("seats_by_date") or {}
         auto_order = bool(task.get("auto_order", True))
         stop_after = bool(task.get("stop_after_order", True))
