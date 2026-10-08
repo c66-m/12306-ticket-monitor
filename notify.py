@@ -93,10 +93,16 @@ def send_email(cfg, subject, body):
         # Task 60b：解密失败如实报错，不拿空密码去登录误报 535
         return False, "邮箱授权码解密失败: {0}".format(e)
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["From"] = formataddr((str(Header("购票监控", "utf-8")), from_addr))
-    msg["To"] = ",".join(to_addrs)
-    msg["Subject"] = Header(subject, "utf-8")
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = formataddr((str(Header("购票监控", "utf-8")), from_addr))
+        msg["To"] = ",".join(to_addrs)
+        msg["Subject"] = Header(subject, "utf-8")
+    except Exception as e:
+        # Task 100a：邮件头构造在 try 之外时，非 ASCII 的 from/to
+        #（手改配置/菜单键入中文）会抛 UnicodeEncodeError 逃出 (ok,msg)
+        # 契约，monitor CLI 测试邮件路径 traceback 退出——诚实返回失败，不抛。
+        return False, "邮件头构造失败（发件人/收件人/主题含非法字符？）: {0}".format(e)
 
     # Task 60d：瞬时异常退避重试 2 次（共 3 次尝试）；认证失败不重试。
     last_err = None

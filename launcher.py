@@ -3605,10 +3605,13 @@ def ensure_passengers():
     if not names:
         return
     try:
+        # Task 100c：首跑双进程竞速——exists 检查与写入之间对方可能新建
+        # passengers.json；传 expect_stamp=None（"load 时文件不存在"语义），
+        # 文件若已出现则 save 内指纹比对失败→放弃，不静默覆写对方数据。
         ok = passengers_mod.save_passengers([
             {"name": n, "id_type_code": "1", "id_no": "", "mobile": "",
              "is_default": i == 0, "is_adult": True}
-            for i, n in enumerate(names)])
+            for i, n in enumerate(names)], expect_stamp=None)
     except Exception as e:
         log("[错误] 乘车人导入失败：%s" % e)
         return

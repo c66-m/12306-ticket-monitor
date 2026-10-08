@@ -878,9 +878,18 @@ def menu_notify():
     # Task 87：load 后立即取指纹；保存时若指纹变化说明交互期间有外部写入，
     # save_config 会警告并放弃（不静默覆写对方修改）。
     stamp = _config_stamp()
-    email = config.setdefault("notify", {}).setdefault("email", {
+    # Task 100b：手改配置致 notify / notify.email 非 dict（如字符串）时，
+    # 后续的 setdefault/.get 会抛 AttributeError 杀死 CLI——友好报错回主菜单。
+    notify_cfg = config.setdefault("notify", {})
+    if not isinstance(notify_cfg, dict):
+        print("  [警告] notify 配置形状非法（应为对象），已跳过通知设置。")
+        return
+    email = notify_cfg.setdefault("email", {
         "enabled": True, "smtp_host": "smtp.qq.com", "smtp_port": 465,
         "username": "", "password": "", "from": "", "to": []})
+    if not isinstance(email, dict):
+        print("  [警告] notify.email 配置形状非法（应为对象），已跳过通知设置。")
+        return
     print("\n===== 邮件通知设置（SMTP 授权码） =====")
     print("  当前：enabled=%s host=%s port=%s user=%s" % (
         email.get("enabled"), email.get("smtp_host"), email.get("smtp_port"),

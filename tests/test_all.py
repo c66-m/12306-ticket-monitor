@@ -10297,6 +10297,141 @@ class TestTask99CaptureSessionP3(unittest.TestCase):
         browser.close.assert_called_once()
 
 
+class TestTask100NotifyPassengersP3(TempDirCase):
+    """Task 100: notify/passengers P3（邮件头非 ASCII 崩 / notify.email 非 dict 崩 CLI /
+    ensure_passengers 裸调无指纹 / print 警告不可见 / 非字符串 password 崩对话框）。"""
+
+    # ---- (a) 非 ASCII 邮件头纳入 (ok,msg) ----
+
+    def test_a_non_ascii_from_returns_false_not_raise(self):
+        # RED on old code: formataddr 在 try 之外抛 UnicodeEncodeError 逃出 (ok,msg)
+        import notify as notify_mod
+        cfg = {"enabled": True, "smtp_host": "x", "smtp_port": 465,
+               "username": "u@x.com", "password": "plain",
+               "from": "测试@example.com", "to": ["a@b.com"]}
+        ok, msg = notify_mod.send_email(cfg, "主题", "正文")
+        self.assertFalse(ok)
+        self.assertIn("邮件头", msg)
+
+    def test_a_ascii_path_unchanged(self):
+        # 回归 pin：ASCII 快路径行为不变（旧代码即通过）
+        import notify as notify_mod
+        cfg = {"enabled": True, "smtp_host": "h", "smtp_port": 465,
+               "username": "u@x.com", "password": "plain",
+               "from": "u@x.com", "to": ["a@b.com"]}
+        s = mock.Mock()
+        with mock.patch("smtplib.SMTP_SSL", return_value=s):
+            ok, msg = notify_mod.send_email(cfg, "ASCII subject", "body")
+        self.assertTrue(ok)
+        self.assertIn("a@b.com", msg)
+        s.login.assert_called_once_with("u@x.com", "plain")
+
+    # ---- (b) notify.email 非 dict 友好降级 ----
+
+    def test_b_email_non_dict_no_crash(self):
+        # RED on old code: email.get 在字符串上抛 AttributeError 杀死 CLI
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"notify": {"email": "dirty"}}), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_notify()
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        self.assertIn("警告", printed)
+        self.assertIn("notify.email", printed)
+
+    def test_b_notify_non_dict_no_crash(self):
+        # RED on old code: 非 dict 的 notify 上调 setdefault 抛 AttributeError
+        import monitor as monitor_mod
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"notify": "dirty"}), \
+             mock.patch("builtins.print") as mprint:
+            monitor_mod.menu_notify()
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        self.assertIn("警告", printed)
+
+    def test_b_normal_config_flow_unchanged(self):
+        # 回归 pin：正常 dict 配置走完整流程（旧代码即通过）
+        import monitor as monitor_mod
+        saved = {}
+        with mock.patch.object(monitor_mod, "load_config", return_value={}), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["", "465", "", "", "", ""]), \
+             mock.patch("getpass.getpass", return_value=""), \
+             mock.patch.object(monitor_mod, "ask_yes_no", return_value=False), \
+             mock.patch.object(monitor_mod, "save_config",
+                               side_effect=lambda c, **k: saved.update(c) or True):
+            monitor_mod.menu_notify()
+        self.assertIsInstance(saved["notify"]["email"], dict)
+        self.assertEqual(saved["notify"]["email"]["smtp_port"], 465)
+
+    # ---- (c) ensure_passengers 传 expect_stamp=None ----
+
+    def test_c_ensure_passengers_passes_expect_stamp_none(self):
+        # RED on old code: 裸调 save_passengers 不传指纹，首跑双进程可静默覆写
+        import launcher
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"passenger_names": ["张三"]}]}, f)
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log"), \
+             mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=True) as m_save:
+            launcher.ensure_passengers()
+        m_save.assert_called_once()
+        self.assertIn("expect_stamp", m_save.call_args.kwargs)
+        self.assertIsNone(m_save.call_args.kwargs["expect_stamp"])
+
+    def test_c_expect_stamp_none_refuses_when_file_appears(self):
+        # 首跑语义 pin：expect_stamp=None = "load 时文件不存在"；
+        # 写入前文件已出现 → 指纹不匹配 → 放弃，不静默覆写
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        self.assertTrue(pax_mod.save_passengers([{"name": "甲"}], path=p,
+                                                expect_stamp=None))
+        self.assertFalse(pax_mod.save_passengers([{"name": "乙"}], path=p,
+                                                 expect_stamp=None))
+        self.assertEqual(pax_mod.load_passengers(p)[0]["name"], "甲")
+
+    # ---- (d) load_passengers 警告走 LOG.error ----
+
+    def test_d_load_read_fail_logs_error(self):
+        # RED on old code: print 在 GUI 下不可见，assertLogs 抓不到 ERROR
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            self.assertEqual(pax_mod.load_passengers(p), [])
+        self.assertTrue(any("读取失败" in m for m in cm.output))
+
+    def test_d_load_decrypt_fail_logs_error(self):
+        # 第二处 print 同样转 LOG.error
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"enc": "none", "data": "not json"}, f)
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            self.assertEqual(pax_mod.load_passengers(p), [])
+        self.assertTrue(any("解密失败" in m for m in cm.output))
+
+    # ---- (e) unprotect_secret 非字符串走 SecretDecryptError ----
+
+    def test_e_unprotect_non_string_raises_secret_decrypt_error(self):
+        # RED on old code: 12345.startwith 抛裸 AttributeError；
+        # gui 邮箱设置对话框只捕 SecretDecryptError → 对话框打不开
+        import passengers as pax_mod
+        with self.assertRaises(pax_mod.SecretDecryptError) as cm:
+            pax_mod.unprotect_secret(12345)
+        self.assertIn("12345", str(cm.exception))
+
+    def test_e_unprotect_legacy_paths_unchanged(self):
+        # 回归 pin：字符串/空/None 路径行为不变（旧代码即通过）
+        import passengers as pax_mod
+        self.assertEqual(pax_mod.unprotect_secret("legacy"), "legacy")
+        self.assertEqual(pax_mod.unprotect_secret(""), "")
+        self.assertEqual(pax_mod.unprotect_secret(None), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

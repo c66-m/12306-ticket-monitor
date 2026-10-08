@@ -193,7 +193,15 @@ def unprotect_secret(text):
     """公开 API：取回敏感串明文。带 dpapi1: 前缀则解密；旧明文原样返回。
 
     解密失败抛 SecretDecryptError（不再吞成空串，避免上层拿空密码
-    去登录而误报 535 认证失败）。"""
+    去登录而误报 535 认证失败）。非字符串输入（如手改配置的数字）同样
+    走 SecretDecryptError 诚实报错路径（Task 100e）。"""
+    if text is not None and not isinstance(text, str):
+        # Task 100e：手改配置把 password 写成非字符串（如 12345）时，
+        # .startswith 会裸 AttributeError 逃出；gui 邮箱设置对话框只捕
+        # SecretDecryptError（Task 71 只修了 send_email 路径，显示路径遗漏）——
+        # 走诚实报错路径，不抛裸 AttributeError。
+        raise SecretDecryptError(
+            "敏感串类型非法（应为字符串）: %r" % (text,))
     if text and text.startswith(_DPAPI_PREFIX):
         try:
             return _dpapi_unprotect(
@@ -361,7 +369,9 @@ def load_passengers(path=None):
         with open(path, "r", encoding="utf-8") as f:
             box = json.load(f)
     except Exception as e:
-        print("[警告] 乘车人文件 %s 读取失败：%s" % (path, e))
+        # Task 100d：print 在 GUI 下不可见（Task 80c 同类同模块遗漏）——
+        # 转 LOG.error（三路可见：控制台/文件/GUI 日志面板）。
+        LOG.error("[警告] 乘车人文件 %s 读取失败：%s", path, e)
         return []
     try:
         text = _decrypt(box.get("enc", "none"), box.get("data", "[]"))
@@ -370,7 +380,9 @@ def load_passengers(path=None):
             return data
         return data.get("passengers", []) if isinstance(data, dict) else []
     except Exception as e:
-        print("[警告] 乘车人文件 %s 解密失败：%s" % (path, e))
+        # Task 100d：print 在 GUI 下不可见（Task 80c 同类同模块遗漏）——
+        # 转 LOG.error（三路可见：控制台/文件/GUI 日志面板）。
+        LOG.error("[警告] 乘车人文件 %s 解密失败：%s", path, e)
         return []
 
 
