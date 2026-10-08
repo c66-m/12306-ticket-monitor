@@ -6,45 +6,55 @@
 SMTP 参数在 config.json 的 notify.email 中配置。
 """
 
+import re
 import smtplib
 import sys
+import time
 import logging
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
+import passengers as pax_mod
+from passengers import SecretDecryptError  # noqa: F401  供 gui/测试引用
+
 LOG = logging.getLogger("monitor")
 
-_DPAPI_PREFIX = "dpapi1:"
+# 前缀常量随公开 API 迁至 passengers；此处保留兼容别名。
+_DPAPI_PREFIX = pax_mod._DPAPI_PREFIX
 
 
 def protect_secret(text):
-    """敏感串（SMTP 授权码）用 Windows DPAPI 加密后落盘。
+    """敏感串（SMTP 授权码）加密落盘。
 
-    返回带 "dpapi1:" 前缀的密文；非 Windows / 加密失败时原样返回明文
-    （保持向后兼容）。已加密的原样返回，避免二次包裹。"""
-    if not text or text.startswith(_DPAPI_PREFIX):
-        return text
-    try:
-        import base64
-        import passengers as pax_mod
-        blob = pax_mod._dpapi_protect(text.encode("utf-8"))
-        return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
-    except Exception:
-        return text
+    公开实现已迁至 passengers.protect_secret，此处保留作兼容委托。"""
+    return pax_mod.protect_secret(text)
 
 
 def secret_of(text):
-    """取回敏感串明文：带 dpapi1: 前缀则解密；旧明文原样返回。"""
-    if text and text.startswith(_DPAPI_PREFIX):
-        try:
-            import base64
-            import passengers as pax_mod
-            return pax_mod._dpapi_unprotect(
-                base64.b64decode(text[len(_DPAPI_PREFIX):])).decode("utf-8")
-        except Exception:
-            return ""
-    return text or ""
+    """取回敏感串明文：带 dpapi1: 前缀则解密；旧明文原样返回。
+
+    解密失败抛 SecretDecryptError（Task 60：不再吞成空串误导为 535）。"""
+    return pax_mod.unprotect_secret(text)
+
+
+def _normalize_recipients(to, fallback_user):
+    """收件人归一化为 list（Task 60a）。
+
+    str → 按逗号/分号（含全角）拆分；list/tuple → 逐项去空白；
+    空结果回退 [fallback_user]（旧语义：to 未配置时发给发件人自己）。
+    """
+    if isinstance(to, str):
+        items = re.split(r"[,;，；]", to)
+    elif isinstance(to, (list, tuple)):
+        items = list(to)
+    elif to:
+        items = [to]
+    else:
+        items = []
+    addrs = [str(x).strip() for x in items]
+    addrs = [a for a in addrs if a]
+    return addrs or [fallback_user]
 
 
 def _safe_port(cfg):
@@ -68,29 +78,49 @@ def send_email(cfg, subject, body):
         host = cfg["smtp_host"]
         port = _safe_port(cfg)
         user = cfg["username"]
-        pwd = secret_of(cfg["password"])  # 兼容明文与 DPAPI 密文两种存储
         from_addr = cfg["from"]
-        to_addrs = cfg.get("to") or [user]
+        to_addrs = _normalize_recipients(cfg.get("to"), user)
     except KeyError as e:
         return False, "邮件配置缺少字段: {0}".format(e)
+    try:
+        pwd = secret_of(cfg["password"])  # 兼容明文与 DPAPI 密文两种存储
+    except SecretDecryptError as e:
+        # Task 60b：解密失败如实报错，不拿空密码去登录误报 535
+        return False, "邮箱授权码解密失败: {0}".format(e)
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["From"] = formataddr((str(Header("购票监控", "utf-8")), from_addr))
     msg["To"] = ",".join(to_addrs)
     msg["Subject"] = Header(subject, "utf-8")
 
-    try:
-        if port == 465:
-            s = smtplib.SMTP_SSL(host, port, timeout=15)
-        else:
-            s = smtplib.SMTP(host, port, timeout=15)
-            s.starttls()
-        s.login(user, pwd)
-        s.sendmail(from_addr, to_addrs, msg.as_string())
-        s.quit()
-        return True, "邮件已发送给 {0}".format(",".join(to_addrs))
-    except Exception as e:
-        return False, "邮件发送失败: {0}".format(e)
+    # Task 60d：瞬时异常退避重试 2 次（共 3 次尝试）；认证失败不重试。
+    last_err = None
+    for attempt in range(3):
+        try:
+            if port == 465:
+                s = smtplib.SMTP_SSL(host, port, timeout=15)
+            else:
+                s = smtplib.SMTP(host, port, timeout=15)
+                s.starttls()
+            s.login(user, pwd)
+            s.sendmail(from_addr, to_addrs, msg.as_string())
+            try:
+                s.quit()
+            except Exception:
+                pass
+            return True, "邮件已发送给 {0}".format(",".join(to_addrs))
+        except smtplib.SMTPAuthenticationError as e:
+            # 认证失败（535 类）：重试无意义，立即明确失败
+            return False, "邮件发送失败（认证失败，请检查发件邮箱/授权码）: {0}".format(e)
+        except (smtplib.SMTPException, OSError) as e:
+            # 瞬时异常（连接断开/超时/4xx/网络抖动）：退避后重试
+            last_err = e
+            LOG.warning("[通知] SMTP 瞬时异常（第 %d/3 次尝试）: %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            return False, "邮件发送失败: {0}".format(e)
+    return False, "邮件发送失败（已重试 2 次）: {0}".format(last_err)
 
 
 if __name__ == "__main__":

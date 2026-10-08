@@ -133,6 +133,49 @@ def _dpapi_unprotect(blob):
         kernel32.LocalFree(data_out.pbData)
 
 
+# ----------------------------- 公开 secrets API -----------------------------
+# Task 60: 统一的敏感串（SMTP 授权码等）加解密公开接口。
+# notify.py / gui.py / 测试一律调这里，不再直调私有的 _dpapi_*。
+
+_DPAPI_PREFIX = "dpapi1:"
+
+
+class SecretDecryptError(Exception):
+    """敏感串解密失败：数据损坏，或密文属于其他 Windows 用户。"""
+
+
+def protect_secret(text):
+    """公开 API：敏感串用 Windows DPAPI 加密后落盘。
+
+    返回带 "dpapi1:" 前缀的密文；非 Windows / 加密失败时原样返回明文
+    （保持向后兼容）并记 error 日志显式告警——不再静默降级。
+    已加密的原样返回，避免二次包裹。"""
+    if not text or text.startswith(_DPAPI_PREFIX):
+        return text
+    try:
+        blob = _dpapi_protect(text.encode("utf-8"))
+        return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
+    except Exception as e:
+        LOG.error("[安全] 敏感串加密失败，已回退明文保存"
+                  "（仅建议在可信的私人机器上使用）: %s", e)
+        return text
+
+
+def unprotect_secret(text):
+    """公开 API：取回敏感串明文。带 dpapi1: 前缀则解密；旧明文原样返回。
+
+    解密失败抛 SecretDecryptError（不再吞成空串，避免上层拿空密码
+    去登录而误报 535 认证失败）。"""
+    if text and text.startswith(_DPAPI_PREFIX):
+        try:
+            return _dpapi_unprotect(
+                base64.b64decode(text[len(_DPAPI_PREFIX):])).decode("utf-8")
+        except Exception as e:
+            raise SecretDecryptError(
+                "敏感串解密失败（数据可能损坏或属于其他 Windows 用户）: %s" % e)
+    return text or ""
+
+
 def _get_fernet():
     """返回 (fernet 实例, key_path)。cryptography 未安装时返回 (None, None)。"""
     try:

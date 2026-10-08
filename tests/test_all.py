@@ -4809,6 +4809,98 @@ class TestOrderP3(TempDirCase):
                 orders, "2026-10-10", "K225", ["张三"]))
 
 
+class TestNotifyP3(TempDirCase):
+    """Task 60: notify P3（to 归一化 / secret_of 抛错 / 明文降级告警 /
+    SMTP 重试 / 公开 secrets API）。"""
+
+    def _email_cfg(self, **over):
+        cfg = {"enabled": True, "smtp_host": "smtp.example.com",
+               "smtp_port": 465, "username": "u", "password": "p",
+               "from": "u@example.com", "to": ["u@example.com"]}
+        cfg.update(over)
+        return cfg
+
+    def test_to_string_normalized_to_list(self):
+        # to 配成字符串：旧代码逐字 join 发往乱码地址却报成功
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(self._email_cfg(to="a@b.com"), "s", "b")
+        self.assertTrue(ok, msg)
+        _from, rcpts, _data = m_ssl.return_value.sendmail.call_args[0]
+        self.assertEqual(rcpts, ["a@b.com"])
+
+    def test_to_semicolon_separated_string_split(self):
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(self._email_cfg(to="a@b.com;b@c.com"), "s", "b")
+        self.assertTrue(ok, msg)
+        _from, rcpts, _data = m_ssl.return_value.sendmail.call_args[0]
+        self.assertEqual(rcpts, ["a@b.com", "b@c.com"])
+
+    def test_secret_of_decrypt_failure_raises(self):
+        # 解密失败不得吞成 ""（旧代码 SMTP 用空密码报 535 误导）
+        with mock.patch.object(pax_mod, "_dpapi_unprotect",
+                               side_effect=RuntimeError("boom")):
+            with self.assertRaises(notify_mod.SecretDecryptError):
+                notify_mod.secret_of("dpapi1:AAAA")
+
+    def test_send_email_decrypt_failure_honest(self):
+        # 授权码解密失败：不得"发送成功"，SMTP 不得被构造
+        with mock.patch.object(pax_mod, "_dpapi_unprotect",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(
+                self._email_cfg(password="dpapi1:AAAA"), "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("解密失败", msg)
+        m_ssl.assert_not_called()
+
+    def test_protect_secret_plaintext_fallback_warns(self):
+        # 非 Windows/加密失败回退明文：必须记 error 日志，不再静默
+        with mock.patch.object(pax_mod, "_dpapi_protect",
+                               side_effect=RuntimeError("boom")):
+            with self.assertLogs("monitor", level="ERROR") as cm:
+                enc = pax_mod.protect_secret("auth-code-x")
+        self.assertEqual(enc, "auth-code-x")  # 行为不变：仍回发明文
+        self.assertTrue(any("明文" in m for m in cm.output))
+
+    def test_smtp_transient_retry_then_success(self):
+        # 瞬时异常重试 2 次：第 3 次成功
+        import smtplib as _smtplib
+        inst = mock.MagicMock()
+        inst.sendmail.side_effect = [_smtplib.SMTPServerDisconnected("c"),
+                                     _smtplib.SMTPServerDisconnected("c"), None]
+        with mock.patch("notify.smtplib.SMTP_SSL", return_value=inst) as m_ssl, \
+             mock.patch("notify.time.sleep") as m_sleep:
+            ok, msg = notify_mod.send_email(self._email_cfg(), "s", "b")
+        self.assertTrue(ok, msg)
+        self.assertEqual(m_ssl.call_count, 3)
+        self.assertEqual(m_sleep.call_count, 2)
+
+    def test_smtp_auth_failure_no_retry(self):
+        # 认证失败（535 类）不重试：立即明确失败
+        import smtplib as _smtplib
+        inst = mock.MagicMock()
+        inst.login.side_effect = _smtplib.SMTPAuthenticationError(535, b"auth")
+        with mock.patch("notify.smtplib.SMTP_SSL", return_value=inst) as m_ssl, \
+             mock.patch("notify.time.sleep") as m_sleep:
+            ok, msg = notify_mod.send_email(self._email_cfg(), "s", "b")
+        self.assertFalse(ok)
+        self.assertEqual(m_ssl.call_count, 1)
+        m_sleep.assert_not_called()
+
+    def test_passengers_public_secrets_api(self):
+        # passengers 暴露公开 protect_secret/unprotect_secret；notify 委托
+        self.assertTrue(callable(pax_mod.protect_secret))
+        self.assertTrue(callable(pax_mod.unprotect_secret))
+        self.assertEqual(pax_mod.unprotect_secret("legacy"), "legacy")
+        self.assertEqual(pax_mod.unprotect_secret(""), "")
+        self.assertEqual(pax_mod.protect_secret("dpapi1:abc"), "dpapi1:abc")  # 不二次包裹
+        self.assertIs(notify_mod.SecretDecryptError, pax_mod.SecretDecryptError)
+        with mock.patch.object(pax_mod, "protect_secret",
+                               return_value="X") as m:
+            self.assertEqual(notify_mod.protect_secret("y"), "X")
+        m.assert_called_once_with("y")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

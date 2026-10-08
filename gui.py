@@ -1772,7 +1772,13 @@ class NotifyFormMixin:
         row("端口", self.port_var, width=10)
         self.user_var = tk.StringVar(value=self.email.get("username", ""))
         row("发件邮箱", self.user_var)
-        self.pwd_var = tk.StringVar(value=notify_mod.secret_of(self.email.get("password", "")))
+        try:
+            _pw = notify_mod.secret_of(self.email.get("password", ""))
+        except notify_mod.SecretDecryptError:
+            # Task 60b：损坏的密文不再吞成空串；显示留空并提示用户重输
+            LOG.warning("[配置] 邮箱授权码解密失败，已清空显示（请重新输入授权码）")
+            _pw = ""
+        self.pwd_var = tk.StringVar(value=_pw)
         row("邮箱授权码", self.pwd_var, show="*")
         self.from_var = tk.StringVar(value=self.email.get("from", ""))
         row("发件人地址", self.from_var)
