@@ -113,9 +113,21 @@ def setup_logging():
 LOG = logging.getLogger("monitor")
 
 
+_CONFIG_CORRUPT_WARNED = False
+
+
 def load_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    """读 config.json。文件损坏（JSON 解析失败）时记一次 warning 并返回空配置，
+    GUI 按缺省/空配置启动（Task 75a；Task 29 只覆盖了 monitor 侧缺文件）。"""
+    global _CONFIG_CORRUPT_WARNED
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        if not _CONFIG_CORRUPT_WARNED:
+            _CONFIG_CORRUPT_WARNED = True
+            LOG.warning("config.json JSON 解析失败，将以空配置启动：%s", CONFIG_PATH)
+        return {}
 
 
 def _lock_timeout_abort():
@@ -186,6 +198,13 @@ def update_state_locked(mutator):
     try:
         with filelock.file_lock(path + ".lock"):
             state = engine_mod.load_state_file(path)
+            if not isinstance(state, dict):
+                # Task 75e：合法非 dict JSON（如 []）直接透传会导致 mutator 的
+                # state.setdefault 抛 AttributeError；记 warning 后按 {} 处理
+                # （与 Task 62c 的 appcommon 读路径口径一致）。
+                LOG.warning("state.json 内容非 dict（%s），已按空状态处理：%s",
+                            type(state).__name__, path)
+                state = {}
             result = mutator(state)
             appcommon.write_state(path, state, tmp_kind="guisave")
             return result
@@ -226,6 +245,68 @@ def format_dates(task):
     if len(ds) <= 3:
         return " / ".join(ds)
     return "{0} ~ {1}（{2}天）".format(ds[0], ds[-1], len(ds))
+
+
+def _date_display_text(dates):
+    """Task 75d：任务编辑器的日期展示文本。返回 (text, non_contiguous)。
+
+    连续多日沿用「首日~末日」区间写法；非连续多日如实列出（、分隔），
+    回写时见 _resolve_saved_dates（绝不静默扩展为连续区间）。
+    """
+    ds = sorted(set(dates or []))
+    if not ds:
+        return "", False
+    if len(ds) == 1:
+        return ds[0], False
+    try:
+        dd = [datetime.date.fromisoformat(d) for d in ds]
+    except (ValueError, TypeError):
+        # 非法条目：原样列出，交由回写决策处理（不静默扩展）
+        return "、".join(ds), True
+    contig = all((dd[i + 1] - dd[i]).days == 1 for i in range(len(dd) - 1))
+    if contig:
+        return "%s~%s" % (ds[0], ds[-1]), False
+    return "、".join(ds), True
+
+
+def _resolve_saved_dates(orig_text, non_contig, orig_dates, orig_range, raw_text):
+    """Task 75d：任务编辑器的日期回写决策。
+
+    非连续展示且用户未改动输入 → 原样返回原 dates/date_range，
+    绝不静默扩展为连续区间；否则走 parse_date_range
+    （非法抛 ValueError，调用方弹提示）。
+    """
+    if non_contig and (raw_text or "").strip() == (orig_text or ""):
+        return list(orig_dates or []), list(orig_range or [])
+    return appcommon.parse_date_range(raw_text)
+
+
+def _build_edited_task(task, *, from_name, to_name, dates, date_range, trains,
+                       seat_types, passengers, auto_order, stop_after_order,
+                       priority, purpose_code):
+    """TaskEditDialog.save 的纯函数部分：组装更新后的任务 dict（便于单测）。
+
+    Task 75b：seats_by_date 原样保留——编辑器不支持按日席别编辑，
+    静默抹除会绕过 engine 的按日席别（:608），导致在用户排除的日期
+    下单不想要的席别。未来编辑器支持按日编辑时，改为传入编辑后的值。
+    """
+    return {
+        "name": task.get("name"),
+        "uid": task.get("uid"),
+        "from": from_name,
+        "to": to_name,
+        "dates": dates,
+        "date_range": date_range,
+        "trains": trains,
+        "seat_types": seat_types,
+        "auto_order": auto_order,
+        "stop_after_order": stop_after_order,
+        "passenger_names": passengers,
+        "priority": priority,
+        "purpose_code": purpose_code,
+        "notify_channels": task.get("notify_channels") or ["email"],
+        "seats_by_date": task.get("seats_by_date") or {},
+    }
 
 
 def remove_task_from_config(config, task):
@@ -2339,6 +2420,10 @@ class TaskPage(ttk.Frame):
         super().__init__(master)
         self.app = app
         self._task_by_iid = {}
+        # Task 75c：日期展示文本缓存。refresh 每 2 秒跑一次，非法日期每次
+        # 调 expand_dates 都会打一条 warning（约 30 条/分/任务）；同一任务
+        # 同一日期配置只展开一次，配置变更时键变化自动重算。
+        self._dates_text_cache = {}
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x", pady=(4, 6))
@@ -2386,6 +2471,18 @@ class TaskPage(ttk.Frame):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
 
+    def _cached_format_dates(self, task):
+        """Task 75c：带缓存的日期展示。键含任务名与日期配置原文，
+        配置不变时直接复用文本，不再调 expand_dates（不重复打 warning）。"""
+        key = (task.get("name"), repr(task.get("dates")),
+               repr(task.get("date_range")))
+        try:
+            return self._dates_text_cache[key]
+        except KeyError:
+            text = format_dates(task)
+            self._dates_text_cache[key] = text
+            return text
+
     def refresh(self):
         try:
             tasks = load_config().get("tasks") or []
@@ -2395,20 +2492,28 @@ class TaskPage(ttk.Frame):
         engine_running = bool(self.app.engine_thread
                               and self.app.engine_thread.is_alive())
         rows = []
+        seen_date_keys = set()
         for i, t in enumerate(tasks, 1):
             st = state.get(t.get("name"), {}).get("status", "paused")
             msg = state.get(t.get("name"), {}).get("message", "")
             # 启动状态：引擎运行中且任务处于 监控中/等待重试 = 已启动
             started = engine_running and st in engine_mod.ACTIVE_STATUSES
+            date_key = (t.get("name"), repr(t.get("dates")),
+                        repr(t.get("date_range")))
+            seen_date_keys.add(date_key)
             rows.append((
                 "● 已启动" if started else "○ 未启动",
                 i, t.get("name", ""), "%s-%s" % (t.get("from", ""), t.get("to", "")),
-                format_dates(t),
+                self._cached_format_dates(t),
                 "/".join(t.get("trains") or []) or "全部",
                 "/".join(t.get("seat_types") or []),
                 t.get("priority", 5),
                 engine_mod.STATUS_LABELS.get(st, st), msg,
                 "started" if started else "stopped", st))
+        # 剪掉已删除/已改配置任务的缓存键，防止无界增长
+        for k in list(self._dates_text_cache):
+            if k not in seen_date_keys:
+                del self._dates_text_cache[k]
         # 内容没变就不重建：避免每 2 秒清空用户选中的行、重置滚动位置
         sig = repr(rows)
         if sig == getattr(self, "_last_rows_sig", None):
@@ -2562,7 +2667,14 @@ class TaskEditDialog(tk.Toplevel):
         self.to_field.entry.insert(0, task.get("to", ""))
 
         dates = engine_mod.expand_dates(task)
-        date_text = dates[0] if len(dates) == 1 else ("%s~%s" % (dates[0], dates[-1])) if dates else ""
+        # Task 75d：记下原始日期配置与展示文本；非连续多日如实列出，
+        # 保存时未改动则原样回写（不静默扩展为连续区间）。
+        self._orig_dates = list(task.get("dates")) \
+            if isinstance(task.get("dates"), list) else []
+        self._orig_date_range = list(task.get("date_range")) \
+            if isinstance(task.get("date_range"), list) else []
+        self._date_text_orig, self._date_non_contig = _date_display_text(dates)
+        date_text = self._date_text_orig
         row = tk.Frame(body, bg=CARD)
         row.pack(fill="x", pady=6)
         tk.Label(row, text="乘车日期", bg=CARD, fg=GRAY, width=8,
@@ -2657,9 +2769,10 @@ class TaskEditDialog(tk.Toplevel):
             messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
             return
         raw = self.date_var.get().strip()
-        dates, date_range = [], []
         try:
-            dates, date_range = appcommon.parse_date_range(raw)
+            dates, date_range = _resolve_saved_dates(
+                self._date_text_orig, self._date_non_contig,
+                self._orig_dates, self._orig_date_range, raw)
         except ValueError as e:
             messagebox.showwarning("提示", "日期格式错误：%s" % e, parent=self)
             return
@@ -2671,23 +2784,14 @@ class TaskEditDialog(tk.Toplevel):
                   self.trains_var.get().replace("，", ",").split(",") if t.strip()]
         passengers = [self.psg_items[i] for i in self.psg_list.curselection()]
 
-        new_task = {
-            "name": self.task.get("name"),
-            "uid": self.task.get("uid"),
-            "from": from_name,
-            "to": to_name,
-            "dates": dates,
-            "date_range": date_range,
-            "trains": trains,
-            "seat_types": seats,
-            "auto_order": bool(self.auto_var.get()),
-            "stop_after_order": bool(self.stop_var.get()),
-            "passenger_names": passengers,
-            "priority": int(self.prio_var.get()),
-            "purpose_code": self.purpose_var.get(),
-            "notify_channels": self.task.get("notify_channels") or ["email"],
-            "seats_by_date": {},  # 编辑为全局席别模式（按日席别需在向导重建）
-        }
+        new_task = _build_edited_task(
+            self.task, from_name=from_name, to_name=to_name,
+            dates=dates, date_range=date_range, trains=trains,
+            seat_types=seats, passengers=passengers,
+            auto_order=bool(self.auto_var.get()),
+            stop_after_order=bool(self.stop_var.get()),
+            priority=int(self.prio_var.get()),
+            purpose_code=self.purpose_var.get())
         def _replace_task(config):
             uid = self.task.get("uid")
             for i, t in enumerate(config.get("tasks") or []):
@@ -3394,6 +3498,18 @@ def _ensure_stdio():
         sys.stderr = _Writer(logging.WARNING)
 
 
+def _config_json_corrupt():
+    """config.json 存在但内容不是合法 JSON（Task 75a）。"""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            json.load(f)
+        return False
+    except json.JSONDecodeError:
+        return True
+    except OSError:
+        return False
+
+
 def main():
     setup_logging()
     _ensure_stdio()
@@ -3404,6 +3520,14 @@ def main():
         root.destroy()
         return
     root = tk.Tk()
+    if _config_json_corrupt():
+        # Task 75a：文件存在但内容损坏——友好提示后按空配置启动
+        # （load_config 会吞掉 JSONDecodeError 返回 {}）。
+        messagebox.showerror(
+            "错误",
+            "config.json 已损坏（JSON 解析失败），将以空配置启动。\n"
+            "请检查文件内容并修复，或删除后重建。",
+            parent=root)
     MonitorApp(root)
     root.mainloop()
 

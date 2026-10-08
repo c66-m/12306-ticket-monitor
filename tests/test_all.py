@@ -6932,6 +6932,187 @@ class TestTask74Launcher(TempDirCase):
         self.assertEqual(app._put_log.call_count, 2)
 
 
+class TestTask75Gui(TempDirCase):
+    """Task 75: gui P2/P3 bundle（a–e）。无 Tk 真机，全部 mock tkinter。"""
+
+    def _write_config(self, content):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(content)
+        return cfg
+
+    # ---- (a) 损坏配置：JSONDecodeError → 空配置 + 友好提示 ----
+
+    def test_load_config_corrupt_returns_empty(self):
+        cfg = self._write_config("{bad json,")
+        with mock.patch.object(gui, "CONFIG_PATH", cfg):
+            gui._CONFIG_CORRUPT_WARNED = False
+            try:
+                self.assertEqual(gui.load_config(), {})
+            finally:
+                gui._CONFIG_CORRUPT_WARNED = False
+
+    def test_load_config_corrupt_warns_once(self):
+        cfg = self._write_config("{bad json,")
+        with mock.patch.object(gui, "CONFIG_PATH", cfg):
+            gui._CONFIG_CORRUPT_WARNED = False
+            try:
+                with self.assertLogs(gui.LOG, level="WARNING") as cm:
+                    gui.load_config()
+                    gui.load_config()
+            finally:
+                gui._CONFIG_CORRUPT_WARNED = False
+        warns = [r for r in cm.records if "解析失败" in r.getMessage()]
+        self.assertEqual(len(warns), 1)
+
+    def test_main_corrupt_config_friendly_prompt_and_starts(self):
+        cfg = self._write_config("{bad json,")
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui.tk, "Tk") as mock_tk, \
+             mock.patch.object(gui, "messagebox") as mock_mb, \
+             mock.patch.object(gui, "MonitorApp") as mock_app, \
+             mock.patch.object(gui, "setup_logging"), \
+             mock.patch.object(gui, "_ensure_stdio"):
+            gui._CONFIG_CORRUPT_WARNED = False
+            try:
+                gui.main()
+            finally:
+                gui._CONFIG_CORRUPT_WARNED = False
+        self.assertEqual(mock_mb.showerror.call_count, 1)
+        self.assertIn("损坏", mock_mb.showerror.call_args[0][1])
+        mock_app.assert_called_once()  # 仍以空配置启动，不直接退出
+        mock_tk.return_value.mainloop.assert_called_once()
+
+    # ---- (b) 编辑保存保留 seats_by_date ----
+
+    def _edited(self, task, **kw):
+        base = dict(from_name="北京", to_name="上海", dates=["2026-10-01"],
+                    date_range=[], trains=["G101"], seat_types=["二等座"],
+                    passengers=["张三"], auto_order=True, stop_after_order=False,
+                    priority=5, purpose_code="ADULT")
+        base.update(kw)
+        return gui._build_edited_task(task, **base)
+
+    def test_build_edited_task_preserves_seats_by_date(self):
+        task = {"name": "t", "uid": "u1", "notify_channels": ["email"],
+                "seats_by_date": {"2026-10-01": ["商务座"]}}
+        new = self._edited(task)
+        # 旧代码：写死 {}，按日席别被静默抹除
+        self.assertEqual(new["seats_by_date"], {"2026-10-01": ["商务座"]})
+        self.assertEqual(new["name"], "t")
+        self.assertEqual(new["seat_types"], ["二等座"])
+
+    def test_build_edited_task_no_seats_by_date(self):
+        new = self._edited({"name": "t"})
+        self.assertEqual(new["seats_by_date"], {})
+        self.assertEqual(new["notify_channels"], ["email"])
+
+    # ---- (c) refresh 缓存日期文本：非法日期只警告一次 ----
+
+    def _make_task_page(self):
+        page = gui.TaskPage.__new__(gui.TaskPage)
+        page.app = mock.Mock()
+        page.app.engine_thread = None
+        page.tree = mock.Mock()
+        page.tree.selection.return_value = ()
+        page.tree.get_children.return_value = ()
+        page.tree.yview.return_value = (0.0, 1.0)
+        page.edit_btn = mock.Mock()
+        page._task_by_iid = {}
+        page._dates_text_cache = {}
+        return page
+
+    def test_refresh_caches_date_text_no_warning_spam(self):
+        task = {"name": "t1", "from": "A", "to": "B",
+                "dates": "20261001", "trains": [], "seat_types": []}
+        page = self._make_task_page()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": [task]}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            with self.assertLogs(gui.LOG, level="WARNING") as cm:
+                page.refresh()
+                page.refresh()
+                page.refresh()
+        warns = [r for r in cm.records if "非列表" in r.getMessage()]
+        # 旧代码：每次 refresh 都调 expand_dates → 3 条 warning 刷屏
+        self.assertEqual(len(warns), 1)
+
+    def test_refresh_cache_invalidates_on_config_change(self):
+        page = self._make_task_page()
+        t1 = {"name": "t1", "dates": ["2026-10-01"]}
+        t2 = {"name": "t1", "dates": ["2026-10-02"]}
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": [t1]}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            page.refresh()
+            shown1 = page._dates_text_cache[("t1", repr(["2026-10-01"]), repr(None))]
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": [t2]}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            page.refresh()
+        self.assertEqual(shown1, "2026-10-01")
+        self.assertNotIn(("t1", repr(["2026-10-01"]), repr(None)),
+                         page._dates_text_cache)
+
+    # ---- (d) 非连续 dates 如实展示/回写 ----
+
+    def test_date_display_text_non_contiguous(self):
+        text, non_contig = gui._date_display_text(["2026-10-03", "2026-10-01"])
+        self.assertTrue(non_contig)
+        self.assertEqual(text, "2026-10-01、2026-10-03")
+
+    def test_date_display_text_contiguous_single_empty(self):
+        self.assertEqual(gui._date_display_text(["2026-10-01", "2026-10-02"]),
+                         ("2026-10-01~2026-10-02", False))
+        self.assertEqual(gui._date_display_text(["2026-10-01"]),
+                         ("2026-10-01", False))
+        self.assertEqual(gui._date_display_text([]), ("", False))
+
+    def test_resolve_saved_dates_keeps_original_when_untouched(self):
+        # 非连续展示且用户未改动 → 原样回写，不静默扩展为连续区间
+        dates, dr = gui._resolve_saved_dates(
+            "2026-10-01、2026-10-03", True,
+            ["2026-10-01", "2026-10-03"], [],
+            "2026-10-01、2026-10-03")
+        self.assertEqual(dates, ["2026-10-01", "2026-10-03"])
+        self.assertEqual(dr, [])
+
+    def test_resolve_saved_dates_parses_edited(self):
+        dates, dr = gui._resolve_saved_dates(
+            "2026-10-01、2026-10-03", True,
+            ["2026-10-01", "2026-10-03"], [],
+            "2026-10-05~2026-10-06")
+        self.assertEqual(dates, [])
+        self.assertEqual(dr, ["2026-10-05", "2026-10-06"])
+
+    def test_resolve_saved_dates_illegal_raises(self):
+        with self.assertRaises(ValueError):
+            gui._resolve_saved_dates("", False, [], [], "not-a-date")
+
+    # ---- (e) 非 dict state 按 {} 处理 ----
+
+    def test_update_state_locked_non_dict_state(self):
+        cfg = self._write_config(json.dumps({"state_file": "state.json"}))
+        def mutator(state):
+            state.setdefault("tasks", {}).setdefault("t", {})["status"] = "paused"
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui.engine_mod, "load_state_file",
+                               return_value=[]), \
+             mock.patch.object(gui.filelock, "file_lock") as mock_lock, \
+             mock.patch.object(gui.appcommon, "write_state") as mock_write:
+            mock_lock.return_value.__enter__.return_value = None
+            with self.assertLogs(gui.LOG, level="WARNING") as cm:
+                gui.update_state_locked(mutator)
+        # 旧代码：state.setdefault 直接 AttributeError
+        mock_write.assert_called_once()
+        saved = mock_write.call_args[0][1]
+        self.assertEqual(saved, {"tasks": {"t": {"status": "paused"}}})
+        self.assertTrue(any("非 dict" in r.getMessage() for r in cm.records))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
