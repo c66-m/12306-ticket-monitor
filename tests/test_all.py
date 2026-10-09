@@ -8835,18 +8835,20 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
     def test_passengers_stamp_mismatch_abandons(self):
         # (d) 旧代码 save_passengers 无 expect_stamp 参数（TypeError）；
         # 且旧行为会静默覆写思考期间的外部写入（数据丢失）。
+        # Task 112 P3：并发冲突警告已从 print 转 LOG（Task 100d 同口径），
+        # 此处断言改为抓 LOG。
         import passengers as pm
         self._patch_pax(pm)
         pm.save_passengers([{"name": "A"}])
         stamp = pm.passengers_stamp()
         # 用户思考期间：另一进程（GUI/Launcher）写入 passengers.json
         pm.save_passengers([{"name": "EXT"}])
-        with mock.patch("builtins.print") as mprint:
+        with self.assertLogs(pm.LOG, level="WARNING") as cm:
             ok = pm.save_passengers([{"name": "A2"}], expect_stamp=stamp)
         self.assertFalse(ok)
         names = [x["name"] for x in pm.load_passengers()]
         self.assertEqual(names, ["EXT"])  # 外部数据保留，未被覆写
-        self.assertIn("已放弃", self._printed(mprint))
+        self.assertIn("已放弃", " ".join(cm.output))
 
     def test_passengers_stamp_match_writes(self):
         # 回归 pin：无外部写入时正常落盘。
@@ -8906,12 +8908,15 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
             return default
 
         with mock.patch.object(monitor_mod, "read", side_effect=fake_read), \
-             mock.patch("builtins.print") as mprint:
+             mock.patch("builtins.print") as mprint, \
+             self.assertLogs(pm.LOG, level="WARNING") as cm:
             monitor_mod.menu_passengers()
         names = [x["name"] for x in pm.load_passengers()]
         self.assertEqual(names, ["EXT"])  # 外部数据保留，未被 A+B 覆写
         printed = self._printed(mprint)
-        self.assertIn("已放弃", printed)
+        # Task 112 P3："已放弃"细节已从 print 转 LOG（GUI 可见）；
+        # monitor 侧"已重新载入"仍走 print（CLI 可操作信息保留）。
+        self.assertIn("已放弃", " ".join(cm.output))
         self.assertIn("重新载入", printed)
         self.assertNotIn("已添加并加密保存", printed)
 
@@ -11973,6 +11978,80 @@ class TestTask111MonitorB5Bundle(TempDirCase):
         printed = self._printed(mprint)
         self.assertIn("警告", printed)
         self.assertIn("尚未保存会话", printed)
+
+
+class TestTask112PassengersB5(TempDirCase):
+    """Task 112: passengers bundle（load 入口非 dict 条目过滤 / 并发冲突 print→LOG /
+    _encrypt 异常进 bool 契约）。"""
+
+    def _write_box(self, data_text, enc="none"):
+        p = os.path.join(self.tmp, "passengers.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "enc": enc, "data": data_text}, f)
+        return p
+
+    # ---- P2: load_passengers 过滤非 dict 条目 ----
+
+    def test_load_filters_non_dict_entries(self):
+        # RED on old code: 非 dict 条目原样返回，下游 p.get("name") 崩
+        import passengers as pax_mod
+        p = self._write_box('["张三", {"name": "李四"}, 123, null]')
+        with self.assertLogs(pax_mod.LOG, level="WARNING") as cm:
+            back = pax_mod.load_passengers(p)
+        self.assertEqual(back, [{"name": "李四"}])
+        self.assertIn("警告", " ".join(cm.output))
+
+    def test_load_clean_list_unchanged(self):
+        # 正向对照：干净 list 原样返回（旧代码即通过）
+        import passengers as pax_mod
+        p = self._write_box('[{"name": "张三"}, {"name": "李四"}]')
+        back = pax_mod.load_passengers(p)
+        self.assertEqual([x["name"] for x in back], ["张三", "李四"])
+
+    def test_load_dict_shape_filters_entries(self):
+        # dict 信封形状的 passengers 节同样过滤
+        import passengers as pax_mod
+        p = self._write_box('{"passengers": ["oops", {"name": "王五"}]}')
+        with self.assertLogs(pax_mod.LOG, level="WARNING"):
+            back = pax_mod.load_passengers(p)
+        self.assertEqual(back, [{"name": "王五"}])
+
+    # ---- P3: 并发冲突 print → LOG ----
+
+    def test_stamp_conflict_warns_via_log(self):
+        # RED on old code: print 走 stdout，assertLogs 抓不到
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        with self.assertLogs(pax_mod.LOG, level="WARNING") as cm:
+            ok = pax_mod.save_passengers([{"name": "A"}], p, expect_stamp="bogus")
+        self.assertFalse(ok)
+        self.assertIn("被其他程序修改", " ".join(cm.output))
+
+    # ---- P3: _encrypt 异常进 bool 契约 ----
+
+    def test_encrypt_runtime_error_returns_false(self):
+        # RED on old code: RuntimeError 逃出 bool 契约
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        with mock.patch.object(pax_mod, "_get_fernet",
+                               side_effect=RuntimeError("密钥文件损坏且无法备份")):
+            ok = pax_mod.save_passengers([{"name": "A"}], p)
+        self.assertFalse(ok)
+
+    def test_encrypt_oserror_returns_false(self):
+        # RED on old code: OSError 逃出 bool 契约
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        with mock.patch.object(pax_mod, "_get_fernet",
+                               side_effect=OSError("磁盘满")):
+            ok = pax_mod.save_passengers([{"name": "A"}], p)
+        self.assertFalse(ok)
+
+    def test_save_success_unchanged(self):
+        # 正向对照：正常保存仍返回 True（旧代码即通过）
+        import passengers as pax_mod
+        p = os.path.join(self.tmp, "passengers.json")
+        self.assertTrue(pax_mod.save_passengers([{"name": "A"}], p))
 
 
 if __name__ == "__main__":

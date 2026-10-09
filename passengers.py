@@ -360,6 +360,27 @@ def _decrypt(enc_name, data_text):
     return data_text
 
 
+def _sanitize_passenger_entries(entries, path):
+    """过滤乘车人条目中的非 dict 脏数据（Task 112 P2，与 Task 104 同口径）。
+
+    load 入口一次性 sanitize：一处堵住下游 8+ 崩溃点（monitor/launcher/gui
+    的 p.get("name") / p["name"] 等）。脏条目记 warning 后剔除；passengers
+    节本身非 list 时按空处理（损坏形状，非用户内容）。
+    """
+    if not isinstance(entries, list):
+        LOG.warning("[警告] 乘车人文件 %s 的 passengers 节不是列表（%r），"
+                    "已按空处理", path, entries)
+        return []
+    clean = []
+    for e in entries:
+        if isinstance(e, dict):
+            clean.append(e)
+        else:
+            LOG.warning("[警告] 乘车人文件 %s 含非法条目（%r），已跳过",
+                        path, e)
+    return clean
+
+
 def load_passengers(path=None):
     """读取并解密乘车人列表。文件不存在或损坏时返回 []。"""
     path = path or DEFAULT_PATH
@@ -377,8 +398,10 @@ def load_passengers(path=None):
         text = _decrypt(box.get("enc", "none"), box.get("data", "[]"))
         data = json.loads(text)
         if isinstance(data, list):
-            return data
-        return data.get("passengers", []) if isinstance(data, dict) else []
+            return _sanitize_passenger_entries(data, path)
+        if isinstance(data, dict):
+            return _sanitize_passenger_entries(data.get("passengers", []), path)
+        return []
     except Exception as e:
         # Task 100d：print 在 GUI 下不可见（Task 80c 同类同模块遗漏）——
         # 转 LOG.error（三路可见：控制台/文件/GUI 日志面板）。
@@ -445,8 +468,10 @@ def save_passengers(passengers, path=None, force=False, expect_stamp=_STAMP_UNSE
             if expect_stamp is not _STAMP_UNSET \
                     and passengers_stamp(path) != expect_stamp:
                 # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
-                print("  [警告] passengers.json 在编辑期间被其他程序修改，"
-                      "本次保存已放弃（未覆盖对方的修改）。")
+                # Task 112 P3：print 在 GUI 下不可见（Task 100d 同类同模块遗漏）——
+                # 转 LOG.warning（三路可见：控制台/文件/GUI 日志面板）。
+                LOG.warning("  [警告] passengers.json 在编辑期间被其他程序修改，"
+                            "本次保存已放弃（未覆盖对方的修改）。")
                 return False
             if not force and _is_undecryptable_box(path):
                 LOG.error("[安全] 拒绝覆盖不可解密的 passengers 数据（%s），"
@@ -463,6 +488,12 @@ def save_passengers(passengers, path=None, force=False, expect_stamp=_STAMP_UNSE
         # 记 error 后返回 False（与 Task 81d 的 upsert_order 同口径）。
         LOG.error("[警告] passengers.json 正被其他进程占用，本次保存已跳过，"
                   "请稍后重试")
+        return False
+    except (RuntimeError, OSError) as e:
+        # Task 112 P3：_encrypt 路径异常（Fernet 密钥损坏且无法备份、密钥生成
+        # 磁盘满等）同样纳入 bool 契约——调用方只处理 False，不接异常。
+        # 注意 TimeoutError 是 OSError 子类，分支顺序不可换。
+        LOG.error("[警告] passengers.json 加密失败，本次保存已跳过：%s", e)
         return False
 
 
