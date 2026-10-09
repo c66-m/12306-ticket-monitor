@@ -11434,6 +11434,198 @@ class TestTask108EngineSanitizeB5(TempDirCase):
         self.assertTrue(q.called)
 
 
+class TestTask109GuiSanitizeB5(TempDirCase):
+    """Task 109（B5-2）：gui sanitize bundle（P2×2 + P3×4，第四轮重扫）。
+
+    - P2：notify/email 非 dict（null）→ setdefault 链 AttributeError，GUI 启动崩
+    - P2：config["tasks"] 非 dict 条目 gui 侧未 sanitize（Task 97 只修 monitor，
+      Task 104 只修 launcher grab_tasks）
+    - P3：priority 非数字字符串 → TaskEditDialog 打不开
+    - P3："to" 裸字符串展示被 ",".join 逐字符拆（round-3 P2-2 同类最后一处）
+    - P3：update_config_locked 内 setdefault("tasks", []).append 在 tasks 非 list
+      时 AttributeError → 对话框卡住
+    - P3：update_state_locked 内 state.setdefault("tasks", {}).setdefault 在
+      tasks 节非 dict 时 AttributeError → 重试产生重复任务
+    改后：读/写两条漏斗单点 sanitize（Task 104 口径）；priority 安全默认；
+    to 展示用 _display_seat_types。无 Tk 真机，逻辑层测试为主。
+    """
+
+    def _patch_gui(self, config_obj=None, state_obj=None):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump(config_obj if config_obj is not None else {}, f)
+        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+            p = mock.patch.object(gui, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        st = os.path.join(self.tmp, "state.json")
+        if state_obj is not None:
+            with open(st, "w", encoding="utf-8") as f:
+                json.dump(state_obj, f)
+        return cfg, st
+
+    def _reset_warned(self):
+        if hasattr(gui, "_SANITIZE_WARNED"):
+            gui._SANITIZE_WARNED.clear()
+
+    # ---- P2：notify/email 非 dict（gui.py:2073/:2554，写侧 :2041） ----
+
+    def test_load_config_notify_null_sanitized(self):
+        # 改前：load_config 原样返回 {"notify": None}，调用点
+        # cfg.setdefault("notify", {}).setdefault("email", {}) 在 None 上
+        # 调 setdefault → AttributeError，GUI 启动崩溃。
+        self._patch_gui({"notify": None})
+        cfg = gui.load_config()
+        self.assertEqual(cfg["notify"], {})
+        email = cfg.setdefault("notify", {}).setdefault("email", {})
+        self.assertEqual(email, {})
+
+    def test_load_config_email_null_sanitized(self):
+        self._patch_gui({"notify": {"email": None, "x": 1}})
+        cfg = gui.load_config()
+        email = cfg.setdefault("notify", {}).setdefault("email", {})
+        self.assertEqual(email, {})
+        self.assertEqual(cfg["notify"], {"email": {}, "x": 1})
+
+    def test_update_config_locked_notify_null_write_safe(self):
+        # 改前：写侧 _save_email 的 c.setdefault("notify", {})["email"] = ...
+        # 在 None 上做 ["email"] = → TypeError。
+        cfg_path, _ = self._patch_gui({"notify": None})
+        gui.update_config_locked(
+            lambda c: c.setdefault("notify", {}).__setitem__(
+                "email", {"username": "a@b.com"}))
+        with open(cfg_path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["notify"]["email"], {"username": "a@b.com"})
+
+    # ---- P2：tasks 非 dict 条目 gui 侧 sanitize ----
+
+    def test_load_config_tasks_entries_dropped(self):
+        self._patch_gui({"tasks": [{"name": "a"}, "junk", None, 42,
+                                    {"name": "b"}]})
+        cfg = gui.load_config()
+        self.assertEqual([t["name"] for t in cfg["tasks"]], ["a", "b"])
+
+    def test_task_name_loop_safe_after_load(self):
+        # gui.py:2339 StartMonitorDialog 循环体原文：t.get("name")。
+        # 改前脏条目在此抛 AttributeError。
+        self._patch_gui({"tasks": [{"name": "a"}, "junk", None]})
+        config = gui.load_config()
+        names = [t.get("name") or "" for t in config.get("tasks") or []]
+        self.assertEqual(names, ["a"])
+
+    def test_update_config_locked_tasks_entries_uid_loop_safe(self):
+        # 覆盖 remove_task_from_config（:400）/_replace_task（:2957）的
+        # t.get("uid") 遍历：二者都经 update_config_locked。
+        self._patch_gui({"tasks": [{"uid": "u1", "name": "a"}, "junk", None]})
+        seen = []
+
+        def mutator(config):
+            for t in config.get("tasks") or []:
+                seen.append(t.get("uid"))  # 改前在 "junk" 处抛 AttributeError
+
+        gui.update_config_locked(mutator)
+        self.assertEqual(seen, ["u1"])
+
+    def test_load_config_dirty_warns_once(self):
+        # 读侧高频调用（TaskPage.refresh 每 2 秒一次），同类问题每进程只记一次。
+        self._patch_gui({"notify": None, "tasks": ["junk"]})
+        self._reset_warned()
+        with self.assertLogs(gui.LOG, level="WARNING") as logs:
+            gui.load_config()
+            gui.load_config()
+        pins = [m for m in logs.output
+                if "已按空配置处理" in m or "已剔除" in m]
+        self.assertEqual(len(pins), 2)  # notify + tasks-entries，各一次
+
+    # ---- P3：priority 非数字（gui.py:2902） ----
+
+    def test_safe_priority_non_numeric_string(self):
+        # 改前表达式 int("abc" or 5) 直接抛 ValueError，TaskEditDialog 打不开。
+        with self.assertRaises(ValueError):
+            int("abc" or 5)
+        self.assertEqual(gui._safe_priority({"priority": "abc"}), 5)
+        self.assertEqual(gui._safe_priority({"priority": None}), 5)
+        self.assertEqual(gui._safe_priority({}), 5)
+        self.assertEqual(gui._safe_priority({"priority": 3}), 3)
+        self.assertEqual(gui._safe_priority({"priority": "7"}), 7)
+
+    # ---- P3："to" 展示逐字符拆（gui.py:2016） ----
+
+    def test_to_display_bare_string_not_char_split(self):
+        # 改前表达式：",".join("a@b.com" or []) → "a,@,b,.,c,o,m"。
+        self.assertEqual(",".join("a@b.com" or []), "a,@,b,.,c,o,m")
+        # 改后：_display_seat_types 归一化（Task 103c/106 同口径）。
+        self.assertEqual(",".join(gui._display_seat_types("a@b.com")),
+                         "a@b.com")
+        self.assertEqual(",".join(gui._display_seat_types(["a@b.com", "c@d.com"])),
+                         "a@b.com,c@d.com")
+        self.assertEqual(",".join(gui._display_seat_types(None)), "")
+        # 调用点 pin：2016 行必须用 helper。
+        import inspect
+        src = inspect.getsource(gui.NotifyFormMixin._build_notify_fields)
+        self.assertIn('_display_seat_types(self.email.get("to"))', src)
+
+    # ---- P3：update_config_locked 内 tasks 非 list（:1529/:1706/:2962） ----
+
+    def test_update_config_locked_tasks_non_list_append_safe(self):
+        # 改前：config.setdefault("tasks", []) 返回 "junk"，.append 抛
+        # AttributeError → 对话框卡住。
+        cfg_path, _ = self._patch_gui({"tasks": "junk"})
+        gui.update_config_locked(
+            lambda c: c.setdefault("tasks", []).append({"name": "t"}))
+        with open(cfg_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["tasks"], [{"name": "t"}])
+
+    def test_update_config_locked_tasks_dict_shape_append_safe(self):
+        cfg_path, _ = self._patch_gui({"tasks": {"a": 1}})
+        gui.update_config_locked(
+            lambda c: c.setdefault("tasks", []).append({"name": "t"}))
+        with open(cfg_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["tasks"], [{"name": "t"}])
+
+    # ---- P3：update_state_locked 内 tasks 节非 dict（:284） ----
+
+    def test_update_state_locked_tasks_section_non_dict(self):
+        # 改前：state.setdefault("tasks", {}).setdefault(name, {}) 在 "junk"
+        # 上调 setdefault → AttributeError；config 已追加但 state 没写，重试
+        # 产生重复任务。
+        _, st_path = self._patch_gui({}, {"tasks": "junk"})
+
+        def _mark(state):
+            entry = state.setdefault("tasks", {}).setdefault("t1", {})
+            entry["status"] = "monitoring"
+            entry.setdefault("fail_streak", 0)
+            entry.setdefault("last_poll", 0)
+
+        gui.update_state_locked(_mark)  # 改前在此抛 AttributeError
+        with open(st_path, encoding="utf-8") as f:
+            state = json.load(f)
+        # 无数据丢失：条目完整写下。
+        self.assertEqual(state["tasks"]["t1"]["status"], "monitoring")
+        self.assertEqual(state["tasks"]["t1"]["fail_streak"], 0)
+        self.assertEqual(state["tasks"]["t1"]["last_poll"], 0)
+
+    # ---- 正向对照：干净配置行为不变 ----
+
+    def test_load_config_clean_unchanged(self):
+        clean = {"notify": {"email": {"to": ["a@b.com"]}},
+                 "tasks": [{"name": "a"}]}
+        self._patch_gui(clean)
+        self._reset_warned()
+        with self.assertNoLogs(gui.LOG, level="WARNING"):
+            cfg = gui.load_config()
+        self.assertEqual(cfg, clean)
+
+    def test_update_config_locked_clean_append_unchanged(self):
+        cfg_path, _ = self._patch_gui({"tasks": [{"name": "a"}]})
+        gui.update_config_locked(
+            lambda c: c.setdefault("tasks", []).append({"name": "b"}))
+        with open(cfg_path, encoding="utf-8") as f:
+            self.assertEqual([t["name"] for t in json.load(f)["tasks"]],
+                             ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

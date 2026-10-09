@@ -115,6 +115,51 @@ LOG = logging.getLogger("monitor")
 
 _CONFIG_CORRUPT_WARNED = False
 
+_SANITIZE_WARNED = set()
+
+
+def _sanitize_config_shapes(config, *, warn_every_time=False):
+    """Task 109：gui 侧 config 形状 sanitize（Task 104「load 入口 sanitize」口径）。
+
+    覆盖读（load_config）写（update_config_locked）两条漏斗的单点守卫：
+    - notify/email 非 dict（如手改的 null）→ warn + {}
+    - tasks 非 list → warn + []
+    - tasks 条目非 dict → warn + 剔除
+    仅改内存对象；写侧经保存自然回写治愈文件（Task 104「自然治愈」裁决：
+    丢弃的是损坏数据，非用户内容）。
+    warn_every_time=False 时同类问题每进程只记一次（读侧高频调用防刷屏；
+    TaskPage.refresh 每 2 秒调一次 load_config）。
+    """
+    def _warn(key, msg, *args):
+        if warn_every_time or key not in _SANITIZE_WARNED:
+            _SANITIZE_WARNED.add(key)
+            LOG.warning(msg, *args)
+
+    notify = config.get("notify")
+    if "notify" in config and not isinstance(notify, dict):
+        _warn("notify", "config.json 的 notify 节不是对象（%s），已按空配置处理",
+              type(notify).__name__)
+        config["notify"] = {}
+        notify = {}
+    if isinstance(notify, dict):
+        email = notify.get("email")
+        if "email" in notify and not isinstance(email, dict):
+            _warn("email", "config.json 的 notify.email 节不是对象（%s），已按空配置处理",
+                  type(email).__name__)
+            notify["email"] = {}
+    tasks = config.get("tasks")
+    if "tasks" in config and not isinstance(tasks, list):
+        _warn("tasks-shape", "config.json 的 tasks 节不是列表（%s），已按空列表处理",
+              type(tasks).__name__)
+        config["tasks"] = []
+        tasks = []
+    if isinstance(tasks, list):
+        clean = [t for t in tasks if isinstance(t, dict)]
+        if len(clean) != len(tasks):
+            _warn("tasks-entries", "config.json 的 tasks 含 %d 条非对象条目，已剔除",
+                  len(tasks) - len(clean))
+            config["tasks"] = clean
+
 
 def load_config():
     """读 config.json。文件损坏（JSON 解析失败、非 UTF-8 编码）或解析成功但
@@ -138,6 +183,7 @@ def load_config():
             LOG.error("config.json 顶层不是 dict 对象（%s），将以空配置启动：%s",
                       type(data).__name__, CONFIG_PATH)
         return {}
+    _sanitize_config_shapes(data)
     return data
 
 
@@ -237,6 +283,11 @@ def update_config_locked(mutator):
                     parent=None)
                 raise RuntimeError(
                     "config.json 内容非 dict：本次保存已取消，旧文件未被覆盖")
+            # Task 109：写侧单点 sanitize（与 load_config 同口径）：tasks 非 list/
+            # 条目非 dict、notify/email 非 dict 在 mutator 运行前归一化，避免
+            # setdefault(...).append / t.get(...) 抛 AttributeError；脏值经本次
+            # 写回自然治愈（Task 104「自然治愈」裁决）。
+            _sanitize_config_shapes(config, warn_every_time=True)
             result = mutator(config)
             # Task 66: config.json 含密钥，落盘 0600
             appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
@@ -263,6 +314,15 @@ def update_state_locked(mutator):
                 LOG.warning("state.json 内容非 dict（%s），已按空状态处理：%s",
                             type(state).__name__, path)
                 state = {}
+            tasks_sec = state.get("tasks")
+            if "tasks" in state and not isinstance(tasks_sec, dict):
+                # Task 109：tasks 节非 dict（如手改的列表/字符串）时，mutator 的
+                # state.setdefault("tasks", {}).setdefault(name, {}) 抛
+                # AttributeError（Task 75e 只守卫了顶层；Task 93 管的是读侧）。
+                # 记 warning 后按 {} 处理，与 _state_tasks_dict 同口径。
+                LOG.warning("state.json 的 tasks 节不是对象（%s），已按空处理：%s",
+                            type(tasks_sec).__name__, path)
+                state["tasks"] = {}
             result = mutator(state)
             appcommon.write_state(path, state, tmp_kind="guisave")
             return result
@@ -362,6 +422,16 @@ def _display_seat_types(raw):
     if not isinstance(raw, (list, tuple)):
         return []
     return [s for s in raw if isinstance(s, str)]
+
+
+def _safe_priority(task):
+    """Task 109：TaskEditDialog 优先级安全默认。task["priority"] 为非数字
+    字符串（如手改的 "abc"）时旧代码 int(...) 抛 ValueError 导致对话框打不开；
+    改后用安全默认 5（与 launcher Task 96b 同口径）。"""
+    try:
+        return int(task.get("priority") or 5)
+    except (TypeError, ValueError):
+        return 5
 
 
 def _build_edited_task(task, *, from_name, to_name, dates, date_range, trains,
@@ -2013,7 +2083,9 @@ class NotifyFormMixin:
         row("邮箱授权码", self.pwd_var, show="*")
         self.from_var = tk.StringVar(value=self.email.get("from", ""))
         row("发件人地址", self.from_var)
-        self.to_var = tk.StringVar(value=",".join(self.email.get("to") or []))
+        # Task 109：to 裸字符串按单个收件人展示（旧代码 ",".join 逐字符拆；
+        # _display_seat_types 函数体通用，Task 106 已有复用先例）。
+        self.to_var = tk.StringVar(value=",".join(_display_seat_types(self.email.get("to"))))
         row("收件人", self.to_var)
         ttk.Label(body, text="收件人多个用逗号分隔；发件人地址留空则默认同发件邮箱；QQ/163 邮箱需在邮箱设置中开启 SMTP 服务并生成授权码",
                   foreground=GRAY, wraplength=hint_wraplength).pack(anchor="w", pady=4)
@@ -2899,7 +2971,7 @@ class TaskEditDialog(tk.Toplevel):
         row.pack(fill="x", pady=8)
         tk.Label(row, text="优先级", bg=CARD, fg=GRAY, width=8,
                  anchor="w").pack(side="left")
-        self.prio_var = tk.IntVar(value=int(task.get("priority") or 5))
+        self.prio_var = tk.IntVar(value=_safe_priority(task))
         for v in range(1, 11):
             tk.Radiobutton(row, text=str(v), value=v, variable=self.prio_var,
                            bg=CARD, activebackground=CARD, font=(FONT, 8),
