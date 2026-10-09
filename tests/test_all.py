@@ -11626,6 +11626,139 @@ class TestTask109GuiSanitizeB5(TempDirCase):
                              ["a", "b"])
 
 
+class TestTask110LauncherB5(TempDirCase):
+    """Task 110 (B5-3): launcher bundle — P2x1 + P3x6，第四轮重扫发现。"""
+
+    # ---- P2: merge_trains_from_monitor 的 config 形状 ----
+    def test_merge_trains_config_top_non_dict(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump([{"tasks": []}], f)
+        lc = {"trains": []}
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", lambda *a: None):
+            ret = launcher.merge_trains_from_monitor(lc, saver=lambda c: None)
+        self.assertFalse(ret)
+
+    def test_merge_trains_tasks_non_list(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": "G101"}, f, ensure_ascii=False)
+        lc = {"trains": []}
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", lambda *a: None):
+            ret = launcher.merge_trains_from_monitor(lc, saver=lambda c: None)
+        self.assertFalse(ret)
+
+    def test_merge_trains_dirty_task_entry_skipped(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": ["脏条目", {"trains": ["G102"]}]}, f,
+                      ensure_ascii=False)
+        lc = {"trains": []}
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", lambda *a: None):
+            ret = launcher.merge_trains_from_monitor(lc, saver=lambda c: None)
+        self.assertTrue(ret)
+        self.assertIn("G102", lc["trains"])
+
+    def test_merge_trains_synced_trains_bare_string_no_pollution(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"trains": ["G102"]}]}, f, ensure_ascii=False)
+        lc = {"trains": [], "synced_trains": "G101"}
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", lambda *a: None):
+            ret = launcher.merge_trains_from_monitor(lc, saver=lambda c: None)
+        self.assertTrue(ret)
+        # 绝不能是逐字符拆成的 ['0', '1', 'G']
+        self.assertEqual(sorted(lc["synced_trains"]), ["G101", "G102"])
+
+    # ---- P3: append_monitor_task 的 state tasks 节 ----
+    def test_append_monitor_task_state_tasks_non_dict(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": []}, f)
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": ["脏"]}, f, ensure_ascii=False)
+        with mock.patch.object(launcher, "HERE", self.tmp):
+            name = launcher.append_monitor_task({"name": "T110"}, start_now=False)
+        self.assertEqual(name, "T110")
+        state = json.load(open(st, encoding="utf-8"))
+        self.assertEqual(state["tasks"]["T110"]["status"], "paused")
+
+    def test_append_monitor_task_state_top_non_dict(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": []}, f)
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump(["脏顶层"], f, ensure_ascii=False)
+        with mock.patch.object(launcher, "HERE", self.tmp):
+            name = launcher.append_monitor_task({"name": "T111"}, start_now=False)
+        self.assertEqual(name, "T111")
+        state = json.load(open(st, encoding="utf-8"))
+        self.assertEqual(state["tasks"]["T111"]["status"], "paused")
+
+    # ---- P3: _remember_query 脏条目 ----
+    def test_remember_query_dirty_entry_no_crash(self):
+        class _FakeApp:
+            pass
+        fake = _FakeApp()
+        fake.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+                   "query_history": ["脏条目",
+                                     {"from": "北京", "to": "上海",
+                                      "date": "2026-10-10"}]}
+        saved = {}
+        fake._save_cfg = lambda lc: saved.update(lc)
+        fake._put_log = lambda line: None
+        launcher.LauncherApp._remember_query(fake)
+        # 脏条目被跳过；好条目与本次查询去重后只剩本次
+        self.assertEqual(len(saved["query_history"]), 1)
+        self.assertEqual(saved["query_history"][0]["from"], "北京")
+
+    # ---- P3: station_history / passenger_names 归一化 ----
+    def test_normalize_station_history_bare_string(self):
+        self.assertEqual(
+            launcher._normalize_station_history("北京", lambda *a: None),
+            ["北京"])
+
+    def test_normalize_station_history_clean_list_unchanged(self):
+        self.assertEqual(
+            launcher._normalize_station_history(["北京", "上海"],
+                                                lambda *a: None),
+            ["北京", "上海"])
+
+    def test_purpose_of_bare_string_names_no_char_split(self):
+        lc = {"passenger_names": "张三", "pax_purpose": {"张三": "0X00"}}
+        # 旧代码把 "张三" 拆成 '张'/'三' 逐字查票种 → 误判为 ADULT
+        self.assertEqual(launcher.purpose_of(lc), "0X00")
+
+    def test_purpose_map_of_bare_string_names_no_char_split(self):
+        lc = {"passenger_names": "张三", "pax_purpose": {}, "purpose_code": "ADULT"}
+        self.assertEqual(launcher.purpose_map_of(lc), {"张三": "ADULT"})
+
+    def test_display_passenger_names_bare_string(self):
+        self.assertEqual(launcher._display_passenger_names("张三"), ["张三"])
+
+    # ---- P3: ensure_passengers 首跑单字乘车人 ----
+    def test_ensure_passengers_bare_string_names(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"passenger_names": "张三"}]}, f,
+                      ensure_ascii=False)
+        with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher, "log", lambda *a: None), \
+             mock.patch.object(launcher.passengers_mod, "save_passengers",
+                               return_value=True) as m_save:
+            launcher.ensure_passengers()
+        m_save.assert_called_once()
+        names = [p["name"] for p in m_save.call_args[0][0]]
+        # 旧代码 for n in "张三" 会建成 ['张', '三'] 两个单字乘车人
+        self.assertEqual(names, ["张三"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

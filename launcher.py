@@ -163,7 +163,9 @@ def purpose_of(lc, name=None):
     default = lc.get("purpose_code") or "ADULT"
     if name is not None:
         return pm.get(name) or default
-    names = lc.get("passenger_names") or []
+    # Task 110：passenger_names 裸字符串归一化，绝不逐字符拆（旧代码会把
+    # "张三" 拆成 '张'/'三' 逐字查票种，导致余票查询口径误判）
+    names = _normalize_passenger_names(lc.get("passenger_names"), log)
     codes = [pm.get(n) or default for n in names] or [default]
     return "0X00" if all(c == "0X00" for c in codes) else "ADULT"
 
@@ -173,7 +175,9 @@ def purpose_map_of(lc):
     lc = lc or {}
     pm = lc.get("pax_purpose") or {}
     default = lc.get("purpose_code") or "ADULT"
-    return {n: (pm.get(n) or default) for n in (lc.get("passenger_names") or [])}
+    # Task 110：同 purpose_of，裸字符串绝不逐字符拆
+    return {n: (pm.get(n) or default)
+            for n in _normalize_passenger_names(lc.get("passenger_names"), log)}
 
 
 # ===== 复选框指示器：clam 主题选中时画的是「叉」(✗)，容易被当成取消，改成「对勾」(✓) =====
@@ -410,6 +414,45 @@ def _display_seat_types(raw):
     席别、绝不逐字符拆），但不打日志——展示路径可能高频刷新，畸形值的警告由
     数据消费路径（engine/launcher 运行链）负责；这里只解决展示。"""
     return _normalize_seat_types(raw, lambda *a: None)
+
+
+def _normalize_passenger_names(raw, warn):
+    """passenger_names 字段归一化（Task 110；与 _normalize_seat_types 同口径）：
+    裸字符串（如漏写方括号的 "张三"）按单个乘车人处理并记警告，绝不逐字符拆
+    （旧代码 for n in "张三" 会拆成 ['张','三']，导致票种口径误判、首跑建成
+    单字乘车人）；形状非法记警告后忽略；非字符串条目跳过。"""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        warn("[提醒] passenger_names 为字符串，已按单个乘车人处理：%s" % raw)
+        return [raw]
+    if not isinstance(raw, (list, tuple)):
+        warn("[提醒] passenger_names 形状非法，已忽略：%r" % (raw,))
+        return []
+    return [n for n in raw if isinstance(n, str)]
+
+
+def _display_passenger_names(raw):
+    """展示用乘车人名归一化（Task 110）：与 _display_seat_types 同口径
+    （字符串按单个乘车人、绝不逐字符拆），但不打日志——展示路径可能高频刷新，
+    畸形值的警告由数据消费路径负责；这里只解决展示。"""
+    return _normalize_passenger_names(raw, lambda *a: None)
+
+
+def _normalize_station_history(raw, warn):
+    """station_history 字段归一化（Task 110；与 _normalize_seat_types 同口径）：
+    裸字符串按单个车站处理并记警告，绝不逐字符拆
+    （旧代码 list("北京") 会拆成 ['北','京'] 写回污染配置）；形状非法记警告后
+    忽略；非字符串条目跳过。"""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        warn("[提醒] station_history 为字符串，已按单个车站处理：%s" % raw)
+        return [raw]
+    if not isinstance(raw, (list, tuple)):
+        warn("[提醒] station_history 形状非法，已忽略：%r" % (raw,))
+        return []
+    return [s for s in raw if isinstance(s, str)]
 
 
 def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
@@ -1002,14 +1045,28 @@ def merge_trains_from_monitor(lc, saver=None):
     except Exception as e:
         log("[提醒] 读取监控系统 config.json 失败，本轮不合并车次：%s" % e)
         return False
+    # Task 110（P2）：config 顶层非 dict / tasks 非 list 时旧代码在 try 之外
+    # 直接 cfg.get / t.get → AttributeError，任务窗口打不开。先守形状。
+    if not isinstance(cfg, dict):
+        log("[提醒] 监控系统 config.json 顶层不是对象，本轮不合并车次：%r" % (cfg,))
+        return False
+    tasks = cfg.get("tasks") or []
+    if not isinstance(tasks, list):
+        log("[提醒] 监控系统 config.json tasks 非列表，本轮不合并车次：%r" % (tasks,))
+        return False
     mon = []
-    for t in (cfg.get("tasks") or []):
+    for t in tasks:
+        if not isinstance(t, dict):
+            log("[提醒] 监控任务条目非对象，已跳过：%r" % (t,))
+            continue
         # Task 84a：字符串 trains 按单车次归一化，绝不逐字符拆
         for tr in _normalize_trains(t.get("trains"), log):
             if tr and tr not in mon:
                 mon.append(tr)
     cur = _normalize_trains(lc.get("trains"), log)
-    old_synced = set(lc.get("synced_trains") or [])
+    # Task 110（P3）：synced_trains 裸字符串归一化——旧代码 set("G101") 会变成
+    # 字符集 {'G','1','0'} 写回污染配置；此处与末尾比较共用同一归一化结果
+    old_synced = set(_normalize_trains(lc.get("synced_trains"), log))
     synced = set(old_synced)
     added = []
     for tr in mon:
@@ -1017,7 +1074,7 @@ def merge_trains_from_monitor(lc, saver=None):
             cur.append(tr)
             added.append(tr)
         synced.add(tr)
-    if added or synced != set(lc.get("synced_trains") or []):
+    if added or synced != old_synced:
         lc["trains"] = cur
         lc["synced_trains"] = sorted(synced)
         (saver or save_launcher_config)(lc)
@@ -1161,7 +1218,19 @@ def append_monitor_task(task, start_now=True):
                         state = {}
                 else:
                     state = {}  # 首次使用：还没有状态文件，从空状态开始是正常的
-                entry = state.setdefault("tasks", {}).setdefault(task["name"], {})
+                # Task 110（P3）：state tasks 节非 dict 时旧代码 setdefault 链直接
+                # AttributeError——此时 config 已追加，报"创建失败"后用户重试会
+                # 产生重复任务。先守形状再链式写入（写回时自然治愈）。
+                # 顶层非 dict 同样会崩在 state.get，必须一并守住。
+                if not isinstance(state, dict):
+                    log("[提醒] state.json 顶层不是对象，已按空重建：%r" % (state,))
+                    state = {}
+                tasks_sec = state.get("tasks")
+                if not isinstance(tasks_sec, dict):
+                    log("[提醒] state.json tasks 节形状非法，已按空重建：%r" % (tasks_sec,))
+                    tasks_sec = {}
+                    state["tasks"] = tasks_sec
+                entry = tasks_sec.setdefault(task["name"], {})
                 entry["status"] = "monitoring" if start_now else "paused"
                 entry.setdefault("fail_streak", 0)
                 entry.setdefault("last_poll", 0)
@@ -2399,7 +2468,9 @@ class LauncherApp(tk.Frame):
                 for n, v in self.pax_purpose_vars.items()}
         # 兼容监控引擎 / 旧配置：全局口径 = 勾选乘车人的余票查询口径
         lc["purpose_code"] = purpose_of(lc)
-        hist = list(lc.get("station_history") or [])
+        # Task 110（P3）：station_history 裸字符串归一化——旧代码 list("北京")
+        # 会逐字符拆成 ['北','京'] 写回污染配置
+        hist = _normalize_station_history(lc.get("station_history"), log)
         for stn in (lc["from"], lc["to"]):
             if stn and stn not in hist:
                 hist.insert(0, stn)
@@ -2423,7 +2494,10 @@ class LauncherApp(tk.Frame):
             ttk.Label(self.pax_box, text="（未添加乘车人，点右侧按钮添加）",
                       foreground="#6e7781").pack(side="left")
             return
-        sel = cur_sel or self.lc.get("passenger_names") or passengers_mod.default_names() or [plist[0]["name"]]
+        # Task 110（P3）：lc 里手改的 passenger_names 裸字符串归一化——旧代码
+        # `name in sel` 会退化成子串检查导致预选错乱
+        sel = (cur_sel or _display_passenger_names(self.lc.get("passenger_names"))
+               or passengers_mod.default_names() or [plist[0]["name"]])
         saved = self.lc.get("pax_purpose") or {}
         default_code = self.lc.get("purpose_code") or "ADULT"
         for p in plist:
@@ -2789,9 +2863,21 @@ class LauncherApp(tk.Frame):
                 "date": lc.get("date") or ""}
         if not (item["from"] and item["to"]):
             return
-        hist = [h for h in (lc.get("query_history") or [])
-                if not (h.get("from") == item["from"] and h.get("to") == item["to"]
-                        and h.get("date") == item["date"])]
+        # Task 110（P3）：query_history 非 dict 条目旧代码 h.get 直接 AttributeError，
+        # 会逃出 _drain（只捕获 queue.Empty）导致 after 链断裂、日志面板+查询管线
+        # 永久冻结。此处跳过脏条目，保证 _drain 永不中断。
+        raw_hist = lc.get("query_history") or []
+        if not isinstance(raw_hist, (list, tuple)):
+            self._put_log("[提醒] query_history 形状非法，已忽略：%r" % (raw_hist,))
+            raw_hist = []
+        hist = []
+        for h in raw_hist:
+            if not isinstance(h, dict):
+                self._put_log("[提醒] 查询历史条目非对象，已跳过：%r" % (h,))
+                continue
+            if not (h.get("from") == item["from"] and h.get("to") == item["to"]
+                    and h.get("date") == item["date"]):
+                hist.append(h)
         hist.insert(0, item)
         lc["query_history"] = hist[:10]
         self._save_cfg(lc)
@@ -3666,9 +3752,23 @@ def ensure_passengers():
     try:
         with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        for t in (cfg.get("tasks") or []):
-            for n in (t.get("passenger_names") or []):
-                n = str(n).strip()
+        # Task 110（P3）：config 顶层非 dict / tasks 非 list / 条目非 dict 时
+        # 旧代码 cfg.get / t.get 直接 AttributeError（被 except 吞掉则整个首跑
+        # 导入静默跳过）；passenger_names 裸字符串归一化，绝不逐字符拆（旧代码
+        # 首跑会建成 ['张','三'] 这样的单字乘车人）。
+        if not isinstance(cfg, dict):
+            log("[提醒] config.json 顶层不是对象，跳过乘车人导入：%r" % (cfg,))
+            return
+        tasks = cfg.get("tasks") or []
+        if not isinstance(tasks, list):
+            log("[提醒] config.json tasks 非列表，跳过乘车人导入：%r" % (tasks,))
+            return
+        for t in tasks:
+            if not isinstance(t, dict):
+                log("[提醒] 监控任务条目非对象，已跳过：%r" % (t,))
+                continue
+            for n in _normalize_passenger_names(t.get("passenger_names"), log):
+                n = n.strip()
                 if n and n not in names:
                     names.append(n)
     except Exception:
