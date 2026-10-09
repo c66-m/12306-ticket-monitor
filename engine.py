@@ -159,9 +159,32 @@ def _safe_config_float(raw, default, what):
     return v
 
 
+def _safe_config_path(config, key, default):
+    """路径类配置安全取值（Task 108，Task 68a 家族）：键缺失→静默用默认；
+    键存在但非字符串（含 null）或空字符串→记一次警告后回默认值。
+
+    供 state_file / history_file / log_dir 共用：手改配置写成 null 时旧代码
+    os.path.join(HERE, None) 直接 TypeError 启动崩。
+    """
+    if key not in config:
+        return default
+    raw = config[key]
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    wk = ("path", key, repr(raw))
+    if wk not in _WARNED_CONFIG:
+        _WARNED_CONFIG.add(wk)
+        LOG.warning("[配置] %s=%r 非法，已按默认值 %r 处理",
+                    key, raw, default)
+    return default
+
+
 def _sanitize_tasks(raw):
     """tasks 字段形状校验（Task 68a）：非列表→记 error 后视为空；非 dict 条目→
-    记 error 后跳过该条。绝不让手改配置的形状手误崩掉引擎进程。"""
+    记 error 后跳过该条。绝不让手改配置的形状手误崩掉引擎进程。
+    Task 108：name 不可哈希（list/dict）的条目→记 error 后跳过。旧代码在
+    _sync_config 集合推导、_resume_or_init_status setdefault、task_status、
+    _run_task 成员检查四处无包裹 → TypeError 杀死整个引擎。"""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -169,10 +192,17 @@ def _sanitize_tasks(raw):
         return []
     out = []
     for t in raw:
-        if isinstance(t, dict):
-            out.append(t)
-        else:
+        if not isinstance(t, dict):
             LOG.error("[配置] tasks 含非法条目已跳过：%r", t)
+            continue
+        name = t.get("name")
+        if name is not None:
+            try:
+                hash(name)
+            except TypeError:
+                LOG.error("[配置] tasks 含不可哈希任务名已跳过：%r", t)
+                continue
+        out.append(t)
     return out
 
 
@@ -344,8 +374,10 @@ class MonitorEngine(object):
         except OSError:
             self._config_mtime = None
 
-        self.state_path = os.path.join(HERE, self.config.get("state_file", "state.json"))
-        self.history_path = os.path.join(HERE, self.config.get("history_file", "order_history.json"))
+        self.state_path = os.path.join(HERE, _safe_config_path(
+            self.config, "state_file", "state.json"))
+        self.history_path = os.path.join(HERE, _safe_config_path(
+            self.config, "history_file", "order_history.json"))
         self.state = self._load_state()
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
@@ -384,7 +416,8 @@ class MonitorEngine(object):
     # ----------------------------- 日志 -----------------------------
 
     def _setup_logging(self):
-        log_dir = os.path.join(HERE, self.config.get("log_dir", "logs"))
+        log_dir = os.path.join(HERE, _safe_config_path(
+            self.config, "log_dir", "logs"))
         os.makedirs(log_dir, exist_ok=True)
         # 按天滚动：长跑跨天后日志自动切到新日期的文件
         fh = logutil.DayFileHandler(log_dir, "monitor")
@@ -474,12 +507,37 @@ class MonitorEngine(object):
         self.state["tasks"].setdefault(...) 直接 AttributeError：启动崩
         （__init__→_resume_or_init_status）或运行中 _sync_state 重载后
         线程死亡。记 error 并按空任务集安全降级，线程不死。
-        _load_state 与 _reload_state 共用（两条独立漏斗）。"""
+        _load_state 与 _reload_state 共用（两条独立漏斗）。
+        Task 108：
+        - 单个 task 条目非 dict（如 "t1": "garbage"）→ _resume_or_init_status
+          的 setdefault 取回旧值后 entry["status"]=... 直接 TypeError 启动崩；
+          _sync_config 杀 run() 循环；task_status AttributeError 杀引擎线程。
+          记 error 后剔除该条目（Task 104 同口径：load 入口 sanitize）。
+        - dedup/retry 非 dict（如 []）→ setdefault 不替换已存在的坏形状 →
+          后续 self.state["dedup"][key]=... 直接 TypeError，任务永久崩溃循环；
+          且 _save_state 只修落盘快照（_merge_state_for_save），self.state
+          内存永不自愈。此处把内存一并修复（error+{}），下次 _save_state
+          自然落盘治愈文件。"""
         if not isinstance(state.get("tasks"), dict):
             LOG.error("[状态] %s 的 tasks 节不是对象（%s），已按空任务集降级；"
                       "请检查文件是否被手改损坏",
                       self.state_path, type(state.get("tasks")).__name__)
             state["tasks"] = {}
+        else:
+            for name in list(state["tasks"]):
+                if not isinstance(state["tasks"][name], dict):
+                    LOG.error("[状态] %s 的任务条目「%s」不是对象（%s），已跳过；"
+                              "请检查文件是否被手改损坏",
+                              self.state_path, name,
+                              type(state["tasks"][name]).__name__)
+                    del state["tasks"][name]
+        for sec in ("dedup", "retry"):
+            if not isinstance(state.get(sec), dict):
+                LOG.error("[状态] %s 的 %s 节不是对象（%s），已按空降级；"
+                          "请检查文件是否被手改损坏",
+                          self.state_path, sec,
+                          type(state.get(sec)).__name__)
+                state[sec] = {}
         return state
 
     def _save_state(self, state=None):
@@ -859,10 +917,20 @@ class MonitorEngine(object):
         if self.task_status(task) not in ACTIVE_STATUSES:
             return False, False
 
-        from_code = self.name2code.get(task["from"])
-        to_code = self.name2code.get(task["to"])
+        from_name = task.get("from")
+        to_name = task.get("to")
+        if not isinstance(from_name, str) or not isinstance(to_name, str):
+            # Task 108：缺 from/to → task["from"] 直接 KeyError；from 非字符
+            # 串（如 list）→ name2code.get 直接 TypeError（不可哈希）；旧代码
+            # 在单任务 backoff 循环里反复崩。记 warning 后按失败跳过本轮。
+            LOG.warning("[任务] 任务「%s」的 from/to 形状非法，已跳过：%r -> %r",
+                        task.get("name"), from_name, to_name)
+            self.set_task_status(task, "failed", "出发/到达站配置非法，已跳过")
+            return False, False
+        from_code = self.name2code.get(from_name)
+        to_code = self.name2code.get(to_name)
         if not from_code or not to_code:
-            self.set_task_status(task, "failed", "车站名称无法识别: %s -> %s" % (task["from"], task["to"]))
+            self.set_task_status(task, "failed", "车站名称无法识别: %s -> %s" % (from_name, to_name))
             return False, False
 
         dates, expired = future_dates(task)
@@ -873,6 +941,14 @@ class MonitorEngine(object):
         trains = normalize_trains(task)
         seats_want_all = normalize_seat_types(task)
         seats_by_date = task.get("seats_by_date") or {}
+        if not isinstance(seats_by_date, dict):
+            # Task 108：真值非 dict（裸字符串）→ 下方 seats_by_date[date]
+            # 直接 TypeError（字符串索引）或 .get 直接 AttributeError；旧代码
+            # 在单任务 backoff 循环里反复崩。记 warning 后按 {} 处理（走全局
+            # seat_types）。
+            LOG.warning("[任务] 任务「%s」的 seats_by_date 形状非法，已忽略：%r",
+                        task.get("name"), task.get("seats_by_date"))
+            seats_by_date = {}
         auto_order = bool(task.get("auto_order", True))
         stop_after = bool(task.get("stop_after_order", True))
 

@@ -11293,6 +11293,147 @@ class TestTask106BareStringHardening(TempDirCase):
         self.assertEqual(launcher._display_seat_types(None), [])
 
 
+class TestTask108EngineSanitizeB5(TempDirCase):
+    """Task 108 (B5-1)：engine sanitize bundle（P2×3 + P3×3，第四轮重扫）。
+    同 Task 91/93/104 口径——load 入口 sanitize + 内存自愈。
+    """
+
+    def _make_engine(self, cfg_path):
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})):
+            with mock.patch.object(engine_mod, "HERE", self.tmp):
+                return engine_mod.MonitorEngine(config_path=cfg_path,
+                                                setup_logging=False)
+
+    def _write_config(self, cfg):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        return p
+
+    def test_unhashable_task_name_skipped_not_crash(self):
+        # P2：任务名不可哈希（list）→ 旧代码 _resume_or_init_status 的
+        # setdefault(name) 直接 TypeError 杀死整个引擎（_sync_config 集合
+        # 推导、task_status、_run_task 成员检查亦然）。应 warn+跳过该条。
+        p = self._write_config({"tasks": [
+            {"name": ["x"], "from": "A", "to": "B"},
+            {"name": "good", "from": "A", "to": "B"}]})
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            e = self._make_engine(p)
+        self.assertEqual([t["name"] for t in e.tasks], ["good"])
+        self.assertTrue(any("哈希" in m for m in logs.output),
+                        "必须明确记 error 指出任务名不可哈希")
+
+    def test_unhashable_task_name_sync_config_not_crash(self):
+        # P2：运行中 _sync_config 的集合推导 {t.get("name") or "" ...}
+        # 同样被不可哈希名杀死。热更新路径亦须覆盖。
+        p = self._write_config({"tasks": [{"name": "good"}]})
+        e = self._make_engine(p)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": ["y"]}, {"name": "good2"}]}, f)
+        st = os.stat(p)
+        os.utime(p, (st.st_mtime + 5, st.st_mtime + 5))
+        changed = e._sync_config()  # 旧代码 TypeError
+        self.assertTrue(changed)
+        self.assertEqual([t["name"] for t in e.tasks], ["good2"])
+
+    def test_state_task_entry_non_dict_sanitized(self):
+        # P2：state.json 单个 task 条目非 dict → 旧代码 _resume_or_init_status
+        # 取回旧值后 entry["status"]=... 直接 TypeError 启动崩（Task 93a
+        # 只守卫了 tasks 节）。应 warn+剔除该条目；配置中仍有的任务由
+        # _resume_or_init_status 重建干净条目。
+        p = self._write_config({"tasks": [{"name": "t1"}]})
+        sp = os.path.join(self.tmp, "state.json")
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"dedup": {}, "tasks": {"tX": "garbage",
+                                             "t2": {"status": "paused"}},
+                       "retry": {}}, f)
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            e = self._make_engine(p)
+        self.assertNotIn("tX", e.state["tasks"])
+        self.assertIn("t2", e.state["tasks"])
+        self.assertIsInstance(e.state["tasks"]["t1"], dict)
+        self.assertTrue(any("tX" in m for m in logs.output))
+
+    def test_dedup_retry_non_dict_memory_healed(self):
+        # P2：state.json dedup/retry 非 dict → setdefault 不替换已存在的坏
+        # 形状 → 后续 self.state["dedup"][key]=... 直接 TypeError，任务永久
+        # 崩溃循环；且 _save_state 只修落盘快照，内存永不自愈。内存亦须修复。
+        p = self._write_config({"tasks": []})
+        sp = os.path.join(self.tmp, "state.json")
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"dedup": [], "tasks": {}, "retry": "xx"}, f)
+        e = self._make_engine(p)
+        self.assertEqual(e.state["dedup"], {})
+        self.assertEqual(e.state["retry"], {})
+        # 内存已愈：后续写入不再 TypeError（旧代码此处崩）
+        e.state["dedup"]["k"] = "SUBMITTED"
+        self.assertEqual(e.state["dedup"]["k"], "SUBMITTED")
+
+    def test_path_keys_non_string_use_default(self):
+        # P3：state_file/history_file/log_dir 非字符串（含 null）→
+        # os.path.join 直接 TypeError 启动崩。应 warn+安全默认。
+        # （键缺失时静默用默认，不警告——与旧 .get(key, default) 行为一致。）
+        p = self._write_config({"tasks": [], "state_file": None,
+                                "history_file": 123, "log_dir": ["x"]})
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            e = self._make_engine(p)
+        self.assertTrue(e.state_path.endswith("state.json"), e.state_path)
+        self.assertTrue(e.history_path.endswith("order_history.json"),
+                        e.history_path)
+        self.assertTrue(any("state_file" in m for m in logs.output))
+
+    def test_path_keys_missing_silent_default(self):
+        # 回归 pin：键缺失时静默用默认，不警告（与旧 .get(key, default)
+        # 行为一致；只有键存在但形状非法才警告）。
+        p = self._write_config({"tasks": []})
+        with self.assertNoLogs("monitor", level="WARNING"):
+            e = self._make_engine(p)
+        self.assertTrue(e.state_path.endswith("state.json"))
+        self.assertTrue(e.history_path.endswith("order_history.json"))
+
+    def test_task_missing_from_does_not_raise(self):
+        # P3：task 缺 from → 旧代码 task["from"] 直接 KeyError，单任务无限
+        # backoff 循环。应 warn+按失败跳过本轮。
+        e = make_engine(self.tmp)
+        e.state["tasks"]["t1"] = {"status": "monitoring", "fail_streak": 0,
+                                  "last_poll": 0}
+        t = task_of()
+        del t["from"]
+        ok, _ = e._run_task(t)  # 旧代码 KeyError
+        self.assertFalse(ok)
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "failed")
+
+    def test_task_non_string_from_does_not_raise(self):
+        # P3：from 非字符串（如 list）→ 旧代码 name2code.get([...])
+        # 直接 TypeError，同循环。应 warn+按失败跳过本轮。
+        e = make_engine(self.tmp)
+        e.state["tasks"]["t1"] = {"status": "monitoring", "fail_streak": 0,
+                                  "last_poll": 0}
+        t = task_of(**{"from": ["长葛"]})
+        ok, _ = e._run_task(t)  # 旧代码 TypeError
+        self.assertFalse(ok)
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "failed")
+
+    def test_seats_by_date_bare_string_treated_as_empty(self):
+        # P3：seats_by_date 真值非 dict（裸字符串）→ 旧代码
+        # seats_by_date[date] 直接 TypeError（字符串索引），单任务 backoff
+        # 循环。应 warn+按 {} 处理（后续走全局 seat_types）。
+        # mock 掉下游网络查询：本测试只验证 seats_by_date 形状处理。
+        e = make_engine(self.tmp)
+        e.state["tasks"]["t1"] = {"status": "monitoring", "fail_streak": 0,
+                                  "last_poll": 0}
+        tomorrow = (datetime.date.today() +
+                    datetime.timedelta(days=1)).isoformat()
+        t = task_of(seats_by_date=tomorrow)  # 含 date 子串，确保命中旧崩点
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[]) as q:
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                e._run_task(t)  # 旧代码 TypeError
+        self.assertTrue(any("seats_by_date" in m for m in logs.output))
+        self.assertTrue(q.called)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
