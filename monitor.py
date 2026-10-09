@@ -171,6 +171,18 @@ def update_config_locked(mutator):
         _lock_timeout_abort()
 
 
+def _config_file_name(config, key, default):
+    """*_file 类配置（state_file/history_file/session_cookies_file）：
+    非字符串（手改损坏）时记警告后用默认值，不让 os.path.join 的
+    TypeError 崩掉调用方（Task 111）。"""
+    v = config.get(key, default)
+    if not isinstance(v, str):
+        print("  [警告] {0} 配置形状非法（应为文件名），已使用默认值 {1}。"
+              .format(key, default))
+        return default
+    return v
+
+
 def update_state_locked(mutator):
     """state.json 读-改-写原子接口：整包在 file_lock 内，与引擎/launcher/gui 互斥。
 
@@ -178,7 +190,8 @@ def update_state_locked(mutator):
     路径解析沿用 gui.save_state 的口径（config 的 state_file，默认 state.json）。
     """
     config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    path = os.path.join(
+        HERE, _config_file_name(config, "state_file", "state.json"))
     try:
         with filelock.file_lock(path + ".lock"):
             state = engine_mod.load_state_file(path)
@@ -523,9 +536,24 @@ def _join_str_list(raw):
     return None
 
 
+def _config_tasks_list(config):
+    """config 的 tasks 节：非 list（手改成 dict/int）时记警告后按空列表
+    处理，不让菜单 2/3 的 enumerate/len/index 抛 TypeError/KeyError 杀死
+    整个 CLI（Task 111；Task 97c 只修了创建路径）。缺键（None）是正常新
+    配置，不警告。降级只作用于本次展示/选择，不回写（不覆写用户数据）。"""
+    tasks = config.get("tasks")
+    if tasks is None:
+        return []
+    if not isinstance(tasks, list):
+        print("  [警告] tasks 配置形状非法（应为列表），已按空列表展示"
+              "（配置损坏，请检查 config.json）。")
+        return []
+    return tasks
+
+
 def menu_task_list():
     config = load_config()
-    tasks = config.get("tasks") or []
+    tasks = _config_tasks_list(config)
     if not tasks:
         print("\n  暂无任务。请先在菜单 [1] 创建。")
         return
@@ -620,7 +648,10 @@ def menu_task_ops():
     # Task 87：load 后立即取指纹；删除保存时若指纹变化说明交互期间有
     # 外部写入，save_config 会警告并放弃（不静默覆写对方修改）。
     stamp = _config_stamp()
-    tasks = config.get("tasks") or []
+    # Task 111：顶层 tasks 非 list（dict/int）时记警告后按空列表展示，
+    # 不让 len/index 抛 TypeError/KeyError 杀死整个 CLI（Task 97c 只修了
+    # 创建路径；展示侧走 _config_tasks_list）。
+    tasks = _config_tasks_list(config)
     if not tasks:
         print("\n  暂无任务。")
         return
@@ -734,8 +765,17 @@ def menu_passengers():
             for code, label in passengers_mod.ID_TYPE_NAMES.items():
                 print("    {0}. {1}".format(code, label))
             id_type = read("  证件类型代码（回车=1 二代身份证）：", "1")
-            id_no = read("  证件号码：", "") or ""
-            mobile = read("  手机号（可空）：", "") or ""
+            id_no = read("  证件号码：", "")
+            if id_no is None:
+                # Ctrl+C/EOF：取消本次添加（旧代码 `or ""` 把中断消化为
+                # 空值后继续添加；Task 111，Task 97e 同口径）。
+                print("  已取消添加。")
+                continue
+            mobile = read("  手机号（可空）：", "")
+            if mobile is None:
+                # Ctrl+C/EOF：取消本次添加（同上）。
+                print("  已取消添加。")
+                continue
             try:
                 is_default = ask_yes_no("  设为默认乘车人？", "n")
                 is_adult = ask_yes_no("  是否成人？", "y")
@@ -762,9 +802,26 @@ def menu_passengers():
                 continue
             if raw.isdigit() and 1 <= int(raw) <= len(passengers):
                 p = passengers[int(raw) - 1]
-                name = read("  姓名（%s）：" % p.get("name"), p.get("name")) or p.get("name")
-                id_no = read("  证件号码（保持不填=不变）：", "") or p.get("id_no")
-                mobile = read("  手机号：", p.get("mobile")) or p.get("mobile")
+                name = read("  姓名（%s）：" % p.get("name"), p.get("name"))
+                if name is None:
+                    # Ctrl+C/EOF：取消本次编辑（旧代码 `or 旧值` 把中断消化
+                    # 为"保留旧值"后继续编辑，用户无法取消；Task 111，
+                    # Task 97e 同口径）。
+                    print("  已取消。")
+                    continue
+                name = name or p.get("name")
+                id_no = read("  证件号码（保持不填=不变）：", "")
+                if id_no is None:
+                    # Ctrl+C/EOF：取消本次编辑（同上）。
+                    print("  已取消。")
+                    continue
+                id_no = id_no or p.get("id_no")
+                mobile = read("  手机号：", p.get("mobile"))
+                if mobile is None:
+                    # Ctrl+C/EOF：取消本次编辑（同上）。
+                    print("  已取消。")
+                    continue
+                mobile = mobile or p.get("mobile")
                 try:
                     is_default = ask_yes_no(
                         "  设为默认乘车人？(当前：%s)" % ("是" if p.get("is_default") else "否"),
@@ -825,7 +882,8 @@ def menu_passengers():
 
 def menu_history():
     config = load_config()
-    path = os.path.join(HERE, config.get("history_file", "order_history.json"))
+    path = os.path.join(
+        HERE, _config_file_name(config, "history_file", "order_history.json"))
     if not os.path.exists(path):
         print("\n  暂无购票历史记录。")
         return
@@ -905,7 +963,14 @@ def menu_notify():
     if port is None:
         # Ctrl+C/EOF：视为用户中断，抛给 main_menu 的已有处理（"已中断，返回主菜单。"）
         raise KeyboardInterrupt
-    email["smtp_port"] = int(port) if port.isdigit() else 465
+    if port.isdigit() and 1 <= int(port) <= 65535:
+        email["smtp_port"] = int(port)
+    else:
+        # 非法端口（非数字/超出 1-65535）：明确提示后用默认 465，
+        # 不再静默强制（Task 111）。
+        print("  [警告] SMTP 端口非法（应为 1-65535 的数字），"
+              "已使用默认端口 465。")
+        email["smtp_port"] = 465
     username = read("  发件邮箱：", email.get("username") or "")
     if username is None:
         # Ctrl+C/EOF：取消本次修改（同上，不消化为"保留旧值"；Task 97e）。
@@ -980,7 +1045,9 @@ def menu_notify():
 def menu_session():
     print("\n===== 登录会话 =====")
     config = load_config()
-    cookie_path = os.path.join(HERE, config.get("session_cookies_file", "session_cookies.json"))
+    cookie_path = os.path.join(
+        HERE, _config_file_name(config, "session_cookies_file",
+                                "session_cookies.json"))
     if os.path.exists(cookie_path):
         try:
             s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))

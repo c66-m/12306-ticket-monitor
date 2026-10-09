@@ -2048,26 +2048,26 @@ class TestMonitorInterruptRound4(TempDirCase):
             monitor_mod.menu_passengers()
         return pm
 
-    def test_edit_name_none_keeps_original(self):
-        # 编辑时在"姓名"处 Ctrl+C：旧代码存 name=None；新代码保留原名
-        pm = self._run_passengers(["2", "1", None, "", "13800138000", "y", "y", "0"])
-        saved = pm.save_passengers.call_args[0][0]
-        self.assertEqual(saved[0]["name"], "张三")
+    def test_edit_name_none_cancels_edit(self):
+        # Task 111（第四轮重扫裁决）：编辑时在"姓名"处 Ctrl+C → 取消本次
+        # 编辑，不保存。旧 Task 28r4 口径是 `or` 保留原值后完成保存，但
+        # 中断被消化为"保留旧值"，用户无法区分取消与保留；现统一为 Task 97e
+        # 的取消语义。P1 关注点（不存 None 入数据）依然成立——取消即不保存。
+        pm = self._run_passengers(["2", "1", None, "0"])
+        pm.save_passengers.assert_not_called()
 
-    def test_edit_mobile_none_keeps_original(self):
-        # 编辑时在"手机号"处 Ctrl+C：旧代码存 mobile=None；新代码保留原号
-        pm = self._run_passengers(["2", "1", "张三", "", None, "y", "y", "0"])
-        saved = pm.save_passengers.call_args[0][0]
-        self.assertEqual(saved[0]["mobile"], "13800138000")
+    def test_edit_mobile_none_cancels_edit(self):
+        # Task 111：编辑时在"手机号"处 Ctrl+C → 取消本次编辑，不保存
+        #（同上，旧口径完成保存；现取消语义）。
+        pm = self._run_passengers(["2", "1", "张三", "", None, "0"])
+        pm.save_passengers.assert_not_called()
 
-    def test_add_idno_mobile_none_stored_empty(self):
-        # 添加时在证件号/手机号处 Ctrl+C：旧代码存 None；新代码按 default 存 ""
-        pm = self._run_passengers(["1", "李四", "1", None, None, "y", "y", "0"])
-        saved = pm.save_passengers.call_args[0][0]
-        new = saved[1]  # append 的新记录；saved[0] 是原有样本
-        self.assertEqual(new["name"], "李四")
-        self.assertEqual(new["id_no"], "")
-        self.assertEqual(new["mobile"], "")
+    def test_add_idno_none_cancels_add(self):
+        # Task 111：添加时在证件号处 Ctrl+C → 取消本次添加，不保存
+        #（旧代码 `or ""` 消化中断后继续添加，用户无法取消；Task 97d 已让
+        # 姓名处可取消，此处统一）。
+        pm = self._run_passengers(["1", "李四", "1", None, "0"])
+        pm.save_passengers.assert_not_called()
 
     def test_notify_username_password_none_keep_original(self):
         # 通知设置在发件邮箱/授权码处 Ctrl+C：旧代码存 None；新代码保留原值
@@ -5384,15 +5384,17 @@ class TestMonitorLogP3(TempDirCase):
 
     def test_log_emit_flushes(self):
         # (c) 写缓冲 flush：硬崩不丢尾——emit 后不 close 也能读到内容。
+        # Task 111 附带修复：期望文件名必须用 logutil._beijing_today()
+        #（与 DayFileHandler 一致），不能用 date.today()——UTC 机器上
+        # 北京时间已过零点时两者差一天，测试必挂（与实现无关的纯测试 bug）。
         log_dir = os.path.join(self.tmp, "logs2")
         h = logutil.DayFileHandler(log_dir, "m")
         try:
             h.emit(logging.LogRecord("t", logging.INFO, __file__, 1,
                                      "hello-flush", None, None))
-            import datetime as dt
             path = os.path.join(
                 log_dir,
-                "m_{0}.log".format(dt.date.today().strftime("%Y%m%d")))
+                "m_{0}.log".format(logutil._beijing_today().strftime("%Y%m%d")))
             with open(path, encoding="utf-8") as f:
                 content = f.read()
         finally:
@@ -11757,6 +11759,220 @@ class TestTask110LauncherB5(TempDirCase):
         names = [p["name"] for p in m_save.call_args[0][0]]
         # 旧代码 for n in "张三" 会建成 ['张', '三'] 两个单字乘车人
         self.assertEqual(names, ["张三"])
+
+
+class TestTask111MonitorB5Bundle(TempDirCase):
+    """Task 111 (B5-4): monitor bundle（P2×1 + P3×3）——
+    (P2) 顶层 "tasks" 非 list（dict/int）→ 菜单 2/3 traceback，整 CLI 不可用
+        （Task 97c 只修了创建路径）；
+    (P3) menu_passengers 新增/编辑 prompt 把 Ctrl+C/EOF 当"保留旧值"消化
+        （Task 97e 只修了 menu_notify）；
+    (P3) 非法 SMTP 端口静默强制为 465，无提示；
+    (P3) state_file/history_file/session_cookies_file 非字符串 →
+        os.path.join TypeError。"""
+
+    @staticmethod
+    def _printed(mprint):
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    @staticmethod
+    def _mock_engine():
+        eng = mock.MagicMock()
+        eng.state = {"tasks": {}}
+        eng.base_interval = 300
+        return eng
+
+    # ---- (P2) tasks 非 list：菜单 2/3 ----
+
+    def test_task_list_tasks_int_no_crash(self):
+        # 旧代码：enumerate(123) 抛 TypeError，菜单 2 直接 traceback。
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": 123}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_list()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertIn("暂无任务", printed)
+
+    def test_task_list_tasks_dict_warns_and_degrades(self):
+        # dict：旧代码不崩但逐 key 打奇怪警告；新代码应统一警告+按空展示。
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": {"a": 1}}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_list()
+        printed = self._printed(mprint)
+        self.assertIn("按空列表展示", printed)
+        self.assertIn("暂无任务", printed)
+
+    def test_task_ops_tasks_int_no_crash(self):
+        # 旧代码：len(123) 抛 TypeError，菜单 3 直接 traceback。
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": 123}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_ops()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertIn("暂无任务", printed)
+
+    def test_task_ops_tasks_dict_select_no_crash(self):
+        # 旧代码：dict 上 tasks[0] 抛 KeyError（选中序号后）。
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": {"a": 1}}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch.object(m, "read", return_value="1"), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_ops()  # 旧代码展示后选中即 KeyError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+
+    def test_task_list_tasks_missing_no_warning(self):
+        # 正向对照：缺键（None）是正常新配置，不警告，走原"暂无任务"流程。
+        import monitor as m
+        with mock.patch.object(m, "load_config", return_value={}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine()), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_list()
+        printed = self._printed(mprint)
+        self.assertIn("暂无任务", printed)
+        self.assertNotIn("警告", printed)
+
+    # ---- (P3) menu_passengers Ctrl+C/EOF 消化 ----
+
+    def _run_passengers(self, passengers, read_values):
+        import monitor as m
+        pm = mock.MagicMock()
+        pm.load_passengers.return_value = passengers
+        pm.passengers_stamp.return_value = "s"
+        printed = []
+        with mock.patch.object(m, "passengers_mod", pm), \
+             mock.patch.object(m, "read", side_effect=read_values), \
+             mock.patch.object(m, "ask_yes_no", return_value=False), \
+             mock.patch.object(m, "_save_passengers_or_refresh",
+                               return_value=(True, passengers,
+                                             "s2")) as m_save, \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            m.menu_passengers()
+        return " ".join(printed), m_save
+
+    def test_passengers_add_ctrlc_id_no_cancels(self):
+        # 旧代码：`or ""` 把 Ctrl+C 消化为空值后继续添加，用户无法取消。
+        printed, m_save = self._run_passengers(
+            [], ["1", "张三", "1", None, "", "0"])
+        self.assertIn("已取消添加", printed)
+        self.assertNotIn("已添加并加密保存", printed)
+        m_save.assert_not_called()
+
+    def test_passengers_edit_ctrlc_name_cancels(self):
+        # 旧代码：`or 旧值` 把 Ctrl+C 消化为"保留旧值"后继续编辑。
+        pax = [{"name": "李四", "id_type_code": "1", "id_no": "123",
+                "mobile": "138", "is_default": False, "is_adult": True}]
+        printed, m_save = self._run_passengers(
+            pax, ["2", "1", None, "0", "", "", "0"])
+        self.assertIn("已取消", printed)
+        self.assertNotIn("已更新并加密保存", printed)
+        m_save.assert_not_called()
+
+    # ---- (P3) SMTP 非法端口 ----
+
+    def _run_notify_port(self, port_input):
+        import monitor as m
+        cfg = {"notify": {"email": {
+            "enabled": True, "smtp_host": "smtp.qq.com", "smtp_port": 465,
+            "username": "u", "password": "", "from": "", "to": []}}}
+        printed = []
+        with mock.patch.object(m, "load_config", return_value=cfg), \
+             mock.patch.object(m, "_config_stamp", return_value="s"), \
+             mock.patch.object(m, "read",
+                               side_effect=["", port_input, None]), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            try:
+                m.menu_notify()
+            except KeyboardInterrupt:
+                pass  # username 处 Ctrl+C → 取消修改（Task 97e 口径）
+        return " ".join(printed), cfg["notify"]["email"]["smtp_port"]
+
+    def test_notify_bad_port_warns_and_defaults(self):
+        # 旧代码：非法端口静默强制为 465，无任何提示。
+        printed, port = self._run_notify_port("abc")
+        self.assertIn("端口", printed)
+        self.assertEqual(port, 465)
+
+    def test_notify_out_of_range_port_warns(self):
+        # "99999".isdigit() 为 True，旧代码静默接受非法端口。
+        printed, port = self._run_notify_port("99999")
+        self.assertIn("端口", printed)
+        self.assertEqual(port, 465)
+
+    def test_notify_valid_port_unchanged(self):
+        # 正向对照：合法端口原样透传，不警告。
+        printed, port = self._run_notify_port("587")
+        self.assertEqual(port, 587)
+        self.assertNotIn("端口非法", printed)
+
+    # ---- (P3) *_file 非字符串 ----
+
+    def test_config_file_name_shapes(self):
+        import monitor as m
+        with mock.patch("builtins.print") as mprint:
+            self.assertEqual(
+                m._config_file_name({"state_file": 123},
+                                    "state_file", "state.json"),
+                "state.json")
+        self.assertIn("警告", self._printed(mprint))
+        with mock.patch("builtins.print") as mprint:
+            # 缺键：正常默认，不警告
+            self.assertEqual(
+                m._config_file_name({}, "state_file", "state.json"),
+                "state.json")
+        self.assertNotIn("警告", self._printed(mprint))
+        with mock.patch("builtins.print") as mprint:
+            # 正常字符串：原样透传
+            self.assertEqual(
+                m._config_file_name({"state_file": "s.json"},
+                                    "state_file", "state.json"),
+                "s.json")
+        self.assertNotIn("警告", self._printed(mprint))
+
+    def test_history_nonstring_file_no_crash(self):
+        # 旧代码：os.path.join(HERE, 123) 抛 TypeError。
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"history_file": 123}), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_history()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertIn("暂无购票历史记录", printed)
+
+    def test_session_nonstring_cookies_file_no_crash(self):
+        # 旧代码：os.path.join(HERE, 123) 抛 TypeError。
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"session_cookies_file": 123}), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch.object(m, "read", return_value=""), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_session()  # 旧代码抛 TypeError
+        printed = self._printed(mprint)
+        self.assertIn("警告", printed)
+        self.assertIn("尚未保存会话", printed)
 
 
 if __name__ == "__main__":
