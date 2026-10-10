@@ -28,9 +28,11 @@ import json
 import logging
 import math
 import os
+import queue
 import sys
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -52,6 +54,19 @@ MIN_INTERVAL_FLOOR = 1
 # 无有效监控日期时的兜底轮询间隔（秒）：任务的 dates/date_range 非法或为空时，
 # 用长间隔并告警，避免无效高频轮询（_run_task 会把该任务标为失败并停止）
 NO_DATES_FALLBACK_INTERVAL = 300
+
+# 例行字段（last_poll/message/fail_streak）合并冲刷间隔（秒）：这些字段每轮
+# 必写但价值低（纯展示/计数），高频轮询下逐次落盘会造成多余的文件锁争用与
+# IO。改为打脏标，由主循环在此间隔内合并写一次；dedup/retry/status 等重要
+# 事件仍立即 _save_state()，不参与节流（正确性不变）。
+_STATE_FLUSH_INTERVAL = 2.0
+
+# 任务并发执行上限：_run_task 平铺到 ThreadPoolExecutor，一个任务在下单/
+# 长查询阻塞时不再让其它任务排队等它。浏览器下单走 browser_order.exclusive()
+# 文件锁天然串行（不会并发抢同一 profile），因此这个上限只影响"查询/判定"
+# 阶段的并行度，不会破坏下单互斥。上限取 4：监控通常是 3-5 个任务，且
+# 12306 对高频并发查询有风控，不宜再放大。
+MAX_TASK_WORKERS = 4
 
 STATUS_LABELS = {
     "monitoring": "监控中",
@@ -346,6 +361,12 @@ class MonitorEngine(object):
 
         self.state_path = os.path.join(HERE, self.config.get("state_file", "state.json"))
         self.history_path = os.path.join(HERE, self.config.get("history_file", "order_history.json"))
+        # 例行字段写盘节流：_mark_state_dirty 置脏（last_poll/message 等低频高
+        # 频写入点），主循环 _flush_state_if_dirty 在 _STATE_FLUSH_INTERVAL 内
+        # 合并写。任何 _save_state() 都可能在过程中被 _run_task 的业务分支直接
+        # 调用（dedup/状态变更），因此该机制不改变"重要状态立即落盘"的语义。
+        self._state_dirty = False
+        self._last_state_flush = 0.0
         self.state = self._load_state()
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
@@ -544,7 +565,33 @@ class MonitorEngine(object):
             self._state_mtime = os.path.getmtime(self.state_path)
         except OSError:
             pass
+        # 已实际落盘：例行字段的脏标随之清空，冲刷基准时间推进。
+        # 仅成功路径走到此处；锁争用/序列化失败的 return 在更早，脏标保留待重试。
+        self._state_dirty = False  # 兼容绕过 __init__ 的测试实例
+        self._last_state_flush = time.time()
         return self.state
+
+    def _mark_state_dirty(self):
+        """例行字段（last_poll/message 等）变更：只置脏标，不立即落盘。
+
+        与直接 _save_state() 的区别仅在于"写盘时机"：交由主循环在
+        _STATE_FLUSH_INTERVAL 内合并写一次。调用点必须确认这些字段属于
+        "每轮必写、丢了也无关正确性"的例行信息；凡涉及 dedup/retry/任务
+        状态转移等落盘后才安全的语义，仍直接调 _save_state()。"""
+        self._state_dirty = True  # 兼容绕过 __init__ 的测试实例
+
+    def _flush_state_if_dirty(self):
+        """主循环统一冲刷例行字段脏标：距上次落盘 ≥ _STATE_FLUSH_INTERVAL 才写。
+
+        返回 True 表示本轮已实际落盘。若仍在节流窗口内则只保留脏标，等到期后
+        由下一轮冲刷兜底（期间任何业务 _save_state 都会顺带清标）。"""
+        if not getattr(self, "_state_dirty", False):
+            return False
+        now = time.time()
+        if now - getattr(self, "_last_state_flush", 0.0) < _STATE_FLUSH_INTERVAL:
+            return False
+        self._save_state()
+        return True
 
     def _reload_state(self):
         """仅重新读取 state.json（供运行中的引擎同步外部修改，不触发写入）。
@@ -854,7 +901,10 @@ class MonitorEngine(object):
         entry = self.state["tasks"].setdefault(name, {})
         entry["fail_streak"] = entry.get("fail_streak", 0)
         entry["last_poll"] = time.time()
-        self._save_state()
+        # last_poll 属每轮必写的例行字段：置脏标合并写，避免高频轮询下
+        # 每个任务每轮都做一次全量序列化+文件锁+原子替换（IO 与锁争用）。
+        # 后续任何业务 _save_state 会顺带落盘；中断丢失的仅是展示时间，无正确性影响。
+        self._mark_state_dirty()
 
         if self.task_status(task) not in ACTIVE_STATUSES:
             return False, False
@@ -1162,7 +1212,9 @@ class MonitorEngine(object):
         if not hit_any:
             entry["fail_streak"] = 0
             entry["message"] = "上次查询 {0}：无余票".format(time.strftime("%H:%M:%S"))
-            self._save_state()
+            # 与开头 last_poll 同理：例行字段脏标合并写；真正落盘由主循环
+            # 冲刷兜底（业务分支里的 dedup/status 变更仍走立即 _save_state）
+            self._mark_state_dirty()
         return False, False
 
     def _order_once(self, task, info, date, seat_name):
@@ -1391,7 +1443,65 @@ class MonitorEngine(object):
         next_due = {}
         for i, t in enumerate(self.tasks):
             if self.task_status(t) in ACTIVE_STATUSES:
-                next_due[i] = time.time()  # 重启后立即恢复轮询
+                next_due[t["name"]] = time.time()  # 重启后立即恢复轮询
+
+        # 任务并发执行：每个到期任务丢给线程池跑 _run_task，主循环只做调度与
+        # 结果回收。这样单个任务在下单/网络退避期间,其它到期任务照常执行,
+        # 不再串行排队。线程池 worker 数上限 MAX_TASK_WORKERS。
+        # 调度键用任务名而非列表索引：_sync_config 热更新会重建 self.tasks
+        # （替换对象），索引会错位，任务名在任务生命周期内稳定。
+        # 并发正确性：不同任务写 state 的不同 entry / dedup key 由 GIL 保证
+        # dict 操作原子；同一 key 的并发下单（重复任务/交叉任务）被浏览器侧
+        # exclusive 文件锁（browser_order）与 12306 服务端行程冲突挡路兜底，
+        # order.py 归因会判 dup/blocked 并停止任务，不会真的下成两单。
+        executor = ThreadPoolExecutor(
+            max_workers=max(1, min(MAX_TASK_WORKERS, len(self.tasks))),
+            thread_name_prefix="task-runner")
+        inflight = {}   # 任务名 -> (Future, task)
+        inflight_lock = threading.Lock()
+
+        def _settle_done():
+            """回收已完成的在途任务，把结果写入 next_due。返回 True 表示本次有回收。"""
+            settled = False
+            with inflight_lock:
+                done = [(name, fut, task) for name, (fut, task) in inflight.items()
+                        if fut.done()]
+                for name, fut, task in done:
+                    del inflight[name]
+            for name, fut, task in done:
+                settled = True
+                try:
+                    interval = self.task_interval(task)
+                except Exception as e:
+                    # 兜底：task_interval 已做形状校验，此处只防未知异常崩进程
+                    LOG.error("[配置] 任务「%s」计算轮询间隔异常，"
+                              "已用兜底间隔 %ss：%s",
+                              task.get("name"), self.base_interval, e)
+                    interval = self.base_interval
+                try:
+                    broke, recoverable = fut.result()
+                except Exception as e:
+                    LOG.error("[错误] 任务「%s」内部异常: %s", task["name"], e)
+                    self._note_failure(task, "内部异常: {0}".format(e))
+                    broke, recoverable = True, True
+                if (task.get("name") or "") in getattr(self, "_deleted_names", ()):
+                    # 任务在本轮询中途被 GUI 删除：在途结果不再写回 state，
+                    # 不重建条目；丢弃本轮调度记录（删任务后 state 无残留）
+                    next_due.pop(name, None)
+                    continue
+                entry = self.state["tasks"].setdefault(name, {})
+                streak = entry.get("fail_streak", 0)
+                if recoverable and streak:
+                    # 连续失败退避：间隔按失败次数拉长（上限 5 分钟），实现自动恢复
+                    backoff_iv = min(max(interval, interval * min(streak, 10) * 0.5), 300)
+                    LOG.info("[运行] 任务「%s」连续失败 %s 次，下次轮询退避到 %.0fs 后",
+                             name, streak, backoff_iv)
+                    next_due[name] = time.time() + backoff_iv
+                else:
+                    next_due[name] = time.time() + interval
+                if broke and self.task_status(task) not in ACTIVE_STATUSES:
+                    next_due.pop(name, None)
+            return settled
 
         try:
             while True:
@@ -1400,53 +1510,44 @@ class MonitorEngine(object):
                 self._sync_state()  # 同步外部（GUI）对状态文件的修改
                 if self._sync_config():
                     # 任务列表变化（增/删）：按最新列表重建调度表，避免旧索引错位
-                    next_due = {i: time.time()
-                                for i, t in enumerate(self.tasks)
+                    next_due = {t["name"]: time.time()
+                                for t in self.tasks
                                 if self.task_status(t) in ACTIVE_STATUSES}
                 self.check_session_if_needed()
                 now = time.time()
                 # 运行中新增/恢复的任务自动纳入调度
-                for i, t in enumerate(self.tasks):
-                    if i not in next_due and self.task_status(t) in ACTIVE_STATUSES:
-                        next_due[i] = now
-                due = [(i, self.tasks[i]) for i in next_due
-                       if self.task_status(self.tasks[i]) in ACTIVE_STATUSES
-                       and now >= next_due[i]]
+                for t in self.tasks:
+                    if (t["name"] not in next_due
+                            and self.task_status(t) in ACTIVE_STATUSES):
+                        next_due[t["name"]] = now
+                due = [(name, t) for name, t in
+                       ((t["name"], t) for t in self.tasks)
+                       if name in next_due
+                       and self.task_status(t) in ACTIVE_STATUSES
+                       and now >= next_due[name]]
                 due.sort(key=lambda x: -_safe_priority(x[1]))
-                for i, task in due:
+                for name, task in due:
                     if stop_event is not None and stop_event.is_set():
                         break
+                    # 同一任务在途未完成时不重复投递（防并发同任务重复下单）
+                    inflight_lock.acquire()
                     try:
-                        interval = self.task_interval(task)
-                    except Exception as e:
-                        # 兜底：task_interval 已做形状校验，此处只防未知异常崩进程
-                        LOG.error("[配置] 任务「%s」计算轮询间隔异常，"
-                                  "已用兜底间隔 %ss：%s",
-                                  task.get("name"), self.base_interval, e)
-                        interval = self.base_interval
+                        if name in inflight:
+                            continue
+                    finally:
+                        inflight_lock.release()
+                    fut = executor.submit(self._run_task, task)
+                    inflight_lock.acquire()
                     try:
-                        broke, recoverable = self._run_task(task)
-                    except Exception as e:
-                        LOG.error("[错误] 任务「%s」内部异常: %s", task["name"], e)
-                        self._note_failure(task, "内部异常: {0}".format(e))
-                        broke, recoverable = True, True
-                    if (task.get("name") or "") in getattr(self, "_deleted_names", ()):
-                        # 任务在本轮询中途被 GUI 删除：在途结果不再写回 state，
-                        # 不重建条目；丢弃本轮调度记录（删任务后 state 无残留）
-                        next_due.pop(i, None)
-                        continue
-                    entry = self.state["tasks"].setdefault(task["name"], {})
-                    streak = entry.get("fail_streak", 0)
-                    if recoverable and streak:
-                        # 连续失败退避：间隔按失败次数拉长（上限 5 分钟），实现自动恢复
-                        backoff_iv = min(max(interval, interval * min(streak, 10) * 0.5), 300)
-                        LOG.info("[运行] 任务「%s」连续失败 %s 次，下次轮询退避到 %.0fs 后",
-                                 task["name"], streak, backoff_iv)
-                        next_due[i] = time.time() + backoff_iv
-                    else:
-                        next_due[i] = time.time() + interval
-                    if broke and self.task_status(task) not in ACTIVE_STATUSES:
-                        next_due.pop(i, None)
+                        inflight[name] = (fut, task)
+                    finally:
+                        inflight_lock.release()
+                # 本轮回收已完成任务的结果；若在途仍有长任务（下单/退避），
+                # _settle_done 只收已经 done 的，不阻塞主循环调度其它任务
+                _settle_done()
+                # 例行字段脏标统一落盘（见 _STATE_FLUSH_INTERVAL 注释）：放在
+                # 本轮任务执行完之后,利用任务间的空档吞掉 2 秒节流窗口。
+                self._flush_state_if_dirty()
                 if stop_event is not None:
                     if stop_event.wait(1):
                         break
@@ -1454,6 +1555,11 @@ class MonitorEngine(object):
                     time.sleep(1)
         except KeyboardInterrupt:
             pass
+        finally:
+            # 停止时不再接收新任务；在途 worker 线程非 daemon，但主循环退出后
+            # shutdown(wait=False) 立即返回（不等长下单），浏览器下单有独立
+            # 文件锁，进程退出后锁自动释放，不会残留跨进程死锁。
+            executor.shutdown(wait=False)
         LOG.info("监控已停止。状态已保存到 %s", self.state_path)
 
 

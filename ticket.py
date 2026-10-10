@@ -577,6 +577,31 @@ QUERY_URLS = (
     "https://kyfw.12306.cn/otn/leftTicket/query",
 )
 
+# ---- 端点亲和（Task：查询端点按序回退的增强）----
+# 高频轮询时若每次从 QUERY_URLS[0] 固定开始，首个端点长期故障则每轮都要
+# 白等它的超时（15s）才换下一个，轮询节奏被拉垮。改为：记住上次成功的端点，
+# 下轮优先尝试；连续失败时端点会回归按序回退，不会永久钉死在单个端点上。
+_LAST_OK_QUERY_URL = None
+
+
+def _query_urls_preferred():
+    """返回本次查询的端点尝试顺序：上次成功端点优先，其余保持声明顺序。"""
+    global _LAST_OK_QUERY_URL
+    with _SESSION_LOCK:
+        last_ok = _LAST_OK_QUERY_URL
+    urls = list(QUERY_URLS)
+    if last_ok and last_ok in urls:
+        urls.remove(last_ok)
+        urls.insert(0, last_ok)
+    return urls
+
+
+def _note_query_endpoint_ok(url):
+    """一次查询在该端点成功：记忆为下次优先端点（进程内，跨线程安全）。"""
+    global _LAST_OK_QUERY_URL
+    with _SESSION_LOCK:
+        _LAST_OK_QUERY_URL = url
+
 
 def query_tickets(from_code, to_code, date, purpose="ADULT"):
     """查询某天某区间余票，返回余票结果列表（官方 result 数组）。免登录。
@@ -589,7 +614,7 @@ def query_tickets(from_code, to_code, date, purpose="ADULT"):
         "purpose_codes": purpose,
     }
     last = None
-    for url in QUERY_URLS:
+    for url in _query_urls_preferred():
         try:
             r = s.get(url, params=params, timeout=15)
             r.raise_for_status()
@@ -611,6 +636,7 @@ def query_tickets(from_code, to_code, date, purpose="ADULT"):
             continue
         result = payload.get("result") or []
         _note_query_success()
+        _note_query_endpoint_ok(url)
         return result
     if last is None:
         last = RuntimeError("查询接口无可用端点")
