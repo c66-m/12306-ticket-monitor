@@ -1,0 +1,9 @@
+# 开发/测试依赖
+#
+# 测试套件（tests/test_all.py）仅使用 Python 标准库（unittest / unittest.mock），
+# 无需安装任何第三方包即可运行：
+#   python -m unittest tests.test_all
+#
+# 以下为可选的开发工具（项目未强制要求）：
+# pytest          # 替代运行器：pytest tests/test_all.py
+# coverage        # 覆盖率：coverage run -m unittest tests.test_all && coverage report

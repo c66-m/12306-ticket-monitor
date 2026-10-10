@@ -6988,6 +6988,97 @@ class TestTask72EngineState(TempDirCase):
             engine_mod.MonitorEngine._cancelled_dedup_keys({}, keys), [])
 
 
+class TestMergeStateForSave(unittest.TestCase):
+    """_merge_state_for_save 直接参数化单测：磁盘为底、内存覆盖、墓碑剔除。
+
+    旧覆盖仅通过 _save_state 端到端间接验证（test_pruned_orphan_stays_dead_on_disk），
+    合并规则本身的边界（非 dict 输入、dedup/retry 内存为准、墓碑剔除、
+    内存空 dedup 不被磁盘复活）无直接断言。"""
+
+    def test_basic_union_disk_plus_mem(self):
+        disk = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
+        mem = {"tasks": {"B": {"status": "monitoring"}}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(set(got["tasks"]), {"A", "B"})
+
+    def test_mem_overrides_disk_same_task(self):
+        disk = {"tasks": {"A": {"status": "old"}}, "dedup": {}, "retry": {}}
+        mem = {"tasks": {"A": {"status": "new"}}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(got["tasks"]["A"]["status"], "new")
+
+    def test_tombstone_removes_task(self):
+        disk = {"tasks": {"A": {"status": "ok"}, "B": {"status": "ok"}},
+                "dedup": {}, "retry": {}}
+        mem = {"tasks": {"B": {"status": "ok"}}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, {"A"})
+        self.assertNotIn("A", got["tasks"])
+        self.assertIn("B", got["tasks"])
+
+    def test_tombstone_removes_even_if_only_on_disk(self):
+        disk = {"tasks": {"ghost": {"status": "monitoring"}},
+                "dedup": {}, "retry": {}}
+        mem = {"tasks": {}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, {"ghost"})
+        self.assertNotIn("ghost", got["tasks"])
+
+    def test_dedup_retry_from_mem_only(self):
+        disk = {"tasks": {}, "dedup": {"k1": True}, "retry": {"k2": True}}
+        mem = {"tasks": {}, "dedup": {"k3": True}, "retry": {"k4": True}}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(got["dedup"], {"k3": True})
+        self.assertEqual(got["retry"], {"k4": True})
+
+    def test_mem_empty_dedup_not_revived_from_disk(self):
+        disk = {"tasks": {}, "dedup": {"k1": True}, "retry": {}}
+        mem = {"tasks": {}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(got["dedup"], {})
+
+    def test_non_dict_disk_state_graceful(self):
+        mem = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(None, mem, set())
+        self.assertEqual(got["tasks"], {"A": {"status": "ok"}})
+
+    def test_non_dict_mem_state_graceful(self):
+        disk = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, None, set())
+        self.assertEqual(got["tasks"], {"A": {"status": "ok"}})
+        self.assertEqual(got["dedup"], {})
+        self.assertEqual(got["retry"], {})
+
+    def test_tasks_not_dict_graceful(self):
+        disk = {"tasks": "garbage", "dedup": {}, "retry": {}}
+        mem = {"tasks": 123, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(got["tasks"], {})
+
+    def test_dedup_retry_not_dict_graceful(self):
+        mem = {"tasks": {}, "dedup": "bad", "retry": 42}
+        got = engine_mod._merge_state_for_save({}, mem, set())
+        self.assertEqual(got["dedup"], {})
+        self.assertEqual(got["retry"], {})
+
+    def test_tombstoned_none_graceful(self):
+        disk = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
+        mem = {"tasks": {}, "dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, None)
+        self.assertIn("A", got["tasks"])
+
+    def test_missing_tasks_key_graceful(self):
+        disk = {"dedup": {}, "retry": {}}
+        mem = {"dedup": {}, "retry": {}}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(got["tasks"], {})
+
+    def test_returned_dedup_is_copy(self):
+        mem_dedup = {"k1": True}
+        mem = {"tasks": {}, "dedup": mem_dedup, "retry": {}}
+        got = engine_mod._merge_state_for_save({}, mem, set())
+        got["dedup"]["k2"] = True
+        self.assertNotIn("k2", mem_dedup)
+
+
 class TestTask73MonitorCreateCancel(TempDirCase):
     """Task 73 (P2, Task 28 回归): 建任务流程中车次选择、乘车人选择两处
     Ctrl+C/EOF（read()→None）不得被 `if trains_choice else []` / `if sel:`
@@ -7972,6 +8063,74 @@ class TestTask77Order(unittest.TestCase):
         cls, ono, raw, recent = order_mod.classify_with_time(
             "2026-10-10", "G101", ["张三"], not_before_ts=12345, session=None)
         self.assertEqual(cls, "error")
+        self.assertIsNone(recent)
+
+    # ---- (g2) classify_with_time 边界用例 ----
+
+    def test_classify_with_time_unpaid_no_match_recent_none(self):
+        # unpaid + not_before_ts 但无匹配订单 → recent=None
+        orders = [{"train": "G999", "date": "2026-10-10",
+                   "passengers": ["张三"], "order_no": "Eother",
+                   "_no_complete": True, "status": "未完成/未支付"}]
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=orders):
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=1000,
+                session=object())
+        self.assertEqual(cls, "blocked")
+        self.assertIsNone(recent)
+
+    def test_classify_with_time_non_unpaid_skips_attribution(self):
+        # 非 unpaid（cancelled）+ not_before_ts → recent=None，不调 find_recent_order
+        orders = [{"train": "G101", "date": "2026-10-10",
+                   "passengers": ["张三"], "order_no": "E1",
+                   "status": "已退票"}]
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=orders) as m_q:
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=1000,
+                session=object())
+        self.assertEqual(cls, "cancelled")
+        self.assertIsNone(recent)
+        self.assertEqual(m_q.call_count, 1)
+
+    def test_classify_with_time_unpaid_not_before_none(self):
+        # unpaid + not_before_ts=None → recent=None（跳过归因）
+        orders = [{"train": "G101", "date": "2026-10-10",
+                   "passengers": ["张三"], "order_no": "Emine",
+                   "_no_complete": True, "status": "未完成/未支付"}]
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=orders):
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=None,
+                session=object())
+        self.assertEqual(cls, "unpaid")
+        self.assertIsNone(recent)
+
+    def test_classify_with_time_query_exception_error(self):
+        # check_existing_orders 抛异常 → error，recent=None
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               side_effect=ConnectionError("timeout")):
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=1000,
+                session=object())
+        self.assertEqual(cls, "error")
+        self.assertIsNone(recent)
+        self.assertIn("timeout", raw)
+
+    def test_classify_with_time_find_recent_exception_graceful(self):
+        # find_recent_order 抛异常 → recent=None（降级不崩）
+        orders = [{"train": "G101", "date": "2026-10-10",
+                   "passengers": ["张三"], "order_no": "Emine",
+                   "_no_complete": True, "status": "未完成/未支付"}]
+        with mock.patch.object(order_mod, "check_existing_orders",
+                               return_value=orders), \
+             mock.patch.object(order_mod, "find_recent_order",
+                               side_effect=RuntimeError("boom")):
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=1000,
+                session=object())
+        self.assertEqual(cls, "unpaid")
         self.assertIsNone(recent)
 
     # ---- (h) 畸形订单警告脱敏 ----
