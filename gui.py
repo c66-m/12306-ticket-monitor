@@ -117,6 +117,28 @@ _CONFIG_CORRUPT_WARNED = False
 
 _SANITIZE_WARNED = set()
 
+_UNHASHABLE_NAME_WARNED = set()
+
+
+def _skip_unhashable_task_name(t, where):
+    """Task 116：不可哈希任务名 → 记 warning 返回 True（调用方跳过该条目）。
+
+    _sanitize_config_shapes 只剔除非 dict 条目；{"name": ["x"]} 等手改
+    JSON 的坏名会穿过读侧漏斗，下游 state.get(name) 直接 TypeError。
+    同一损坏条目每进程只记一次（TaskPage.refresh 每 2 秒调用，防刷屏；
+    与 _SANITIZE_WARNED 同口径）。
+    """
+    name = t.get("name") if isinstance(t, dict) else t
+    try:
+        hash(name)
+    except TypeError:
+        sig = (where, repr(t))
+        if sig not in _UNHASHABLE_NAME_WARNED:
+            _UNHASHABLE_NAME_WARNED.add(sig)
+            LOG.warning("[配置] %s：任务名不可哈希已跳过：%r", where, t)
+        return True
+    return False
+
 
 def _sanitize_config_shapes(config, *, warn_every_time=False):
     """Task 109：gui 侧 config 形状 sanitize（Task 104「load 入口 sanitize」口径）。
@@ -2409,6 +2431,13 @@ class StartMonitorDialog(tk.Toplevel):
             tk.Label(self.task_rows, text="暂无任务，请先创建任务。", bg=CARD, fg=GRAY,
                      font=(FONT, 11)).pack(pady=30)
         for idx, t in enumerate(tasks):
+            # Task 116：_sanitize_config_shapes 只剔非 dict 条目，
+            # {"name": ["x"]} 等不可哈希名会穿过；旧代码 state.get(name)
+            # 直接 TypeError，对话框打不开。非法条目记 warning 后跳过
+            # （逐条检查而非整体过滤，保持 idx 与 self.vars 对齐，
+            # apply_start 用 idx 查 self.vars）。
+            if _skip_unhashable_task_name(t, "启动对话框"):
+                continue
             name = t.get("name") or ""
             st = state.get(name, {}).get("status", "paused")
             active = st in engine_mod.ACTIVE_STATUSES
@@ -2732,8 +2761,16 @@ class TaskPage(ttk.Frame):
         engine_running = bool(self.app.engine_thread
                               and self.app.engine_thread.is_alive())
         rows = []
+        shown = []  # Task 116：与 rows 一一对应的有效任务（坏条目已跳过）
         seen_date_keys = set()
         for i, t in enumerate(tasks, 1):
+            # Task 116：不可哈希任务名（如 {"name": ["x"]}）→ warn + 跳过；
+            # 旧代码 state.get(t.get("name")) 直接 TypeError，Tk 吞掉后
+            # 任务列表永久不再更新；同一跳过覆盖 _cached_format_dates
+            # 的 dict 键 shadow crash（跳过发生在它之前）。
+            # warn 同一损坏条目每进程只记一次（每 2 秒调用，防刷屏）。
+            if _skip_unhashable_task_name(t, "任务列表"):
+                continue
             st = state.get(t.get("name"), {}).get("status", "paused")
             msg = state.get(t.get("name"), {}).get("message", "")
             # 启动状态：引擎运行中且任务处于 监控中/等待重试 = 已启动
@@ -2750,6 +2787,7 @@ class TaskPage(ttk.Frame):
                 t.get("priority", 5),
                 engine_mod.STATUS_LABELS.get(st, st), msg,
                 "started" if started else "stopped", st))
+            shown.append(t)
         # 剪掉已删除/已改配置任务的缓存键，防止无界增长
         for k in list(self._dates_text_cache):
             if k not in seen_date_keys:
@@ -2767,8 +2805,7 @@ class TaskPage(ttk.Frame):
         yview = self.tree.yview()
         self.tree.delete(*self.tree.get_children())
         self._task_by_iid = {}
-        for i, t in enumerate(tasks, 1):
-            row = rows[i - 1]
+        for t, row in zip(shown, rows):
             iid = self.tree.insert("", "end", values=row[:10],
                                    tags=(row[10], row[11]))
             self._task_by_iid[iid] = (t, row[11])

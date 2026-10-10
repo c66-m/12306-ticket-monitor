@@ -12496,6 +12496,200 @@ class TestTask115BrowserOrderMsgB5(unittest.TestCase):
         self.assertEqual(info["limit_ticket_types"], [])
 
 
+
+
+class TestTask116GuiEngineB5(TempDirCase):
+    """Task 116 (B5-9)：gui 不可哈希名 loop hardening（P3×2）+ engine
+    task_status/set_task_status 边界 guard（Task 114 评审建议的纵深防御）。
+
+    (1) StartMonitorDialog.__init__ 循环体：{"name": ["x"]} 穿过
+        _sanitize_config_shapes → state.get(name) 直接 TypeError，对话框打不开。
+    (2) TaskPage.refresh 循环（每 2 秒）：state.get(t.get("name")) →
+        TypeError → 任务列表永久不再更新；同一修复覆盖 _cached_format_dates
+        的 dict 键 shadow crash。
+    (3) engine.task_status/set_task_status input guard：warn + 安全默认。
+    """
+
+    def _reset_unhashable_warned(self):
+        if hasattr(gui, "_UNHASHABLE_NAME_WARNED"):
+            gui._UNHASHABLE_NAME_WARNED.clear()
+
+    def _make_engine(self):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"tasks": []}, f)
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})), \
+             mock.patch.object(engine_mod, "HERE", self.tmp):
+            eng = engine_mod.MonitorEngine(config_path=p,
+                                           setup_logging=False)
+        eng.state = {"tasks": {}}
+        return eng
+
+    def _make_task_page(self):
+        page = gui.TaskPage.__new__(gui.TaskPage)
+        page.app = mock.Mock()
+        page.app.engine_thread = None
+        page.tree = mock.Mock()
+        page.tree.selection.return_value = ()
+        page.tree.get_children.return_value = ()
+        page.tree.yview.return_value = (0.0, 1.0)
+        page.edit_btn = mock.Mock()
+        page._task_by_iid = {}
+        page._dates_text_cache = {}
+        return page
+
+    def _patch_tk_for_dialog(self):
+        import tkinter as tk
+        from tkinter import ttk
+        return (
+            mock.patch.object(tk.Toplevel, "__init__", return_value=None),
+            mock.patch.object(gui.StartMonitorDialog, "title"),
+            mock.patch.object(gui.StartMonitorDialog, "geometry"),
+            mock.patch.object(gui.StartMonitorDialog, "configure"),
+            mock.patch.object(tk, "Frame", return_value=mock.Mock()),
+            mock.patch.object(tk, "Label", return_value=mock.Mock()),
+            mock.patch.object(tk, "BooleanVar"),
+            mock.patch.object(tk, "Checkbutton", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Button", return_value=mock.Mock()),
+        )
+
+    # ---- (1) StartMonitorDialog.__init__ ----
+
+    def test_dialog_init_skips_unhashable_name(self):
+        # P3：改前 state.get(["x"], {}) 直接 TypeError，对话框打不开。
+        # 应 warn+跳过坏条目，好任务照常建行；idx 与原始 tasks 对齐
+        # （apply_start 用 idx 查 self.vars）。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"},
+                 {"name": "good", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-12"]}]
+        dlg = gui.StartMonitorDialog.__new__(gui.StartMonitorDialog)
+        patches = self._patch_tk_for_dialog()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "_state_tasks_dict",
+                               return_value={}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                gui.StartMonitorDialog.__init__(dlg, mock.Mock())  # 改前 TypeError
+        self.assertTrue(any("哈希" in m for m in logs.output),
+                        "必须明确记 warning 指出任务名不可哈希")
+        self.assertEqual(sorted(dlg.vars.keys()), [1])
+
+    def test_dialog_init_all_good_unchanged(self):
+        # 正向对照：全合法任务时原行为不变（逐条建行，idx 连续）。
+        self._reset_unhashable_warned()
+        tasks = [{"name": "a", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-12"]},
+                 {"name": "b", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-13"]}]
+        dlg = gui.StartMonitorDialog.__new__(gui.StartMonitorDialog)
+        patches = self._patch_tk_for_dialog()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "_state_tasks_dict",
+                               return_value={}):
+            gui.StartMonitorDialog.__init__(dlg, mock.Mock())
+        self.assertEqual(sorted(dlg.vars.keys()), [0, 1])
+
+    # ---- (2) TaskPage.refresh ----
+
+    def test_refresh_skips_unhashable_name(self):
+        # P3：改前 state.get(["x"], {}) 直接 TypeError，任务列表永久不更新。
+        # 应 warn+跳过坏条目，好任务照常展示。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"},
+                 {"name": "good", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-12"]}]
+        page = self._make_task_page()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                page.refresh()  # 改前 TypeError
+        self.assertTrue(any("哈希" in m for m in logs.output),
+                        "必须明确记 warning 指出任务名不可哈希")
+        self.assertEqual(page.tree.insert.call_count, 1)
+        shown = [t for t, _st in page._task_by_iid.values()]
+        self.assertEqual([t.get("name") for t in shown], ["good"])
+
+    def test_refresh_unhashable_warns_once(self):
+        # refresh 每 2 秒调用：同一损坏条目只记一次 warning，不刷屏。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"}]
+        page = self._make_task_page()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                page.refresh()
+                page.refresh()
+                page.refresh()
+        pins = [m for m in logs.output if "哈希" in m]
+        self.assertEqual(len(pins), 1)
+
+    def test_refresh_all_good_unchanged(self):
+        # 正向对照：全合法任务时原行为不变（逐条展示）。
+        self._reset_unhashable_warned()
+        tasks = [{"name": "a", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-12"]},
+                 {"name": "b", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-13"]}]
+        page = self._make_task_page()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            page.refresh()
+        self.assertEqual(page.tree.insert.call_count, 2)
+
+    # ---- (3) engine task_status / set_task_status 边界 guard ----
+
+    def test_task_status_normal_path_unchanged(self):
+        # 先 pin 正常路径：str/None/int 名行为与旧代码逐字一致。
+        eng = self._make_engine()
+        eng.state["tasks"] = {"a": {"status": "monitoring"}}
+        self.assertEqual(eng.task_status({"name": "a"}), "monitoring")
+        self.assertEqual(eng.task_status({"name": "missing"}), "paused")
+        self.assertEqual(eng.task_status({"name": None}), "paused")
+        self.assertEqual(eng.task_status({"name": 1}), "paused")
+
+    def test_task_status_unhashable_name_safe_default(self):
+        # P3 纵深防御：不可哈希名 → warn + 按未知任务默认 "paused"，
+        # 不抛 TypeError。
+        eng = self._make_engine()
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            st = eng.task_status({"name": ["x"]})  # 改前 TypeError
+        self.assertEqual(st, "paused")
+        self.assertTrue(any("哈希" in m for m in logs.output))
+
+    def test_set_task_status_normal_path_unchanged(self):
+        # 先 pin 正常路径：str 名写入条目（旧行为）。
+        eng = self._make_engine()
+        with mock.patch.object(eng, "_save_state"):
+            eng.set_task_status({"name": "a"}, "monitoring", "ok")
+        self.assertEqual(eng.state["tasks"]["a"]["status"], "monitoring")
+
+    def test_set_task_status_unhashable_name_no_write(self):
+        # P3 纵深防御：不可哈希名 → warn + 忽略写入（不抛 TypeError，
+        # 不写脏键；调用方本就忽略返回值）。
+        eng = self._make_engine()
+        with mock.patch.object(eng, "_save_state") as m_save:
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                eng.set_task_status({"name": ["x"]}, "monitoring", "ok")  # 改前 TypeError
+        self.assertEqual(eng.state["tasks"], {})
+        m_save.assert_not_called()
+        self.assertTrue(any("哈希" in m for m in logs.output))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

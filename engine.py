@@ -771,10 +771,29 @@ class MonitorEngine(object):
 
     def task_status(self, task):
         name = task["name"]
+        try:
+            hash(name)
+        except TypeError:
+            # Task 116：engine API 边界 guard（Task 114 评审建议的纵深防御，
+            # 覆盖未来调用方）。不可哈希任务名 → 记 warning，按未知任务
+            # 默认 "paused" 处理（与 .get(name, {}).get("status", "paused")
+            # 的缺省一致）；正常路径逐字不变。
+            LOG.warning("[状态] task_status：任务名不可哈希，已按 paused 处理：%r",
+                        task)
+            return "paused"
         return self.state["tasks"].get(name, {}).get("status", "paused")
 
     def set_task_status(self, task, status, message="", force=False):
         name = task["name"]
+        try:
+            hash(name)
+        except TypeError:
+            # Task 116：同上。注意 guard 必须在墓碑检查之前：
+            # _deleted_names 是 set，unhashable 的 name 做 `in` 检查
+            # 本身就会 TypeError。忽略写入（调用方本就忽略返回值）。
+            LOG.warning("[状态] set_task_status：任务名不可哈希，忽略状态写入 %s：%r",
+                        STATUS_LABELS.get(status, status), task)
+            return
         # 墓碑守卫（Task 53 返工）：已删除任务的在途轮询写回不得复活 state
         # 条目——setdefault 会无声复活；GUI 显式动作（恢复/重置/新建）经
         # force=True 放行（删→同名重建流程不受影响）。
