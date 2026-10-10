@@ -3934,7 +3934,9 @@ class TestTask50MonitorSecretsAndEmptyDates(TempDirCase):
         saved, gp = self._run_menu_notify(
             ["", "465", "", "oldpw", "", "a@x.com", "n"], "newpw123")
         gp.assert_called_once()
-        self.assertEqual(saved["notify"]["email"]["password"], "newpw123")
+        # 授权码加密落盘(Task 66):解密比对,不比密文(DPAPI 密文非确定)
+        self.assertEqual(notify_mod.secret_of(
+            saved["notify"]["email"]["password"]), "newpw123")
 
     def test_menu_notify_empty_getpass_keeps_old_password(self):
         # getpass 回车（空串）→ 保留旧授权码，与旧 read 空输入语义一致。
@@ -3951,7 +3953,9 @@ class TestTask50MonitorSecretsAndEmptyDates(TempDirCase):
              mock.patch.object(monitor_mod, "save_config",
                                side_effect=lambda c, **k: saved.update(c)):
             monitor_mod.menu_notify()
-        self.assertEqual(saved["notify"]["email"]["password"], "keepme")
+        # 旧值本就是密文(getpass 空=保留):解密验证语义不变
+        self.assertEqual(notify_mod.secret_of(
+            saved["notify"]["email"]["password"]), "keepme")
 
     def test_menu_task_list_empty_dates_no_crash(self):
         # 旧代码 dates[0] 在空 dates 时抛 IndexError。
