@@ -12302,6 +12302,138 @@ class TestTask113CredMiscB5(unittest.TestCase):
         self.assertEqual(new_found, {"ghost_hist"})
 
 
+class TestTask114GuiEngineB5(TempDirCase):
+    """Task 114 (B5-7)：Task 108 评审确认的两处同类残留（P3×2）。
+
+    (1) gui StartMonitorDialog.apply_start 传原始 config task 给
+        eng.task_status/set_task_status，绕过 _sanitize_tasks 漏斗 →
+        不可哈希 name → state["tasks"].get(name) 直接 TypeError。
+    (2) engine.empty_task_dedup 的 task["from"] → from-less 任务
+        （monitor op-4 / gui 右键重置可达）→ KeyError。
+    """
+
+    class _FakeVar:
+        def __init__(self, v):
+            self._v = v
+
+        def get(self):
+            return self._v
+
+    class _FakeApp:
+        def __init__(self, eng):
+            self._eng = eng
+
+        def get_ops_engine(self):
+            return self._eng
+
+        def refresh_tasks(self):
+            pass
+
+        def start_engine(self):
+            pass
+
+    class _FakeDialog:
+        def __init__(self, varmap, eng):
+            test = TestTask114GuiEngineB5
+            self.vars = {i: test._FakeVar(v) for i, v in varmap.items()}
+            self.app = test._FakeApp(eng)
+
+        def destroy(self):
+            pass
+
+    class _RecordingEngine:
+        """task_status 复用真实 MonitorEngine.task_status 的崩溃语义
+        （state["tasks"].get(name) 对不可哈希 name 直接 TypeError）；
+        set_task_status 只记录调用。"""
+        def __init__(self):
+            self.state = {"tasks": {}}
+            self.set_calls = []
+
+        def task_status(self, task):
+            return engine_mod.MonitorEngine.task_status(self, task)
+
+        def set_task_status(self, task, status, message="", force=False):
+            self.set_calls.append((task.get("name"), status))
+
+    def _make_engine(self, cfg):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        with mock.patch.object(ticket, "load_station_map",
+                               return_value=({}, {})), \
+             mock.patch.object(engine_mod, "HERE", self.tmp):
+            return engine_mod.MonitorEngine(config_path=p,
+                                            setup_logging=False)
+
+    # ---- (1) apply_start 不可哈希任务名 ----
+
+    def test_apply_start_skips_unhashable_task_name(self):
+        # P3：改前 eng.task_status(t) 内 state["tasks"].get(["x"]) 直接
+        # TypeError（Tk 兜住回调异常，不杀 GUI，但点"启动"无反应）。
+        # 应 warn+跳过坏条目，好任务照常处理。
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"},
+                 {"name": "good", "from": "BJ", "to": "SH"}]
+        eng = self._RecordingEngine()
+        dlg = self._FakeDialog({0: True, 1: True}, eng)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                gui.StartMonitorDialog.apply_start(dlg)  # 改前 TypeError
+        self.assertTrue(any("哈希" in m for m in logs.output),
+                        "必须明确记 warning 指出任务名不可哈希")
+        self.assertEqual([n for n, _ in eng.set_calls], ["good"])
+        self.assertEqual(eng.set_calls[0][1], "monitoring")
+
+    def test_apply_start_all_good_unchanged(self):
+        # 正向对照：全合法任务时原行为不变（逐个处理）。
+        tasks = [{"name": "a", "from": "BJ", "to": "SH"},
+                 {"name": "b", "from": "BJ", "to": "SH"}]
+        eng = self._RecordingEngine()
+        dlg = self._FakeDialog({0: True, 1: False}, eng)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}):
+            gui.StartMonitorDialog.apply_start(dlg)
+        self.assertEqual([n for n, _ in eng.set_calls], ["a"])
+        self.assertEqual(eng.set_calls[0][1], "monitoring")
+
+    # ---- (2) empty_task_dedup 缺 from/to ----
+
+    def test_empty_task_dedup_missing_from_warns_and_keeps(self):
+        # P3：from-less 任务（monitor op-4 / gui 右键重置可达）→ 改前
+        # task["from"] 直接 KeyError。应 warn+返回，不删任何防重记录。
+        e = self._make_engine({"tasks": [{"name": "t"}]})
+        e.state["dedup"] = {"BJ|SH|k1": 1, "BJ|GZ|k2": 1}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            e.empty_task_dedup({"name": "t", "to": "SH"})  # 改前 KeyError
+        self.assertEqual(e.state["dedup"], {"BJ|SH|k1": 1, "BJ|GZ|k2": 1})
+        self.assertTrue(any("from" in m for m in logs.output),
+                        "警告须指出 from/to 形状问题")
+
+    def test_empty_task_dedup_missing_to_warns_and_keeps(self):
+        # to 缺失同类：改前 task["to"] 直接 KeyError（与 108(e) 同口径）。
+        e = self._make_engine({"tasks": [{"name": "t"}]})
+        e.state["dedup"] = {"BJ|SH|k1": 1}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            e.empty_task_dedup({"name": "t", "from": "BJ"})  # 改前 KeyError
+        self.assertEqual(e.state["dedup"], {"BJ|SH|k1": 1})
+
+    def test_empty_task_dedup_non_string_from_warns_and_keeps(self):
+        # from 非字符串：改前 format 出 "['BJ']|SH|" 怪异前缀静默删空；
+        # 与 108(e) 同口径记 warning 后返回。
+        e = self._make_engine({"tasks": [{"name": "t"}]})
+        e.state["dedup"] = {"BJ|SH|k1": 1}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            e.empty_task_dedup({"name": "t", "from": ["BJ"], "to": "SH"})
+        self.assertEqual(e.state["dedup"], {"BJ|SH|k1": 1})
+
+    def test_empty_task_dedup_normal_clears_prefix(self):
+        # 正向对照：正常任务只清自己的 from|to| 前缀，不动他人。
+        e = self._make_engine({"tasks": [{"name": "t"}]})
+        e.state["dedup"] = {"BJ|SH|k1": 1, "BJ|GZ|k2": 1}
+        e.empty_task_dedup({"name": "t", "from": "BJ", "to": "SH"})
+        self.assertEqual(e.state["dedup"], {"BJ|GZ|k2": 1})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

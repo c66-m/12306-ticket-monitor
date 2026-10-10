@@ -2461,6 +2461,19 @@ class StartMonitorDialog(tk.Toplevel):
             var = self.vars.get(idx)
             if var is None:
                 continue
+            # Task 114：此处是重新 load 的原始 config tasks，未经 engine
+            # _sanitize_tasks 漏斗（Task 108）；不可哈希的 name 会让
+            # eng.task_status/set_task_status 的 state["tasks"].get(name)
+            # 直接 TypeError。非法条目记 warning 后跳过（逐条检查而非
+            # 整体过滤，保持 idx 与 self.vars 对齐）。
+            if not isinstance(t, dict):
+                LOG.warning("[配置] 启动对话框：tasks 含非法条目已跳过：%r", t)
+                continue
+            try:
+                hash(t.get("name"))
+            except TypeError:
+                LOG.warning("[配置] 启动对话框：任务名不可哈希已跳过：%r", t)
+                continue
             st = eng.task_status(t)
             if var.get():
                 if st not in engine_mod.ACTIVE_STATUSES:

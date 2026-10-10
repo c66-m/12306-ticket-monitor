@@ -802,7 +802,17 @@ class MonitorEngine(object):
 
     def empty_task_dedup(self, task):
         """清空某任务的本地防重记录（状态重置后重新抢同一张票时用）。"""
-        prefix = "{0}|{1}|".format(task["from"], task["to"])
+        from_name = task.get("from")
+        to_name = task.get("to")
+        if not isinstance(from_name, str) or not isinstance(to_name, str):
+            # Task 114：from-less 任务（monitor op-4 / gui 右键重置可达）
+            # → 旧代码 task["from"] 直接 KeyError。与 Task 108(e) 同口径：
+            # 记 warning 后返回，不清任何记录（缺键无法定位该任务的防重
+            # 前缀，误删整节更危险）。
+            LOG.warning("[状态] 任务「%s」的 from/to 形状非法，未清除防重记录：%r -> %r",
+                        task.get("name"), from_name, to_name)
+            return
+        prefix = "{0}|{1}|".format(from_name, to_name)
         for k in list(self.state["dedup"].keys()):
             if k.startswith(prefix):
                 del self.state["dedup"][k]
