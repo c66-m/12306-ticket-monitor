@@ -91,6 +91,20 @@ def _mask_tt_diag(tt_diag):
     return d
 
 
+def _tt_mismatch_report(tt_args, tt_bad, tt_now):
+    """票种未同步中止返回的 (msg, info)：姓名用 101h/113 同口径脱敏（Task 115）。
+
+    msg 用户可见，且经 _record_timing 以 (msg or "")[:140] 持久化进
+    logs/order_timing.jsonl；map 键用 _mask_tt_diag、name 字段用
+    _mask_ticket_names——只脱敏传给外部的取证副本，票种值/结构保留以
+    维持可调试性。注意：page 用的 tt_args 本体不动（map 键仍是真实姓名，
+    JS 对齐逻辑需要它），这里两个 helper 都返回副本。"""
+    msg = ("票种未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单"
+           % (json.dumps(_mask_tt_diag(tt_args), ensure_ascii=False),
+              json.dumps(_mask_ticket_names(tt_bad), ensure_ascii=False)))
+    return msg, {"limit_ticket_types": _mask_ticket_names(tt_now)}
+
+
 def _mask_text_names(text, names):
     """自由文本里的已知姓名替换为脱敏形（核对窗原文取证用）。"""
     for n in sorted((n for n in names or [] if n), key=len, reverse=True):
@@ -1094,11 +1108,10 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 tt_bad = [t for t in tt_now
                           if t["tt"] != str((tt_args["map"] or {}).get(t["name"]) or tt_args["code"])]
                 if tt_bad:
-                    return (False,
-                            "票种未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单"
-                            % (json.dumps(tt_args, ensure_ascii=False),
-                               json.dumps(tt_bad, ensure_ascii=False)),
-                            {"limit_ticket_types": tt_now})
+                    # Task 115：msg 用户可见且进 jsonl，姓名脱敏后才返回
+                    # （同口径 helper，tt_args 本体不动——page JS 仍需真实姓名）。
+                    msg, extra = _tt_mismatch_report(tt_args, tt_bad, tt_now)
+                    return (False, msg, extra)
             mark("ticket_type")
 
             # 7) 提交订单。#submitOrder_id 是 <a href="javascript:">，

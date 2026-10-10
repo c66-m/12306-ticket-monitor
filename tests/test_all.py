@@ -12434,6 +12434,68 @@ class TestTask114GuiEngineB5(TempDirCase):
         self.assertEqual(e.state["dedup"], {"BJ|GZ|k2": 1})
 
 
+
+class TestTask115BrowserOrderMsgB5(unittest.TestCase):
+    """Task 115 (B5-8)：browser_order 票种未同步中止返回的 msg/info 姓名脱敏（P3×1）。
+
+    msg 用户可见且经 _record_timing 以 (msg or "")[:140] 持久化进
+    logs/order_timing.jsonl；Task 113 只定了 :1065 的 _log sink（2.18），
+    这是另一条数据流（返回值 + jsonl 持久化）。
+    口径：复用 _mask_tt_diag（map 键）/ _mask_ticket_names（name 字段），
+    与 65a/78b/98a/101h/113 同尺度，不自创新 scheme。
+    """
+
+    def _tt(self):
+        tt_args = {"code": "1", "map": {"张三丰": "1", "李四": "3"}}
+        tt_bad = [{"name": "张三丰", "tt": "3"}]
+        tt_now = [{"name": "张三丰", "tt": "3"}, {"name": "李四", "tt": "1"}]
+        return tt_args, tt_bad, tt_now
+
+    def test_mismatch_msg_redacts_real_names(self):
+        # RED on old code: AttributeError（无此 helper）；旧 msg 表达式直接
+        # json.dumps(tt_args) → map 键=真实乘车人姓名明文进 msg。
+        import browser_order as bo
+        tt_args, tt_bad, tt_now = self._tt()
+        msg, _info = bo._tt_mismatch_report(tt_args, tt_bad, tt_now)
+        self.assertNotIn("张三丰", msg)
+        self.assertNotIn("李四", msg)
+        # 脱敏形与 _mask_name 同口径（首字+星号）
+        self.assertIn("张**", msg)
+        # 结构信息保留（可调试性）：票种值/文案不动
+        self.assertIn("票种未同步到页面内部状态", msg)
+        self.assertIn('"code": "1"', msg)
+        self.assertIn('"tt": "3"', msg)
+
+    def test_mismatch_msg_matches_helper口径(self):
+        # msg 必须嵌入 helper 脱敏后的取证副本——行为级口径一致性。
+        import browser_order as bo
+        import json as _json
+        tt_args, tt_bad, tt_now = self._tt()
+        msg, _info = bo._tt_mismatch_report(tt_args, tt_bad, tt_now)
+        self.assertIn(_json.dumps(bo._mask_tt_diag(tt_args), ensure_ascii=False), msg)
+        self.assertIn(_json.dumps(bo._mask_ticket_names(tt_bad), ensure_ascii=False), msg)
+
+    def test_mismatch_info_redacts_limit_ticket_types(self):
+        # info 字典 {"limit_ticket_types": tt_now} 同样带姓名（brief 附带面）。
+        import browser_order as bo
+        import json as _json
+        tt_args, tt_bad, tt_now = self._tt()
+        _msg, info = bo._tt_mismatch_report(tt_args, tt_bad, tt_now)
+        text = _json.dumps(info, ensure_ascii=False)
+        self.assertNotIn("张三丰", text)
+        self.assertNotIn("李四", text)
+        self.assertEqual([t["tt"] for t in info["limit_ticket_types"]],
+                         ["3", "1"])  # 票种值保留
+        self.assertEqual(tt_now[0]["name"], "张三丰")  # 不污染原数据
+
+    def test_mismatch_empty_inputs_safe(self):
+        # 正向对照：空/缺名不崩（旧代码即通过）
+        import browser_order as bo
+        msg, info = bo._tt_mismatch_report({"code": "1", "map": {}}, [], [])
+        self.assertIn("票种未同步", msg)
+        self.assertEqual(info["limit_ticket_types"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
