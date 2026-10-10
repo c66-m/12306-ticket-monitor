@@ -5338,7 +5338,9 @@ class TestMonitorLogP3(TempDirCase):
         # (a) load_session(config.get("session_cookies_file")) key 缺失传 None；
         # 应与 :601 一致补 default "session_cookies.json"。
         import monitor as monitor_mod
-        with mock.patch.object(monitor_mod.os.path, "exists",
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"tasks": []}), \
+             mock.patch.object(monitor_mod.os.path, "exists",
                                return_value=True), \
              mock.patch.object(order_mod, "load_session") as m_ls, \
              mock.patch.object(order_mod, "check_login",
@@ -5346,6 +5348,23 @@ class TestMonitorLogP3(TempDirCase):
              mock.patch.object(monitor_mod, "read", return_value=""):
             monitor_mod.menu_session()
         m_ls.assert_called_once_with("session_cookies.json")
+
+    def test_menu_session_browser_mode_uses_browser_check(self):
+        # browser 模式下 menu_session 应走 browser_order.check_session，
+        # 不碰 session_cookies.json / load_session。
+        import monitor as monitor_mod
+        import browser_order as bo_mod
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"order_mode": "browser"}), \
+             mock.patch.object(monitor_mod.os.path, "exists",
+                               return_value=True), \
+             mock.patch.object(bo_mod, "check_session",
+                               return_value=(True, "张三")) as m_chk, \
+             mock.patch.object(order_mod, "load_session") as m_ls, \
+             mock.patch.object(monitor_mod, "read", return_value=""):
+            monitor_mod.menu_session()
+        m_chk.assert_called_once()
+        m_ls.assert_not_called()
 
     def test_op5_delete_clears_state_entry(self):
         # (b) 删任务 op5 只删 config，state 残留僵尸；应同步清 state 条目。

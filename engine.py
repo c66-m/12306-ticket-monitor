@@ -1034,7 +1034,8 @@ class MonitorEngine(object):
                         # 本地记录仅作线索:以 12306 官方接口的订单状态为准决策
                         cls, ono, raw, recent = order_mod.classify_with_time(
                             date, train_code, task.get("passenger_names") or [],
-                            not_before_ts=attempt_ts)
+                            not_before_ts=attempt_ts,
+                            session=self._classify_session())
                         okey = "%s|%s" % (date, train_code)
                         LOG.info("[防重核查] 任务「%s」%s %s 官方查询结果=%s %s",
                                  name, date, train_code, cls,
@@ -1109,7 +1110,8 @@ class MonitorEngine(object):
                             # 其余（查不到/更早旧单/其它行程挡路）=保守停任务，防重复下单。
                             cls, ono, raw, recent = order_mod.classify_with_time(
                                 date, train_code, task.get("passenger_names") or [],
-                                not_before_ts=attempt_ts)
+                                not_before_ts=attempt_ts,
+                                session=self._classify_session())
                             if cls == "unpaid" and recent:
                                 self.state["dedup"][key] = "SUBMITTED"
                                 self._save_state()
@@ -1308,6 +1310,22 @@ class MonitorEngine(object):
 
     # ----------------------------- 会话体检 -----------------------------
 
+    def _classify_session(self):
+        """返回当前模式下供 classify_order_status / classify_with_time 复用的会话。
+
+        browser 模式返回 None——classify 内部默认回退到 session_from_browser_state()
+        读 .browser_state.json，与 browser_order 写盘的载体一致。
+        http 模式显式 load_session(session_cookies.json)，修正旧代码中 classify
+        无条件回退 .browser_state.json 导致的载体错配（http 下单写 session_cookies
+        但分类读 .browser_state → 防重核查误判 error）。"""
+        if (self.config.get("order_mode") or "http") == "browser":
+            return None
+        try:
+            return order_mod.load_session(
+                self.config.get("session_cookies_file", "session_cookies.json"))
+        except Exception:
+            return None
+
     def check_session_if_needed(self):
         """定期检查登录会话；确认失效时把开启自动下单的监控中任务标记为失败。
         临时故障（网络异常/系统繁忙页/浏览器校验异常）只告警不杀任务，稍后自动重试。
@@ -1406,7 +1424,8 @@ class MonitorEngine(object):
                          rec.get("train"), rec.get("date"), rec.get("seat"),
                          _mask_order_no(rec.get("order_no") or ""))
                 cls, ono, raw = order_mod.classify_order_status(
-                    rec.get("date"), rec.get("train"), rec.get("passengers"))
+                    rec.get("date"), rec.get("train"), rec.get("passengers"),
+                    session=self._classify_session())
                 rec.update({"classify": cls, "official_status": raw,
                             "order_no": ono or rec.get("order_no"),
                             "decision": "启动复核:%s" % cls})

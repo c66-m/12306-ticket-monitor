@@ -980,17 +980,33 @@ def menu_notify():
 def menu_session():
     print("\n===== 登录会话 =====")
     config = load_config()
-    cookie_path = os.path.join(HERE, config.get("session_cookies_file", "session_cookies.json"))
-    if os.path.exists(cookie_path):
-        try:
-            s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))
-            ok, who = order_mod.check_login(s)
-            print("  会话文件：%s" % cookie_path)
-            print("  当前状态：%s" % ("有效（%s）" % who if ok else "失效（%s）" % who))
-        except Exception as e:
-            print("  会话校验异常：%s" % e)
+    browser_mode = (config.get("order_mode") or "http") == "browser"
+    if browser_mode:
+        import browser_order
+        state_path = getattr(browser_order, "STATE_PATH",
+                             os.path.join(HERE, ".browser_state.json"))
+        print("  会话模式：浏览器下单（.browser_profile）")
+        if os.path.exists(state_path):
+            try:
+                ok, who = browser_order.check_session(timeout=6)
+                print("  状态文件：%s" % state_path)
+                print("  当前状态：%s" % ("有效（%s）" % who if ok else "失效（%s）" % who))
+            except Exception as e:
+                print("  会话校验异常：%s" % e)
+        else:
+            print("  尚未保存浏览器会话。")
     else:
-        print("  尚未保存会话。")
+        cookie_path = os.path.join(HERE, config.get("session_cookies_file", "session_cookies.json"))
+        if os.path.exists(cookie_path):
+            try:
+                s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))
+                ok, who = order_mod.check_login(s)
+                print("  会话文件：%s" % cookie_path)
+                print("  当前状态：%s" % ("有效（%s）" % who if ok else "失效（%s）" % who))
+            except Exception as e:
+                print("  会话校验异常：%s" % e)
+        else:
+            print("  尚未保存会话。")
     print("  1. 重新登录（弹出 Edge，扫码/账号密码登录后自动保存 Cookie）")
     print("  2. 查看账号已保存的乘车人")
     op = read("  选择操作（回车=返回）：", "")
@@ -1000,16 +1016,19 @@ def menu_session():
         subprocess.call([sys.executable, script], cwd=HERE)
     elif op == "2":
         try:
-            s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))
-            ok, who = order_mod.check_login(s)
-            if not ok:
-                print("  会话无效：%s" % who)
+            if browser_mode:
+                s = order_mod.session_from_browser_state()
             else:
-                ps = order_mod.get_passengers(s)
-                print("  账号已保存乘车人 %d 位：" % len(ps))
-                for p in ps:
-                    print("    %s（%s）" % (
-                        p["name"], "成人" if p.get("is_adult", True) else "非成人"))
+                s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))
+                ok, who = order_mod.check_login(s)
+                if not ok:
+                    print("  会话无效：%s" % who)
+                    return
+            ps = order_mod.get_passengers(s)
+            print("  账号已保存乘车人 %d 位：" % len(ps))
+            for p in ps:
+                print("    %s（%s）" % (
+                    p["name"], "成人" if p.get("is_adult", True) else "非成人"))
         except Exception as e:
             print("  查询失败：%s" % e)
 
