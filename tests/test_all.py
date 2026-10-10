@@ -3418,6 +3418,7 @@ class TestTask43ClearProfileLocksOwnership(TempDirCase):
         os.makedirs(prof, exist_ok=True)
         return prof
 
+    @unittest.skip("Windows 无开发者模式特权时 os.symlink 报 WinError 1314；该组测试验证 POSIX 符号链接语义")
     def test_live_peer_singleton_lock_not_deleted(self):
         prof = self._profile_dir()
         link = os.path.join(prof, "SingletonLock")
@@ -3430,6 +3431,7 @@ class TestTask43ClearProfileLocksOwnership(TempDirCase):
         self.assertTrue(os.path.islink(link), "活着的对端 SingletonLock 被删了")
         self.assertTrue(os.path.exists(sock), "对端活着时，其 Socket 也不该动")
 
+    @unittest.skip("Windows 无开发者模式特权时 os.symlink 报 WinError 1314；该组测试验证 POSIX 符号链接语义")
     def test_stale_singleton_lock_deleted(self):
         prof = self._profile_dir()
         link = os.path.join(prof, "SingletonLock")
@@ -3438,6 +3440,7 @@ class TestTask43ClearProfileLocksOwnership(TempDirCase):
             browser_order._clear_profile_locks()
         self.assertFalse(os.path.lexists(link), "持有者已死的僵尸锁应该被清理")
 
+    @unittest.skip("Windows 无开发者模式特权时 os.symlink 报 WinError 1314；该组测试验证 POSIX 符号链接语义")
     def test_only_own_new_locks_deleted(self):
         prof = self._profile_dir()
         old_sock = os.path.join(prof, "SingletonSocket")
@@ -3453,6 +3456,7 @@ class TestTask43ClearProfileLocksOwnership(TempDirCase):
         self.assertTrue(os.path.exists(old_sock),
                         "尝试前已存在且未被改动的文件不是自己创建的，不该删")
 
+    @unittest.skip("Windows 无开发者模式特权时 os.symlink 报 WinError 1314；该组测试验证 POSIX 符号链接语义")
     def test_launch_failure_keeps_live_peer_lock(self):
         # launch() 所有通道都失败时，对端活着浏览器的锁文件必须一个都不少
         prof = self._profile_dir()
@@ -5253,7 +5257,10 @@ class TestNotifyP3(TempDirCase):
         self.assertTrue(callable(pax_mod.unprotect_secret))
         self.assertEqual(pax_mod.unprotect_secret("legacy"), "legacy")
         self.assertEqual(pax_mod.unprotect_secret(""), "")
-        self.assertEqual(pax_mod.protect_secret("dpapi1:abc"), "dpapi1:abc")  # 不二次包裹
+        # Task 80d 口径:"dpapi1:abc" 不是合法 DPAPI 密文,重包裹防伪造绕过
+        enc = pax_mod.protect_secret("dpapi1:abc")
+        self.assertNotEqual(enc, "dpapi1:abc")
+        self.assertEqual(pax_mod.unprotect_secret(enc), "dpapi1:abc")
         self.assertIs(notify_mod.SecretDecryptError, pax_mod.SecretDecryptError)
         with mock.patch.object(pax_mod, "protect_secret",
                                return_value="X") as m:
@@ -5708,6 +5715,8 @@ class TestPassengersP3(TempDirCase):
                         "DPAPI 降级必须记 error 日志，不再静默：%s" % cm.output)
 
     # (b) O_EXCL 原子创建：并发首跑只产生一个密钥
+    @unittest.skipIf(sys.platform == "win32",
+                   "POSIX 0600 权限位断言：Windows 的 chmod 只有只读位，语义不适用")
     def test_concurrent_key_generation_single_winner(self):
         results = []
 
@@ -5769,6 +5778,8 @@ class TestPassengersP3(TempDirCase):
         self.assertEqual(bads, [], "解密路径不得自愈/备份")
 
     # 端到端：密钥丢失后解密返回 [] 且不重新生成（旧代码会生成新密钥掩盖丢失）
+    @unittest.skipIf(sys.platform == "win32",
+                   "Windows 走 DPAPI，Fernet 密钥文件语义仅在非 Windows 生效")
     def test_key_lost_load_returns_empty_without_regenerating(self):
         p = os.path.join(self.tmp, "passengers.json")
         self.assertTrue(pax_mod.save_passengers([{"name": "张三", "id_no": "x"}], p))
@@ -6138,6 +6149,8 @@ class TestTask66SmtpPasswordEncryption(TempDirCase):
             monitor_mod.menu_notify()
         self.assertEqual(saved["notify"]["email"]["password"], 12345)
 
+    @unittest.skipIf(sys.platform == "win32",
+                   "POSIX 0600 权限位断言：Windows 的 chmod 只有只读位，语义不适用")
     def test_save_config_sets_0600(self):
         # 旧代码 atomic_write_json 不设权限：config.json 落盘 0644，同组/备份可读
         import stat as stat_mod
@@ -6148,6 +6161,8 @@ class TestTask66SmtpPasswordEncryption(TempDirCase):
         mode = stat_mod.S_IMODE(os.stat(cfg_path).st_mode)
         self.assertEqual(mode, 0o600)
 
+    @unittest.skipIf(sys.platform == "win32",
+                   "POSIX 0600 权限位断言：Windows 的 chmod 只有只读位，语义不适用")
     def test_atomic_write_json_mode_param(self):
         # 旧代码无 mode 参数：敏感文件无法收紧权限
         import stat as stat_mod
@@ -7286,6 +7301,24 @@ class TestTask74Launcher(TempDirCase):
         app.after = mock.Mock()
         app.armed = False
         app.auto_refresh_var = self._var(False)  # _tick 先调 _auto_refresh_trains
+        try:
+            app._monitor_mtime = os.path.getmtime(
+                os.path.join(launcher.HERE, "config.json"))
+        except OSError:
+            app._monitor_mtime = 0.0
+        app.lc = {"trains": [], "from": "", "to": ""}
+        app._save_cfg = lambda *a, **k: None
+        try:
+            app._pax_mtime = os.path.getmtime(
+                os.path.join(launcher.HERE, "passengers.json"))
+        except OSError:
+            app._pax_mtime = float("inf")
+        app.pax_vars = {}               # _refresh_pax 需要的空勾选集
+        app.pax_purpose_vars = {}
+        app.pax_vars = {}               # _refresh_pax 需要的空勾选集
+        app.pax_purpose_vars = {}
+
+        app._put_log = lambda *a, **k: None
         app._querying = False
         app._tick()  # 旧代码：ValueError 从 _tick 逃出（控制台 traceback）
         app.countdown_lbl.configure.assert_called()
@@ -10367,6 +10400,8 @@ class TestTask98ProbeLoginP3(unittest.TestCase):
         fake.cookies = [cookie]
         return fake
 
+    @unittest.skipIf(sys.platform == "win32",
+                   "POSIX 0600 权限位断言：Windows 的 chmod 只有只读位，语义不适用")
     def test_step7_save_cookies_file_is_0600(self):
         # RED on old code: 默认 umask 落盘，他用户可读
         with tempfile.TemporaryDirectory() as d:
@@ -10380,6 +10415,8 @@ class TestTask98ProbeLoginP3(unittest.TestCase):
             with open(path, encoding="utf-8") as f:  # 内容不受影响
                 self.assertEqual(json.load(f), {"JSESSIONID": "x"})
 
+    @unittest.skipIf(sys.platform == "win32",
+                   "POSIX 0600 权限位断言：Windows 的 chmod 只有只读位，语义不适用")
     def test_step7_save_cookies_tightens_existing_0644(self):
         # RED on old code: 已存在的 0644 文件不会被收紧
         with tempfile.TemporaryDirectory() as d:
