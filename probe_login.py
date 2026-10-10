@@ -82,9 +82,12 @@ def banner(title):
     print("=" * 64)
 
 
+# Task 113：newapptk 是可换会话 Cookie 的 bearer token（Task 98a 同口径按
+# *** 处理）。step5 的 show(r, mask_pii=True) 曾把它明文打印——mask_pii=True
+# 只覆盖字段表里的 PII 字段名，不等于已脱敏（Task 98 reviewer 误判，第四轮重扫 2.4）。
 _PII_VALUE_RE = re.compile(
     r'("(?:passenger_name|passenger_id_no|mobile_no|id_no|user_name|username|name|'
-    r'phone_no|email|address|born_date)"'
+    r'phone_no|email|address|born_date|newapptk)"'
     r"\s*:\s*\""
     r')(?:[^"\\]|\\.)*(")')
 
@@ -96,6 +99,7 @@ def _mask_pii(text):
     打印前把 passenger_name / passenger_id_no / mobile_no / phone_no /
     email / address / born_date 等字段值抹掉，
     字段名与 JSON 结构保留，仍可判断接口变更（Task 65a，Task 78b 补全字段）。
+    newapptk（bearer token，可换会话 Cookie）同按 *** 处理（Task 113）。
     """
     if not text:
         return text
@@ -150,6 +154,10 @@ def step1_connectivity():
             # create-qr64 是 POST，这里先用 GET 探活即可（返回 405 也说明域名可达）
             r = SESSION.get(url, timeout=10)
             show(r)
+        except KeyboardInterrupt:
+            # Task 113：短请求 Ctrl+C 优雅退出（78g 同口径），不抛 traceback
+            print("\n  [中断] 用户取消（Ctrl+C），退出连通性探测。")
+            return
         except Exception as e:
             print("    [异常] {0}: {1}".format(type(e).__name__, e))
 
@@ -161,6 +169,10 @@ def step2_bootstrap_cookies():
     try:
         r = SESSION.get("https://kyfw.12306.cn/otn/index12306/getLoginBanner", timeout=10)
         show(r, limit=200)
+    except KeyboardInterrupt:
+        # Task 113：短请求 Ctrl+C 优雅退出（78g 同口径），不抛 traceback
+        print("\n  [中断] 用户取消（Ctrl+C），退出。")
+        return
     except Exception as e:
         print("    [异常] {0}: {1}".format(type(e).__name__, e))
 
@@ -184,6 +196,10 @@ def create_qr_raw():
         data = r.json()
         uuid = data.get("uuid")
         image_b64 = data.get("image")
+    except KeyboardInterrupt:
+        # Task 113：短请求 Ctrl+C 优雅退出（78g 同口径），不抛 traceback
+        print("\n  [中断] 用户取消（Ctrl+C），退出。")
+        return None
     except Exception as e:
         print("    [异常] {0}: {1}".format(type(e).__name__, e))
         return None
@@ -355,6 +371,11 @@ def step5_finish_login(uamtk):
             tk = r.json().get("newapptk")
         except Exception:
             pass
+    except KeyboardInterrupt:
+        # Task 113：短请求 Ctrl+C 优雅退出（78g 同口径）——直接返回，
+        # 不落入下面的 uamtk 回退（用户已取消，不应再打第二个请求）
+        print("\n  [中断] 用户取消（Ctrl+C），退出。")
+        return False
     except Exception as e:
         print("    [异常] {0}: {1}".format(type(e).__name__, e))
         tk = None
@@ -382,6 +403,10 @@ def step5_finish_login(uamtk):
             return j.get("result_code") == 0
         except Exception:
             return False
+    except KeyboardInterrupt:
+        # Task 113：短请求 Ctrl+C 优雅退出（78g 同口径），不抛 traceback
+        print("\n  [中断] 用户取消（Ctrl+C），退出。")
+        return False
     except Exception as e:
         print("    [异常] {0}: {1}".format(type(e).__name__, e))
         return False
@@ -428,6 +453,10 @@ def step6_verify_session():
             show(r, mask_pii=True)
             if _session_looks_valid(r):
                 ok = True
+        except KeyboardInterrupt:
+            # Task 113：短请求 Ctrl+C 优雅退出（78g 同口径），不抛 traceback
+            print("\n  [中断] 用户取消（Ctrl+C），退出。")
+            return ok
         except Exception as e:
             print("    [异常] {0}: {1}".format(type(e).__name__, e))
     return ok

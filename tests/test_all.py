@@ -1575,6 +1575,9 @@ class TestConfigKeys(TempDirCase):
         others = [f for f in self._PRODUCT_FILES if f != "notify.py"]
         code_keys = (self._scan(r"(?<![\w.])config\.get\(\s*['\"](\w+)[\"']")
                      | self._scan(r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']", others)
+                     # Task 113：第 6 形状——launcher.py:610 经 _cfg 别名读顶层键
+                     # （前导 _ 是 word char，旧 cfg\.get 的 lookbehind 挡住）
+                     | self._scan(r"(?<![\w.])_cfg\.get\(\s*['\"](\w+)[\"']", others)
                      | self._scan(r"self\.config\.get\(\s*['\"](\w+)[\"']")
                      | self._scan(r"(?<![\w.])config\[['\"](\w+)[\"']")
                      # Task 101c：补 2 类漏报形态——json.load(f).get("k")
@@ -12052,6 +12055,251 @@ class TestTask112PassengersB5(TempDirCase):
         import passengers as pax_mod
         p = os.path.join(self.tmp, "passengers.json")
         self.assertTrue(pax_mod.save_passengers([{"name": "A"}], p))
+
+
+class TestTask113CredMiscB5(unittest.TestCase):
+    """Task 113: B5-6 凭证/杂项 bundle（P3×7）。"""
+
+    def _printed(self, mprint):
+        return "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+
+    # ---- 2.4 newapptk 脱敏 ----
+
+    def test_mask_pii_redacts_newapptk(self):
+        # RED on old code: _mask_pii 原样返回 newapptk（第四轮重扫实测确认）
+        out = probe_login._mask_pii('{"result_code":0,"newapptk":"SECRET-TOKEN-XYZ"}')
+        self.assertNotIn("SECRET-TOKEN-XYZ", out)
+        self.assertIn('"newapptk":"***"', out)  # 字段名/结构保留，仍可判断接口变更
+
+    def test_step5_show_masks_newapptk(self):
+        # RED on old code: show(r, mask_pii=True) 把 newapptk 明文打印
+        resp = _FakeResp('{"result_code":0,"result_message":"ok",'
+                        '"newapptk":"SECRET-TOKEN-XYZ"}')
+        with mock.patch("builtins.print") as mprint:
+            probe_login.show(resp, mask_pii=True)
+        out = self._printed(mprint)
+        self.assertNotIn("SECRET-TOKEN-XYZ", out)
+        self.assertIn("newapptk", out)
+
+    def test_mask_pii_keeps_existing_fields(self):
+        # 正向对照：已有 PII 字段仍脱敏（旧代码即通过）
+        out = probe_login._mask_pii('{"username":"张三丰"}')
+        self.assertNotIn("张三丰", out)
+        self.assertIn('"username":"***"', out)
+
+    # ---- 2.5 短请求 Ctrl+C（78g 同口径） ----
+
+    def _ki_session(self, method):
+        fake = mock.Mock()
+        getattr(fake, method).side_effect = KeyboardInterrupt
+        return fake
+
+    def _no_kb_interrupt(self, fn):
+        # 旧代码下 Ctrl+C 会逃出被测函数；直接让它逃出会杀掉整个 runner
+        # （exit=130），故在测试内捕获并转为普通 FAIL
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C 抛出了 KeyboardInterrupt（应优雅退出，不抛 traceback）")
+
+    def test_step1_ctrl_c_exits_gracefully(self):
+        # RED on old code: Ctrl+C 穿透 except Exception 抛 traceback
+        with mock.patch.object(probe_login, "SESSION", self._ki_session("get")), \
+             mock.patch("builtins.print") as mprint:
+            self._no_kb_interrupt(probe_login.step1_connectivity)
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_step2_ctrl_c_exits_gracefully(self):
+        # RED on old code: 同上
+        with mock.patch.object(probe_login, "SESSION", self._ki_session("get")), \
+             mock.patch("builtins.print") as mprint:
+            self._no_kb_interrupt(probe_login.step2_bootstrap_cookies)
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_create_qr_raw_ctrl_c_returns_none(self):
+        # RED on old code: 同上
+        with mock.patch.object(probe_login, "SESSION", self._ki_session("post")), \
+             mock.patch("builtins.print") as mprint:
+            self.assertIsNone(self._no_kb_interrupt(probe_login.create_qr_raw))
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_step5_first_post_ctrl_c_returns_false_without_fallback(self):
+        # RED on old code: traceback；改后直接返回 False，不落入
+        # "改用二维码返回的 uamtk 尝试"回退（不再打第二个请求）
+        fake = mock.Mock()
+        fake.post.side_effect = KeyboardInterrupt
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint:
+            self.assertFalse(self._no_kb_interrupt(
+                lambda: probe_login.step5_finish_login("uamtk-from-qr")))
+        out = self._printed(mprint)
+        self.assertIn("中断", out)
+        self.assertNotIn("回退", out)
+        self.assertEqual(fake.post.call_count, 1)
+
+    def test_step5_second_post_ctrl_c_returns_false(self):
+        # RED on old code: traceback（第一个请求成功取到 newapptk，第二个请求时 Ctrl+C）
+        fake = mock.Mock()
+        fake.post.side_effect = [
+            _FakeResp('{"result_code":0,"newapptk":"TK123"}'),
+            KeyboardInterrupt,
+        ]
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint:
+            self.assertFalse(self._no_kb_interrupt(
+                lambda: probe_login.step5_finish_login("uamtk-from-qr")))
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_step6_ctrl_c_returns_gracefully(self):
+        # RED on old code: traceback
+        with mock.patch.object(probe_login, "SESSION", self._ki_session("get")), \
+             mock.patch("builtins.print") as mprint:
+            self.assertFalse(self._no_kb_interrupt(probe_login.step6_verify_session))
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_step4_poll_inner_request_ctrl_c_still_graceful(self):
+        # :284 回归 pin：轮询内层请求的 Ctrl+C 早已被 78g 外层 except
+        # KeyboardInterrupt 捕获——本次无需改动，此测试锁定该行为
+        fake = mock.Mock()
+        fake.post.side_effect = KeyboardInterrupt
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint, \
+             mock.patch("time.sleep"):
+            self.assertIsNone(probe_login.step4_poll_qr("uuid-x"))
+        self.assertIn("中断", self._printed(mprint))
+
+    # ---- 2.6 session cookies 0o600 ----
+
+    def _run_cs_main(self, **kw):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = kw.get("connected", True)
+        context = browser.new_context.return_value
+        context.cookies.return_value = kw.get("cookies", [])
+        fake_mod = mock.MagicMock()  # playwright.sync_api 桩
+        with mock.patch.object(capture_session, "_order_mode",
+                               return_value="http"), \
+             mock.patch.object(capture_session, "_launch_browser",
+                               return_value=browser), \
+             mock.patch.object(capture_session, "_goto_login_page",
+                               return_value=kw.get("goto_ok", True)), \
+             mock.patch.object(capture_session, "_wait_for_login",
+                               return_value=kw.get("wait_status",
+                                                   capture_session.LOGIN_OK)), \
+             mock.patch.object(capture_session, "_final_verify",
+                               return_value=kw.get("final_ok", True)), \
+             mock.patch.dict("sys.modules",
+                             {"playwright": mock.MagicMock(),
+                              "playwright.sync_api": fake_mod}), \
+             mock.patch("builtins.print"):
+            rc = capture_session.main()
+        return rc, browser
+
+    def test_capture_session_cookie_write_is_0600(self):
+        # RED on old code: atomic_write_json 未传 mode
+        import capture_session
+        cookies = [{"name": "tk", "value": "v",
+                    "domain": "kyfw.12306.cn", "path": "/"}]
+        with mock.patch.object(capture_session.appcommon,
+                               "atomic_write_json") as m_write:
+            browser = mock.Mock()
+            browser.is_connected.return_value = True
+            browser.new_context.return_value.cookies.return_value = cookies
+            fake_mod = mock.MagicMock()
+            with mock.patch.object(capture_session, "_order_mode",
+                                   return_value="http"), \
+                 mock.patch.object(capture_session, "_launch_browser",
+                                   return_value=browser), \
+                 mock.patch.object(capture_session, "_goto_login_page",
+                                   return_value=True), \
+                 mock.patch.object(capture_session, "_wait_for_login",
+                                   return_value=capture_session.LOGIN_OK), \
+                 mock.patch.object(capture_session, "_final_verify",
+                                   return_value=True), \
+                 mock.patch.dict("sys.modules",
+                                 {"playwright": mock.MagicMock(),
+                                  "playwright.sync_api": fake_mod}), \
+                 mock.patch("builtins.print"):
+                rc = capture_session.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(m_write.call_args.kwargs.get("mode"), 0o600)
+
+    def test_order_save_session_write_is_0600(self):
+        # RED on old code: atomic_write_json 未传 mode
+        cookie = mock.Mock()
+        cookie.name = "tk"
+        cookie.value = "v"
+        cookie.domain = "kyfw.12306.cn"
+        cookie.path = "/otn"
+        session = mock.Mock()
+        session.cookies = [cookie]
+        with mock.patch.object(order_mod.appcommon,
+                               "atomic_write_json") as m_write:
+            order_mod.save_session(session, "/tmp/x_cookies.json")
+        self.assertEqual(m_write.call_args.kwargs.get("mode"), 0o600)
+
+    # ---- 2.7 _final_verify Ctrl+C ----
+
+    def test_final_verify_ctrl_c_returns_false_gracefully(self):
+        # RED on old code: KeyboardInterrupt 穿透 except Exception 冲出 main()
+        import capture_session
+        page = mock.Mock()
+        page.goto.side_effect = KeyboardInterrupt
+        with mock.patch("builtins.print") as mprint:
+            self.assertFalse(self._no_kb_interrupt(
+                lambda: capture_session._final_verify(page)))
+        self.assertIn("中断", self._printed(mprint))
+
+    # ---- 2.8 _safe_close_browser 一致性 ----
+
+    def test_goto_login_fail_uses_safe_close(self):
+        # RED on old code: 裸 browser.close() 作用于已断开浏览器
+        rc, browser = self._run_cs_main(goto_ok=False, connected=False)
+        self.assertEqual(rc, 1)
+        browser.close.assert_not_called()
+
+    def test_login_timeout_uses_safe_close(self):
+        # RED on old code: 同上（超时路径）
+        import capture_session
+        rc, browser = self._run_cs_main(wait_status=capture_session.LOGIN_TIMEOUT,
+                                       connected=False)
+        self.assertEqual(rc, 1)
+        browser.close.assert_not_called()
+
+    def test_goto_login_fail_still_closes_connected_browser(self):
+        # 正向对照：浏览器还连着 → 照常关闭（旧代码即通过）
+        rc, browser = self._run_cs_main(goto_ok=False, connected=True)
+        self.assertEqual(rc, 1)
+        browser.close.assert_called_once()
+
+    # ---- 2.18 tt_diag 姓名脱敏 ----
+
+    def test_mask_tt_diag_redacts_map_keys(self):
+        # RED on old code: 无此函数；tt_diag["map"] 键为乘车人姓名明文
+        diag = {"before": ["1", "3"], "map": {"张三丰": "1", "李四": "3"}}
+        out = browser_order._mask_tt_diag(diag)
+        text = json.dumps(out, ensure_ascii=False)
+        self.assertNotIn("张三丰", text)
+        self.assertNotIn("李四", text)
+        self.assertEqual(out["before"], ["1", "3"])  # 结构保留
+        self.assertEqual(sorted(out["map"].values()), ["1", "3"])  # 票种值保留
+
+    def test_mask_tt_diag_empty_safe(self):
+        # 空/None 输入不崩（正向对照）
+        self.assertEqual(browser_order._mask_tt_diag(None)["map"], {})
+        self.assertEqual(browser_order._mask_tt_diag({})["map"], {})
+
+    # ---- 2.25 _cfg.get 扫描形状 ----
+
+    def test_scan_catches_cfg_underscore_shape(self):
+        # 缺口锁定：旧 (?<![\w.])cfg\.get 形状漏报 _cfg.get（前导 _ 被 lookbehind 挡住）
+        old_found = {m.group(1) for m in re.finditer(
+            r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']", '_cfg.get("ghost_hist")')}
+        self.assertEqual(old_found, set())
+        # 新 _cfg 分支必须扫到
+        new_found = {m.group(1) for m in re.finditer(
+            r"(?<![\w.])_cfg\.get\(\s*['\"](\w+)[\"']", '_cfg.get("ghost_hist")')}
+        self.assertEqual(new_found, {"ghost_hist"})
 
 
 if __name__ == "__main__":

@@ -81,6 +81,16 @@ def _mask_ticket_names(tickets):
     return out
 
 
+def _mask_tt_diag(tt_diag):
+    """票种诊断取证 JSON：只脱敏 map 键（乘车人姓名），票种值/before 结构保留。
+
+    Task 113（Task 101h sweep 漏网的新位置）：tt_diag["map"] = {姓名: "1"/"3"}，
+    整包 json.dumps 进 _log 会把全部乘车人姓名明文打到控制台。"""
+    d = dict(tt_diag or {})
+    d["map"] = {_mask_name(k): v for k, v in (d.get("map") or {}).items()}
+    return d
+
+
 def _mask_text_names(text, names):
     """自由文本里的已知姓名替换为脱敏形（核对窗原文取证用）。"""
     for n in sorted((n for n in names or [] if n), key=len, reverse=True):
@@ -1062,7 +1072,9 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     d.after = (window.limit_tickets || []).map(t => t.ticket_type);
                     return d;
                 }""", tt_args)
-            _log("  [浏览器] 票种诊断：%s" % json.dumps(tt_diag, ensure_ascii=False))
+            # Task 113：map 键是乘车人姓名，脱敏后才进日志（101h 同口径）
+            _log("  [浏览器] 票种诊断：%s"
+                 % json.dumps(_mask_tt_diag(tt_diag), ensure_ascii=False))
             try:
                 page.wait_for_function(
                     """(args) => (window.limit_tickets || []).every(

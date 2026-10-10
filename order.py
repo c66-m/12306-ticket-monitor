@@ -146,7 +146,8 @@ def save_session(session, cookie_path=None):
     ])
     if not cookies:
         return
-    appcommon.atomic_write_json(path, cookies)
+    # Task 113：会话凭证落盘 0o600（Task 98c 同口径；capture_session.py 同类已修）
+    appcommon.atomic_write_json(path, cookies, mode=0o600)
 
 
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"

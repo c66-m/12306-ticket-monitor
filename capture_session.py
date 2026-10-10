@@ -207,6 +207,11 @@ def _final_verify(page):
         page.goto(CHECK_URL)
         time.sleep(2)
         body = page.content()
+    except KeyboardInterrupt:
+        # Task 113：sleep(2)/goto/content 同 try 块，Ctrl+C 优雅退出
+        # （Task 65c 干净退出码口径），不抛 traceback 冲出 main()
+        print("\n[中断] 用户取消最终验证（Ctrl+C），退出。")
+        return False
     except Exception as e:
         print("[警告] 最终验证请求失败：{0}".format(e))
         return False
@@ -253,7 +258,7 @@ def main():
         )
         page = context.new_page()
         if not _goto_login_page(page):
-            browser.close()
+            _safe_close_browser(browser)  # Task 113：与 :277 同口径（Task 99d）
             return 1
 
         # 轮询判断：登录成功后 Cookie 里会出现 tk / RAIL_EXPIRATION 等关键字段
@@ -265,7 +270,7 @@ def main():
             return 1
         if status != LOGIN_OK:
             print("\n[失败] 未检测到登录状态（{0}s 超时）。窗口已自动关闭，请重试。".format(MAX_WAIT_SEC))
-            browser.close()
+            _safe_close_browser(browser)  # Task 113：与 :277 同口径（Task 99d）
             return 1
 
         # 最终验证：通过才存 Cookie、才打印成功（Task 65d）。
@@ -289,9 +294,11 @@ def main():
             print("[警告] 以下关键 Cookie 未捕获: {0}（不影响保存，但下单可能失败）".format(missing))
 
         # 原子写：写一半被杀会留下半截 JSON，下次下单直接"未登录"
-        appcommon.atomic_write_json(cookie_path, cookie_dict)
+        # Task 113：会话凭证落盘 0o600（Task 98c 同口径；Linux 默认 umask
+        # 下他用户可读，文件内是活的 tk/JSESSIONID/BIGipServerotn）
+        appcommon.atomic_write_json(cookie_path, cookie_dict, mode=0o600)
 
-        browser.close()
+        _safe_close_browser(browser)  # Task 113：与 :277 同口径（Task 99d）
         print("\n[完成] 已保存 {0} 个 Cookie 到 {1}".format(len(cookie_dict), cookie_path))
         print("之后直接运行：python monitor.py")
         return 0
