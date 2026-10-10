@@ -55,15 +55,32 @@ import order as order_mod
 import passengers as passengers_mod
 import ticket
 
+import launcher_utils
+from launcher_utils import (
+    SEAT_OPTIONS, SEAT_ORDER, MONITOR_SEAT_CHOICES,
+    FONT, _DEFAULT_LC, PURPOSE_LABELS, LABEL_TO_PURPOSE,
+    _ORDER_NO_RE, _FW_TRANS,
+    _is_soft_fail, purpose_of, purpose_map_of,
+    _make_check_icon, _patch_tick_layout,
+    new_grab_task,
+    mask_id, mask_mobile,
+    _mask_order_no, _mask_one_name, _mask_names, _mask_pii_text,
+    _normalize_seat_types, _display_seat_types,
+    parse_dt, fmt_countdown,
+    is_emu, train_kind, fmt_date_tag,
+    ip_locate,
+    build_monitor_task,
+    _norm_query,
+    TrainCard,
+)
+import launcher_widgets
+from launcher_widgets import CalendarDialog, DateTimeDialog, TrainCardList
+
 __version__ = "1.0.0"
 LAUNCHER_CFG_PATH = os.path.join(HERE, "launcher_config.json")
 LOG_DIR = os.path.join(HERE, "logs")
 
-# 席别勾选列表：唯一定义在 ticket.py（含动卧），此处只引用
-SEAT_OPTIONS = list(ticket.SEAT_CHOICES)
-SEAT_ORDER = {v: i for i, v in enumerate(SEAT_OPTIONS)}
-# 监控系统任务的席别表：与 SEAT_OPTIONS 同一份（原先三处拷贝已收敛）
-MONITOR_SEAT_CHOICES = SEAT_OPTIONS
+
 LOG_COLOR = {
     "[有票]": "#d97706", "[抢到]": "#0969da", "[错误]": "#cf222e",
     "[会话]": "#6e7781", "[运行]": "#57606a", "[提醒]": "#9a6700", "[更新]": "#8250df",
@@ -72,15 +89,6 @@ LOG_COLOR = {
 
 LOGQ = queue.Queue()
 
-
-def _is_soft_fail(msg):
-    """瞬时繁忙/排队类软失败判定（Task 65i）。
-
-    这类错误是 12306 侧的瞬时拥塞，不是"下单逻辑失败"：不计入 fail_streak
-    （"同一目标连续失败 N 次自动停止"守卫本意只拦硬失败）。busy_n 继续驱动
-    退避（3s→30s 封顶）；持续繁忙会一直重试直到用户停止——抢票本意如此。
-    """
-    return any(k in (msg or "") for k in ("系统繁忙", "网络异常", "排队"))
 
 
 class _QHandler(logging.Handler):
@@ -123,91 +131,10 @@ def log(msg):
     LOG.info(msg)
 
 
-# ----------------------------- 配置读写 -----------------------------
-
-_DEFAULT_LC = {
-    "version": 1,
-    "passenger_names": [],
-    "from": "长葛",
-    "to": "确山",
-    "trains": ["K225", "K1969", "K925"],
-    "seat_types": ["硬座"],
-    "seat_priority": "",
-    "date": "",
-    "date_to": "",
-    "start_time": "",
-    "remind_minutes": 10,
-    "warm_minutes": 10,
-    "poll_seconds": 3,
-    "presets": [],
-    "update_url": "",
-    "station_history": ["长葛", "确山"],
-    "purpose_code": "ADULT",
-    "pax_purpose": {},
-    "query_history": [],
-}
-
-# 票种：界面按乘车人分别选择（成人票 / 学生票），下单按人写入 ticket_type
-PURPOSE_LABELS = {"ADULT": "成人票", "0X00": "学生票"}
-LABEL_TO_PURPOSE = {v: k for k, v in PURPOSE_LABELS.items()}
-
-
-def purpose_of(lc, name=None):
-    """按人取票种代码；name=None 时返回余票查询口径（全是学生才用 0X00）。
-
-    12306 的 queryLeftTicket 用 ADULT / 0X00 切换余票口径；下单时每个乘车人的
-    ticket_type 由本人票种决定（成人=1，学生=3），所以两者分开提供。
-    """
-    lc = lc or {}
-    pm = lc.get("pax_purpose") or {}
-    default = lc.get("purpose_code") or "ADULT"
-    if name is not None:
-        return pm.get(name) or default
-    names = lc.get("passenger_names") or []
-    codes = [pm.get(n) or default for n in names] or [default]
-    return "0X00" if all(c == "0X00" for c in codes) else "ADULT"
-
-
-def purpose_map_of(lc):
-    """{姓名: 票种代码}，只含本次勾选的乘车人（下单按人写 ticket_type 用）。"""
-    lc = lc or {}
-    pm = lc.get("pax_purpose") or {}
-    default = lc.get("purpose_code") or "ADULT"
-    return {n: (pm.get(n) or default) for n in (lc.get("passenger_names") or [])}
-
 
 # ===== 复选框指示器：clam 主题选中时画的是「叉」(✗)，容易被当成取消，改成「对勾」(✓) =====
 _CHECK_ICONS = {}   # 保持 PhotoImage 引用，防止被垃圾回收后图标消失
 
-
-def _make_check_icon(checked, size=14):
-    """内存生成复选框指示器图标（不依赖外部图片文件）：空框 / 框内对勾。"""
-    img = tk.PhotoImage(width=size, height=size)
-    border, fill = "#8A94A6", "#FFFFFF"
-    img.put(fill, to=(0, 0, size, size))
-    img.put(border, to=(0, 0, size, 1))
-    img.put(border, to=(0, size - 1, size, size))
-    img.put(border, to=(0, 1, 1, size - 1))
-    img.put(border, to=(size - 1, 1, size, size - 1))
-    if checked:
-        tick = "#1A73E8"
-        pts = [(3, 6), (4, 7), (5, 8), (6, 9), (7, 8), (8, 7), (9, 6), (10, 4)]
-        for x, y in pts:
-            img.put(tick, to=(x, y, x + 2, y + 2))
-    return img
-
-
-def _patch_tick_layout(items):
-    """把 TCheckbutton 布局里的 indicator element 换成自定义的对勾。"""
-    out = []
-    for name, opts in items:
-        opts = dict(opts)
-        if name == "Checkbutton.indicator":
-            name = "Tick.indicator"
-        if "children" in opts:
-            opts["children"] = _patch_tick_layout(opts["children"])
-        out.append((name, opts))
-    return out
 
 
 def install_tick_indicator(style=None):
@@ -302,68 +229,8 @@ def save_grab_tasks(tasks):
     appcommon.atomic_write_json(GRAB_TASKS_PATH, {"tasks": tasks})
 
 
-def new_grab_task(seq):
-    """新建一个空任务模板（配置与主配置同构，各任务互不影响）。"""
-    t = dict(_DEFAULT_LC)
-    t["id"] = uuid.uuid4().hex[:8]
-    t["name"] = "任务 %d" % seq
-    t["status"] = "idle"
-    t["date"] = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    return t
-
 
 # ----------------------------- 掩码 -----------------------------
-
-def mask_id(no):
-    no = str(no or "").strip()
-    if len(no) <= 8:
-        return no
-    return no[:4] + "*" * (len(no) - 8) + no[-4:]
-
-
-def mask_mobile(m):
-    m = str(m or "").strip()
-    if len(m) == 11:
-        return m[:3] + "****" + m[-4:]
-    return m
-
-
-def _mask_order_no(no):
-    """订单号脱敏（日志用；与 engine._mask_order_no 同口径）：保留前后各 4 位，
-    中间打码；过短则全打码。"""
-    s = str(no or "")
-    if len(s) <= 8:
-        return "****"
-    return s[:4] + "****" + s[-4:]
-
-
-def _mask_one_name(n):
-    """单个姓名打码（Task 88c：与 _mask_names 同口径的单源）：保留首字其余打码。"""
-    n = (n or "").strip()
-    if not n:
-        return ""
-    return n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*"
-
-
-def _mask_names(names):
-    """乘车人姓名打码（日志用；与 engine._mask_names 同口径）：保留首字其余打码；
-    ['张三','李四'] -> '张*、李*'。"""
-    out = []
-    for n in names or []:
-        m = _mask_one_name(n)
-        if m:
-            out.append(m)
-    return "、".join(out)
-
-
-_ORDER_NO_RE = re.compile(r"(订单号\s?)([A-Za-z0-9]{4,})")
-
-
-def _mask_pii_text(text):
-    """日志文本 PII 脱敏（Task 84c）：把文本中「订单号 XXX」形式的订单号打码；
-    无 PII 的文本原样返回。只用于日志路径，不碰用户界面与历史记录。"""
-    return _ORDER_NO_RE.sub(
-        lambda m: m.group(1) + _mask_order_no(m.group(2)), text or "")
 
 
 def _normalize_trains(raw, warn):
@@ -388,28 +255,6 @@ def _display_trains(raw):
     警告由数据消费路径（engine/launcher 运行链）负责；这里只解决展示。"""
     return _normalize_trains(raw, lambda *a: None)
 
-
-def _normalize_seat_types(raw, warn):
-    """seat_types 字段归一化（Task 103a；与 engine.normalize_seat_types 同口径）：
-    裸字符串（如漏写方括号的 "二等座"）按单个席别处理并记警告，绝不逐字符拆
-    （旧代码 list("二等座") 会拆成 ['二','等','座'] 写回污染配置 → 漏单类）；
-    形状非法记警告后忽略；非字符串条目跳过（席别为中文名，不做 strip/upper）。"""
-    if raw is None or raw == "":
-        return []
-    if isinstance(raw, str):
-        warn("[提醒] seat_types 为字符串，已按单个席别处理：%s" % raw)
-        return [raw]
-    if not isinstance(raw, (list, tuple)):
-        warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))
-        return []
-    return [s for s in raw if isinstance(s, str)]
-
-
-def _display_seat_types(raw):
-    """展示用席别归一化（Task 103b）：与 _display_trains 同口径（字符串按单个
-    席别、绝不逐字符拆），但不打日志——展示路径可能高频刷新，畸形值的警告由
-    数据消费路径（engine/launcher 运行链）负责；这里只解决展示。"""
-    return _normalize_seat_types(raw, lambda *a: None)
 
 
 def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
@@ -440,87 +285,6 @@ def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._ST
                          parent=parent)
     return False
 
-
-# ----------------------------- 时间工具 -----------------------------
-
-def parse_dt(s):
-    """解析开抢时间。支持 YYYY-MM-DD HH:MM[:SS] / MM-DD HH:MM / HH:MM[:SS]。"""
-    s = (s or "").strip()
-    if not s:
-        return None
-    now = datetime.now()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m-%d %H:%M:%S",
-                "%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if fmt.startswith("%H"):
-                dt = dt.replace(year=now.year, month=now.month, day=now.day)
-                if dt < now - timedelta(hours=1):
-                    dt += timedelta(days=1)
-            elif fmt.startswith("%m-%d"):
-                # strptime 对 MM-DD 默认年份是 1900：先归位到今年；
-                # 只填月日不跨年——12 月填「01-05」应理解为明年，而不是"已过"
-                dt = dt.replace(year=now.year)
-                if dt < now - timedelta(hours=1):
-                    dt = dt.replace(year=now.year + 1)
-            return dt
-        except ValueError:
-            continue
-    return None
-
-
-def fmt_countdown(sec):
-    sec = int(sec)
-    if sec <= 0:
-        return "00:00:00"
-    d, rem = divmod(sec, 86400)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-    if d:
-        return "%d天 %02d:%02d:%02d" % (d, h, m, s)
-    return "%02d:%02d:%02d" % (h, m, s)
-
-
-# ---------------------- 车次类型 / 日期标签 ----------------------
-
-def is_emu(train_code):
-    """动车组（高铁 G / 动车 D / 城际 C）判定。"""
-    return bool(train_code) and str(train_code)[0].upper() in ("G", "D", "C")
-
-
-def train_kind(train_code):
-    """车次号首字母 → 中文类型。"""
-    c = str(train_code or "")[:1].upper()
-    return {"G": "高铁", "D": "动车", "C": "城际", "Z": "直达", "T": "特快",
-            "K": "快速", "Y": "旅游", "S": "市郊", "L": "临客"}.get(c, "普速")
-
-
-def fmt_date_tag(date_str):
-    """2026-10-06 → 10-06 周二（卡片日期角标用）。"""
-    try:
-        d = datetime.strptime(str(date_str), "%Y-%m-%d")
-    except Exception:
-        return str(date_str or "")
-    return "%s 周%s" % (d.strftime("%m-%d"), "一二三四五六日"[d.weekday()])
-
-
-# ----------------------------- 位置定位 -----------------------------
-
-def ip_locate(timeout=6):
-    """百度 IP 定位（公开接口，免 key）。返回可读字符串或错误提示。"""
-    try:
-        r = requests.get("https://qifu-api.baidubce.com/ip/local/geo/v1/district",
-                         timeout=timeout)
-        d = r.json()
-        if d.get("code") == "Success":
-            g = d.get("data") or {}
-            parts = [g.get("country", ""), g.get("prov", ""), g.get("city", "")]
-            parts = [p for p in parts if p]
-            isp = g.get("isp", "")
-            return ("%s（%s）" % (" ".join(parts), isp)) if isp else " ".join(parts)
-        return "定位失败：%s" % (d.get("message") or d)
-    except Exception as e:
-        return "定位失败：%s" % e
 
 
 # ----------------------------- 抢票引擎 -----------------------------
@@ -1052,33 +816,6 @@ def check_update(lc):
 
 # ----------------------------- GUI -----------------------------
 
-def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
-                       passengers, purpose_code, auto_order, stop_after_order,
-                       priority, pax_purpose=None, seat_priority=None):
-    """按监控系统的任务结构组装任务字典（与 gui.py QuickMonitorDialog 一致）。"""
-    name = "%s-%s %s %s" % (
-        from_name, to_name, "/".join(trains) if trains else "全部车次",
-        "/".join(seats))
-    return {
-        "name": name,
-        "uid": uuid.uuid4().hex,
-        "from": from_name,
-        "to": to_name,
-        "dates": dates,
-        "date_range": date_range,
-        "trains": trains,
-        "seat_types": seats,
-        "seat_priority": (str(seat_priority).strip()
-                          if isinstance(seat_priority, str) else list(seat_priority or [])),
-        "auto_order": bool(auto_order),
-        "stop_after_order": bool(stop_after_order),
-        "passenger_names": passengers,
-        "priority": int(priority),
-        "purpose_code": purpose_code,
-        "pax_purpose": dict(pax_purpose or {}),
-        "notify_channels": ["email"],
-    }
-
 
 # 同进程对 config.json/state.json 的读-改-写串行锁：mtime 冲突检测在
 # Windows 上有 ~15.6ms 系统时钟量化盲区，同进程并发必须靠锁兜住；
@@ -1180,7 +917,6 @@ def append_monitor_task(task, start_now=True):
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
-FONT = ("Microsoft YaHei UI", 10) if sys.platform == "win32" else ("Helvetica", 11)
 
 ID_TYPES = {v: k for k, v in passengers_mod.ID_TYPE_NAMES.items()}
 
@@ -1207,15 +943,6 @@ def get_station_index():
                 % e)
     return _STATION_INDEX or []
 
-
-_FW_TRANS = {0x3000: 0x20}
-_FW_TRANS.update({0xFF01 + i: 0x21 + i for i in range(0x5E)})   # ａｂｃ１２３→abc123
-
-
-def _norm_query(text):
-    """中文输入容错：全角→半角、剔除全部空白、转小写（长 葛→长葛,ｃｑ→cq）。"""
-    t = (text or "").translate(_FW_TRANS)
-    return "".join(t.split()).lower()
 
 
 def search_stations(text, limit=12):
@@ -1595,222 +1322,6 @@ class StationEntry(ttk.Frame):
         self.entry.icursor("end")
 
 
-class CalendarDialog(tk.Toplevel):
-    """简易月历，选中日期写回 var（YYYY-MM-DD）。"""
-
-    def __init__(self, master, var):
-        super().__init__(master)
-        self.var = var
-        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", (var.get() or "").strip())
-        try:
-            self.cur = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else datetime.now()
-        except ValueError:
-            self.cur = datetime.now()
-        self.title("选择乘车日期")
-        self.resizable(False, False)
-        self.transient(master.winfo_toplevel())
-        self.body = ttk.Frame(self, padding=10)
-        self.body.pack(fill="both", expand=True)
-        self._render()
-        self.grab_set()
-
-    def _shift(self, delta):
-        y, m = self.cur.year, self.cur.month + delta
-        y += (m - 1) // 12
-        m = (m - 1) % 12 + 1
-        self.cur = self.cur.replace(year=y, month=m, day=1)
-        self._render()
-
-    def _sel_date(self):
-        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", (self.var.get() or "").strip())
-        if not m:
-            return None
-        try:
-            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
-        except ValueError:
-            return None
-
-    def _render(self):
-        for w in self.body.winfo_children():
-            w.destroy()
-        head = ttk.Frame(self.body)
-        head.pack(fill="x", pady=(0, 8))
-        ttk.Button(head, text="‹", width=3, command=lambda: self._shift(-1)).pack(side="left")
-        ttk.Label(head, text="%d 年 %d 月" % (self.cur.year, self.cur.month),
-                  font=(FONT[0], 11, "bold"), anchor="center").pack(side="left", expand=True)
-        ttk.Button(head, text="›", width=3, command=lambda: self._shift(1)).pack(side="left")
-        ttk.Button(head, text="今天", width=5, command=self._today).pack(side="left", padx=(8, 0))
-
-        grid_w = ttk.Frame(self.body)
-        grid_w.pack()
-        for i, wd in enumerate("一二三四五六日"):
-            ttk.Label(grid_w, text=wd, width=4, anchor="center",
-                      foreground="#6e7781").grid(row=0, column=i, padx=1, pady=(0, 3))
-        today = datetime.now().date()
-        sel = self._sel_date()
-        for r, week in enumerate(calendar.monthcalendar(self.cur.year, self.cur.month), start=1):
-            for c, day in enumerate(week):
-                if day == 0:
-                    continue
-                d = datetime(self.cur.year, self.cur.month, day).date()
-                bg, fg = "#f6f8fa", "#1f2328"
-                if d == today:
-                    fg = "#0969da"
-                if d == sel:
-                    bg, fg = "#0969da", "#ffffff"
-                tk.Button(grid_w, text=str(day), width=4, relief="flat", bg=bg, fg=fg,
-                          activebackground="#dbeafe", cursor="hand2",
-                          command=lambda dd=day: self._choose(dd)).grid(
-                    row=r, column=c, padx=1, pady=1)
-
-        tail = ttk.Frame(self.body)
-        tail.pack(fill="x", pady=(10, 0))
-        ttk.Button(tail, text="清除", command=self._clear).pack(side="left")
-        ttk.Button(tail, text="关闭", command=self.destroy).pack(side="right")
-
-    def _choose(self, day):
-        self.var.set("%04d-%02d-%02d" % (self.cur.year, self.cur.month, day))
-        self.destroy()
-
-    def _today(self):
-        self.var.set(datetime.now().strftime("%Y-%m-%d"))
-        self.destroy()
-
-    def _clear(self):
-        self.var.set("")
-        self.destroy()
-
-
-class DateTimeDialog(tk.Toplevel):
-    """表格选日期 + 时/分/秒，确定后写回 var（YYYY-MM-DD HH:MM:SS）。"""
-
-    def __init__(self, master, var):
-        super().__init__(master)
-        self.var = var
-        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$",
-                     (var.get() or "").strip())
-        now = datetime.now() + timedelta(minutes=5)
-        try:
-            self.sel = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                                int(m.group(4) or 0), int(m.group(5) or 0),
-                                int(m.group(6) or 0)) if m else now
-        except ValueError:
-            self.sel = now
-        self.cur = self.sel.replace(day=1)
-        self.h_var = tk.StringVar(value="%02d" % self.sel.hour)
-        self.m_var = tk.StringVar(value="%02d" % self.sel.minute)
-        self.s_var = tk.StringVar(value="%02d" % self.sel.second)
-        self.title("选择开抢时间")
-        self.resizable(False, False)
-        self.transient(master.winfo_toplevel())
-        self.body = ttk.Frame(self, padding=10)
-        self.body.pack(fill="both", expand=True)
-        self._render()
-        self.grab_set()
-
-    def _shift(self, delta):
-        y, m = self.cur.year, self.cur.month + delta
-        y += (m - 1) // 12
-        m = (m - 1) % 12 + 1
-        self.cur = self.cur.replace(year=y, month=m, day=1)
-        self._render()
-
-    def _render(self):
-        for w in self.body.winfo_children():
-            w.destroy()
-        head = ttk.Frame(self.body)
-        head.pack(fill="x", pady=(0, 8))
-        ttk.Button(head, text="‹", width=3, command=lambda: self._shift(-1)).pack(side="left")
-        ttk.Label(head, text="%d 年 %d 月" % (self.cur.year, self.cur.month),
-                  font=(FONT[0], 11, "bold"), anchor="center").pack(side="left", expand=True)
-        ttk.Button(head, text="›", width=3, command=lambda: self._shift(1)).pack(side="left")
-        ttk.Button(head, text="今天", width=5, command=self._today).pack(side="left", padx=(8, 0))
-
-        grid_w = ttk.Frame(self.body)
-        grid_w.pack()
-        for i, wd in enumerate("一二三四五六日"):
-            ttk.Label(grid_w, text=wd, width=4, anchor="center",
-                      foreground="#6e7781").grid(row=0, column=i, padx=1, pady=(0, 3))
-        today = datetime.now().date()
-        for r, week in enumerate(calendar.monthcalendar(self.cur.year, self.cur.month), start=1):
-            for c, day in enumerate(week):
-                if day == 0:
-                    continue
-                d = datetime(self.cur.year, self.cur.month, day).date()
-                bg, fg = "#f6f8fa", "#1f2328"
-                if d == today:
-                    fg = "#0969da"
-                if d == self.sel.date():
-                    bg, fg = "#0969da", "#ffffff"
-                tk.Button(grid_w, text=str(day), width=4, relief="flat", bg=bg, fg=fg,
-                          activebackground="#dbeafe", cursor="hand2",
-                          command=lambda dd=day: self._choose_day(dd)).grid(
-                    row=r, column=c, padx=1, pady=1)
-
-        tw = ttk.Frame(self.body)
-        tw.pack(fill="x", pady=(8, 0))
-        ttk.Label(tw, text="时间", foreground="#57606a").pack(side="left", padx=(0, 6))
-        ttk.Spinbox(tw, from_=0, to=23, width=3, textvariable=self.h_var,
-                    format="%02.0f", wrap=True).pack(side="left")
-        ttk.Label(tw, text="时").pack(side="left", padx=(2, 10))
-        ttk.Spinbox(tw, from_=0, to=59, width=3, textvariable=self.m_var,
-                    format="%02.0f", wrap=True).pack(side="left")
-        ttk.Label(tw, text="分").pack(side="left", padx=(2, 10))
-        ttk.Spinbox(tw, from_=0, to=59, width=3, textvariable=self.s_var,
-                    format="%02.0f", wrap=True).pack(side="left")
-        ttk.Label(tw, text="秒").pack(side="left", padx=(2, 0))
-
-        qw = ttk.Frame(self.body)
-        qw.pack(fill="x", pady=(6, 0))
-        ttk.Label(qw, text="常用", foreground="#57606a").pack(side="left", padx=(0, 6))
-        for hh, mm in ((8, 0), (10, 0), (12, 0), (17, 0), (19, 0), (20, 0)):
-            ttk.Button(qw, text="%02d:%02d" % (hh, mm), width=6,
-                       command=lambda h=hh, mm2=mm: self._quick_time(h, mm2)).pack(
-                side="left", padx=(0, 4))
-
-        tail = ttk.Frame(self.body)
-        tail.pack(fill="x", pady=(10, 0))
-        ttk.Label(tail, text="格式 %s" % "YYYY-MM-DD HH:MM:SS",
-                  foreground="#8c959f").pack(side="left")
-        ttk.Button(tail, text="确定", command=self._ok).pack(side="right")
-        ttk.Button(tail, text="清除", command=self._clear).pack(side="right", padx=(0, 6))
-
-    def _choose_day(self, day):
-        try:
-            self.sel = self.sel.replace(year=self.cur.year, month=self.cur.month, day=day)
-        except ValueError:
-            self.sel = datetime(self.cur.year, self.cur.month, day)
-        self._render()
-
-    def _today(self):
-        n = datetime.now()
-        self.sel = n.replace(microsecond=0)
-        self.h_var.set("%02d" % n.hour)
-        self.m_var.set("%02d" % n.minute)
-        self.s_var.set("%02d" % n.second)
-        self.cur = self.sel.replace(day=1)
-        self._render()
-
-    def _quick_time(self, hh, mm):
-        self.h_var.set("%02d" % hh)
-        self.m_var.set("%02d" % mm)
-        self.s_var.set("00")
-
-    def _ok(self):
-        def _num(v, hi):
-            try:
-                return max(0, min(hi, int(str(v.get()).strip())))
-            except ValueError:
-                return 0
-        self.var.set("%04d-%02d-%02d %02d:%02d:%02d" % (
-            self.sel.year, self.sel.month, self.sel.day,
-            _num(self.h_var, 23), _num(self.m_var, 59), _num(self.s_var, 59)))
-        self.destroy()
-
-    def _clear(self):
-        self.var.set("")
-        self.destroy()
-
 
 def _history_item_text(it):
     """历史查询记录条目的显示文本；非 dict 条目记 warning 返回 None（调用方跳过）。
@@ -1865,164 +1376,6 @@ class QueryHistoryDialog(tk.Toplevel):
         self.destroy()
 
 
-# ------------------------- 车次卡片列表 -------------------------
-
-class TrainCard(tk.Frame):
-    """单趟车卡片：时间 — 车次 类型 — 时间 / 历时 / 区间 / 有票席别摘要，整卡可点选。"""
-
-    def __init__(self, master, info, on_click, selected=False):
-        super().__init__(master, bd=0, bg="#ffffff",
-                         highlightthickness=1, highlightbackground="#d0d7de", cursor="hand2")
-        self.info = info
-        self.on_click = on_click
-        self.key = "%s@%s" % (info.get("_date") or info.get("query_date") or "",
-                              info.get("train_code") or "?")
-        self.selected = False
-        body = tk.Frame(self, bg="#ffffff")
-        body.pack(fill="x", padx=8, pady=3)
-
-        small = (FONT[0], 9)
-        head = tk.Frame(body, bg="#ffffff")
-        head.pack(fill="x")
-        big = (FONT[0], 11, "bold")
-        tk.Label(head, text=info.get("start_time") or "-", font=big, bg="#ffffff").pack(side="left")
-        tk.Label(head, text="——", fg="#8c959f", bg="#ffffff").pack(side="left", padx=5)
-        tk.Label(head, text=info.get("train_code") or "?", font=(FONT[0], 10, "bold"),
-                 fg="#0969da", bg="#ffffff").pack(side="left")
-        tk.Label(head, text=train_kind(info.get("train_code")), fg="#57606a",
-                 bg="#ffffff", font=small).pack(side="left", padx=(4, 0))
-        tk.Label(head, text="——", fg="#8c959f", bg="#ffffff").pack(side="left", padx=5)
-        tk.Label(head, text=info.get("arrive_time") or "-", font=big, bg="#ffffff").pack(side="left")
-        tk.Label(head, text="历时 " + (info.get("duration") or "-"), fg="#57606a",
-                 bg="#ffffff", font=small).pack(side="right")
-
-        sub = tk.Frame(body, bg="#ffffff")
-        sub.pack(fill="x")
-        tk.Label(sub, text="%s → %s" % (info.get("from_name") or "?",
-                                        info.get("to_name") or "?"),
-                 fg="#57606a", bg="#ffffff", font=small).pack(side="left")
-        if info.get("_date"):
-            tk.Label(sub, text="  " + fmt_date_tag(info["_date"]), fg="#8250df",
-                     bg="#ffffff", font=small).pack(side="left")
-        # 席别只摘有票的，一行放下；全无票时给一句灰字
-        seats = info.get("available_seats") or {}
-        names = list(SEAT_OPTIONS) + [k for k in seats if k not in SEAT_ORDER]
-        avail = [(n, seats.get(n)) for n in names if seats.get(n)]
-        if avail:
-            parts = ["%s %s" % (n, v) for n, v in avail[:5]]
-            if len(avail) > 5:
-                parts.append("…另 %d 席" % (len(avail) - 5))
-            tk.Label(sub, text="    " + " · ".join(parts), fg="#1a7f37",
-                     bg="#ffffff", font=(FONT[0], 9, "bold")).pack(side="left")
-        else:
-            tk.Label(sub, text="    %d 种席别均无票" % len(names), fg="#8c959f",
-                     bg="#ffffff", font=small).pack(side="left")
-
-        self._bind_click_all(self)
-        self.set_selected(selected)
-
-    def _bind_click_all(self, w):
-        w.bind("<Button-1>", self._clicked)
-        for c in w.winfo_children():
-            self._bind_click_all(c)
-
-    def _clicked(self, _e=None):
-        self.on_click(self)
-        return "break"
-
-    def _all_children(self, w):
-        out = []
-        for c in w.winfo_children():
-            out.append(c)
-            out.extend(self._all_children(c))
-        return out
-
-    def set_selected(self, on):
-        self.selected = bool(on)
-        bg = "#eff6ff" if self.selected else "#ffffff"
-        self.configure(highlightbackground="#0969da" if self.selected else "#d0d7de",
-                       highlightthickness=2 if self.selected else 1)
-        for w in [self] + self._all_children(self):
-            try:
-                w.configure(bg=bg)
-            except tk.TclError:
-                pass
-
-
-class TrainCardList(ttk.Frame):
-    """可滚动的车次卡片列表，支持多选；选中的车次经 on_change 回调给主界面。"""
-
-    def __init__(self, master, on_change, height=128):
-        super().__init__(master)
-        self.on_change = on_change
-        self.selected = {}
-        self.cards = []
-        self.canvas = tk.Canvas(self, height=height, highlightthickness=0, bg="#ffffff")
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vsb.set)
-        self.vsb.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.inner = tk.Frame(self.canvas, bg="#ffffff")
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>",
-                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfigure(self._win, width=e.width))
-        # 滚轮绑到所属 Toplevel（add 叠加，不占全局 bind_all 槽位），由指针位置
-        # 决定滚谁：多任务窗口并存时不再互抢全局绑定、也不会把别的窗口滚跑
-        self.winfo_toplevel().bind("<MouseWheel>", self._wheel, add="+")
-
-    def _wheel(self, event):
-        try:
-            w = self.winfo_containing(event.x_root, event.y_root)
-            while w is not None and w is not self.canvas:
-                w = w.master
-            if w is None:
-                return  # 指针不在本滚动区上：不接管
-            if self.canvas.winfo_exists():
-                self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
-        except tk.TclError:
-            pass  # 窗口/控件销毁竞态
-        except Exception:
-            return
-
-    def render(self, infos, empty_text="（没有符合条件的车次）"):
-        for w in self.inner.winfo_children():
-            w.destroy()
-        self.cards = []
-        keep = set(self.selected)
-        self.selected = {}
-        if not infos:
-            tk.Label(self.inner, text=empty_text, fg="#6e7781", bg="#ffffff").pack(
-                anchor="w", pady=8, padx=4)
-            self.on_change([])
-            return
-        for info in infos:
-            card = TrainCard(self.inner, info, self._clicked)
-            card.pack(fill="x", pady=(0, 4), padx=(0, 2))
-            self.cards.append((card, info))
-            if card.key in keep:
-                card.set_selected(True)
-                self.selected[card.key] = info
-        self.canvas.yview_moveto(0)
-        self.on_change(list(self.selected.values()))
-
-    def _clicked(self, card):
-        if card.key in self.selected:
-            self.selected.pop(card.key, None)
-            card.set_selected(False)
-        else:
-            self.selected[card.key] = card.info
-            card.set_selected(True)
-        self.on_change(list(self.selected.values()))
-
-    def selected_codes(self):
-        codes = []
-        for info in self.selected.values():
-            c = info.get("train_code")
-            if c and c not in codes:
-                codes.append(c)
-        return codes
 
 
 class LauncherApp(tk.Frame):
