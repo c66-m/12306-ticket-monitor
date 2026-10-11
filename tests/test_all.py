@@ -12690,6 +12690,78 @@ class TestTask116GuiEngineB5(TempDirCase):
         self.assertTrue(any("哈希" in m for m in logs.output))
 
 
+class TestTask117MiniWindowB5(TempDirCase):
+    """Task 117 (B5-10)：MiniWindow._collect 不可哈希任务名 crash（P3×1，
+    Task 116 评审确认）。
+
+    _collect 的 loop 在 try 块之外（try 只包两行 load），由 refresh_tasks
+   （Tk 定时回调）调用；{"name": ["x"]} 等手改 JSON 的坏名穿过
+    _sanitize_config_shapes → state.get(name) 直接 TypeError → Tk 吞掉后
+    小窗任务区永久不再更新。与 TaskPage.refresh（Task 116）同类同
+    reachability。要求 warn + skip，与 Task 114/116 同口径。
+    """
+
+    def _reset_unhashable_warned(self):
+        if hasattr(gui, "_UNHASHABLE_NAME_WARNED"):
+            gui._UNHASHABLE_NAME_WARNED.clear()
+
+    def _mini(self):
+        # _collect 不碰 self 属性，无需 Tk 初始化。
+        return gui.MiniWindow.__new__(gui.MiniWindow)
+
+    def test_collect_skips_unhashable_name(self):
+        # P3：改前 state.get(["x"]) 直接 TypeError，小窗任务区永久不更新。
+        # 应 warn+跳过坏条目，好任务照常收集。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"},
+                 {"name": "good", "from": "BJ", "to": "SH"}]
+        mw = self._mini()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks":
+                                             {"good":
+                                              {"status": "monitoring"}}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                rows = mw._collect()  # 改前 TypeError
+        self.assertTrue(any("哈希" in m for m in logs.output),
+                        "必须明确记 warning 指出任务名不可哈希")
+        self.assertEqual([n for n, _st, _m in rows], ["good"])
+
+    def test_collect_unhashable_warns_once(self):
+        # refresh_tasks 是 Tk 定时回调：同一损坏条目只记一次 warning，不刷屏。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"}]
+        mw = self._mini()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                mw._collect()
+                mw._collect()
+                mw._collect()
+        pins = [m for m in logs.output if "哈希" in m]
+        self.assertEqual(len(pins), 1)
+
+    def test_collect_all_good_unchanged(self):
+        # 正向对照：全合法任务时原行为不变（已成功置顶，活跃在后）。
+        self._reset_unhashable_warned()
+        tasks = [{"name": "a", "from": "BJ", "to": "SH"},
+                 {"name": "b", "from": "BJ", "to": "SH"}]
+        mw = self._mini()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {
+                                   "a": {"status": "monitoring"},
+                                   "b": {"status": "success",
+                                         "message": "ok"}}}):
+            rows = mw._collect()
+        self.assertEqual(rows, [("b", "success", "ok"),
+                                ("a", "monitoring", "")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

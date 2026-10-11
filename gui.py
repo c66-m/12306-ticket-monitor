@@ -3185,6 +3185,13 @@ class MiniWindow(tk.Toplevel):
             return []
         live, done = [], []
         for t in tasks:
+            # Task 117：不可哈希任务名（如 {"name": ["x"]}）→ warn + 跳过；
+            # 旧代码 state.get(name) 直接 TypeError，此 loop 在 try 块之外，
+            # 由 refresh_tasks（Tk 定时回调）调用，Tk 吞掉后小窗任务区永久
+            # 不再更新。与 Task 114/116 同口径：同一损坏条目每进程只记
+            # 一次（定时回调，防刷屏）。
+            if _skip_unhashable_task_name(t, "小窗任务"):
+                continue
             name = t.get("name", "")
             rec = state.get(name) or {}
             st = rec.get("status", "paused")
