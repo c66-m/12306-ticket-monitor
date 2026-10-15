@@ -15922,6 +15922,146 @@ class TestTask138StatusShapesB10(TempDirCase):
         lbl.configure.assert_called()
 
 
+class TestTask140EngineValueShapesB11(TempDirCase):
+    """Task 140（B11-1）：engine 值形状 bundle（P2×2）。
+
+    2.1.1 engine.py:1551 check_session_if_needed：state.json 任务条目 message
+        真值不可迭代（如手改 "message": 5）→ "登录会话失效" in 5 → TypeError →
+        逃出 check_session_if_needed → 启动期/主循环调用点都只有
+        except KeyboardInterrupt → 逃出 run() → 整引擎死亡（P2）。
+    2.1.2 engine.py:1640 run() 启动期 LOG.info：STATUS_LABELS.get(
+        self.task_status(t), …) 对真值不可哈希 status（如 "status": ["x"]）
+        → TypeError → 逃出 run() → 整引擎死亡（P2，启动即崩）。
+    修复口径：_sanitize_state_tasks 值级归一（message 非 str → warn + ""；
+        status 非 str → warn + "paused"），与 Task 137 同一 sanitize 点一次收敛。
+    """
+
+    def _write_cfg_state(self, tasks_state, full_task=False):
+        st = os.path.join(self.tmp, "state.json")
+        cfg = os.path.join(self.tmp, "config.json")
+        if full_task:
+            tomorrow = (datetime.date.today() +
+                        datetime.timedelta(days=1)).isoformat()
+            tasks = [{"name": "t1", "from": "VNP", "to": "ZAF",
+                      "dates": [tomorrow], "trains": ["K225"],
+                      "seat_types": ["硬座"], "auto_order": True,
+                      "passenger_names": ["张三"], "priority": 5,
+                      "purpose_code": "ADULT"},
+                     {"name": "t2", "from": "VNP", "to": "ZAF",
+                      "dates": [tomorrow], "trains": ["K225"],
+                      "seat_types": ["硬座"], "auto_order": True,
+                      "passenger_names": ["张三"], "priority": 5,
+                      "purpose_code": "ADULT"}]
+        else:
+            tasks = [{"name": "t1"}, {"name": "t2"}]
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks, "state_file": st,
+                       "poll_interval_seconds": 45,
+                       "min_interval_seconds": 30}, f)
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks_state, "dedup": {},
+                       "retry": {}}, f)
+        return cfg
+
+    def _engine(self, tasks_state, full_task=False):
+        cfg = self._write_cfg_state(tasks_state, full_task)
+        return engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+
+    def _no_escape(self, fn):
+        # 旧代码下 TypeError 会逃出 run()/check_session_if_needed 杀死引擎；
+        # 直接让它逃出会以 ERROR 中断测试，故在测试内捕获并转为普通 FAIL
+        # （Task 113 同口径）。
+        try:
+            fn()
+        except TypeError as ex:
+            self.fail("TypeError 逃出（引擎死亡）: %s" % ex)
+
+    def _mock_session_ok(self):
+        return (mock.patch.object(order_mod, "load_session",
+                                  return_value=object()),
+                mock.patch.object(order_mod, "verify_session",
+                                  return_value=(True, "tester", False)))
+
+    # ---------- 2.1.1：message 值级归一 ----------
+
+    def test_message_non_iterable_normalized_at_load(self):
+        # RED on old code: "message": 5 原样进内存，后续 in 检查崩。
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            e = self._engine({"t1": {"status": "failed", "message": 5}})
+        self.assertEqual(e.state["tasks"]["t1"]["message"], "")
+        self.assertTrue(any("message" in m and "不是字符串" in m
+                            for m in cm.output),
+                        "未记录 message 归一: %s" % cm.output)
+
+    def test_p2_dirty_message_does_not_kill_session_check(self):
+        # P2 集成：t1 failed + message 5（脏），t2 monitoring（让 auto_tasks
+        # 非空以便进入 ok 分支）；mock 会话体检 ok=True → 恢复循环读到脏 message。
+        # RED on old code: "登录会话失效" in 5 → TypeError 逃出。
+        e = self._engine({"t1": {"status": "failed", "message": 5},
+                          "t2": {"status": "monitoring"}}, full_task=True)
+        p1, p2 = self._mock_session_ok()
+        with p1, p2:
+            self._no_escape(e.check_session_if_needed)
+        # 脏 message 按 "" 处理：不匹配，不拉起（t1 仍 failed）
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "failed")
+
+    def test_legit_session_expired_message_still_repulls(self):
+        # 对照：干净 message "登录会话失效…" 仍触发重新拉起（新旧代码都通过）。
+        e = self._engine({"t1": {"status": "failed",
+                                 "message": "登录会话失效，请重新登录"},
+                          "t2": {"status": "monitoring"}}, full_task=True)
+        p1, p2 = self._mock_session_ok()
+        with p1, p2:
+            e.check_session_if_needed()
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "monitoring")
+
+    # ---------- 2.1.2：status 值级归一 ----------
+
+    def test_status_unhashable_normalized_at_load(self):
+        # RED on old code: "status": ["x"] 原样进内存，:1640 的 .get 崩。
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            e = self._engine({"t1": {"status": ["x"]}})
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "paused")
+        self.assertTrue(any("status" in m and "不是字符串" in m
+                            for m in cm.output),
+                        "未记录 status 归一: %s" % cm.output)
+
+    def test_status_falsy_non_str_normalized(self):
+        # falsy 不可哈希 []/{} 同样会崩 :1640 的 .get；None/0 无崩但归一更干净。
+        # RED on old code: 原样进内存。
+        e = self._engine({"t1": {"status": []},
+                          "t2": {"status": None},
+                          "t3": {"status": "monitoring"}})
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "paused")
+        self.assertEqual(e.state["tasks"]["t2"]["status"], "paused")
+        self.assertEqual(e.state["tasks"]["t3"]["status"], "monitoring")
+
+    def test_p2_dirty_status_does_not_kill_run_startup(self):
+        # P2 集成：手改 "status": ["x"] → run() 启动期 LOG.info（:1640）。
+        # RED on old code: STATUS_LABELS.get(["x"], ["x"]) → TypeError 逃出 run()。
+        e = self._engine({"t1": {"status": ["x"]}}, full_task=True)
+        ev = threading.Event()
+        ev.set()  # 主循环首轮即退出，只走启动期
+        with mock.patch.object(e, "check_session_if_needed"), \
+             mock.patch.object(engine_mod.appcommon, "load_orders",
+                               return_value={"orders": {}}):
+            self._no_escape(lambda: e.run(stop_event=ev))
+        # 归一后按 paused：不在 ACTIVE_STATUSES，引擎空转但不死
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "paused")
+
+    # ---------- 对照：干净输入零行为变化 ----------
+
+    def test_clean_message_status_unchanged(self):
+        # 对照：干净 str 原样通过，不记 warning（新旧代码都通过）。
+        with self.assertNoLogs("monitor", level="WARNING"):
+            e = self._engine({"t1": {"status": "failed",
+                                     "message": "登录会话失效，请重新登录"},
+                              "t2": {"status": "monitoring", "message": ""}})
+        self.assertEqual(e.state["tasks"]["t1"]["message"],
+                         "登录会话失效，请重新登录")
+        self.assertEqual(e.state["tasks"]["t2"]["status"], "monitoring")
+
+
 class TestTask139EngineStartupKiB10(TempDirCase):
     """Task 139（B10-3）：engine.py run() 启动期（订单恢复逐条复核 +
     check_session_if_needed 会话体检）在 except KeyboardInterrupt 保护之外 →

@@ -609,6 +609,16 @@ class MonitorEngine(object):
         run() → 整引擎死亡（P2）；busy_count 同模式（P3）；retry 值被改成
         可读日期字符串 → time.time() < due_at 直接 TypeError（P3）。此处归一
         后所有下游读点（含 handler 内调用）恒安全；bool 视为数值（True+1 合法）。
+        Task 140（2.1.1/2.1.2）：条目内 message/status **值级**形状归一。
+        手改 "message": 5 → check_session_if_needed 的 "登录会话失效" in 5
+        直接 TypeError（None/bool 同理——"x" in None 同样抛），逃出
+        check_session_if_needed → 启动期/主循环调用点都只有
+        except KeyboardInterrupt → 逃出 run() → 整引擎死亡（P2）；
+        手改 "status": ["x"] → run() 启动期 STATUS_LABELS.get(["x"], …)
+        在参数求值期直接 TypeError → 启动即崩（P2）。message 非 str → warn
+        + ""；status 非 str（含 falsy 不可哈希 []/{}——.get 同样 TypeError）
+        → warn + "paused"（与 task_status 的 .get 缺省一致）。task_status
+        是 engine 侧 status 读取漏斗，归一后 :1640 及各处 == 比较全部自动安全。
         """
         if not isinstance(state.get("tasks"), dict):
             LOG.error("[状态] %s 的 tasks 节不是对象（%s），已按空任务集降级；"
@@ -635,6 +645,26 @@ class MonitorEngine(object):
                                   self.state_path, name, key,
                                   type(entry[key]).__name__)
                         entry[key] = 0
+                # Task 140（2.1.1）：message 值级归一。非 str（含 None/5/True
+                # 等 falsy 与真值——"登录会话失效" in <非可迭代> 直接 TypeError；
+                # []/{} 虽可迭代不崩，归一为 "" 同样无匹配，行为一致）→ 记
+                # warning 后按 ""（即不匹配、不拉起）。缺键不动（.get 缺省 ""
+                # 本就是 str，自然跳过）。
+                if not isinstance(entry.get("message", ""), str):
+                    LOG.warning("[状态] %s 的任务「%s」的 message 不是字符串"
+                                "（%s），已按空归一；请检查文件是否被手改损坏",
+                                self.state_path, name,
+                                type(entry["message"]).__name__)
+                    entry["message"] = ""
+                # Task 140（2.1.2）：status 值级归一。非 str（含 falsy 不可哈希
+                # []/{}——STATUS_LABELS.get 同样 TypeError）→ 记 warning 后按
+                # "paused"（与 task_status 的 .get 缺省一致）。缺键不动。
+                if not isinstance(entry.get("status", "paused"), str):
+                    LOG.warning("[状态] %s 的任务「%s」的 status 不是字符串"
+                                "（%s），已按 paused 归一；请检查文件是否被手改损坏",
+                                self.state_path, name,
+                                type(entry["status"]).__name__)
+                    entry["status"] = "paused"
         for sec in ("dedup", "retry"):
             if not isinstance(state.get(sec), dict):
                 LOG.error("[状态] %s 的 %s 节不是对象（%s），已按空降级；"
