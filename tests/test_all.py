@@ -15563,6 +15563,142 @@ class TestTask136BrowserOrderCheckKiB9(TempDirCase):
         self.assertNotIn("[中断]", out)
 
 
+class TestTask137EngineValueShapes(TempDirCase):
+    """Task 137（B10-1）：engine 状态值形状 bundle（P2×1 + P3×2）。
+
+    2.1.1 engine.py:1445 _note_failure：state.json 任务条目 fail_streak
+        真值非数值（如手改 "fail_streak": "0"）→ "0" + 1 → TypeError →
+        逃出 _run_task → run() :1650 except 接住 → 同一 handler 内二次调用
+        _note_failure → TypeError 在 except 块内重抛 → 逃出 run() →
+        整引擎死亡（P2）。第二崩溃点 :1658/:1661 min(streak, 10)。
+    2.2.2 engine.py:1356 busy_count 同模式（P3）。
+    2.2.3 engine.py:1168 retry 节值真值非数值 → time.time() < due_at
+        TypeError（P3）。
+    修复口径：_sanitize_state_tasks 值级归一（fail_streak/busy_count 非数值
+        → error + 0；retry 真值非数值 → warn + 按过期丢弃）。
+    """
+
+    def _write_cfg_state(self, tasks_state, retry=None, full_task=False):
+        st = os.path.join(self.tmp, "state.json")
+        cfg = os.path.join(self.tmp, "config.json")
+        if full_task:
+            tomorrow = (datetime.date.today() +
+                        datetime.timedelta(days=1)).isoformat()
+            tasks = [{"name": "t1", "from": "VNP", "to": "ZAF",
+                      "dates": [tomorrow], "trains": ["K225"],
+                      "seat_types": ["硬座"], "auto_order": True,
+                      "passenger_names": ["张三"], "priority": 5,
+                      "purpose_code": "ADULT"}]
+        else:
+            tasks = [{"name": "t1"}]
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks, "state_file": st,
+                       "poll_interval_seconds": 45,
+                       "min_interval_seconds": 30}, f)
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks_state, "dedup": {},
+                       "retry": retry or {}}, f)
+        return cfg
+
+    def _engine(self, tasks_state, retry=None, full_task=False):
+        cfg = self._write_cfg_state(tasks_state, retry, full_task)
+        return engine_mod.MonitorEngine(config_path=cfg, setup_logging=False)
+
+    def _no_escape(self, fn):
+        # 旧代码下 TypeError 会逃出 run() 杀死引擎；直接让它逃出会以 ERROR
+        # 中断测试，故在测试内捕获并转为普通 FAIL（Task 113 同口径）。
+        try:
+            fn()
+        except TypeError as ex:
+            self.fail("TypeError 逃出 run()（引擎死亡）: %s" % ex)
+
+    # ---------- 2.1.1：fail_streak 值级归一 ----------
+
+    def test_fail_streak_string_normalized_at_load(self):
+        # RED on old code: 手改 "fail_streak": "0" 原样进内存，后续 +1 崩。
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            e = self._engine({"t1": {"status": "monitoring",
+                                     "fail_streak": "0"}})
+        self.assertEqual(e.state["tasks"]["t1"]["fail_streak"], 0)
+        self.assertTrue(any("fail_streak" in m and "不是数值" in m
+                            for m in cm.output),
+                        "未记录 fail_streak 归一: %s" % cm.output)
+
+    def test_p2_dirty_fail_streak_does_not_kill_run(self):
+        # P2 集成：手改 state.json 写入 "fail_streak": "0" → 触发一次失败 →
+        # 断言 run() 不逃出（引擎不死），fail_streak 正常累加到 1。
+        # RED on old code: TypeError: can only concatenate str (not "int")
+        # to str 逃出 run()（_note_failure 在 except handler 内二次调用处重抛）。
+        e = self._engine({"t1": {"status": "monitoring",
+                                 "fail_streak": "0"}}, full_task=True)
+        ev = threading.Event()
+
+        def boom(task):
+            ev.set()
+            raise RuntimeError("boom")
+
+        with mock.patch.object(e, "_run_task", side_effect=boom), \
+             mock.patch.object(e, "check_session_if_needed"), \
+             mock.patch.object(engine_mod.appcommon, "load_orders",
+                               return_value={"orders": {}}):
+            self._no_escape(lambda: e.run(stop_event=ev))
+        self.assertEqual(e.state["tasks"]["t1"]["fail_streak"], 1)
+
+    def test_fail_streak_second_crash_point_safe(self):
+        # 第二崩溃点 :1658/:1661：streak 非数值 → min(streak, 10) TypeError。
+        # 归一后 streak 恒为数值，退避计算不崩。
+        e = self._engine({"t1": {"status": "monitoring",
+                                 "fail_streak": "0"}})
+        streak = e.state["tasks"]["t1"].get("fail_streak", 0)
+        self.assertEqual(min(streak, 10), 0)  # 旧代码此处 min("0", 10) 抛 TypeError
+
+    # ---------- 2.2.2：busy_count 值级归一 ----------
+
+    def test_busy_count_non_numeric_normalized_at_load(self):
+        # RED on old code: "busy_count": [1] 原样进内存，:1356 的 +1 崩。
+        with self.assertLogs("monitor", level="ERROR") as cm:
+            e = self._engine({"t1": {"status": "monitoring",
+                                     "busy_count": [1]}})
+        self.assertEqual(e.state["tasks"]["t1"]["busy_count"], 0)
+        self.assertTrue(any("busy_count" in m and "不是数值" in m
+                            for m in cm.output),
+                        "未记录 busy_count 归一: %s" % cm.output)
+
+    # ---------- 2.2.3：retry 值级归一 ----------
+
+    def test_retry_string_value_dropped_at_load(self):
+        # RED on old code: retry 值 "2026-10-20" 原样进内存，
+        # time.time() < due_at 直接 TypeError。
+        with self.assertLogs("monitor", level="WARNING") as cm:
+            e = self._engine({"t1": {"status": "monitoring"}},
+                             retry={"k1": "2026-10-20",
+                                    "k2": 1728971234.5})
+        self.assertNotIn("k1", e.state["retry"])
+        self.assertEqual(e.state["retry"]["k2"], 1728971234.5)
+        self.assertTrue(any("retry" in m and "非数值" in m
+                            for m in cm.output),
+                        "未记录 retry 丢弃: %s" % cm.output)
+
+    # ---------- 对照：干净输入零行为变化 ----------
+
+    def test_bool_fail_streak_kept(self):
+        # 对照：bool 是数值（True+1 合法），归一不动（新旧代码都通过）。
+        e = self._engine({"t1": {"status": "monitoring",
+                                 "fail_streak": True, "busy_count": False}})
+        self.assertIs(e.state["tasks"]["t1"]["fail_streak"], True)
+        self.assertIs(e.state["tasks"]["t1"]["busy_count"], False)
+
+    def test_clean_values_unchanged_no_error(self):
+        # 对照：数值/缺键原样通过，不记 error（新旧代码都通过）。
+        e = self._engine({"t1": {"status": "monitoring", "fail_streak": 3,
+                                 "busy_count": 0},
+                          "t2": {"status": "paused"}})
+        self.assertEqual(e.state["tasks"]["t1"]["fail_streak"], 3)
+        self.assertEqual(e.state["tasks"]["t1"]["busy_count"], 0)
+        self.assertNotIn("fail_streak",
+                         e.state["tasks"]["t2"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

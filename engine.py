@@ -601,7 +601,15 @@ class MonitorEngine(object):
           后续 self.state["dedup"][key]=... 直接 TypeError，任务永久崩溃循环；
           且 _save_state 只修落盘快照（_merge_state_for_save），self.state
           内存永不自愈。此处把内存一并修复（error+{}），下次 _save_state
-          自然落盘治愈文件。"""
+          自然落盘治愈文件。
+        Task 137（2.1.1/2.2.2/2.2.3）：条目内 fail_streak/busy_count 与 retry
+        节**值级**形状归一。节级/条目级校验从不看字段值：手改 "fail_streak":
+        "0"（字符串，经典 JSON 手误）→ _note_failure 的 +1 直接 TypeError，
+        且 run() 的 except handler 内二次调用 _note_failure 时重抛 → 逃出
+        run() → 整引擎死亡（P2）；busy_count 同模式（P3）；retry 值被改成
+        可读日期字符串 → time.time() < due_at 直接 TypeError（P3）。此处归一
+        后所有下游读点（含 handler 内调用）恒安全；bool 视为数值（True+1 合法）。
+        """
         if not isinstance(state.get("tasks"), dict):
             LOG.error("[状态] %s 的 tasks 节不是对象（%s），已按空任务集降级；"
                       "请检查文件是否被手改损坏",
@@ -609,12 +617,24 @@ class MonitorEngine(object):
             state["tasks"] = {}
         else:
             for name in list(state["tasks"]):
-                if not isinstance(state["tasks"][name], dict):
+                entry = state["tasks"][name]
+                if not isinstance(entry, dict):
                     LOG.error("[状态] %s 的任务条目「%s」不是对象（%s），已跳过；"
                               "请检查文件是否被手改损坏",
                               self.state_path, name,
                               type(state["tasks"][name]).__name__)
                     del state["tasks"][name]
+                    continue
+                # Task 137（2.1.1/2.2.2）：fail_streak/busy_count 值级归一。
+                # 非数值（含 ""/None 等 falsy——""+1 同样 TypeError）→ 记 error
+                # 后按 0；缺键不动（保持旧行为）。
+                for key in ("fail_streak", "busy_count"):
+                    if key in entry and not isinstance(entry[key], (int, float)):
+                        LOG.error("[状态] %s 的任务「%s」的 %s 不是数值（%s），"
+                                  "已按 0 归一；请检查文件是否被手改损坏",
+                                  self.state_path, name, key,
+                                  type(entry[key]).__name__)
+                        entry[key] = 0
         for sec in ("dedup", "retry"):
             if not isinstance(state.get(sec), dict):
                 LOG.error("[状态] %s 的 %s 节不是对象（%s），已按空降级；"
@@ -622,6 +642,18 @@ class MonitorEngine(object):
                           self.state_path, sec,
                           type(state.get(sec)).__name__)
                 state[sec] = {}
+        # Task 137（2.2.3）：retry 节值级归一。值是 epoch 浮点；真值非数值
+        # （如手改成可读日期字符串）→ 按过期丢弃该键（falsy 非数值无害，
+        # 旧代码本就按"未到期"跳过，保持不动）。
+        retry = state.get("retry")
+        if isinstance(retry, dict):
+            for key in list(retry):
+                val = retry[key]
+                if val and not isinstance(val, (int, float)):
+                    LOG.warning("[状态] %s 的 retry 值非数值（%s），已按过期丢弃；"
+                                "请检查文件是否被手改损坏",
+                                self.state_path, type(val).__name__)
+                    retry.pop(key, None)
         return state
 
     def _save_state(self, state=None):
