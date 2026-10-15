@@ -13881,6 +13881,27 @@ def _iter_warn_repr_calls(here):
     return hits
 
 
+def _iter_param_warn_calls(here):
+    """扫描 launcher.py 的 bare `warn(` 调用（_normalize_* 的参数化 warn）。
+
+    返回 (文件名, 归一化调用源码) 列表。Task 135（2.2.6）：这类调用的
+    sink 随调用方而定，不能按调用源码一刀切认证——须按最坏调用方 sink
+    逐条登记在 _PARAM_WARN_SINKS。
+    """
+    import ast
+    hits = []
+    path = os.path.join(here, "launcher.py")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "warn":
+            seg = ast.get_source_segment(src, node)
+            hits.append(("launcher.py", " ".join(seg.split())))
+    return hits
+
+
 class TestTask124PiiConvergeB7(TempDirCase):
     """Task 124 (B7-1)：日志 PII 收敛 bundle（P3×2）。
 
@@ -14048,12 +14069,22 @@ class TestTask124PiiConvergeB7(TempDirCase):
         ('gui.py', 'LOG.warning("history_file 非字符串，已用默认值 order_history.json：%r", hist_file)'),
         # Task 127（2.2.5）：state_file 同口径守卫——值是配置路径，非 PII。
         ('gui.py', 'LOG.warning("state_file 非字符串，已用默认值 state.json：%r", state_file)'),
+        # Task 135（2.2.6）：参数化 warn（bare warn()，sink 随调用方而定）。
+        # 认证必须按"最坏调用方 sink"（见 TestTask135LauncherPiiB9
+        # 的 _PARAM_WARN_SINKS），不能按调用源码一刀切。sink 取值：
+        # persistent = 模块级 log → LOG.info → DayFileHandler 落盘；
+        # tk = self._put_log（只写内存文本框）；none = 丢弃。
+        # worst=persistent 的条目，其 %r 值必须本身非 PII（车次号/车站名）。
         ('launcher.py', 'warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))'),
-        ('launcher.py', 'warn("[提醒] passenger_names 形状非法，已忽略：%r" % (raw,))'),
+        # worst=tk（_normalize_seat_types 的调用方：_put_log / lambda 丢弃）
         ('launcher.py', 'warn("[提醒] station_history 形状非法，已忽略：%r" % (raw,))'),
+        # worst=persistent（调用方传模块级 log）；车站名非 PII
         ('launcher.py', 'warn("[提醒] pax_purpose 形状非法，已忽略：%r" % (raw,))'),
+        # worst=tk（唯一调用方传 self._put_log）
         ('launcher.py', 'LOG.warning("查询历史记录条目非 dict，已跳过：%r" % (it,))'),
         ('launcher.py', 'warn("[提醒] trains 形状非法，已忽略：%r" % (raw,))'),
+        # worst=persistent（_normalize_trains 的调用方传模块级 log）；
+        # 车次号非 PII
         ('launcher.py', 'self._put_log("[提醒] query_history 形状非法，已忽略：%r" % (raw_hist,))'),
         ('launcher.py', 'LOG.warning("抢票任务条目非 dict，已跳过展示：%r" % (task,))'),
         ('launcher.py', 'self._put_log("[警告] 配置 remind_minutes 非法（%r），已用默认值 10" % (lc.get("remind_minutes"),))'),
@@ -14063,14 +14094,13 @@ class TestTask124PiiConvergeB7(TempDirCase):
         ('launcher.py', 'self._put_log("[提醒] 任务名非字符串，已跳过序号统计：%r" % (raw_name,))'),
         ('notify.py', 'LOG.warning("[配置] smtp_port 非法，已回退 465：%r", raw)'),
         ('ticket.py', 'LOG.warning("[余票] 未知席别码 %r（码串 %r），已跳过", s[i:i + 4], s)'),
-        # Task 131（2.2.5）：sweep 口径扩展到 LOG.info / 裸 log( 后新增的
-        # 5 处未登记调用——均为配置/状态文件顶层形状或配置路径值，不含乘车人
-        # 结构：顶层非 dict / tasks 节非 dict 的是"整个文件形状错误"的调试值；
-        # state_file 是配置路径值（Task 127 已裁决非 PII）。确认无 PII 后登记。
-        ('launcher.py', 'log("[提醒] 监控系统 config.json 顶层不是对象，本轮不合并车次：%r" % (cfg,))'),
-        ('launcher.py', 'log("[提醒] config.json 顶层不是对象，跳过乘车人导入：%r" % (cfg,))'),
-        ('launcher.py', 'log("[提醒] state.json 顶层不是对象，已按空重建：%r" % (state,))'),
-        ('launcher.py', 'log("[提醒] state.json tasks 节形状非法，已按空重建：%r" % (tasks_sec,))'),
+        # Task 131（2.2.5）：sweep 口径扩展到 LOG.info / 裸 log( 后登记。
+        # Task 135（2.2.5）修正：原先登记的 4 处顶层/tasks 节 %r
+        #（config.json 顶层×2、state.json 顶层、state.json tasks 节）的
+        # "无 PII"认证是错误的——{"tasks": ["张三"]} 下 tasks_sec 就是
+        # ['张三']，%r 直接打印真名。这 4 处已按 Task 131 口径收敛为
+        # _type_len_summary，不再含 %r，故从 allowlist 移除。
+        # 仅保留 state_file（配置路径值，Task 127 已裁决非 PII）。
         ('launcher.py', 'log("[提醒] state_file 非字符串，已用默认值 state.json：%r" % (state_file,))'),
     ])
 
@@ -14941,20 +14971,161 @@ class TestTask131LauncherPiiB8(TempDirCase):
 
     def test_sweep_covers_log_info_calls(self):
         # 锁定口径扩展：扫描器必须看见 LOG.info / 裸 log( 的 %r 调用。
-        # 5 处非 PII 调用保留（已在 _WARN_REPR_ALLOW 登记），此处正向断言
-        # 扫描器确实覆盖该口径；回退任一已修复点为 %r 整值 →
+        # 1 处非 PII 调用保留（state_file，已在 _WARN_REPR_ALLOW 登记），
+        # 此处正向断言扫描器确实覆盖该口径；回退任一已修复点为 %r 整值 →
         # test_warn_repr_sweep_locked 失败（未登记的新命中）。
+        # Task 135：原先的 5 处里 4 处是误认证（见 allowlist 注释），已收敛。
         hits = _iter_warn_repr_calls(HERE)
         launcher_hits = sorted(
             s for n, s in hits
             if n == "launcher.py"
             and (s.startswith("log(") or "LOG.info" in s))
-        self.assertEqual(len(launcher_hits), 5,
-                         "扩展口径应恰好看到 5 处已登记的非 PII 调用：\n%s"
+        self.assertEqual(len(launcher_hits), 1,
+                         "扩展口径应恰好看到 1 处已登记的非 PII 调用：\n%s"
                          % "\n".join(launcher_hits))
         for s in launcher_hits:
             self.assertIn(("launcher.py", s),
                           TestTask124PiiConvergeB7._WARN_REPR_ALLOW)
+
+
+class TestTask135LauncherPiiB9(TempDirCase):
+    """Task 135（B9-3）：launcher PII bundle（P3×2）。
+
+    2.2.5：launcher.py 4 处顶层/tasks 节 %r（:1096/:3830/:1283/:1287）
+    整文件内容进持久 logs/launcher_*.log；Task 131 sweep allowlist 的
+    "无 PII"认证错误（:1287 的 tasks_sec 在 {"tasks": ["张三"]} 下就是
+    ['张三']）。Task 131 口径：_type_len_summary（类型+长度，不打印值）。
+    附带：修正 allowlist 注释；sweep 对"整文件内容 %r"类加 PII 断言。
+    2.2.6：_normalize_passenger_names :445 的 %s 直印裸字符串真名、
+    :448 的 %r（参数化 warn 的 sink 随调用方而定，3 处传持久 log）；
+    sweep %r-only 盲区 + 参数化 warn 方法论缺口。
+    """
+
+    def _write(self, name, obj):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        return path
+
+    def _here(self, files):
+        for name, obj in files.items():
+            self._write(name, obj)
+        real = launcher.HERE
+        launcher.HERE = self.tmp
+        self.addCleanup(setattr, launcher, "HERE", real)
+
+    def _logged(self, mlog):
+        return "\n".join(str(c.args[0]) for c in mlog.call_args_list
+                         if c.args)
+
+    # ---------- 2.2.5：4 处顶层/tasks 节 %r ----------
+
+    def test_monitor_config_top_level_no_repr(self):
+        # RED：改前 log("…本轮不合并车次：%r" % (cfg,)) 把 ["张三"] 原样
+        # 打进持久日志。
+        self._here({"config.json": ["张三"]})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.merge_trains_from_monitor(
+                {"trains": [], "synced_trains": []}, saver=lambda c: None)
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_ensure_passengers_config_top_level_no_repr(self):
+        # RED：改前 log("…跳过乘车人导入：%r" % (cfg,)) 打印 ["张三"]。
+        self._here({"config.json": ["张三"]})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.ensure_passengers()
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_state_top_level_no_repr(self):
+        # RED：改前 log("…顶层不是对象，已按空重建：%r" % (state,))
+        # 把 ["张三"] 原样打进持久日志。
+        self._here({"config.json": {"tasks": []}, "state.json": ["张三"]})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.append_monitor_task({"name": "t1"})
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_state_tasks_section_no_repr(self):
+        # RED（最强证据 + sweep PII 断言）：改前
+        # log("…tasks 节形状非法，已按空重建：%r" % (tasks_sec,))
+        # 在 state.json = {"tasks": ["张三"]} 下把 ['张三'] 原样打进
+        # 持久日志。
+        self._here({"config.json": {"tasks": []},
+                    "state.json": {"tasks": ["张三"]}})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.append_monitor_task({"name": "t1"})
+        self.assertNotIn("张三", self._logged(mlog))
+
+    # ---------- 2.2.6：_normalize_passenger_names ----------
+
+    def test_normalize_bare_string_no_raw_value(self):
+        # RED：改前 warn("…已按单个乘车人处理：%s" % raw) 把"张三"原样
+        # 打进持久日志（3 处调用方传模块级 log）。
+        warns = []
+        out = launcher._normalize_passenger_names("张三", warns.append)
+        self.assertEqual(out, ["张三"])  # 归一化语义不变
+        self.assertTrue(warns, "仍须记警告")
+        self.assertNotIn("张三", "\n".join(warns))
+
+    def test_normalize_illegal_shape_no_repr(self):
+        # RED：改前 warn("…形状非法，已忽略：%r" % (raw,)) 打印
+        # {'name': '张三'} 进持久日志。
+        warns = []
+        out = launcher._normalize_passenger_names({"name": "张三"},
+                                                  warns.append)
+        self.assertEqual(out, [])
+        self.assertTrue(warns, "仍须记警告")
+        self.assertNotIn("张三", "\n".join(warns))
+
+    # ---------- sweep 方法论修复：参数化 warn 的最坏调用方 sink 认证 ----------
+
+    # (文件名, 归一化调用源码) -> (最坏调用方 sink, PII 判定)。
+    # sink 取值："persistent"（模块级 log → LOG.info → DayFileHandler 落盘）；
+    # "tk"（self._put_log，只写内存文本框）；"none"（lambda *a: None，直接丢弃）。
+    # Task 135（2.2.6）：bare warn( 在 launcher.py 里恒为 _normalize_*
+    # 的参数，sink 随调用方而定——认证必须按"最坏调用方"。
+    _PARAM_WARN_SINKS = {
+        ('launcher.py',
+         'warn("[提醒] trains 为字符串，已按单个车次处理：%s" % raw)'):
+            ("persistent", "车次号非 PII"),
+        ('launcher.py',
+         'warn("[提醒] trains 形状非法，已忽略：%r" % (raw,))'):
+            ("persistent", "车次号非 PII"),
+        ('launcher.py',
+         'warn("[提醒] seat_types 为字符串，已按单个席别处理：%s" % raw)'):
+            ("tk", "席别码非 PII；最坏调用方 _put_log（Tk 展示）"),
+        ('launcher.py',
+         'warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))'):
+            ("tk", "席别码非 PII；最坏调用方 _put_log（Tk 展示）"),
+        ('launcher.py',
+         'warn("[提醒] passenger_names 为字符串，已按单个乘车人处理"'
+         ' "（类型：%s）" % type(raw).__name__)'):
+            ("persistent", "Task 135 2.2.6：不再打印原值"),
+        ('launcher.py',
+         'warn("[提醒] passenger_names 形状非法，已忽略"'
+         ' "（类型/长度：%s）" % _type_len_summary(raw))'):
+            ("persistent", "Task 135 2.2.6：_type_len_summary 不打印值"),
+        ('launcher.py',
+         'warn("[提醒] station_history 为字符串，已按单个车站处理：%s" % raw)'):
+            ("persistent", "车站名非 PII"),
+        ('launcher.py',
+         'warn("[提醒] station_history 形状非法，已忽略：%r" % (raw,))'):
+            ("persistent", "车站名非 PII"),
+        ('launcher.py',
+         'warn("[提醒] pax_purpose 形状非法，已忽略：%r" % (raw,))'):
+            ("tk", "唯一调用方传 self._put_log（Tk 展示）"),
+    }
+
+    def test_param_warn_sinks_certified(self):
+        # 方法论锁定：launcher 的参数化 warn（bare warn()）sink 随调用方
+        # 而定，必须按"最坏调用方 sink"逐条认证。新增未认证的调用 →
+        # 本测试失败（回退 :445/:448 任一 → 对应条目失配 → 失败）。
+        hits = _iter_param_warn_calls(HERE)
+        new = [(n, s) for n, s in hits
+               if (n, s) not in self._PARAM_WARN_SINKS]
+        self.assertEqual(new, [],
+                         "发现未认证的参数化 warn 调用：\n%s\n"
+                         "请按最坏调用方 sink 认证后加入 _PARAM_WARN_SINKS。"
+                         % "\n".join("%s: %s" % (n, s) for n, s in new))
 
 
 class TestTask132BrowserOrderMainKiB8(TempDirCase):

@@ -442,10 +442,16 @@ def _normalize_passenger_names(raw, warn):
     if raw is None or raw == "":
         return []
     if isinstance(raw, str):
-        warn("[提醒] passenger_names 为字符串，已按单个乘车人处理：%s" % raw)
+        # Task 135（2.2.6）：%s 直印裸字符串真名进持久日志（3 处调用方传
+        # 模块级 log）。只记类型提示，不打印原值。
+        warn("[提醒] passenger_names 为字符串，已按单个乘车人处理"
+             "（类型：%s）" % type(raw).__name__)
         return [raw]
     if not isinstance(raw, (list, tuple)):
-        warn("[提醒] passenger_names 形状非法，已忽略：%r" % (raw,))
+        # Task 135（2.2.6）：%r 在参数化 warn 的错误 sink 假设下被 allowlist；
+        # 改用 _type_len_summary（Task 131 口径），与 sink 无关。
+        warn("[提醒] passenger_names 形状非法，已忽略"
+             "（类型/长度：%s）" % _type_len_summary(raw))
         return []
     return [n for n in raw if isinstance(n, str)]
 
@@ -1093,7 +1099,9 @@ def merge_trains_from_monitor(lc, saver=None):
     # Task 110（P2）：config 顶层非 dict / tasks 非 list 时旧代码在 try 之外
     # 直接 cfg.get / t.get → AttributeError，任务窗口打不开。先守形状。
     if not isinstance(cfg, dict):
-        log("[提醒] 监控系统 config.json 顶层不是对象，本轮不合并车次：%r" % (cfg,))
+        # Task 135（2.2.5）：%r 整文件内容进持久日志（类型+长度）。
+        log("[提醒] 监控系统 config.json 顶层不是对象，本轮不合并车次"
+            "（类型/长度：%s）" % _type_len_summary(cfg))
         return False
     tasks = cfg.get("tasks") or []
     if not isinstance(tasks, list):
@@ -1280,11 +1288,16 @@ def append_monitor_task(task, start_now=True):
                 # 产生重复任务。先守形状再链式写入（写回时自然治愈）。
                 # 顶层非 dict 同样会崩在 state.get，必须一并守住。
                 if not isinstance(state, dict):
-                    log("[提醒] state.json 顶层不是对象，已按空重建：%r" % (state,))
+                    # Task 135（2.2.5）：%r 整文件内容进持久日志（类型+长度）。
+                    log("[提醒] state.json 顶层不是对象，已按空重建"
+                        "（类型/长度：%s）" % _type_len_summary(state))
                     state = {}
                 tasks_sec = state.get("tasks")
                 if not isinstance(tasks_sec, dict):
-                    log("[提醒] state.json tasks 节形状非法，已按空重建：%r" % (tasks_sec,))
+                    # Task 135（2.2.5）：同上；{"tasks": ["张三"]} 下
+                    # tasks_sec 就是 ['张三']，%r 会直接打印真名。
+                    log("[提醒] state.json tasks 节形状非法，已按空重建"
+                        "（类型/长度：%s）" % _type_len_summary(tasks_sec))
                     tasks_sec = {}
                     state["tasks"] = tasks_sec
                 entry = tasks_sec.setdefault(task["name"], {})
@@ -3827,7 +3840,9 @@ def ensure_passengers():
         # 导入静默跳过）；passenger_names 裸字符串归一化，绝不逐字符拆（旧代码
         # 首跑会建成 ['张','三'] 这样的单字乘车人）。
         if not isinstance(cfg, dict):
-            log("[提醒] config.json 顶层不是对象，跳过乘车人导入：%r" % (cfg,))
+            # Task 135（2.2.5）：%r 整文件内容进持久日志（类型+长度）。
+            log("[提醒] config.json 顶层不是对象，跳过乘车人导入"
+                "（类型/长度：%s）" % _type_len_summary(cfg))
             return
         tasks = cfg.get("tasks") or []
         if not isinstance(tasks, list):
