@@ -931,9 +931,14 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         break
                     page.wait_for_timeout(500)
                 if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
-                    i = max(0, body.find("订单") - 30)
                     mark("result")
-                    return False, body[i:i + 200].replace("\n", " "), {"reason": "dup"}
+                    # Task 147（R11-S5-1）：弹窗原文 raw 切片此前把真实姓名
+                    # 进 msg → 控制台 + logs/order_timing.jsonl。复用
+                    # _fail_body_slice(body, "订单", names)——窗口语义与旧内联
+                    # 逐字等价（锚点 body.find("订单")-30、200 字符）+
+                    # _mask_text_names 脱敏（Task 124 2.2.8 同口径）。
+                    return False, _fail_body_slice(body, "订单",
+                                                   passenger_names or []), {"reason": "dup"}
                 raise
             page.wait_for_selector("#normal_passenger_id input[type=checkbox]",
                                    state="attached", timeout=40000)

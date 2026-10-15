@@ -16903,6 +16903,100 @@ class TestTask146DedupValueShapes(TempDirCase):
         m_order.assert_not_called()
 
 
+
+
+class TestTask147DupPopupSliceMaskB12(TempDirCase):
+    """Task 147（B12-4）：browser_order 未处理订单弹窗切片脱敏（P3×1）。
+
+    R11-S5-1 — browser_order.py:936（_order_impl 的 wait_for_url 超时 except
+    分支）：未处理订单弹窗的页面原文 raw 切片（body.find("订单")-30 起 200
+    字符）→ 真实姓名进 msg → 控制台 + logs/order_timing.jsonl（_record_timing
+    的 "msg"）。Task 124 2.2.8 只修了 :1362 的提交失败分支（锚点 hit-30），
+    本分支（点「预订」后、提交前）漏网。
+    修复：复用 _fail_body_slice(body, "订单", passenger_names or [])——窗口语义
+    与旧内联逐字等价（同锚点/同窗口）+ _mask_text_names 脱敏（2.2.6 同口径）。
+    """
+
+    class _Page:
+        """走「确认页导航超时→未处理订单弹窗」分支的假页面。"""
+
+        def __init__(self, body):
+            self._body = body
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def wait_for_url(self, *a, **k):
+            raise Exception("timeout")  # 触发 except 分支
+
+        def evaluate(self, js, arg=None):
+            if arg is not None:
+                return True   # 点「预订」JS（带 code 参数）
+            return self._body  # "() => document.body ? document.body.innerText : ''"
+
+    class _Ctx:
+        def __init__(self, page):
+            self.pages = [page]
+
+    def _run_dup_popup(self, body, passenger_names):
+        import sys
+        import types as _types
+        pw = _types.ModuleType("playwright")
+        pw_sync = _types.ModuleType("playwright.sync_api")
+        pw_sync.sync_playwright = lambda: mock.MagicMock()
+        pw.sync_api = pw_sync
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "BJP", "to_code": "SHH"}
+        page = self._Page(body)
+        ctx = self._Ctx(page)
+        with mock.patch.dict("sys.modules",
+                             {"playwright": pw,
+                              "playwright.sync_api": pw_sync}), \
+             mock.patch.object(browser_order, "launch", return_value=ctx), \
+             mock.patch.object(browser_order, "session_ok",
+                               return_value=(True, "who")), \
+             mock.patch.object(browser_order, "_goto_and_query"), \
+             mock.patch.object(browser_order, "_safe_close_ctx"):
+            return browser_order._order_impl(
+                info, "二等座", "O", passenger_names, "2026-10-20")
+
+    def _dup_body(self):
+        return ("系统提示：您还有未处理的订单，请先前往处理。订单详情："
+                "乘客张三，车次 G101，北京到上海，二等座，2026-10-20。")
+
+    def test_dup_popup_slice_masks_names(self):
+        # RED（旧代码）：return 的 msg 是 raw 切片 → "张三" 原样进 msg。
+        body = self._dup_body()
+        ok, msg, extra = self._run_dup_popup(body, ["张三"])
+        self.assertFalse(ok)
+        self.assertEqual(extra, {"reason": "dup"})
+        self.assertNotIn("张三", msg)          # 真实姓名不再进 msg/jsonl
+        self.assertIn("张*", msg)              # 与 _mask_name 同口径
+        self.assertIn("未处理", msg)           # 关键词锚点保留，可调试
+
+    def test_dup_popup_empty_names_residual(self):
+        # 2.2.8 已接受的残留口径：未点名（passenger_names 为空）→ 无姓名可
+        # 脱敏，切片与旧 raw 逐字一致（pin 住，不 silently 改变）。
+        body = self._dup_body()
+        i = max(0, body.find("订单") - 30)
+        expected = body[i:i + 200].replace("\n", " ")
+        ok, msg, extra = self._run_dup_popup(body, [])
+        self.assertFalse(ok)
+        self.assertEqual(extra, {"reason": "dup"})
+        self.assertEqual(msg, expected)
+        self.assertIn("张三", msg)  # 残留口径：无点名则无脱敏
+
+    def test_dup_popup_window_semantics(self):
+        # 窗口语义 pin：_fail_body_slice(body, "订单", names) 与旧内联
+        # body[max(0, body.find("订单")-30):][:200] 逐字等价（+脱敏）。
+        body = "A" * 100 + "订单" + "B" * 300
+        out = browser_order._fail_body_slice(body, "订单", [])
+        self.assertEqual(out, ("A" * 30 + "订单" + "B" * 300)[:200])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
