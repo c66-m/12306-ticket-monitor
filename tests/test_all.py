@@ -16844,6 +16844,65 @@ class TestTask145IdFieldShapes(TempDirCase):
         self.assertEqual(out[1]["id_no"], "110101199001011234")
 
 
+class TestTask146DedupValueShapes(TempDirCase):
+    """Task 146（B12-3）：engine dedup 节值形状 bundle（P3×1）。
+
+    R11-S1-1 — engine.py:1194（_run_task 有票命中分支）：state.json 的
+    dedup 节值被手改成不可哈希（如 ["SUBMITTED"]）→ DEDUPE_VALUES.get
+    抛 TypeError → 整轮 _run_task 中止 → 单任务无限 loud backoff，
+    永久无法下单。
+    修复：:1194 取值处 try/except TypeError（只守实际崩溃面）→ 记 warning
+    后按"未知记录"占位跳过。跳过分支照常生效（fail-safe）：绝不因脏值
+    误删防重记录或重复下单——sanitize 点"丢弃该键"方案会丢失防重保护
+    （丢键 → 跳过分支不再触发 → 可能重复下单），故不采用。
+    """
+
+    def _run_task_with_dedup(self, dedup_value):
+        e = make_engine(self.tmp)
+        t = task_of()
+        key = engine_mod.dedup_key(t, t["dates"][0], "K225", "硬座",
+                                   t["passenger_names"])
+        e.state["dedup"][key] = dedup_value
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        e.tasks = [t]
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket") as m_order, \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            e._run_task(t)
+        return e, t, key, m_order
+
+    def test_unhashable_dedup_value_no_crash_skips(self):
+        # RED（旧代码）：DEDUPE_VALUES.get(["SUBMITTED"], ...) → TypeError
+        # 逃出 _run_task。修后：warn + 按"未知记录"占位跳过，不下单，
+        # 防重键保留（fail-safe：不丢键、不重复下单）。
+        e, t, key, m_order = self._run_task_with_dedup(["SUBMITTED"])
+        m_order.assert_not_called()
+        self.assertIn(key, e.state["dedup"])  # 键未被丢弃：防重保护保留
+        self.assertEqual(e.state["dedup"][key], ["SUBMITTED"])  # 值原样未动
+
+    def test_legit_dedup_value_skip_unchanged(self):
+        # 对照：合法值走跳过分支，文案与旧代码一致，无警告。
+        with self.assertNoLogs(engine_mod.LOG, level="WARNING"):
+            e, t, key, m_order = self._run_task_with_dedup("SUBMITTED")
+        m_order.assert_not_called()
+
+    def test_falsy_dedup_value_keeps_old_behavior(self):
+        # 对照：falsy 值（None）旧代码不崩（.get(None, None) → None），
+        # 修后行为不变，无警告。
+        with self.assertNoLogs(engine_mod.LOG, level="WARNING"):
+            e, t, key, m_order = self._run_task_with_dedup(None)
+        m_order.assert_not_called()
+
+    def test_hashable_non_str_dedup_value_keeps_old_behavior(self):
+        # 对照：可哈希非 str（5）旧代码不崩（.get(5, 5) → 5），
+        # 修后行为不变，无警告（崩溃面精确限定为不可哈希）。
+        with self.assertNoLogs(engine_mod.LOG, level="WARNING"):
+            e, t, key, m_order = self._run_task_with_dedup(5)
+        m_order.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

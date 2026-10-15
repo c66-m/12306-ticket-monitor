@@ -1190,8 +1190,25 @@ class MonitorEngine(object):
                     key = dedup_key(task, date, train_code, seat_name,
                                     task.get("passenger_names") or [])
                     if key in self.state["dedup"]:
-                        LOG.info("[跳过] 任务「%s」已有记录：%s", name,
-                                 DEDUPE_VALUES.get(self.state["dedup"][key], self.state["dedup"][key]))
+                        dedup_val = self.state["dedup"][key]
+                        try:
+                            dedup_label = DEDUPE_VALUES.get(dedup_val, dedup_val)
+                        except TypeError:
+                            # Task 146（R11-S1-1）：dedup 节值被手改成不可哈希
+                            # （如 ["SUBMITTED"]）→ DEDUPE_VALUES.get 在哈希键时
+                            # 抛 TypeError，整轮 _run_task 中止 → 单任务无限 loud
+                            # backoff，永久无法下单。记 warning 后按"未知记录"
+                            # 占位跳过：跳过分支照常生效，键与值原样保留——
+                            # 绝不因脏值误删防重记录或重复下单（fail-safe）。
+                            # try 块内只有这一条语句，except TypeError 精确对应
+                            # 不可哈希值崩溃面（Task 142 同口径）；可哈希非 str
+                            # （如 5）/ falsy 保持旧行为。
+                            LOG.warning("[状态] %s 的 dedup 值不可哈希（%s），"
+                                        "已按未知记录跳过；请检查文件是否被手改损坏",
+                                        self.state_path,
+                                        type(dedup_val).__name__)
+                            dedup_label = "（未知记录）"
+                        LOG.info("[跳过] 任务「%s」已有记录：%s", name, dedup_label)
                         continue
                     if not auto_order:
                         # 未开启自动下单：只报警不下单，供人工在 App/网页快速购买
