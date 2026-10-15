@@ -42,10 +42,10 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `ui/index.html` + `ui/app.js` + `ui/style.css` | 主窗 87 / 1671 / 960 行 | **唯一界面（纯 HTML/CSS/JS，无框架）**：顶栏（会话胶囊 / 监控开关 / 窗口键：置顶 · 小窗 · 最小化 · 最大化 · 关闭）+ 侧边栏 = 监控任务 / 抢票任务 / 乘车人 / 历史 / 设置 + 主区 + 底部全局日志。渲染、轮询、外观设置全在 app.js |
 | `ui/mini.html` + `ui/mini.js` + `ui/mini.css` | 小窗 3 文件 | **抢票小窗（B7 第二步）**：460×420 无边框，只显示账号 / 进行中任务 / 抢票日志；打开时主窗隐藏，关闭自动还原。外观经 `--appear` 启动参数继承主窗 |
 | `electron/main.js` + `electron/preload.js` | 221 / 27 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
-| `api.py` | 1259 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1174-1211）；引擎启停、日志泵、抢票定时调度、config/state 原子写 |
-| `launcher.py` | 1165 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
-| `gui.py` | 4317 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
-| `monitor.py` | 1127 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
+| `api.py` | 1262 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停、日志泵、抢票定时调度、config/state 原子写 |
+| `launcher.py` | 1168 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
+| `gui.py` | 4323 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
+| `monitor.py` | 1133 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
 
 ### 核心链路
 
@@ -65,11 +65,14 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `logutil.py` | 132 行 | 按天滚动日志 handler，保持 `logs/<prefix>_YYYYMMDD.log` 命名习惯（标准库 handler 会改变命名，故自实现） |
 | `config_keys.py` | 22 行 | 配置键唯一定义处：代码读取的键 ⊆ example 模板键（测试防漂移回归） |
 | `tools/gen_icon.py`、`tools/gen_icon_emoji.py` | — | 图标生成脚本（产出 ui/appicon.png、electron/icon.ico） |
+| `tools/clean_profile.py` | 135 行 | 清 `.browser_profile/` 可再生产物（缓存/遥测/崩溃转储），保留登录态；无参干跑、`--force` 真删，抢不到 profile 锁即认为浏览器在跑并拒绝清理 |
 | `notify.py` | 147 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
 | `passengers.py` | 496 行 | 乘车人管理：DPAPI（Windows）/ Fernet / 明文三级加密，按环境自动选最安全可用者 |
 | `station_db.py` | 152 行 | 全量车站本地库（3404 站）：在库=运营中；车型标签来自实际查询学习。`rebuild` 从车站索引+车型表合成，`check` 校验三份同源车站文件的 name↔code 漂移（非零退出） |
 | `capture_session.py` | 305 行 | 会话抓取：Playwright 打开 Edge 人工登录一次，Cookie 持久化到 `session_cookies.json` |
 | `probe_login.py` | 520 行 | 登录链路诊断：域名连通性、二维码申请/轮询、会话有效性验证（只诊断，不绕过） |
+| `web-dashboard/` | 静态稿 | 车票监控控制台**设计稿**（`DESIGN.md` + 单文件 `index.html` + 预览图）：纯静态、零依赖、无后端，是 `ui/` 玻璃拟态方向的演进提案，**未被 Electron 壳加载**。注意：其中的 `PRODUCT.md` 与根目录的 `PRODUCT.md` 同名不同物 |
+| `runs/` | — | 独立侦察工具（`fofa_client.py`，FOFA 资产采集）。**与抢票主链路无关** |
 
 ## 功能入口
 
