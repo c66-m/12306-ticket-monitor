@@ -623,6 +623,13 @@ def menu_task_list():
                   "（配置损坏），已用占位显示。".format(i))
         dates = engine_mod.expand_dates(t)
         status = eng.task_status(t)
+        # Task 133 返工：status 真值非 str（如手改成 list/dict）→ 下面的
+        # STATUS_LABELS.get(status, status) 对不可哈希键 TypeError 崩菜单 [2]；
+        # 记警告后按空处理（与 message 守卫同口径）。
+        if status and not isinstance(status, str):
+            print("  [警告] 第 {0} 个任务的状态字段非字符串"
+                  "（配置损坏），已忽略。".format(i))
+            status = ""
         dates_disp = (dates[0] + ("..." if len(dates) > 1 else "")) \
             if dates else "（未配置日期）"
         # 发/到站非字符串（手改 config.json）：记警告后用占位显示，

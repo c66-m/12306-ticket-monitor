@@ -15095,9 +15095,14 @@ class TestTask133MonitorDisplayGuards(TempDirCase):
 
     @staticmethod
     def _mock_engine(tasks_state):
+        # Task 133 返工：task_status 返回 state 里 status 字段原值（与真实
+        # engine.task_status 同行为），避免非 str 的 MagicMock 误触发守卫。
         eng = mock.MagicMock()
         eng.state = {"tasks": tasks_state}
         eng.base_interval = 300
+        eng.task_status = lambda t: eng.state["tasks"].get(
+            t.get("name"), {}).get("status", "paused")
+        eng.task_interval = lambda t: 300
         return eng
 
     def _run_task_list(self, tasks, tasks_state):
@@ -15128,6 +15133,62 @@ class TestTask133MonitorDisplayGuards(TempDirCase):
             [self._task()], {"t1": {"message": "一切正常"}})
         self.assertIn("一切正常", printed)
         self.assertNotIn("警告", printed)
+
+
+class TestTask133ReworkStatusField(TempDirCase):
+    """Task 133 返工（P3）：reviewer 新发现——menu_task_list 同一循环内
+    status 真值非 str（如手改成 list）→ STATUS_LABELS.get(status, status)
+    对不可哈希键 TypeError 崩菜单 [2]。口径与 message 守卫一致：
+    warn + 按空处理。"""
+
+    @staticmethod
+    def _task(name="t1"):
+        return {"name": name, "from": "北京", "to": "上海", "dates": []}
+
+    @staticmethod
+    def _mock_engine(tasks_state):
+        # 与真实 engine.task_status 同行为：返回 state 里 status 字段原值。
+        eng = mock.MagicMock()
+        eng.state = {"tasks": tasks_state}
+        eng.base_interval = 300
+        eng.task_status = lambda t: eng.state["tasks"].get(
+            t.get("name"), {}).get("status", "paused")
+        # 避免 status="monitoring" 时走入轮询估算块的无关 TypeError。
+        eng.task_interval = lambda t: 300
+        return eng
+
+    def _run_task_list(self, tasks, tasks_state):
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine(tasks_state)), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_list()  # 不得抛 TypeError
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    def test_status_unhashable_warn_empty(self):
+        # RED（旧代码）：status=["x"] → STATUS_LABELS.get(["x"], ["x"])
+        # → TypeError，菜单 [2] 崩溃。修后：warn + 记录仍展示（状态按空）。
+        printed = self._run_task_list(
+            [self._task()], {"t1": {"status": ["x"]}})
+        self.assertIn("警告", printed)
+        self.assertIn("t1", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_status_dict_warn_empty(self):
+        # RED（旧代码）：status={"a": 1} → dict.get 不可哈希键 → TypeError。
+        printed = self._run_task_list(
+            [self._task()], {"t1": {"status": {"a": 1}}})
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_status_str_unchanged(self):
+        # 对照：干净 status 照常显示，无警告。
+        printed = self._run_task_list(
+            [self._task()], {"t1": {"status": "monitoring"}})
+        self.assertNotIn("警告", printed)
+        self.assertIn("t1", printed)
 
 
 if __name__ == "__main__":
