@@ -138,7 +138,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ### tests/TEST_REPORT.md（历史存档 + 已加复核抬头）
 - 5.3KB，抬头写「日期:2026-10-06 · 基线:a8b4b57 · 测试套件(47 项)」，内容为当时的二次自我检查报告（append_monitor_task 并发丢数据、mtime 15.6ms 盲区、误导性日志等**已修项**）。
-- 当前基线是 **716 项**（2026-10-16 复核；本报告写于 47 项时代，早于 Electron 迁移与三轮重构），**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
+- 当前基线是 **723 项**（2026-10-16 复核；本报告写于 47 项时代，早于 Electron 迁移与三轮重构），**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
 
 ## 0.98 本批（2026-10-16）：config/state 收敛 + 文档订正 + 会话失效判定修复
 
@@ -172,6 +172,26 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 **回归**：`compileall` 干净；`tests\test_all.py` → **Ran 716 tests, OK (skipped=15)**。
 
 **教训**：把「异常」整类当瞬时故障的兜底，会把真失效吞掉——兜底判据要用**确认失效的白名单**，不要用「排除了异常前缀就算永久」。
+
+### 停止后日志仍在刷 + 无限重试（2026-10-15 修，用户截图报告）
+
+**症状**：点了「停止」，全局日志栏仍每 2 秒一条 ERR「任务「…」抢票失败：浏览器会话不可用（校验异常: Expecting value: line 1 column 1 (char 0)）」，连刷十几条不停；且该会话失效永不把任务标 failed。
+
+**这是两个独立缺陷**（上一节只修了 `check_session_if_needed` 那条判定路径，这两条都在**下单路径/线程收尾**上）：
+
+- **缺陷 A：下单路径的会话失效仍被判瞬时**。`browser_order._order_impl`（browser_order.py:817-823）冷启动会话校验失败返回「浏览器会话不可用（%s）。请先运行：python browser_order.py login」，`engine._run_task` 的会话分支（engine.py:1170）只匹配「会话已失效」/「未找到会话文件」（那是 http 模式 `order.py` 的文案），browser 模式的文案匹配不上 → 落到兜底 `continue` → **每趟车重试一遍、永不 failed、停止也停不住**。
+  修法：判据扩为 `("会话已失效" in msg or "未找到会话文件" in msg or browser_order.session_failure_is_permanent(msg))`，命中即 `set_task_status(task, "failed", "登录会话失效，请点界面上的「重新登录」后恢复任务")` + `return True, False`；engine.py:43 顶层 import browser_order（原本只在 check_session_if_needed 里局部 import）。
+  文案保留「登录会话失效」串：`check_session_if_needed` 靠它做会话恢复后的自动重启监控，gui.py:4036 靠 `[错误] 登录会话失效` 触发重登弹窗。
+- **缺陷 A 的文案层**：兜底分支（engine.py:1189）原来也打「任务「…」抢票失败」，让人以为任务已终止，其实每轮都在重试 → 改为 `LOG.warning("[重试] 任务「%s」本轮未成功：%s", name, msg)`。
+- **缺陷 B：停止后在途任务不停**。`run()` 的 `stop_event` 只出现在 run() 内部（engine.py:1513/1535/1556），`_run_task` 看不见它；`executor.shutdown(wait=False)` 只停止提交新任务，**在途的一轮会跑完**（本例 18 趟车 ≈ 36 秒日志）。
+  修法：`run()` 里 `self._stop_event = stop_event`；`_run_task` 用 `getattr(self, "_stop_event", None)` 兜底取（测试有 6 处直接调 `_run_task` 不经 run()），在 `for date in dates:` 与 `for seat_name in hit_seats:` 两个循环头检查 `stop.is_set()` 即 `return True, False`。
+- **launcher 侧同样补判据**（launcher.py:493-503）：`Grabber._run` 拿到 `ok=False` 时不打「抢票失败」也不标 failed，会一路走到 fail_streak（要凑满 `MAX_ORDER_FAILS=5` 次、中间白等 5×3 秒）→ 现在 `session_failure_is_permanent(msg)` 命中即 `self.result = (False, "登录会话已失效（%s）。请点界面上的「重新登录」后重新开抢" % msg)` 并 return。
+- **api.stop_engine 文案**（api.py:254）：join 超时时的「仍在收尾（在途任务未结束）」→「仍在收尾（在途任务跑完当轮即停）」。
+
+**测试**：新增 `TestRunTaskStopAware`（置位 stop 后不再查询 / 无 `_stop_event` 时老路径仍跑）、`TestOrderPathSessionDead`（门户文案→failed 且 message 带「重新登录」/ status=false→failed / 「校验异常」→ 仍 monitoring）、`TestTask55ExcStreakStop` 加两例（launcher 门户文案→立即收尾且零等待 / 瞬时文案→继续重试）。
+**回归**：`compileall` 干净；`tests\test_all.py` → **Ran 723 tests, OK (skipped=15)**。
+
+**教训**：同一个「会话失效」在**三条路径**上各判一次（`check_session_if_needed` / 下单结果 / launcher 兜底），修一条不等于修完；判据要单源（`session_failure_is_permanent`），文案要能被恢复逻辑认出来。
 
 ## 1. 位置与仓库现状（2026-10-16 复核）
 - 当前家：C:\develep\产物\12306（本项目唯一工作副本）。
@@ -257,7 +277,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 7. 测试与验证口径
 - 语法检查：python -X utf8 -m compileall -q .
-- 全量测试：python -X utf8 tests\test_all.py → 现状 **Ran 716, OK (skipped=15)**（2026-10-16 复核，零失败）。
+- 全量测试：python -X utf8 tests\test_all.py → 现状 **Ran 723, OK (skipped=15)**（2026-10-16 复核，零失败）。
   历史：曾一度为 696/5/15、701/4/15，那批 Windows 平台差异失败（test_append_history_shape_invalid_abandon_rereads、
   test_cookie_path_absolute_passthrough、test_menu_notify_routes_password_through_protect_secret、
   test_load_session_relative_path_resolves_against_here、test_save_session_relative_path_resolves_against_here）
@@ -288,9 +308,12 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 ## 10. 未决 / 待办（没有授权就别动）
 - ~~main ahead 8：是否 git push~~ **已完成**：HEAD=190a919 已推送，与 origin/main 同步（见第 1 节）。
 - ~~交接文档校正未提交~~ **已完成**：3f683ff（HANDOFF/README）+ 671324a（PRODUCT.md）已提交，工作树干净。**下次 push 时这两个 commit 会一起上去**。
-- ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（现 716 OK）。
-- ~~浏览器模式会话失效被误判成瞬时故障（引擎永不标 failed、无限重试）~~ **已修（2026-10-16，见 §0.98 末节）**：
-  session_ok 先判落点/正文的门户标志（顺序在 json.loads 之前），引擎改用白名单 session_failure_is_permanent；新增 5 条测试，全量 716 OK。
+- ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（现 723 OK）。
+- ~~浏览器模式会话失效被误判成瞬时故障（引擎永不标 failed、无限重试）~~ **已修（2026-10-16，见 §0.98 末节）**：session_ok 先判落点/正文的门户标志（顺序在 json.loads 之前），引擎改用白名单 session_failure_is_permanent；新增 5 条测试。
+- ~~**停止后日志仍在刷 + 会话失效无限重试**（2026-10-15 用户截图报告）~~ **已修（2026-10-15，见 §0.98 末节「停止后日志仍在刷」）**：这是与上一条**不同的两条路径**（下单路径 + 线程收尾）。
+  其一：browser_order 的「浏览器会话不可用（…）」匹配不上 engine 的会话判据 → 落兜底 continue → 每趟车重试、永不 failed；现接 session_failure_is_permanent，launcher 侧（Grabber._run）同样接，避免撞满 MAX_ORDER_FAILS=5 才停。
+  其二：engine 的 stop_event 原本只在 run() 内部可见，_run_task 感知不到停止，stopEngine 后在途一轮仍跑满（用户截图里 17:23:02→17:23:13 每 2 秒一条 ERR 就是这么来的）；现 run() 暴露 self._stop_event，_run_task 在两个循环头 getattr 兜底查 is_set() 即退出。
+  **注意：需重启桌面端生效**（入口是 Electron 壳 + 子进程 api.py）。
 - 一等卧/二等卧/高级动卧（官方码 I/J/A）是否进下单码表（长期未决）。
 - 重新登录后做一次真实下单核对（核对窗席别 vs 订单详情，需登录实跑）。
 - ~~**config/state 家族跨文件重复尚未收敛**~~ **已完成（2026-10-16，见 §0.98；策略以参数/回调注入保留，未拉平）**（用户 2026-10-16 裁决「消掉」）：load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records 在 api.py、gui.py、monitor.py 各有一份。实测三份不是机械重复而是**能力分层**（monitor 有 FileNotFoundError 分支 + `_DAMAGED_STAMP` 指纹拒写 + expect_stamp；gui 有 messagebox 弹窗与 `guisave` 临时名；api 最简但有 expect_stamp），收敛必须**参数化保留策略**（RULES.md §七 第 2 条是硬约束），落点是 appcommon.py（已具 state.json 共享 plumbing 分节，含 read_state_or_none / `_read_history_list`）。逐字等价可无痛下沉的只有 `load_state` 与 `normalize_email_settings`（后者须统一选 gui 的**严格** EMAIL_RE，api 现为宽松版）。
@@ -364,6 +387,6 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
 2. git status -sb + `git log --oneline origin/main..main` 看实况（本文档不记 sha；是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
-4. python -X utf8 tests\test_all.py（预期 716 OK / skipped=15）
+4. python -X utf8 tests\test_all.py（预期 723 OK / skipped=15）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
 6. 需要下线实跑就先重新登录，再动代码。

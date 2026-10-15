@@ -40,6 +40,7 @@ except Exception:
     pass
 
 import appcommon
+import browser_order
 import filelock
 import notify as notify_mod
 import order as order_mod
@@ -912,8 +913,14 @@ class MonitorEngine(object):
         auto_order = bool(task.get("auto_order", True))
         stop_after = bool(task.get("stop_after_order", True))
 
+        # 停止感知：run() 退出后线程池里的在途 _run_task 仍会跑完，
+        # 不查 stop_event 就会出现「点了停止，日志还在刷」的假象。
+        stop = getattr(self, "_stop_event", None)
+
         hit_any = False
         for date in dates:
+            if stop is not None and stop.is_set():
+                return True, False
             # 按日独立席别：seats_by_date 里有的日期用当天的列表；没有的用全局 seat_types
             seats_want = (seats_by_date[date] if date in seats_by_date
                           and isinstance(seats_by_date.get(date), list)
@@ -945,6 +952,8 @@ class MonitorEngine(object):
                 if not hit_seats:
                     continue
                 for seat_name in hit_seats:
+                    if stop is not None and stop.is_set():
+                        return True, False
                     hit_any = True
                     LOG.info("[有票] 任务「%s」%s %s %s->%s %s 有余票(码%s)",
                              name, date, train_code, info["from_name"], info["to_name"],
@@ -1167,9 +1176,18 @@ class MonitorEngine(object):
                                      name, date, train_code, seat_name,
                                      (extra or {}).get("alias_seat") or "?", cooldown)
                             continue
-                        if "会话已失效" in msg or "未找到会话文件" in msg:
-                            self.set_task_status(task, "failed",
-                                "登录会话不可用，请重新运行 capture_session.py 登录后恢复任务")
+                        # 会话失效判据与 check_session_if_needed 同源：http 模式看
+                        # order.py 的文案，browser 模式看 browser_order 的确认失效白名单
+                        # （跳登录门户 / status=false）。否则「浏览器会话不可用」会落到
+                        # 下面的兜底 continue —— 每趟车重试一次、永不 failed、停止也停不住。
+                        if ("会话已失效" in msg or "未找到会话文件" in msg
+                                or browser_order.session_failure_is_permanent(msg)):
+                            hint = ("请点界面上的「重新登录」后恢复任务"
+                                    if (self.config.get("order_mode") or "http") == "browser"
+                                    else "请重新运行 capture_session.py 登录后恢复任务")
+                            # 文案带「登录会话失效」：check_session_if_needed 靠它做
+                            # 会话恢复后的自动重启监控
+                            self.set_task_status(task, "failed", "登录会话失效，" + hint)
                             LOG.error("[错误] 任务「%s」抢票失败：%s", name, msg)
                             return True, False
                         if order_mod.is_busy_error(msg):
@@ -1186,7 +1204,10 @@ class MonitorEngine(object):
                                 "下单遇系统忙（累计 %d 次），%d 秒后自动重试"
                                 % (entry["busy_count"], cooldown))
                             continue
-                        LOG.error("[错误] 任务「%s」抢票失败：%s", name, msg)
+                        # 兜底：能走到这里的都是"下轮继续"的临时失败（无票/排队/
+                        # 下单页状态变化）。文案不能复用会话失效分支的「抢票失败」
+                        # 前缀——用户会以为任务已经终止，其实它每轮都在重试。
+                        LOG.warning("[重试] 任务「%s」本轮未成功：%s", name, msg)
                         appcommon.append_history(self.history_path, {
                             "time": self._now(), "task": name, "result": "failed",
                             "train": train_code, "date": date, "from": info["from_name"],
@@ -1399,6 +1420,8 @@ class MonitorEngine(object):
         """主循环。stop_event: threading.Event，置位后本轮结束即优雅退出（GUI 内嵌用）。"""
         LOG.info("=" * 64)
         LOG.info("监控引擎启动")
+        # 暴露给在途任务线程：_run_task 每轮查一次，停止后尽快收手
+        self._stop_event = stop_event
         # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核
         try:
             op = os.path.join(HERE, "orders.json")

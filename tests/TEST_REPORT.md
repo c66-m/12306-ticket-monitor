@@ -3,7 +3,7 @@
 日期:2026-10-06  ·  基线:a8b4b57(含并行会话的在途改动)
 
 > **2026-10-16 复核：本报告是历史存档**——第一~九节的结论与其成因分析保留价值，但**已不是当前事实基线**。
-> 现状：`tests/test_all.py` 为 **711 项**（skipped=15），`python tests/test_all.py` 全绿；架构、文件清单、文件行数以 `HANDOFF.md` 为准，业务规则以 `RULES.md` 为准。
+> 现状：`tests/test_all.py` 为 **723 项**（skipped=15），`python tests/test_all.py` 全绿；架构、文件清单、文件行数以 `HANDOFF.md` 为准，业务规则以 `RULES.md` 为准。
 > 本轮复核增量见文末「十、2026-10-16 复核增量」。
 
 ## 一、测试执行概况
@@ -71,5 +71,9 @@ Windows 优先(msvcrt 跨进程锁、DPAPI),非 Windows 路径均有降级:锁�
 - **`state_file` / `history_file` 路径解析单源**：`appcommon.state_path_of / history_path_of`，api / gui / monitor / launcher 四处统一。
 - **RULES.md 第七节门禁订正**：launcher.py 实测 1164 行（旧文「约 3000 行」）、其 `python launcher.py` 兼容条款失效（已无 `__main__`）、`browser_order._order_impl` 实测 599 行（`browser_order.py:726`→`:1324`）。
 - **浏览器模式会话失效被误判成瞬时故障（已修）**：12306 踢会话是 302 到 `/otn/passport?redirect=...`（不是 `/login`），落点页是登录门户 HTML，`session_ok` 的 `json.loads` 抛 `JSONDecodeError` 被兜进通用的「校验异常」，而 `engine.py` 用 `startswith("校验异常")` 前缀黑名单把它当瞬时 → 任务永不标 `failed`、无限重试、永不下单。现改为落点/正文门户标志先判（顺序在 `json.loads` 之前）+ 确认失效白名单 `session_failure_is_permanent`。全库只有 engine 用 permanent 做任务状态分支。
-- 回归：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 716 tests, OK (skipped=15)**。
+- **停止后日志仍在刷 + 会话失效无限重试（2026-10-15 修，用户截图报告）**：上面那条改的是 `check_session_if_needed` 的判定路径；**下单路径**与**线程收尾**上还有两个独立缺陷。
+  其一：`browser_order._order_impl` 返回「浏览器会话不可用（…）」既不匹配「会话已失效」也不匹配「未找到会话文件」，engine._run_task 落到兜底 `continue` → 每趟车重试一遍、永不标 `failed`；现判据接 `browser_order.session_failure_is_permanent`，命中即 failed 并提示「重新登录」。
+  其二：`run()` 的 `stop_event` 原本只在 run() 内部可见，`_run_task` 感知不到停止，`executor.shutdown(wait=False)` 之后在途一轮仍跑满（18 趟车约 36 秒日志）；现 `run()` 暴露 `self._stop_event`，`_run_task` 在两个循环头 `getattr` 兜底查 `is_set()` 即退出。
+  launcher 侧（`Grabber._run`）同样接判据，避免撞满 `MAX_ORDER_FAILS=5` 才停；engine 兜底分支的「抢票失败」改为「[重试] …本轮未成功」，与真终止区分。
+- 回归：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 723 tests, OK (skipped=15)**。
 

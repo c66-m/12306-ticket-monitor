@@ -2986,6 +2986,96 @@ class TestSessionCheckTransient(TempDirCase):
         self.assertEqual(e.task_status(t), "failed")
 
 
+class TestRunTaskStopAware(TempDirCase):
+    """用户实测（2026-10-15）：点「停止」后全局日志仍在刷同一句「抢票失败」。
+
+    run() 退出时线程池里的在途 _run_task 不会被收回（finally 走
+    shutdown(wait=False)，不等长下单），旧代码不查 stop_event，于是点停止后
+    仍会跑完整轮（18 趟车 × 冷启动浏览器 ≈ 36 秒的日志）。现在 _run_task
+    每轮开头查一次 self._stop_event，停止后立即收手。
+    """
+
+    def _engine(self):
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        return e, t
+
+    def test_stop_event_short_circuits_before_query(self):
+        e, t = self._engine()
+        stop = threading.Event()
+        stop.set()
+        e._stop_event = stop
+        with mock.patch.object(e, "_query_with_retry") as mq:
+            broke, rec = e._run_task(t)
+        self.assertEqual(mq.call_count, 0, "停止后不应再发起余票查询")
+        self.assertEqual((broke, rec), (True, False))
+
+    def test_without_stop_event_still_runs(self):
+        # make_engine 不设 _stop_event（六个用例直接调 _run_task）：
+        # getattr 兜底必须让老路径行为不变
+        e, t = self._engine()
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E1",
+                                             {"order_no": "E1", "passengers": "张三"})):
+            e._run_task(t)
+        self.assertEqual(e.task_status(t), "success")
+
+
+class TestOrderPathSessionDead(TempDirCase):
+    """下单路径的会话失效必须停任务，不能每趟车重试一次。
+
+    旧代码只认 http 模式的「会话已失效」/「未找到会话文件」；browser 模式返回的
+    是「浏览器会话不可用（已跳转登录门户…）」，两个都不匹配 → 落到兜底
+    continue，任务永远留在 monitoring（用户日志 17:23 那串刷屏）。
+    """
+
+    def _engine(self):
+        e = make_engine(self.tmp)
+        e.config["order_mode"] = "browser"
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        return e, t
+
+    def _fail_msg(self, who):
+        return "浏览器会话不可用（%s）。请先运行：python browser_order.py login" % who
+
+    def _run(self, order_ret):
+        e, t = self._engine()
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=order_ret):
+            broke, rec = e._run_task(t)
+        return e, t, (broke, rec)
+
+    def test_portal_redirect_fails_task_with_relogin_hint(self):
+        portal = ("已跳转登录门户："
+                  "https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api")
+        e, t, (broke, rec) = self._run((False, self._fail_msg(portal), None))
+        self.assertEqual(e.task_status(t), "failed")
+        self.assertEqual((broke, rec), (True, False))
+        msg = e.state["tasks"][t["name"]]["message"]
+        self.assertIn("登录会话失效", msg)
+        self.assertIn("重新登录", msg)
+
+    def test_status_false_fails_task(self):
+        e, t, _ = self._run((False, self._fail_msg("接口返回 status=false（会话已失效）"), None))
+        self.assertEqual(e.task_status(t), "failed")
+
+    def test_transient_check_error_keeps_monitoring(self):
+        # 用户日志里的原文：goto 超时/风控非 JSON 页 → 默认方向取「继续重试」
+        e, t, (broke, rec) = self._run(
+            (False, self._fail_msg("校验异常: Expecting value: line 1 column 1 (char 0)"), None))
+        self.assertEqual(e.task_status(t), "monitoring",
+                         e.state["tasks"][t["name"]].get("message"))
+        self.assertEqual((broke, rec), (False, False))
+
+
 class TestLoadStateErrorSplit(TempDirCase):
     """Task 40: _load_state 区分"真坏档"与"瞬时占用"。
 
@@ -4775,6 +4865,46 @@ class TestTask55ExcStreakStop(TempDirCase):
             g._run()
         self.assertIsNone(g.result, "交替出现的异常不应触发连续停止：%r" % (g.result,))
         self.assertEqual(len(waits), 8)
+
+    def test_session_dead_stops_immediately(self):
+        # 用户实测（2026-10-15）：登录态被踢后，下单每轮返回
+        # 「浏览器会话不可用（已跳转登录门户…）」。旧代码不认这条文案，
+        # 一路走到「同目标第 N 次失败」，要凑满 MAX_ORDER_FAILS=5 次才停；
+        # 中间还要白等 5 × 3 秒。确认失效必须当轮收尾。
+        g, waits = self._make_grabber()
+        portal = ("已跳转登录门户："
+                  "https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api")
+        msg = "浏览器会话不可用（%s）。请先运行：python browser_order.py login" % portal
+
+        def side(*a, **k):
+            return (False, msg, None)
+
+        patches = self._patch_loop(side)
+        with patches[0], patches[1], patches[2], patches[3], \
+                patches[4], patches[5], patches[6]:
+            g._run()
+        self.assertIsNotNone(g.result, "会话确认失效后仍在无限重试")
+        ok, out = g.result
+        self.assertFalse(ok)
+        self.assertIn("登录会话已失效", out)
+        self.assertIn("重新登录", out)
+        # 确认失效不走 fail_streak 的 3 秒等待链
+        self.assertEqual(waits, [])
+
+    def test_transient_session_error_keeps_retrying(self):
+        # pin：goto 超时/风控非 JSON 页（用户日志里的「校验异常」）是瞬时故障，
+        # 默认方向取「继续重试」，不得误杀任务
+        # 3 轮即收手：再跑下去会撞上 fail_streak >= MAX_ORDER_FAILS=5 的
+        # 「同目标连续失败」自停，那是另一条规则，不该污染本用例
+        g, waits = self._make_grabber(max_waits=3)
+        msg = ("浏览器会话不可用（校验异常: Expecting value: line 1 column 1 "
+               "(char 0)）。请先运行：python browser_order.py login")
+        patches = self._patch_loop(lambda *a, **k: (False, msg, None))
+        with patches[0], patches[1], patches[2], patches[3], \
+                patches[4], patches[5], patches[6]:
+            g._run()
+        self.assertIsNone(g.result, "瞬时校验异常不应停任务：%r" % (g.result,))
+        self.assertEqual(len(waits), 3)
 
 
 class TestTask55AutoFired(TempDirCase):

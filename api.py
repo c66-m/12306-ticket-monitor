@@ -251,7 +251,11 @@ def stop_engine():
     if not alive:
         # T6：引擎停止后，状态停留 monitoring 的任务实际上已停摆——落盘标 paused
         _mark_running_tasks_paused()
-    launcher.log("[停止] 监控引擎%s" % ("仍在收尾（在途任务未结束）" if alive else "已停止"))
+    # 在途任务的两种收尾：run() 主循环已在 10s 内退出（_run_task 每轮查
+    # stop_event，下一轮头即返回），或主循环本身还没轮到 break。前者之外
+    # 的「仍在收尾」不等于任务会跑完一整轮（旧文案「在途任务未结束」会
+    # 让人以为日志还要刷很久）。
+    launcher.log("[停止] 监控引擎%s" % ("仍在收尾（在途任务跑完当轮即停）" if alive else "已停止"))
     return not alive
 
 

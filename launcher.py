@@ -491,6 +491,14 @@ class Grabber(threading.Thread):
                         self._notify_success(info, seat, msg)
                         return
                     extra = extra or {}
+                    if browser_order.session_failure_is_permanent(msg):
+                        # 下单中途登录态被踢：再点下去每轮都是同一句失败，
+                        # 且会一路走到下面的 fail_streak 计数（要凑满 5 次才停）。
+                        # 确认失效就直接收尾，提示用户点「重新登录」。
+                        self.result = (False, "登录会话已失效（%s）。请点界面上的"
+                                              "「重新登录」后重新开抢" % msg)
+                        log("[错误] %s" % self.result[1])
+                        return
                     if extra.get("reason") == "ambiguous":
                         # 提交确认后结果未知：先回读官方订单接口做时间戳归因。
                         # 订单已生成且下单时间对得上=本次成功；确认无订单=安全重试；
