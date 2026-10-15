@@ -766,14 +766,33 @@ def menu_passengers():
         if not passengers:
             print("  （空）")
         for i, p in enumerate(passengers, 1):
+            # Task 126（2.2.2）：手改 plaintext passengers.json 可能写出不可哈希的
+            # id_type_code / 数字 id_no / 数字 mobile（Task 112 只过滤非 dict
+            # 条目，字段类型无校验）。不可哈希证件类型→跳过该条+warn；
+            # 数字证件号/手机号（漏引号的典型手改失误）→转字符串显示。
+            id_type_code = p.get("id_type_code")
+            try:
+                hash(id_type_code)
+            except TypeError:
+                print("  [警告] 乘车人 {0} 的证件类型形状非法，已跳过显示。".format(
+                    p.get("name")))
+                continue
+            id_no = p.get("id_no")
+            if isinstance(id_no, (int, float)) and id_no:
+                # 真值数字才转字符串；0/0.0 保持旧行为（_mask_id → ""）。
+                id_no = str(id_no)
+            mobile = p.get("mobile")
+            if isinstance(mobile, (int, float)) and mobile:
+                # 真值数字才转字符串；0/0.0 保持旧行为（"未填"）。
+                mobile = str(mobile)
             mark = "【默认】" if p.get("is_default") else ""
             print("  {0:>2}. {1} {2}{3}  证件:{4} {5}  手机:{6}".format(
                 i, p.get("name"), mark,
                 "" if p.get("is_adult", True) else "(非成人)",
-                passengers_mod.ID_TYPE_NAMES.get(p.get("id_type_code"), p.get("id_type_code", "?")),
-                _mask_id(p.get("id_no")),
-                (p.get("mobile") or "")[:3] + "****" + (p.get("mobile") or "")[-4:]
-                if p.get("mobile") else "未填"))
+                passengers_mod.ID_TYPE_NAMES.get(id_type_code, p.get("id_type_code", "?")),
+                _mask_id(id_no),
+                (mobile or "")[:3] + "****" + (mobile or "")[-4:]
+                if mobile else "未填"))
         print("  1. 添加乘车人   2. 编辑   3. 删除   4. 设为默认乘车人   0. 返回")
         op = read("  选择操作：", "")
         if op is None:
@@ -943,6 +962,13 @@ def menu_history():
         print("-" * 100)
         print("  {0}  {1}".format(r.get("time"), r.get("task", "")))
         raw_names = r.get("passengers") or []
+        # Task 126（2.2.3）：真值非可迭代（如手改成数字）→ warn+空列表，不崩
+        #（Task 120 只收紧了元素过滤，容器形状未守卫）。
+        try:
+            iter(raw_names)
+        except TypeError:
+            print("  [警告] 历史记录 passengers 字段形状非法，已按空乘车人展示。")
+            raw_names = []
         # Task 120（2.2.8）：真值非字符串姓名（如 ["张三"]）→ "、".join
         # 抛 TypeError；与创建菜单同口径过滤。
         names = [n for n in raw_names if isinstance(n, str) and n]

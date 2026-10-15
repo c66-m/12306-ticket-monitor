@@ -14231,6 +14231,110 @@ class TestTask125EntryShapesB7(TempDirCase):
         self.assertTrue(fake.armed)
 
 
+class TestTask126MonitorDisplayGuards(TempDirCase):
+    """Task 126（B7-3，P3×2）：2.2.2 menu_passengers 展示循环字段形状守卫
+    （dict 条目内 id_type_code 不可哈希 / id_no、mobile 为数字 → TypeError →
+    菜单 [4] 崩溃）；2.2.3 menu_history passengers 真值非可迭代 → TypeError →
+    菜单 [5] 崩溃。"""
+
+    # ---------- 2.2.2：menu_passengers ----------
+
+    def _run_passengers_menu(self, passengers):
+        import monitor as monitor_mod
+        import passengers as passengers_mod
+        printed = []
+        with mock.patch.object(passengers_mod, "load_passengers",
+                               return_value=passengers), \
+             mock.patch.object(passengers_mod, "passengers_stamp",
+                               return_value=None), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["0"]), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            monitor_mod.menu_passengers()  # 展示循环不得抛 TypeError
+        return "\n".join(printed)
+
+    @staticmethod
+    def _pax(**kw):
+        p = {"name": "张三", "is_adult": True, "id_type_code": "1",
+             "id_no": "110101199001011234", "mobile": "13800138000"}
+        p.update(kw)
+        return p
+
+    def test_2_2_2_unhashable_id_type_code_skip_warn(self):
+        # RED（旧代码）：ID_TYPE_NAMES.get(["1"]) → TypeError，菜单 [4] 崩溃。
+        # 修后：该条跳过+warn（warn 提到姓名以便定位），其余条目正常显示。
+        dirty = self._pax(id_type_code=["1"])
+        clean = self._pax(name="李四")
+        out = self._run_passengers_menu([dirty, clean])
+        self.assertIn("警告", out)
+        self.assertIn("李四", out)
+        self.assertNotIn("1. 张三", out)
+
+    def test_2_2_2_numeric_id_no_masked(self):
+        # RED（旧代码）：_mask_id(110101199001011234) → len(123) → TypeError。
+        # 修后：转字符串后脱敏显示（口径 pin）。
+        out = self._run_passengers_menu(
+            [self._pax(id_no=110101199001011234)])
+        self.assertIn("张三", out)
+        self.assertIn("110***********1234", out)
+        self.assertNotIn("警告", out)
+
+    def test_2_2_2_numeric_mobile_masked(self):
+        # RED（旧代码）：(13800138000 or "")[:3] → TypeError。
+        # 修后：转字符串后脱敏显示（口径 pin）。
+        out = self._run_passengers_menu([self._pax(mobile=13800138000)])
+        self.assertIn("张三", out)
+        self.assertIn("138****8000", out)
+        self.assertNotIn("警告", out)
+
+    def test_2_2_2_clean_control(self):
+        # 对照：干净条目渲染与旧代码一致，无警告。
+        out = self._run_passengers_menu([self._pax()])
+        self.assertIn("张三", out)
+        self.assertIn("110***********1234", out)
+        self.assertIn("138****8000", out)
+        self.assertNotIn("警告", out)
+
+    # ---------- 2.2.3：menu_history ----------
+
+    def _run_history(self, records):
+        import monitor as monitor_mod
+        hist_path = os.path.join(self.tmp, "order_history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        printed = []
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"history_file": hist_path}), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            monitor_mod.menu_history()  # 不得抛 TypeError
+        return "\n".join(printed)
+
+    @staticmethod
+    def _record(passengers):
+        return {"time": "2026-10-08 10:00:00", "task": "t1",
+                "date": "2026-10-09", "train": "G101",
+                "from": "北京", "to": "上海", "seat": "二等座",
+                "passengers": passengers, "result": "success", "message": "ok"}
+
+    def test_2_2_3_non_iterable_passengers_no_crash(self):
+        # RED（旧代码）：[n for n in 5] → TypeError，菜单 [5] 崩溃。
+        # 修后：warn+空乘车人，记录本身仍展示。
+        out = self._run_history([self._record(5)])
+        self.assertIn("t1", out)
+        self.assertIn("警告", out)
+        self.assertIn("乘车人:", out)
+
+    def test_2_2_3_clean_control(self):
+        # 对照：干净记录渲染与旧代码一致，无警告。
+        out = self._run_history([self._record(["张三", "李四"])])
+        self.assertIn("张三、李四", out)
+        self.assertNotIn("警告", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
