@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<title>12306 抢票小窗</title>
+<link rel="stylesheet" href="mini.css">
+</head>
+<body data-wall="flat">
+
+<div class="mini" id="mini">
+
+  <header class="mbar glass glass-chrome">
+    <span class="mtitle">抢票小窗</span>
+    <span class="mstatus" id="mEngine"><span class="dot"></span><span id="mEngineText">未启动</span></span>
+    <span class="mspacer"></span>
+    <button class="mb" id="mTop" title="置顶" aria-label="置顶"><svg viewBox="0 0 12 12"><path d="M6 1.9v6.2"/><path d="M3.5 4.4 6 1.9l2.5 2.5"/><path d="M2.7 10.2h6.6"/></svg></button>
+    <button class="mb" id="mBack" title="回到主窗口" aria-label="回到主窗口"><svg viewBox="0 0 12 12"><path d="M7.4 2.6 4 6l3.4 3.4"/><path d="M2.4 6h5"/></svg></button>
+    <button class="mb" id="mMin" title="最小化" aria-label="最小化"><svg viewBox="0 0 12 12"><path d="M2.4 6h7.2"/></svg></button>
+    <button class="mb mb-close" id="mClose" title="关闭小窗（回到主窗口）" aria-label="关闭"><svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+  </header>
+
+  <div class="mrow">
+    <span class="chip" id="mAcc" title="点击回主窗查看会话">账号检查中…</span>
+    <span class="mspacer"></span>
+    <button class="btn btn-mini" id="mToggle">启动监控</button>
+  </div>
+
+  <div class="mtasks" id="mTasks"><div class="muted">暂无正在进行的任务</div></div>
+
+  <div class="mlogs" id="mLogs"></div>
+</div>
+
+<script src="mini.js"></script>
+</body>
+</html>

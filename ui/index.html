@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12306 车票监控 · 桌面端</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ===== 顶栏（全宽，可拖拽）：左 = 头像 + 搜索，右 = 监控开关 + 窗口按钮 ===== -->
+  <header class="topbar glass glass-chrome">
+    <div class="tb-left">
+      <div class="session-chip" id="sessionChip" title="点击登录 / 查看乘车人">
+        <span class="ava">👤</span>
+        <span class="meta"><b>加载中…</b><i>正在检查会话</i></span>
+      </div>
+    </div>
+
+    <div class="tb-drag" title="拖动窗口"></div>
+
+    <div class="tb-mid">
+      <span class="monitor-toggle" id="monitorToggle" title="点击启动/停止监控">
+        <span class="dot"></span><span id="mtText">监控未启动</span>
+      </span>
+    </div>
+
+    <div class="winbtns">
+      <button class="wb" id="btnPin" title="窗口置顶" aria-label="窗口置顶">
+        <svg viewBox="0 0 12 12"><path d="M6 1.9v6.2"/><path d="M3.5 4.4 6 1.9l2.5 2.5"/><path d="M2.7 10.2h6.6"/></svg></button>
+      <button class="wb" id="btnMini" title="小窗模式（只看抢票结果与日志）" aria-label="小窗模式">
+        <svg viewBox="0 0 12 12"><rect x="1.6" y="2.2" width="8.8" height="7.6" rx="1.3"/><rect x="6.7" y="5.7" width="5" height="4" rx="1"/></svg></button>
+      <button class="wb" data-win="min" title="最小化" aria-label="最小化">
+        <svg viewBox="0 0 12 12"><path d="M2.4 6h7.2"/></svg></button>
+      <button class="wb" data-win="max" title="最大化 / 还原" aria-label="最大化">
+        <svg viewBox="0 0 12 12"><rect x="2.4" y="2.4" width="7.2" height="7.2" rx="1.3"/></svg></button>
+      <button class="wb wb-close" data-win="close" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+    </div>
+  </header>
+
+  <div class="shell">
+
+    <!-- ===== 侧边栏（位于顶栏下方，不与顶栏重叠） ===== -->
+    <aside class="sidebar glass glass-chrome">
+      <div class="brand">
+        <div class="name"><b id="crumb">监控任务</b><small>车票监控与自动下单</small></div>
+      </div>
+
+      <nav id="nav">
+        <div class="nav-item active" data-page="monitor"><span class="ic">📡</span><span class="tx">监控任务</span><span class="badge" id="badge-monitor">0</span></div>
+        <div class="nav-item" data-page="grab"><span class="ic">⚡</span><span class="tx">抢票任务</span><span class="badge" id="badge-grab">0</span></div>
+        <div class="nav-item" data-page="pax"><span class="ic">👥</span><span class="tx">乘车人</span></div>
+        <div class="nav-item" data-page="history"><span class="ic">🕘</span><span class="tx">历史</span></div>
+      </nav>
+
+      <div class="side-bottom">
+        <button class="btn-setting" id="btnSettings">
+          <span class="ic">⚙️</span>
+          <span class="tx"><b>设置</b><small>外观 · 通知 · 下单</small></span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- ===== 主区 ===== -->
+    <section class="main">
+      <div class="content" id="content"></div>
+
+      <div class="logbar glass glass-chrome">
+        <div class="head">全局日志 <span class="lvl">事件标签分级着色</span>
+          <button class="btn btn-mini btn-ghost" id="btnClearLog">清空</button>
+        </div>
+        <div class="logs" id="logs"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div class="overlay hidden" id="overlay"><div class="modal glass glass-surface" id="modal"></div></div>
+<div class="dd hidden" id="dd"></div>
+<div class="toast hidden" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

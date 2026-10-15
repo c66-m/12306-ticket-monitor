@@ -1,0 +1,12 @@
+{
+  "name": "12306-desktop",
+  "version": "1.0.0",
+  "description": "12306 车票监控与自动购票系统 - Electron 壳",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
