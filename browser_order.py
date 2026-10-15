@@ -1404,6 +1404,11 @@ def order_via_browser(info, seat_name, seat_code, passenger_names, date,
     分支的 finally 会把 depth 恢复为进入前的值，造成"本线程仍持有锁"的假象，
     此后本线程的 exclusive() 永久走重入捷径、跨进程 profile 互斥静默失效（P2）。
     """
+    # Task 125（2.2.9）：passenger_names 非字符串条目（如手改配置）→ 确认页
+    # p["text"].startswith(name) 抛 TypeError（:952）；入口漏斗一次过滤，
+    # 下游循环及全部调用方收敛（与 Task 110 的 _normalize_passenger_names
+    # 同口径）。
+    passenger_names = [n for n in (passenger_names or []) if isinstance(n, str)]
     try:
         if warm is not None and not warm.usable():
             # 预热现场已失效（页面被关 / 跨了线程）：先释放它占着的锁再进锁
@@ -1680,7 +1685,15 @@ def order_ticket_via_browser(config, task, ticket, seat_name):
     # Task 120（2.2.7）：裸字符串（如漏写方括号的 "张三"）→ 单元素列表，
     # 绝不逐字符拆（旧代码拆成单字 → 点名零命中 → 回退为全体成人乘车人下单，
     # wrong-scope）。
-    names = [pn_raw] if isinstance(pn_raw, str) else list(pn_raw)
+    # Task 125（2.2.9）：非字符串形状（如手改配置写成数字 5）→ list() 抛
+    # TypeError（Task 120 str-only 归一化残留）；可迭代守卫 + 元素级过滤，
+    # 与 Task 110 的 _normalize_passenger_names 同口径（静默，Task 120 口径）。
+    if isinstance(pn_raw, str):
+        names = [pn_raw]
+    elif isinstance(pn_raw, (list, tuple)):
+        names = [n for n in pn_raw if isinstance(n, str)]
+    else:
+        names = []
     # 按人票种：任务里存了 {姓名: 票种代码} 就逐人下发，覆盖到的走本人票种
     pp_raw = task.get("pax_purpose")
     purpose_map = dict(pp_raw) if isinstance(pp_raw, dict) else {}

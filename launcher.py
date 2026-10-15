@@ -2473,7 +2473,11 @@ class LauncherApp(tk.Frame):
             self._pax_mtime = os.path.getmtime(os.path.join(HERE, "passengers.json"))
         except OSError:
             pass
-        st = parse_dt(self.lc.get("start_time") or "")
+        # Task 125（2.2.7）：start_time 真值非字符串（如手改 grab_tasks.json
+        # 写成列表）→ parse_dt 内 .strip() 抛 AttributeError，任务窗口打不开；
+        # 非字符串按缺失处理（armed=False），窗口正常打开。
+        st_raw = self.lc.get("start_time") or ""
+        st = parse_dt(st_raw) if isinstance(st_raw, str) else None
         self.armed = bool(st and st > datetime.now())
         self.auto_fired = False
         self._auto_vfail_last_msg = None

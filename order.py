@@ -514,6 +514,10 @@ def get_passengers(session):
 
 def select_passengers(all_passengers, wanted_names):
     """按偏好选乘车人：配置点名 > 本地默认乘车人 > 账号内全部成人乘车人。"""
+    # Task 125（2.2.9）：wanted_names 非字符串条目（如手改配置）→ 下方
+    # "、".join(missing) 抛 TypeError；入口一次过滤，下游全收敛
+    # （与 Task 110 的 _normalize_passenger_names 同口径）。
+    wanted_names = [n for n in (wanted_names or []) if isinstance(n, str)]
     if wanted_names:
         # 按 wanted_names 的顺序挑选，保持用户指定的组合顺序
         picked = []
@@ -935,7 +939,15 @@ def order_ticket(config, task, ticket, seat_name):
     # Task 120（2.2.7）：裸字符串（如漏写方括号的 "张三"）→ 单元素列表，
     # 绝不逐字符拆（旧代码拆成单字 → 点名零命中 → 回退为全体成人乘车人下单，
     # wrong-scope）。
-    wanted_names = [pn_raw] if isinstance(pn_raw, str) else list(pn_raw)
+    # Task 125（2.2.9）：非字符串形状（如手改配置写成数字 5）→ list() 抛
+    # TypeError（Task 120 str-only 归一化残留）；可迭代守卫 + 元素级过滤，
+    # 与 Task 110 的 _normalize_passenger_names 同口径（静默，Task 120 口径）。
+    if isinstance(pn_raw, str):
+        wanted_names = [pn_raw]
+    elif isinstance(pn_raw, (list, tuple)):
+        wanted_names = [n for n in pn_raw if isinstance(n, str)]
+    else:
+        wanted_names = []
     if purpose_map and wanted_names:
         codes = [purpose_map.get(n) or purpose for n in wanted_names]
         purpose = "0X00" if all(c == "0X00" for c in codes) else "ADULT"
@@ -964,7 +976,14 @@ def order_ticket(config, task, ticket, seat_name):
 
     try:
         passengers = get_passengers(sess)
-        wanted = [pn_raw] if isinstance(pn_raw, str) else list(pn_raw)
+        # Task 125（2.2.9）：与上方 wanted_names 同口径（可迭代守卫 + 元素级
+        # 过滤）；非字符串条目绝不进 select_passengers。
+        if isinstance(pn_raw, str):
+            wanted = [pn_raw]
+        elif isinstance(pn_raw, (list, tuple)):
+            wanted = [n for n in pn_raw if isinstance(n, str)]
+        else:
+            wanted = []
         if not wanted:
             # 未在任务里点名时，优先使用本地加密库中的"默认乘车人"
             try:

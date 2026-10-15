@@ -14076,6 +14076,161 @@ class TestTask124PiiConvergeB7(TempDirCase):
                          % "\n".join("%s: %s" % (n, s) for n, s in new))
 
 
+class TestTask125EntryShapesB7(TempDirCase):
+    """Task 125（B7-2）：order/engine 入口形状 bundle（P3×3）。
+
+    2.2.1 engine.py:1065：p_names = sorted(...) 对非字符串乘车人名条目
+        TypeError → 有票命中时单任务无限 loud backoff（Task 120 只修了
+        :1060 的 dedup_key，同一脏数据在 1065 行先崩）。
+    2.2.9 order.py:938/:967、browser_order.py:1681（及 :952、:531）：
+        passenger_names 非字符串形状仍 TypeError（Task 120 str-only
+        归一化残留）。
+    2.2.7 launcher.py:2476（_sync_from_lc）：parse_dt 在真值非字符串
+        start_time 上 AttributeError → 任务窗口打不开。
+    """
+
+    # ---------- 2.2.1：engine 有票命中路径 ----------
+
+    def _run_task_hit(self, passenger_names):
+        e = make_engine(self.tmp)
+        t = task_of(passenger_names=passenger_names)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123",
+                                              "passengers": "张三"})), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            broke, _rec = e._run_task(t)
+        return e, t
+
+    def test_2_2_1_mixed_names_hit_path_no_crash(self):
+        # RED（旧代码）：sorted(["张三", 123]) → TypeError 直接逃出 _run_task
+        # （命中→通知→下单之前），单任务无限 loud backoff。
+        e, t = self._run_task_hit(["张三", 123])
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "success")
+        self.assertTrue(all("123" not in k for k in e.state["dedup"]),
+                        e.state["dedup"])
+
+    # ---------- 2.2.9：order.py 双入口 ----------
+
+    @staticmethod
+    def _order_ticket_basics():
+        config = {}
+        task = {"passenger_names": 5, "purpose_code": "ADULT"}
+        ticket = {"train_code": "K225", "query_date": "2026-10-10",
+                  "start_date": "20261010"}
+        return config, task, ticket
+
+    def test_2_2_9_order_entry_int_shape_no_crash(self):
+        # RED（旧代码）：order.py:938 list(5) → TypeError（不在 try 内，直接逃出）。
+        config, task, ticket = self._order_ticket_basics()
+        with mock.patch.object(order_mod, "load_session",
+                               return_value=object()), \
+             mock.patch.object(order_mod, "check_login",
+                               return_value=(True, "ok")), \
+             mock.patch.object(order_mod, "submit_with_busy_retry",
+                               return_value=(False, "busy")):
+            ok, msg, extra = order_mod.order_ticket(config, task, ticket, "硬座")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "busy")
+
+    def test_2_2_9_order_wanted_int_shape_guarded(self):
+        # RED（旧代码）：order.py:967 list(5) → TypeError 被 try 接住，
+        # 返回"拉取乘车人异常"，脏配置永远走不到正常 fallback。
+        config, task, ticket = self._order_ticket_basics()
+        with mock.patch.object(order_mod, "load_session",
+                               return_value=object()), \
+             mock.patch.object(order_mod, "check_login",
+                               return_value=(True, "ok")), \
+             mock.patch.object(order_mod, "submit_with_busy_retry",
+                               return_value=(True, "submitted")), \
+             mock.patch.object(order_mod, "get_init_dc",
+                               return_value=("tok", "left", "key", None)), \
+             mock.patch.object(order_mod, "get_passengers",
+                               return_value=[{"name": "张三", "is_adult": 1}]), \
+             mock.patch.object(pax_mod, "default_names", return_value=[]):
+            ok, msg, extra = order_mod.order_ticket(config, task, ticket, "硬座")
+        self.assertFalse(ok)
+        self.assertFalse(msg.startswith("拉取乘车人异常"), msg)
+        self.assertIn("没有可用乘车人", msg)
+
+    def test_2_2_9_select_passengers_filters_nonstring(self):
+        # RED（旧代码）：wanted 含 123 → missing=[123] → "、".join(missing)
+        # 抛 TypeError（order.py:531）。
+        picked = order_mod.select_passengers(
+            [{"name": "张三", "is_adult": 1, "id_no": "110101199001011234"}],
+            ["张三", 123])
+        self.assertEqual([p["name"] for p in picked], ["张三"])
+
+    # ---------- 2.2.9：browser_order.py 入口 ----------
+
+    @staticmethod
+    def _browser_ticket():
+        return {"query_date": "2026-10-10", "train_code": "K225"}
+
+    def test_2_2_9_browser_entry_int_shape_no_crash(self):
+        # RED（旧代码）：browser_order.py:1681 list(5) → TypeError（不在 try 内）。
+        task = {"passenger_names": 5}
+        with mock.patch.object(browser_order, "order_via_browser",
+                               return_value=(True, "ok", {"r": 1})):
+            ok, msg, extra = browser_order.order_ticket_via_browser(
+                {}, task, self._browser_ticket(), "硬座")
+        self.assertTrue(ok)
+        self.assertEqual(extra["passengers"], "")
+
+    def test_2_2_9_browser_entry_mixed_names_filtered(self):
+        # RED（旧代码）：names=["张三", 123] → extra 的 "、".join(names)
+        # 抛 TypeError；修后元素级过滤 → "张三"。
+        task = {"passenger_names": ["张三", 123]}
+        with mock.patch.object(browser_order, "order_via_browser",
+                               return_value=(True, "ok", {"r": 1})):
+            ok, msg, extra = browser_order.order_ticket_via_browser(
+                {}, task, self._browser_ticket(), "硬座")
+        self.assertTrue(ok)
+        self.assertEqual(extra["passengers"], "张三")
+
+    def test_2_2_9_browser_funnel_filters_names(self):
+        # RED（旧代码）：order_via_browser 的 passenger_names 原样透传，
+        # 确认页 p["text"].startswith(123)（:952）抛 TypeError。
+        # 修后入口漏斗一次过滤，下游循环收敛。
+        with mock.patch.object(browser_order, "_order_via_browser_locked",
+                               return_value=(True, "ok", {})) as m_locked:
+            browser_order.order_via_browser(
+                {"x": 1}, "硬座", "M", ["张三", 123, None], "2026-10-10")
+        self.assertEqual(m_locked.call_args[0][3], ["张三"])
+
+    # ---------- 2.2.7：launcher _sync_from_lc ----------
+
+    @staticmethod
+    def _fake_app(start_time):
+        fake = mock.Mock()
+        fake.lc = {"start_time": start_time}
+        fake.seat_vars = {}
+        fake._save_cfg = lambda *a: None
+        return fake
+
+    def test_2_2_7_start_time_list_no_crash(self):
+        # RED（旧代码）：parse_dt(["2026-10-20 10:00"]) → .strip() 在 list 上
+        # 抛 AttributeError，任务窗口打不开。
+        fake = self._fake_app(["2026-10-20 10:00"])
+        with mock.patch.object(launcher, "merge_trains_from_monitor",
+                               return_value=False):
+            launcher.LauncherApp._sync_from_lc(fake)
+        self.assertFalse(fake.armed)
+
+    def test_2_2_7_start_time_str_control(self):
+        # 对照：合法字符串（未来时间）不受影响，armed 正常置位。
+        fake = self._fake_app("2026-12-01 10:00")
+        with mock.patch.object(launcher, "merge_trains_from_monitor",
+                               return_value=False):
+            launcher.LauncherApp._sync_from_lc(fake)
+        self.assertTrue(fake.armed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

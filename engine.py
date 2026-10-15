@@ -1062,7 +1062,12 @@ class MonitorEngine(object):
                              name, date, train_code, info["from_name"], info["to_name"],
                              seat_name, avail.get(seat_name))
                     # 先不查乘车人，直接用任务配置的乘车人组合做历史查重键
-                    p_names = sorted(task.get("passenger_names") or []) or ["(账号默认)"]
+                    # Task 125（2.2.1）：乘车人名非字符串条目（如手改配置）
+                    # → sorted() 比较 str < int 抛 TypeError，崩在下方
+                    # dedup_key 的修复之前（Task 120 只给 dedup_key 加了元素级
+                    # 过滤）；与 dedup_key 同口径元素级过滤。
+                    p_names = sorted(n for n in (task.get("passenger_names") or [])
+                                     if isinstance(n, str)) or ["(账号默认)"]
                     key = dedup_key(task, date, train_code, seat_name,
                                     task.get("passenger_names") or [])
                     if key in self.state["dedup"]:
