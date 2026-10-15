@@ -16432,6 +16432,146 @@ class TestTask142HistoryResultGuard(TempDirCase):
         self.assertNotIn("（配置损坏）", out)
 
 
+class TestTask143GuiHistoryResultB11(TempDirCase):
+    """Task 143（B11-4）：gui 历史 result 形状 bundle（P3×1）。
+
+    2.2.4 R10-S2-1-ext — gui.py:2186（HistoryDialog.load）与 :2788
+    （HistoryPanel.load）的 RESULT_LABEL.get(r.get("result"), …) 对真值
+    不可哈希 result（如手改成 ["success"]）抛 TypeError（Task 142 同形状，
+    rescan-10 未覆盖）。后果：HistoryDialog 构造期崩溃（对话框打不开）；
+    HistoryPanel.load 可被手动重复刷新 → 异常刷屏 + 面板冻结。
+    修复：Task 142 同口径——只守实际崩溃面（try/except TypeError；
+    result: 5/falsy 保持旧行为，warn+占位不崩）；热路径 warn-once。
+    """
+
+    # ---------- 测试脚手架 ----------
+
+    def _reset_warned(self):
+        if hasattr(gui, "_UNHASHABLE_RESULT_WARNED"):
+            gui._UNHASHABLE_RESULT_WARNED.clear()
+
+    def _write_history(self, records):
+        hist_path = os.path.join(self.tmp, "order_history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        return hist_path
+
+    @staticmethod
+    def _record(**kw):
+        r = {"time": "2026-10-08 10:00:00", "task": "t1",
+             "date": "2026-10-09", "train": "G101",
+             "from": "北京", "to": "上海", "seat": "二等座",
+             "passengers": ["张三"], "order_no": "E123",
+             "result": "success", "message": "ok"}
+        r.update(kw)
+        return r
+
+    def _patch_history_file(self, hist_path):
+        # history_file 用绝对路径：read_history_records 做
+        # os.path.join(HERE, hist_file)，绝对路径原样返回。
+        return mock.patch.object(gui, "load_config",
+                                return_value={"history_file": hist_path})
+
+    def _patch_tk_for_history_dialog(self):
+        import tkinter as tk
+        from tkinter import ttk
+        return (
+            mock.patch.object(tk.Toplevel, "__init__", return_value=None),
+            mock.patch.object(gui.HistoryDialog, "title"),
+            mock.patch.object(gui.HistoryDialog, "geometry"),
+            mock.patch.object(ttk, "Frame", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Treeview", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Scrollbar", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Button", return_value=mock.Mock()),
+        )
+
+    def _make_panel(self):
+        panel = gui.HistoryPanel.__new__(gui.HistoryPanel)
+        panel.tree = mock.Mock()
+        panel.tree.get_children.return_value = ()
+        return panel
+
+    # ---------- 站点 1：HistoryDialog.load（:2186） ----------
+
+    def test_history_dialog_unhashable_result_no_crash(self):
+        # RED（旧代码）：__init__ → load() → RESULT_LABEL.get(["success"])
+        # → TypeError，对话框打不开。修后：warn + "（配置损坏）"占位。
+        self._reset_warned()
+        hist = self._write_history([self._record(result=["success"])])
+        patches = self._patch_tk_for_history_dialog()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with self._patch_history_file(hist):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                dlg = gui.HistoryDialog(mock.Mock())  # 改前 TypeError
+        warned = [m for m in logs.output if "result" in m]
+        self.assertEqual(len(warned), 1,
+                         "必须恰好记一次 warning：%s" % logs.output)
+        inserted = dlg.tree.insert.call_args_list
+        self.assertTrue(inserted, "树里应写入占位行")
+        values = inserted[0][1]["values"]
+        self.assertIn("（配置损坏）", values)
+        self.assertIn("t1", values)  # 记录其余字段仍展示
+
+    # ---------- 站点 2：HistoryPanel.load（:2788，热路径） ----------
+
+    def test_history_panel_unhashable_result_warn_once(self):
+        # :2788 可被手动重复刷新：连续两次 load → 不崩 + 只记一次 warning。
+        self._reset_warned()
+        hist = self._write_history([self._record(result=["success"])])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel.load()  # 改前 TypeError
+                panel.load()
+        warned = [m for m in logs.output if "result" in m]
+        self.assertEqual(len(warned), 1,
+                         "热路径刷屏回归：%s" % logs.output)
+        inserted = panel.tree.insert.call_args_list
+        self.assertEqual(len(inserted), 2)
+        for c in inserted:
+            self.assertIn("（配置损坏）", c[1]["values"])
+
+    # ---------- 对照：干净路径零漂移 ----------
+
+    def test_legit_results_unchanged(self):
+        # 合法 result 渲染与旧代码一致，不记 warning。
+        self._reset_warned()
+        hist = self._write_history([
+            self._record(result="success"),
+            self._record(result="dup"),
+            self._record(result="failed"),
+            self._record(result="hit_no_order"),
+            self._record(result="ambiguous"),  # 不在 label 内，走默认回显
+        ])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertNoLogs("monitor", level="WARNING"):
+                panel.load()
+        results = {str(c[1]["values"][8])
+                   for c in panel.tree.insert.call_args_list}
+        self.assertEqual(results,
+                         {"下单成功", "防重跳过", "下单失败", "命中未下单",
+                          "ambiguous"})
+
+    def test_numeric_and_falsy_result_keep_old_behavior(self):
+        # result: 5 → 旧代码 .get(5, 5) → 显示 "5"；缺键 → 旧代码
+        # r.get("result", "") → .get("", "") → 显示 ""。修后行为不变，不 warn。
+        self._reset_warned()
+        r2 = self._record()
+        del r2["result"]
+        hist = self._write_history([self._record(result=5), r2])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertNoLogs("monitor", level="WARNING"):
+                panel.load()
+        results = {str(c[1]["values"][8])
+                   for c in panel.tree.insert.call_args_list}
+        self.assertIn("5", results)
+        self.assertIn("", results)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

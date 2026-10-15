@@ -121,6 +121,8 @@ _UNHASHABLE_NAME_WARNED = set()
 
 _UNHASHABLE_STATUS_WARNED = set()
 
+_UNHASHABLE_RESULT_WARNED = set()
+
 
 def _coerce_status_str(st, where):
     """Task 138：status 真值非 str（如手改成 list）→ STATUS_LABELS.get /
@@ -144,6 +146,28 @@ def _coerce_status_str(st, where):
                         "已按 paused 处理", where, type(st).__name__)
         return "paused"
     return st
+
+
+def _coerce_history_result_label(res, label_map, where):
+    """Task 143（2.2.4 R10-S2-1-ext）：历史 result 真值不可哈希
+    （如手改成 ["success"]）→ RESULT_LABEL.get 抛 TypeError
+    （Task 142 同形状；rescan-10 未覆盖 HistoryDialog.load 与
+    HistoryPanel.load）。Task 142 同口径：只守实际崩溃面
+    （try/except TypeError）——真值可哈希非 str（如 5）/ falsy
+    保持旧行为。记警告后按"（配置损坏）"占位展示，不崩菜单/面板。
+    同一脏值每进程只记一次（HistoryPanel.load 可被手动重复刷新，
+    防刷屏；与 _coerce_status_str 同口径）。警告只记类型名，
+    不打印原值（Task 124/135 PII 口径）。
+    """
+    try:
+        return label_map.get(res, res)
+    except TypeError:
+        sig = (where, repr(res))
+        if sig not in _UNHASHABLE_RESULT_WARNED:
+            _UNHASHABLE_RESULT_WARNED.add(sig)
+            LOG.warning("[历史] %s：result 字段不可哈希（类型：%s），"
+                        "已用占位展示", where, type(res).__name__)
+        return "（配置损坏）"
 
 
 def _skip_unhashable_task_name(t, where):
@@ -2183,7 +2207,10 @@ class HistoryDialog(tk.Toplevel):
                 r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
                 r.get("seat", ""), "、".join(r.get("passengers") or []),
                 r.get("order_no", ""),
-                self.RESULT_LABEL.get(r.get("result"), r.get("result", ""))))
+                # Task 143（2.2.4）：result 真值不可哈希 → 旧代码
+                # RESULT_LABEL.get 直接 TypeError，对话框打不开。
+                _coerce_history_result_label(
+                    r.get("result", ""), self.RESULT_LABEL, "历史对话框")))
 
 
 # ----------------------------- 通知设置 -----------------------------
@@ -2785,7 +2812,11 @@ class HistoryPanel(ttk.Frame):
                 r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
                 r.get("seat", ""), "、".join(r.get("passengers") or []),
                 r.get("order_no", ""),
-                self.RESULT_LABEL.get(r.get("result"), r.get("result", ""))))
+                # Task 143（2.2.4）：result 真值不可哈希 → 旧代码
+                # RESULT_LABEL.get 直接 TypeError；本 load 可被手动重复
+                # 刷新，warn-once 在 helper 内保证。
+                _coerce_history_result_label(
+                    r.get("result", ""), self.RESULT_LABEL, "历史面板")))
 
 
 # ----------------------------- 通知设置页 -----------------------------
