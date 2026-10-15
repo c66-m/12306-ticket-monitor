@@ -1578,6 +1578,12 @@ class TestConfigKeys(TempDirCase):
                      # Task 113：第 6 形状——launcher.py:610 经 _cfg 别名读顶层键
                      # （前导 _ 是 word char，旧 cfg\.get 的 lookbehind 挡住）
                      | self._scan(r"(?<![\w.])_cfg\.get\(\s*['\"](\w+)[\"']", others)
+                     # Task 121 2.1.2：第 7 形状——_safe_config_path(config, "key",
+                     # default)（engine.py:162；Task 108 家族）。字面键是第 2
+                     # 个实参，旧 6 形状全漏（state_file/history_file/log_dir
+                     # 读的是顶层 config 键，须进 CONFIG_KEYS 断言）。
+                     | self._scan(r"(?<![\w.])_safe_config_path\(\s*[\w.]+\s*,"
+                                  r"\s*['\"](\w+)[\"']")
                      | self._scan(r"self\.config\.get\(\s*['\"](\w+)[\"']")
                      | self._scan(r"(?<![\w.])config\[['\"](\w+)[\"']")
                      # Task 101c：补 2 类漏报形态——json.load(f).get("k")
@@ -13565,6 +13571,186 @@ class TestTask123GuiUpdateStateLockedB6(TempDirCase):
             state = json.load(f)
         self.assertEqual(state["tasks"]["t"]["status"], "paused")
         self.assertTrue(any("tasks" in r.getMessage() for r in cm.records))
+
+
+class TestTask121CtrlCScanB6(TempDirCase):
+    """Task 121 (B6-4)：Ctrl+C/测试 bundle（P3×4）。
+
+    2.2.2 step3_create_qr 短请求 Ctrl+C；2.2.3 _goto_login_page 的 page.goto
+    + main 的 new_context/new_page 的 KI 守卫（Task 65c 0/1 口径）；
+    2.1.2 TestConfigKeys 第 7 扫描形状 _safe_config_path(config, "key", d)；
+    2.1.4 保存失败弹窗文案泛化（Task 112 回归：--force 建议限定不可解密分支）。
+    """
+
+    def _printed(self, mprint):
+        return "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+
+    def _no_kb_interrupt(self, fn):
+        # 旧代码下 Ctrl+C 会逃出被测函数；直接让它逃出会杀掉整个 runner
+        # （exit=130），故在测试内捕获并转为普通 FAIL（Task 113 同口径）。
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C 抛出了 KeyboardInterrupt（应优雅退出，不抛 traceback）")
+
+    def _scan(self, pattern, files):
+        keys = set()
+        for f in files:
+            for m in re.finditer(pattern, open(f, encoding="utf-8").read()):
+                keys.add(m.group(1))
+        return keys
+
+    # ---- 2.2.2 step3_create_qr ----
+
+    def test_step3_create_qr_ctrl_c_exits_gracefully(self):
+        # RED on old code: Ctrl+C 穿透 except Exception 抛 traceback
+        fake = mock.Mock()
+        fake.post.side_effect = KeyboardInterrupt
+        with mock.patch.object(probe_login, "SESSION", fake), \
+             mock.patch("builtins.print") as mprint:
+            result = self._no_kb_interrupt(probe_login.step3_create_qr)
+        self.assertIsNone(result)
+        self.assertIn("中断", self._printed(mprint))
+
+    # ---- 2.2.3 _goto_login_page / _open_login_page ----
+
+    def test_goto_login_page_ctrl_c_exits_gracefully(self):
+        # RED on old code: page.goto 的 Ctrl+C 穿透，抛 traceback
+        import capture_session
+        page = mock.Mock()
+        page.goto.side_effect = KeyboardInterrupt
+        with mock.patch("builtins.print") as mprint:
+            result = self._no_kb_interrupt(
+                lambda: capture_session._goto_login_page(page))
+        self.assertFalse(result)  # 调用方既有失败出口：关浏览器 → return 1
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_goto_login_page_normal_failure_unchanged(self):
+        # 正向对照：普通异常仍走原失败文案（新旧代码都通过）
+        import capture_session
+        page = mock.Mock()
+        page.goto.side_effect = RuntimeError("boom")
+        with mock.patch("builtins.print"):
+            self.assertFalse(capture_session._goto_login_page(page))
+
+    def test_open_login_page_new_context_ctrl_c_returns_none(self):
+        # RED on old code: _open_login_page 不存在（main 内裸 new_context，
+        # Ctrl+C 抛 traceback 冲出 main）
+        import capture_session
+        browser = mock.Mock()
+        browser.new_context.side_effect = KeyboardInterrupt
+        with mock.patch("builtins.print") as mprint:
+            ctx, page = self._no_kb_interrupt(
+                lambda: capture_session._open_login_page(browser))
+        self.assertIsNone(ctx)
+        self.assertIsNone(page)
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_open_login_page_new_page_ctrl_c_returns_none(self):
+        # RED on old code: 同上（context.new_page() 处 Ctrl+C）
+        import capture_session
+        browser = mock.Mock()
+        browser.new_context.return_value.new_page.side_effect = KeyboardInterrupt
+        with mock.patch("builtins.print") as mprint:
+            ctx, page = self._no_kb_interrupt(
+                lambda: capture_session._open_login_page(browser))
+        self.assertIsNone(ctx)
+        self.assertIsNone(page)
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_open_login_page_normal_path_unchanged(self):
+        # 正向对照：正常路径返回 (context, page)，且 UA/viewport 与旧内联值一致
+        import capture_session
+        browser = mock.Mock()
+        ctx, page = capture_session._open_login_page(browser)
+        self.assertIs(ctx, browser.new_context.return_value)
+        self.assertIs(page, browser.new_context.return_value.new_page.return_value)
+        kw = browser.new_context.call_args.kwargs
+        self.assertIn("Windows NT 10.0", kw["user_agent"])
+        self.assertEqual(kw["viewport"], {"width": 1280, "height": 800})
+
+    def test_main_open_login_page_ctrl_c_returns_1(self):
+        # 2.2.3 口径 pin：Ctrl+C → _open_login_page 返回 None → 关浏览器 →
+        # return 1（Task 65c 干净退出码口径，无 traceback、无 130）。
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = True
+        fake_mod = mock.MagicMock()
+        with mock.patch.object(capture_session, "_order_mode",
+                               return_value="http"), \
+             mock.patch.object(capture_session, "_launch_browser",
+                               return_value=browser), \
+             mock.patch.object(capture_session, "_open_login_page",
+                               return_value=(None, None)), \
+             mock.patch.dict("sys.modules",
+                             {"playwright": mock.MagicMock(),
+                              "playwright.sync_api": fake_mod}), \
+             mock.patch("builtins.print"):
+            rc = capture_session.main()
+        self.assertEqual(rc, 1)
+        browser.close.assert_called_once()  # _safe_close_browser 正常收尾
+
+    # ---- 2.1.2 第 7 扫描形状 ----
+
+    _PAT7 = r"(?<![\w.])_safe_config_path\(\s*[\w.]+\s*,\s*['\"](\w+)[\"']"
+
+    def test_scan_catches_safe_config_path_shape(self):
+        # RED on old code：_safe_config_path(config, "key", default) 的字面键是
+        # 第 2 个实参，旧 6 形状全漏（TestConfigKeys 不报警）。
+        import tempfile
+        src = ('a = _safe_config_path(config, "ghost_a", "d")\n'
+               'b = _safe_config_path(\n'
+               '    self.config, "ghost_b", "d")\n')
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as f:
+            f.write(src)
+            path = f.name
+        try:
+            self.assertEqual(self._scan(self._PAT7, [path]),
+                             {"ghost_a", "ghost_b"})
+            # 对照：旧 6 形状全漏（RED 依据）
+            for pat in (r"(?<![\w.])config\.get\(\s*['\"](\w+)[\"']",
+                        r"(?<![\w.])cfg\.get\(\s*['\"](\w+)[\"']",
+                        r"(?<![\w.])config\[['\"](\w+)[\"']"):
+                self.assertEqual(self._scan(pat, [path]), set())
+        finally:
+            os.unlink(path)
+
+    # ---- 2.1.4 保存失败弹窗文案泛化 ----
+
+    def _run_save_fail(self, mod, undecryptable):
+        with mock.patch.object(pax_mod, "save_passengers",
+                               return_value=False), \
+             mock.patch.object(pax_mod, "_is_undecryptable_box",
+                               return_value=undecryptable), \
+             mock.patch.object(mod, "messagebox") as mbox:
+            self.assertFalse(mod._save_passengers_or_warn(["p"], parent=None))
+        return mbox.showerror.call_args.args[1]
+
+    def test_gui_save_fail_undecryptable_keeps_force_advice(self):
+        # 不可解密分支：保留 --force 建议（旧文案逐字，新旧代码都通过）
+        text = self._run_save_fail(gui, True)
+        self.assertIn("不可解密", text)
+        self.assertIn("--force", text)
+
+    def test_gui_save_fail_other_modes_no_force_advice(self):
+        # RED on old code：加密失败/锁争用等其他 False 模式仍弹"不可解密"+
+        # "--force 放弃旧数据"，误导用户。
+        text = self._run_save_fail(gui, False)
+        self.assertNotIn("--force", text)
+        self.assertNotIn("不可解密", text)
+
+    def test_launcher_save_fail_undecryptable_keeps_force_advice(self):
+        # launcher 同口径：不可解密分支保留 --force 建议
+        text = self._run_save_fail(launcher, True)
+        self.assertIn("不可解密", text)
+        self.assertIn("--force", text)
+
+    def test_launcher_save_fail_other_modes_no_force_advice(self):
+        # RED on old code：launcher 同上
+        text = self._run_save_fail(launcher, False)
+        self.assertNotIn("--force", text)
+        self.assertNotIn("不可解密", text)
 
 
 if __name__ == "__main__":

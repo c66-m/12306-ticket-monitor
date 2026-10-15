@@ -1852,6 +1852,10 @@ def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._ST
     Task 89(c)：expect_stamp 传入时做乐观并发检查（与 Task 88d/monitor 同口径）；
     编辑期间被外部修改导致放弃保存时弹 warning（不覆盖对方修改），返回 False。
     不传 expect_stamp 时保持 Task 80 行为（直接写）。
+
+    Task 121 2.1.4：文案泛化（Task 112 回归）——save_passengers 的 False 模式
+    新增加密失败（RuntimeError/OSError）/ 锁争用（TimeoutError）；"--force
+    放弃旧数据"建议只在不可解密分支出现，其他模式弹泛化文案。
     """
     if passengers_mod.save_passengers(passengers, expect_stamp=expect_stamp):
         return True
@@ -1864,11 +1868,22 @@ def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._ST
                                "未覆盖对方的修改。请基于最新数据重新操作。",
                                parent=parent)
         return False
-    messagebox.showerror("保存失败",
-                         "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
-                         "已拒绝覆盖以保护原数据。\n"
-                         "请在原机器解密后迁移，或使用 --force 放弃旧数据。",
-                         parent=parent)
+    if passengers_mod._is_undecryptable_box(passengers_mod.DEFAULT_PATH):
+        # 不可解密分支：保留 --force 建议（save_passengers 内的 LOG.error
+        # 口径已准确，见 Task 80）。
+        messagebox.showerror("保存失败",
+                             "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
+                             "已拒绝覆盖以保护原数据。\n"
+                             "请在原机器解密后迁移，或使用 --force 放弃旧数据。",
+                             parent=parent)
+    else:
+        # Task 121 2.1.4：文案泛化（Task 112 回归）——加密失败
+        # （RuntimeError/OSError）/ 锁争用（TimeoutError）等其他 False 模式下，
+        # "不可解密"归因与"--force 放弃旧数据"建议都是误导；详情以日志为准。
+        messagebox.showerror("保存失败",
+                             "乘车人数据保存失败，本次保存已跳过，磁盘数据未被改动。\n"
+                             "详情请查看日志输出。",
+                             parent=parent)
     return False
 
 

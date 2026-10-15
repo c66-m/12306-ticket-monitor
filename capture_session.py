@@ -176,10 +176,34 @@ def _goto_login_page(page):
     try:
         page.goto(LOGIN_URL)
         return True
+    except KeyboardInterrupt:
+        # Task 121 2.2.3：Ctrl+C 优雅退出（Task 65c 干净退出码口径），不抛 traceback
+        print("\n[中断] 用户取消（Ctrl+C），退出。")
+        return False
     except Exception as e:
         print("[失败] 打不开 12306 登录页：{0}".format(e))
         print("       请检查网络连接 / 代理设置后重试。")
         return False
+
+
+def _open_login_page(browser):
+    """创建 context/page（Task 121 2.2.3）。
+
+    browser.new_context()/context.new_page() 的 Ctrl+C 优雅退出：成功返回
+    (context, page)；中断返回 (None, None)（main 按 Task 65c 口径关浏览器
+    返回 1）。UA/viewport 与旧内联值逐字一致，正常路径无行为变化。
+    """
+    try:
+        context = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            viewport={"width": 1280, "height": 800},
+        )
+        return context, context.new_page()
+    except KeyboardInterrupt:
+        # Task 121 2.2.3：上下文/页面创建中 Ctrl+C——不抛 traceback
+        print("\n[中断] 用户取消（Ctrl+C），退出。")
+        return None, None
 
 
 def _safe_close_browser(browser):
@@ -251,12 +275,12 @@ def main():
         browser = _launch_browser(p)
         if browser is None:
             return 1
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
+        context, page = _open_login_page(browser)
+        if page is None:
+            # Task 121 2.2.3：new_context/new_page 中 Ctrl+C——关闭浏览器后
+            # 返回 1（Task 65c 干净退出码口径），不抛 traceback。
+            _safe_close_browser(browser)
+            return 1
         if not _goto_login_page(page):
             _safe_close_browser(browser)  # Task 113：与 :277 同口径（Task 99d）
             return 1

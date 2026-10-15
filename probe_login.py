@@ -223,6 +223,10 @@ def step3_create_qr():
     url = "https://kyfw.12306.cn/passport/web/create-qr64"
     try:
         r = SESSION.post(url, data={"appid": "otn"}, timeout=10)
+    except KeyboardInterrupt:
+        # Task 121 2.2.2：短请求 Ctrl+C 优雅退出（Task 113 同口径），不抛 traceback
+        print("\n  [中断] 用户取消（Ctrl+C），退出。")
+        return None
     except Exception as e:
         print("    [异常] {0}: {1}".format(type(e).__name__, e))
         return None
