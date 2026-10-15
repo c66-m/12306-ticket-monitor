@@ -9,7 +9,7 @@ Python 后端 + Electron 桌面壳：查票/监控余票 + 自动抢票（Playwr
 
 ## 0.95 当前架构：Electron 桌面壳 + JSON-RPC 后端（2026-10-14 起，最新批次）
 
-**旧 Tkinter 界面（gui.py）已停用**：文件仍在仓库内（4323 行，2026-10-16 实测）供 test_all.py 引用，但不再是入口、
+**旧 Tkinter 界面（gui.py）已停用**：文件仍在仓库内（4296 行，2026-10-16 实测）供 test_all.py 引用，但不再是入口、
 不再维护。「启动桌面版.bat」现在启动 Electron。
 
 ### 分层
@@ -22,7 +22,7 @@ ui/            界面（纯 HTML/CSS/JS，无框架）
 electron/      壳（Node）
   main.js      221 行：spawn python api.py + JSON-RPC 桥 + 窗口（无边框 1440×900）+ win/win-top 通道
   preload.js   27 行：contextBridge 暴露 window.api = { call, onPush, win, top }
-api.py         1262 行：JSON-RPC 后端（stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项）
+api.py         1222 行：JSON-RPC 后端（stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项）
   ↓ 复用既有业务模块
 launcher.py(Grabber/任务库) engine.py(监控引擎) ticket.py(查票) order.py(browser_order.py)/...
 ```
@@ -136,24 +136,36 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 ### .browser_profile/ 现状
 - 已 gitignore；清理见上。**内含登录态**，删了要重新 `python browser_order.py login`。
 
-### tests/TEST_REPORT.md（陈旧，仅存档）
+### tests/TEST_REPORT.md（历史存档 + 已加复核抬头）
 - 5.3KB，抬头写「日期:2026-10-06 · 基线:a8b4b57 · 测试套件(47 项)」，内容为当时的二次自我检查报告（append_monitor_task 并发丢数据、mtime 15.6ms 盲区、误导性日志等**已修项**）。
 - 当前基线是 **711 项**，该报告早于 Electron 迁移与三轮重构，**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
+
+## 0.98 本轮批次（2026-10-16：config/state 收敛 + 文档订正）
+
+- **config/state 家族跨文件重复已收敛**（原第 10 节待办，用户 2026-10-16 裁决「消掉」）：
+  `load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records` 原在 `api.py`、`gui.py`、`monitor.py` 各有一份，现机械层单源到 `appcommon.py` 新分节「config.json 共享 plumbing」（appcommon.py:534 起）：
+  `EMAIL_RE`（严格版）/ `_STAMP_UNSET` / `state_path_of` / `history_path_of` / `read_config_or_empty` / `_config_refusal` / `write_config_locked` / `update_config_locked`（`on_corrupt`/`on_non_dict`/`return_result` 钩子）/ `update_state_locked`（注入 `read_state`）/ `normalize_email_settings` / `read_history_records`（`on_non_list`/`on_error` 钩子）。
+  **策略差异全部以参数/回调注入，未拉平**（RULES.md §七第 2 条硬约束）：monitor 的坏档指纹拒写 + CLI print、gui 的 messagebox + `guisave` + `return_result=True`、api 的 stderr 出口 + `apisave`、launcher 的路径解析。
+  邮箱正则统一取**严格**口径（旧 `api.EMAIL_RE` 宽松，会让 gui 拒收的地址从桌面版设置页落进 config.json）。
+  `state_file` / `history_file` 两键的路径解析在 api/gui/monitor/launcher 四处统一走 `appcommon.state_path_of / history_path_of`。
+- **monitor.update_config_locked 新增损坏/非 dict 的 CLI 提示**（旧版静默 `return False`）——仍在锁内、仍在 mutator 之前拒绝，只是补一句人话；无测试断言旧文案。
+- **回归**：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 711 tests, OK (skipped=15)**。代码改动 5 个文件（api.py / appcommon.py / gui.py / launcher.py / monitor.py），文档订正 5 个（RULES / HANDOFF / README / PRODUCT / tests/TEST_REPORT）。
+- **本轮踩到的坑**：改造 `api.load_config` 时内部闭包 `_broken` 给模块级 `_CONFIG_CORRUPT_WARNED` 赋值忘了再声明 `global` → 名字退化成局部变量 → `UnboundLocalError`，被只覆盖该路径的 `test_api_load_config_gbk_still_returns_empty` 逮到。**模块级哨兵在嵌套函数里赋值，每层都要 `global`。**
 
 ## 1. 位置与仓库现状（2026-10-16 复核）
 - 当前家：C:\develep\产物\12306（本项目唯一工作副本）。
 - 旧位置 C:\develep\deepseek harness\工作目录\12306-probe 已删除（robocopy 复制 → 校验 MISSING=0 → 验证通过 → 删源）。
 - 嵌套评审 worktree p1-review：**2026-10-15 已用 `git worktree remove` 移除**（内容早已并入 main），`git worktree list` 现只剩主树 190a919 [main]。同理 `_undo_backup/`、`_ann/`、根 `node_modules/` 均已删除。
 - remote：https://github.com/c66-m/12306-ticket-monitor.git
-- 分支/HEAD：main = **190a919**（chore(web-dashboard): 预览图入库，.gitignore 开白名单），**与 origin/main 完全同步（ahead 0）**。
-  上一轮记的「ahead 8 未推送」已过时：那 8 个 commit 连同 190a919 均已推送。
-  已用 `git ls-remote origin refs/heads/main` 校验远端真实值为 `190a919`（不是只信本地记录）。
+- 分支/HEAD（2026-10-16 本轮结束实测）：main = **60f4947**，origin/main = **190a919** → **ahead 4**（本地领先，未推送）。
+  待推送的 4 个：`190a919` → `3f683ff`（docs: 交接文档校正）→ `671324a`（docs: PRODUCT.md 行数校正）→ `0695c70`（docs: HANDOFF 待办段同步）；再叠上本轮 1 个收敛 commit。
+  上一轮记的「ahead 8 未推送」已过时（那 8 个均已推送）；但**「与 origin 完全同步 / ahead 0」也已过时**——是否 push 是外向操作，待裁决。
 - 工作树：共 **60 个跟踪文件**。历史在途改动**已全部提交**，包括：Electron 三件套（api.py / ui/ / electron/）、
   5 个过期 md 与 .scratch/（按用户裁决删除后一并提交）、launcher_widgets.py（已删除）、
   `web-dashboard/preview-*.png`（190a919 入库，`.gitignore` 已开白名单 `!web-dashboard/preview-*.png`）。
   新目录 web-dashboard/、runs/、tools/clean_profile.py 均已入库（见 §0.97）。
   __pycache__/ 按 .gitignore 忽略，本地存在但不入库。
-  **当前唯一未提交项**：本文件的 `M HANDOFF.md`（即本轮校正，等用户决定是否提交）。
+  **当前未提交项（2026-10-16 本轮）**：10 个文件的修改（HANDOFF / RULES / README / PRODUCT / api.py / appcommon.py / gui.py / launcher.py / monitor.py / tests/TEST_REPORT.md），见 §0.98；尚未 commit。
 - fix/p1-critical（e4a090a）已并入 main（git merge-base --is-ancestor e4a090a main → true），本地无该分支、仅远程存在。
 - 桌面快捷方式：C:\Users\Admini\Desktop\12306车票监控系统.lnk → C:\develep\产物\12306\启动桌面版.bat
   （不变，但 bat 内容已改为启动 Electron，见第 0.95 节）。
@@ -171,24 +183,24 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 | ui/style.css | 960 | 当前界面样式（玻璃拟态 + 主题变量 + 外观设置项 + .eye-wrap/.g-result/.wb.on 等本轮新增） |
 | electron/main.js | 221 | Electron 壳：spawn python api.py、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、win/win-top 通道、F11、DSH_DEBUG 日志开关 |
 | electron/preload.js | 27 | contextBridge：window.api = { call, onPush, win, top } |
-| api.py | 1262 | **JSON-RPC 后端**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项；引擎启停（_engine_stop）、日志泵 log_pump、抢票定时调度 _armed_loop、config/state 原子写与文件锁 |
-| launcher.py | 1168 | **抢票业务模块（无界面）**：Grabber、任务库/配置 IO、车站搜索/类型探测、append_monitor_task、merge_trains_from_monitor、check_update、ensure_passengers、resolve_dates |
+| api.py | 1222 | **JSON-RPC 后端**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项；引擎启停（_engine_stop）、日志泵 log_pump、抢票定时调度 _armed_loop、config/state 原子写与文件锁 |
+| launcher.py | 1164 | **抢票业务模块（无界面）**：Grabber、任务库/配置 IO、车站搜索/类型探测、append_monitor_task、merge_trains_from_monitor、check_update、ensure_passengers、resolve_dates |
 | launcher_utils.py | 290 | 纯业务工具（席别表/掩码 mask_id·mask_mobile/归一化/时间/车型/IP 定位 ip_locate/build_monitor_task）；无 tkinter 依赖 |
 | engine.py | 1621 | 监控引擎：多任务调度、自适应频率、防重三层、历史/重试冷却；run(stop_event=None) 支持优雅退出 |
 | browser_order.py | 1708 | Playwright 真浏览器下单全流程（_order_impl 分 8 段 mark()） |
 | ticket.py | 823 | 查票 + parse_row 竖线行解析 + 席别/偏好规则 |
 | order.py | 1042 | 订单查询/归因/session 载入与校验（唯一事实来源） |
-| monitor.py | 1133 | 命令行后备入口（无 GUI 环境；功能以桌面版为准） |
+| monitor.py | 1140 | 命令行后备入口（无 GUI 环境；功能以桌面版为准） |
 | passengers.py | 496 | 乘车人（_passengers_key 为 Fernet 密钥文件，非 Windows 落明文 0o600） |
 | capture_session.py | 305 | 采集登录态 cookie（Playwright 打开浏览器人工登录一次） |
 | probe_login.py | 520 | 登录链路诊断（域名连通性/二维码/会话有效性；只诊断不绕过） |
-| appcommon.py | 533 | 跨模块机械层：日期区间解析、原子文件写、state.json 读容错、PII 脱敏口径（mask_order_no / mask_one_name / mask_names / mask_id_partial）、北京时间（beijing_tz）、展示归一化（normalize/display 车次与席别） |
+| appcommon.py | 708 | 跨模块机械层：日期区间解析、原子文件写、state.json 读容错、PII 脱敏口径（mask_order_no / mask_one_name / mask_names / mask_id_partial）、北京时间（beijing_tz）、展示归一化（normalize/display 车次与席别） |
 | filelock.py | 144 | 跨进程文件锁（msvcrt 字节锁） |
 | logutil.py | 132 | 按天滚动日志 handler（保持 logs/<prefix>_YYYYMMDD.log 命名） |
 | notify.py | 147 | 邮件通知（SMTP SSL） |
 | station_db.py | 152 | 全量车站本地库（3404 站）；`rebuild` 合成、`check` 校验三份同源车站文件 name↔code 漂移（非零退出） |
 | config_keys.py | 22 | 配置键唯一定义处（测试防漂移） |
-| gui.py | 4323 | **legacy（已停用）**：旧 Tkinter 单窗口界面；不再是任何入口，仅因 tests/test_all.py 深度引用（288 处）而原地保留；新功能一律改 ui/ |
+| gui.py | 4296 | **legacy（已停用）**：旧 Tkinter 单窗口界面；不再是任何入口，仅因 tests/test_all.py 深度引用（288 处）而原地保留；新功能一律改 ui/ |
 | launcher_widgets.py / theme.py / liquid.py | 已删除 | 2026-10-13 随 Tkinter 界面推翻；`_undo_backup/` 备份目录已于 2026-10-15 清理 |
 | tools/gen_icon.py、tools/gen_icon_emoji.py | — | 图标生成脚本（原根目录 _icon_gen*.py，2026-10-14 归位） |
 
@@ -257,15 +269,15 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 - ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（711 OK）。
 - 一等卧/二等卧/高级动卧（官方码 I/J/A）是否进下单码表（长期未决）。
 - 重新登录后做一次真实下单核对（核对窗席别 vs 订单详情，需登录实跑）。
-- **config/state 家族跨文件重复尚未收敛**（用户 2026-10-16 裁决「消掉」）：load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records 在 api.py、gui.py、monitor.py 各有一份。实测三份不是机械重复而是**能力分层**（monitor 有 FileNotFoundError 分支 + `_DAMAGED_STAMP` 指纹拒写 + expect_stamp；gui 有 messagebox 弹窗与 `guisave` 临时名；api 最简但有 expect_stamp），收敛必须**参数化保留策略**（RULES.md §七 第 2 条是硬约束），落点是 appcommon.py（已具 state.json 共享 plumbing 分节，含 read_state_or_none / `_read_history_list`）。逐字等价可无痛下沉的只有 `load_state` 与 `normalize_email_settings`（后者须统一选 gui 的**严格** EMAIL_RE，api 现为宽松版）。
+- ~~**config/state 家族跨文件重复尚未收敛**~~ **已完成（2026-10-16，见 §0.98；策略以参数/回调注入保留，未拉平）**（用户 2026-10-16 裁决「消掉」）：load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records 在 api.py、gui.py、monitor.py 各有一份。实测三份不是机械重复而是**能力分层**（monitor 有 FileNotFoundError 分支 + `_DAMAGED_STAMP` 指纹拒写 + expect_stamp；gui 有 messagebox 弹窗与 `guisave` 临时名；api 最简但有 expect_stamp），收敛必须**参数化保留策略**（RULES.md §七 第 2 条是硬约束），落点是 appcommon.py（已具 state.json 共享 plumbing 分节，含 read_state_or_none / `_read_history_list`）。逐字等价可无痛下沉的只有 `load_state` 与 `normalize_email_settings`（后者须统一选 gui 的**严格** EMAIL_RE，api 现为宽松版）。
 - 两条驱动循环（launcher Grabber 一次性 vs engine MonitorEngine 常驻）是否重构——语义不同，暂缓到真实抢票跑通之后。
-- **RULES.md §七 两条门禁的数字与措辞已过期**（本轮核实，**未改**——RULES 是业务规则，改动建议先与你对齐）：
-  (a) 「拆 launcher.py（**约 3000 行**）」实测只有 **1168 行**；
-  (b) 同条要求门面保 `python launcher.py` 兼容，但实测 launcher.py **已无 `__main__`**（2026-10-13 起不再是独立入口，见 README:84），该兼容条款已失效；
-  (c) 「拆 browser_order._order_impl（约 579 行）」实测 `def _order_impl` 在 `browser_order.py:726`、下一定义在 `:1324` → 约 **599 行**（量级未变）。
-- **拆 launcher.py 的《拆分清单》文档已随 2026-10-16 裁决被删**（原 LAUNCHER_SPLIT_PLAN.md）——该门禁要求「拆前单独出拆分清单给用户确认」，真到拆的时候需重新起草。
+- ~~**RULES.md §七 两条门禁的数字与措辞已过期**~~ **已订正（2026-10-16）**：
+  (a) launcher.py 实测 **1164 行**（旧文「约 3000 行」已删）；
+  (b) 「门面保 `python launcher.py` 兼容」条款删除，改为明写「已于 2026-10-13 停止支持（launcher.py 无 `__main__`），门面只需保 `import launcher`」；
+  (c) `browser_order._order_impl` 599 行（`browser_order.py:726` → 下一顶层定义 `:1324`）已写进 RULES。
+- ~~**拆 launcher.py 的《拆分清单》已删**~~ 已在 RULES 里注明「原稿已删，真拆时重新起草」，不留悬空引用。
 - `web-dashboard/` 设计稿是否落地到 `ui/`（见 §0.97）：它是玻璃拟态方向的演进提案（全域零实线边框、层级用阴影写），落地需重写 ui/ 的样式与部分结构，属独立批次。
-- `tests/TEST_REPORT.md` 抬头仍是「日期:2026-10-06 · 基线:a8b4b57 · 测试套件(47 项)」，远早于当前 711 项基线。**要么更新、要么删**（保留价值是那几个已修并发 bug 的成因分析）。
+- ~~`tests/TEST_REPORT.md` 陈旧~~ **已裁决并完成（2026-10-16）：保留 + 加存档抬头**（历史成因分析有价值），文末追加「十、2026-10-16 复核增量」记录本轮代码变更与回归。
 - ~~5 个 md + .zip + .scratch/ 如何处置~~ **已裁决（2026-10-16）：删除**，已提交。
 - ~~PRODUCT.md 视觉口径冲突~~ **已裁决（2026-10-16）：以落地的 Electron 玻璃拟态为准**，PRODUCT.md §Brand Commitments 已改写。
 
@@ -326,7 +338,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 12. 下一次开工第一步建议
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
-2. git status -sb 确认 HEAD 仍是 190a919（与 origin/main 同步，见第 1 节）；预期只有本文件可能是脏的
+2. git status -sb 看 HEAD 与本文件第 1 节的记录是否一致（当前 60f4947 / origin 190a919 → ahead 4，是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
 4. python -X utf8 tests\test_all.py（预期 711 OK / skipped=15）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟

@@ -243,13 +243,9 @@ class Grabber(threading.Thread):
         log = self._log
         lc = self.lc
         # 历史文件路径与监控系统同源(config.history_file),别写错文件
-        try:
-            _cfg = json.load(open(os.path.join(HERE, "config.json"),
-                                  encoding="utf-8-sig"))
-            hist_path = os.path.join(HERE, _cfg.get("history_file",
-                                                    "order_history.json"))
-        except Exception:
-            hist_path = os.path.join(HERE, "order_history.json")
+        # 读失败（缺文件/坏档）按空配置走缺省名——appcommon 单源口径
+        hist_path = appcommon.history_path_of(
+            appcommon.read_config_or_empty(os.path.join(HERE, "config.json")), HERE)
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
         trains = _normalize_trains(lc.get("trains"), log)
@@ -789,7 +785,7 @@ def append_monitor_task(task, start_now=True):
             log("[错误] 文件被占用，稍后重试：%s" % cfg_path)
             raise TimeoutError("文件被占用，稍后重试") from e
         # state.json 条目（与 gui.mark_task_created 的无 app 分支保持一致）
-        state_path = os.path.join(HERE, cfg.get("state_file", "state.json"))
+        state_path = appcommon.state_path_of(cfg, HERE)
         try:
             with filelock.file_lock(state_path + ".lock"):
                 if os.path.exists(state_path):

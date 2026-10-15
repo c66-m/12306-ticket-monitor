@@ -125,22 +125,22 @@ def load_config():
     与非 dict 口径——旧代码只抓 JSONDecodeError，GBK 等非 UTF-8 文件的
     UnicodeDecodeError 逃出崩启动，[] 等非 dict 则在下游 .get() 处崩）。"""
     global _CONFIG_CORRUPT_WARNED
-    try:
-        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+
+    def _warn_once(msg, *args):
+        global _CONFIG_CORRUPT_WARNED
         if not _CONFIG_CORRUPT_WARNED:
             _CONFIG_CORRUPT_WARNED = True
-            LOG.error("config.json JSON 解析失败或非 UTF-8 编码，将以空配置启动：%s",
-                      CONFIG_PATH)
-        return {}
-    if not isinstance(data, dict):
-        if not _CONFIG_CORRUPT_WARNED:
-            _CONFIG_CORRUPT_WARNED = True
-            LOG.error("config.json 顶层不是 dict 对象（%s），将以空配置启动：%s",
-                      type(data).__name__, CONFIG_PATH)
-        return {}
-    return data
+            LOG.error(msg, *args)
+
+    # 解析与降级策略单源在 appcommon.read_config_or_empty，这里只保留界面文案
+    return appcommon.read_config_or_empty(
+        CONFIG_PATH,
+        broken=lambda e: _warn_once(
+            "config.json JSON 解析失败或非 UTF-8 编码，将以空配置启动：%s",
+            CONFIG_PATH),
+        non_dict=lambda data: _warn_once(
+            "config.json 顶层不是 dict 对象（%s），将以空配置启动：%s",
+            type(data).__name__, CONFIG_PATH))
 
 
 def _lock_timeout_abort():
@@ -161,16 +161,14 @@ def save_config(config):
     # 原子写 + 跨进程锁：与 launcher 的读-改-写互斥（config.json.lock）
     # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
     try:
-        with filelock.file_lock(CONFIG_PATH + ".lock"):
-            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
+        appcommon.write_config_locked(CONFIG_PATH, config)
     except TimeoutError:
         _lock_timeout_abort()
 
 
 def load_state():
-    config = load_config()
     return engine_mod.load_state_file(
-        os.path.join(HERE, config.get("state_file", "state.json")))
+        appcommon.state_path_of(load_config(), HERE))
 
 
 def _state_tasks_dict():
@@ -196,8 +194,7 @@ def _state_tasks_dict():
 
 def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
-    config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    path = appcommon.state_path_of(load_config(), HERE)
     # 跨进程锁：与 launcher.append_monitor_task 的 state 段互斥（state.json.lock）
     try:
         with filelock.file_lock(path + ".lock"):
@@ -215,37 +212,34 @@ def update_config_locked(mutator):
     Task 84b：config.json 损坏（JSON 解析失败）时友好中止——弹 error 提示并抛
     友好异常（不 traceback、不覆盖旧文件）；与 Task 75 读侧口径一致。
     """
+    def _on_corrupt(_exc):
+        LOG.warning("config.json 已损坏，拒绝覆盖写入：%s", CONFIG_PATH)
+        messagebox.showerror(
+            "配置损坏",
+            "config.json 已损坏，本次保存已取消（旧文件未被覆盖）。\n"
+            "请手动修复该文件，或备份后删除让程序重建。",
+            parent=None)
+        raise RuntimeError("config.json 已损坏：本次保存已取消，旧文件未被覆盖")
+
+    def _on_non_dict(config):
+        # Task 103d：合法 JSON 但非 dict（如手改的 []）——写侧同样友好
+        # 拒绝（与解析失败同口径）：记 warning + 弹 error，不抛裸 TypeError；
+        # 拒绝点在 mutator 之前，无任何写入，旧文件不丢。
+        LOG.warning("config.json 内容非 dict（%s），拒绝覆盖写入：%s",
+                    type(config).__name__, CONFIG_PATH)
+        messagebox.showerror(
+            "配置损坏",
+            "config.json 内容不是对象，本次保存已取消（旧文件未被覆盖）。\n"
+            "请手动修复该文件，或备份后删除让程序重建。",
+            parent=None)
+        raise RuntimeError("config.json 内容非 dict：本次保存已取消，旧文件未被覆盖")
+
     try:
-        with filelock.file_lock(CONFIG_PATH + ".lock"):
-            try:
-                with open(CONFIG_PATH, encoding="utf-8-sig") as f:
-                    config = json.load(f)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                LOG.warning("config.json 已损坏，拒绝覆盖写入：%s", CONFIG_PATH)
-                messagebox.showerror(
-                    "配置损坏",
-                    "config.json 已损坏，本次保存已取消（旧文件未被覆盖）。\n"
-                    "请手动修复该文件，或备份后删除让程序重建。",
-                    parent=None)
-                raise RuntimeError(
-                    "config.json 已损坏：本次保存已取消，旧文件未被覆盖")
-            if not isinstance(config, dict):
-                # Task 103d：合法 JSON 但非 dict（如手改的 []）——写侧同样友好
-                # 拒绝（与解析失败同口径）：记 warning + 弹 error，不抛裸 TypeError；
-                # 拒绝点在 mutator 之前，无任何写入，旧文件不丢。
-                LOG.warning("config.json 内容非 dict（%s），拒绝覆盖写入：%s",
-                            type(config).__name__, CONFIG_PATH)
-                messagebox.showerror(
-                    "配置损坏",
-                    "config.json 内容不是对象，本次保存已取消（旧文件未被覆盖）。\n"
-                    "请手动修复该文件，或备份后删除让程序重建。",
-                    parent=None)
-                raise RuntimeError(
-                    "config.json 内容非 dict：本次保存已取消，旧文件未被覆盖")
-            result = mutator(config)
-            # Task 66: config.json 含密钥，落盘 0600
-            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
-            return result
+        # 机械层单源在 appcommon（锁 + 读 + 守卫 + 原子写）；这里只注入界面文案。
+        # return_result=True 保持本模块「返回 mutator 返回值」的旧契约。
+        return appcommon.update_config_locked(
+            CONFIG_PATH, mutator,
+            on_corrupt=_on_corrupt, on_non_dict=_on_non_dict, return_result=True)
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -256,21 +250,19 @@ def update_state_locked(mutator):
     mutator(state) 就地修改读到的 dict；返回其返回值。
     路径解析沿用 save_state 的口径（config 的 state_file，默认 state.json）。
     """
-    config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    path = appcommon.state_path_of(load_config(), HERE)
+
+    def _on_non_dict(state):
+        # Task 75e：合法非 dict JSON（如 []）直接透传会导致 mutator 的
+        # state.setdefault 抛 AttributeError；记 warning 后按 {} 处理
+        # （与 Task 62c 的 appcommon 读路径口径一致）。
+        LOG.warning("state.json 内容非 dict（%s），已按空状态处理：%s",
+                    type(state).__name__, path)
+
     try:
-        with filelock.file_lock(path + ".lock"):
-            state = engine_mod.load_state_file(path)
-            if not isinstance(state, dict):
-                # Task 75e：合法非 dict JSON（如 []）直接透传会导致 mutator 的
-                # state.setdefault 抛 AttributeError；记 warning 后按 {} 处理
-                # （与 Task 62c 的 appcommon 读路径口径一致）。
-                LOG.warning("state.json 内容非 dict（%s），已按空状态处理：%s",
-                            type(state).__name__, path)
-                state = {}
-            result = mutator(state)
-            appcommon.write_state(path, state, tmp_kind="guisave")
-            return result
+        return appcommon.update_state_locked(
+            path, mutator, read_state=engine_mod.load_state_file,
+            tmp_kind="guisave", on_non_dict=_on_non_dict)
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -295,7 +287,7 @@ def mark_task_created(app, task, start_now):
         update_state_locked(_mark)
 
 
-EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+EMAIL_RE = appcommon.EMAIL_RE  # 正则单源（本模块是严格口径的原作者）
 
 
 def format_dates(task):
@@ -424,27 +416,12 @@ def delete_task_everywhere(app, task):
 
 
 def normalize_email_settings(email):
-    """校验并清洗邮件配置：
+    """校验并清洗邮件配置（实现单源 appcommon.normalize_email_settings）：
     - 发件邮箱必须是完整地址，否则抛 ValueError
     - 发件人地址为空或格式不对（如只填 @qq.com）时自动回退为发件邮箱
     - 收件人逐个校验格式，非法时抛 ValueError
     返回清洗后的配置字典。"""
-    user = (email.get("username") or "").strip()
-    if not EMAIL_RE.match(user):
-        raise ValueError("发件邮箱格式不正确：「%s」" % user)
-    from_addr = (email.get("from") or "").strip()
-    if not EMAIL_RE.match(from_addr):
-        from_addr = user
-    email["username"] = user
-    email["from"] = from_addr
-    to_list = [x.strip() for x in (email.get("to") or []) if x.strip()]
-    bad = [x for x in to_list if not EMAIL_RE.match(x)]
-    if bad:
-        raise ValueError("收件人格式不正确：%s" % "、".join(bad))
-    if not to_list:
-        raise ValueError("请至少填写一个收件人邮箱")
-    email["to"] = to_list
-    return email
+    return appcommon.normalize_email_settings(email)
 
 
 _RESULT_QUEUE = queue.Queue()
@@ -1674,18 +1651,14 @@ HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
 def read_history_records(limit=200):
     """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
     顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
-    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
-    path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
-    try:
-        with open(path, encoding="utf-8-sig") as f:
-            history = json.load(f)
-        if not isinstance(history, list):
-            LOG.warning("order_history.json 顶层不是列表（%s），按空历史展示：%s",
-                        type(history).__name__, path)
-            return []
-        return list(reversed(history[-limit:]))
-    except Exception:
-        return []
+    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。
+    机械层单源在 appcommon.read_history_records，这里只注入日志口径。"""
+    path = appcommon.history_path_of(load_config(), HERE)
+    return appcommon.read_history_records(
+        path, limit=limit,
+        on_non_list=lambda history: LOG.warning(
+            "order_history.json 顶层不是列表（%s），按空历史展示：%s",
+            type(history).__name__, path))
 
 
 class HistoryTab(ttk.Frame):

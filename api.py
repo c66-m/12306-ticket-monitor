@@ -88,14 +88,15 @@ STATUS_COLOR = {"monitoring": "#0969da", "retrying": "#d97706", "paused": "#6e77
 HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
                         "notified": "已通知", "failed": "下单失败", "error": "异常"}
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# 邮箱正则单源到 appcommon.EMAIL_RE（严格口径）。旧版这里另有一份宽松正则，
+# 会让 gui 拒收的地址从桌面版设置页落进 config.json。
 
 _CONFIG_CORRUPT_WARNED = False
 
 # 乐观并发检查的哨兵：update_config_locked 的 expect_stamp 取此值表示"不检查"
 #（旧调用方式）；None 是合法指纹，表示"调用方 load 时文件不存在"。
 # 与 passengers._STAMP_UNSET / monitor._STAMP_UNSET 同口径。
-_STAMP_UNSET = object()
+_STAMP_UNSET = appcommon._STAMP_UNSET
 
 
 def _config_stamp():
@@ -112,30 +113,26 @@ def _config_stamp():
 
 
 def load_config():
-    """读 config.json（gui.py 116 原版语义，messagebox 换日志）。"""
+    """读 config.json（gui.py 116 原版语义，messagebox 换 stderr）。解析与
+    降级策略单源在 appcommon.read_config_or_empty（缺失/损坏/非 dict 都给 {}）。"""
     global _CONFIG_CORRUPT_WARNED
-    try:
-        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+
+    def _broken(exc):
+        global _CONFIG_CORRUPT_WARNED
         if not _CONFIG_CORRUPT_WARNED:
             _CONFIG_CORRUPT_WARNED = True
             print("[api] config.json 解析失败，按空配置", file=sys.stderr)
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return data
+
+    return appcommon.read_config_or_empty(CONFIG_PATH, broken=_broken)
 
 
 def save_config(config):
-    with filelock.file_lock(CONFIG_PATH + ".lock"):
-        appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
+    appcommon.write_config_locked(CONFIG_PATH, config)
 
 
 def load_state():
-    config = load_config()
     return engine_mod.load_state_file(
-        os.path.join(HERE, config.get("state_file", "state.json")))
+        appcommon.state_path_of(load_config(), HERE))
 
 
 def remove_task_from_config(config, task):
@@ -156,31 +153,15 @@ def update_config_locked(fn, expect_stamp=_STAMP_UNSET):
     不传 expect_stamp 时保持旧行为（直接写）。返回值自本轮起统一为布尔
     （旧行为是返回 mutator 的返回值，仓内两个调用点均未消费）。
     """
-    with filelock.file_lock(CONFIG_PATH + ".lock"):
-        if expect_stamp is not _STAMP_UNSET and _config_stamp() != expect_stamp:
-            return False
-        try:
-            with open(CONFIG_PATH, encoding="utf-8-sig") as f:
-                config = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise RuntimeError("config.json 已损坏：本次保存已取消，旧文件未被覆盖")
-        if not isinstance(config, dict):
-            raise RuntimeError("config.json 内容非 dict：本次保存已取消，旧文件未被覆盖")
-        fn(config)
-        appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
-        return True
+    return appcommon.update_config_locked(
+        CONFIG_PATH, fn, expect_fingerprint=expect_stamp)
 
 
 def update_state_locked(fn):
-    """state.json 读-改-写原子接口（gui.py 245 原版语义）。"""
-    config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
-    with filelock.file_lock(path + ".lock"):
-        state = engine_mod.load_state_file(path)
-        if not isinstance(state, dict):
-            state = {}
-        fn(state)
-        appcommon.write_state(path, state, tmp_kind="apisave")
+    """state.json 读-改-写原子接口（gui.py 245 原版语义；机械层单源 appcommon）。"""
+    path = appcommon.state_path_of(load_config(), HERE)
+    return appcommon.update_state_locked(
+        path, fn, read_state=engine_mod.load_state_file, tmp_kind="apisave")
 
 
 def delete_task_everywhere(app, task):
@@ -203,37 +184,16 @@ def delete_task_everywhere(app, task):
 
 
 def normalize_email_settings(email):
-    """校验清洗邮件配置（gui.py 437 原版逻辑）。"""
-    user = (email.get("username") or "").strip()
-    if not EMAIL_RE.match(user):
-        raise ValueError("发件邮箱格式不正确：「%s」" % user)
-    from_addr = (email.get("from") or "").strip()
-    if not EMAIL_RE.match(from_addr):
-        from_addr = user
-    email["username"] = user
-    email["from"] = from_addr
-    to_list = [x.strip() for x in (email.get("to") or []) if x.strip()]
-    bad = [x for x in to_list if not EMAIL_RE.match(x)]
-    if bad:
-        raise ValueError("收件人格式不正确：%s" % "、".join(bad))
-    if not to_list:
-        raise ValueError("请至少填写一个收件人邮箱")
-    email["to"] = to_list
-    return email
+    """校验清洗邮件配置（单源 appcommon.normalize_email_settings：正则取严格口径，
+    旧版 api 的宽松版会让 gui 拒收的地址从桌面版设置页偷偷落进 config.json）。"""
+    return appcommon.normalize_email_settings(email)
 
 
 def read_history_records(limit=200):
-    """读购票历史（gui.py 1686 原版逻辑）。"""
-    path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
-    try:
-        with open(path, encoding="utf-8-sig") as f:
-            history = json.load(f)
-        if not isinstance(history, list):
-            return []
-        return list(reversed(history[-limit:]))
-    except Exception as e:
-        _warn("读取历史文件", e)
-        return []
+    """读购票历史（单源 appcommon.read_history_records；失败只留 stderr 一行）。"""
+    path = appcommon.history_path_of(load_config(), HERE)
+    return appcommon.read_history_records(
+        path, limit=limit, on_error=lambda e: _warn("读取历史文件", e))
 
 
 # ---------------- 引擎管理（单例） ----------------

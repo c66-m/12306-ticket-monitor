@@ -531,3 +531,178 @@ def upsert_order(path, key, rec):
     except TimeoutError as e:
         LOG.warning("[数据] orders.json 锁争用超时，本条订单记录跳过: %s", e)
         return
+# ----------------------------- config.json 共享 plumbing -----------------------------
+# api 后端 / gui 界面 / monitor CLI 曾各持一份 config.json 读写与邮件校验。共同
+# 机械层收到这里；各自的策略差异（gui 弹窗、monitor 的 CLI 提示与坏档指纹拒写、
+# api 的 stderr 出口）仍由调用方用钩子参数注入——参数化保留，不是抹平
+# （见 RULES.md 第七节）。
+
+# 邮箱校验的单源：取 gui 的严格口径（旧 api 版宽松，会让 gui 拒收的地址从
+# Electron 设置页落进 config.json——两个前端对同一 config 不能两套校验）。
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+# 乐观并发检查/坏档守卫的哨兵：指纹取此值表示「不检查」。None 是合法指纹，
+# 表示「调用方取指纹时文件不存在」。
+_STAMP_UNSET = object()
+
+
+def state_path_of(config, base_dir):
+    """config 的 state_file 键 → 绝对路径（缺省 state.json）。"""
+    return os.path.join(base_dir, config.get("state_file", "state.json"))
+
+
+def history_path_of(config, base_dir):
+    """config 的 history_file 键 → 绝对路径（缺省 order_history.json）。"""
+    return os.path.join(base_dir, config.get("history_file", "order_history.json"))
+
+
+def read_config_or_empty(path, *, missing=None, broken=None, non_dict=None):
+    """读 config.json（容忍 UTF-8 BOM）。文件缺失/损坏/顶层非 dict 一律返回 {}。
+
+    missing(exc) / broken(exc) / non_dict(data) 是各前端的提示钩子（省略即静默）：
+    提示时机与文案属于各前端的 UI 语义，不在这里统一。坏档证据保护由调用方
+    在钩子里记指纹，再用 write_config_locked / update_config_locked 的守卫拒写。
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        if missing is not None:
+            missing(e)
+        return {}
+    except (OSError, ValueError) as e:
+        # JSONDecodeError / UnicodeDecodeError 都是 ValueError 子类
+        if broken is not None:
+            broken(e)
+        return {}
+    if not isinstance(data, dict):
+        if non_dict is not None:
+            non_dict(data)
+        return {}
+    return data
+
+
+def _config_refusal(path, expect_fingerprint, damaged_fingerprint):
+    """锁内守卫：返回拒绝原因（"damaged"/"stale"）或 None（可写）。"""
+    if damaged_fingerprint is not None \
+            and stat_fingerprint(path) == damaged_fingerprint:
+        # 读侧发现的坏档仍在原地（指纹未变）：绝不覆写证据
+        return "damaged"
+    if expect_fingerprint is not _STAMP_UNSET \
+            and stat_fingerprint(path) != expect_fingerprint:
+        # 交互期间有外部写入（抢票进程/另一个窗口）：放弃本次保存，不静默覆写
+        return "stale"
+    return None
+
+
+def write_config_locked(path, config, *, expect_fingerprint=_STAMP_UNSET,
+                        damaged_fingerprint=None, mode=0o600):
+    """锁内整块写 config.json。已写入返回 None，否则返回拒绝原因
+    （"damaged"/"stale"）供调用方打印自己的提示。锁争用 TimeoutError 原样上抛，
+    提示口径（弹窗/print）归调用方。"""
+    with filelock.file_lock(path + ".lock"):
+        reason = _config_refusal(path, expect_fingerprint, damaged_fingerprint)
+        if reason is not None:
+            return reason
+        atomic_write_json(path, config, mode=mode)
+        return None
+
+
+def update_config_locked(path, mutator, *, expect_fingerprint=_STAMP_UNSET,
+                         damaged_fingerprint=None, on_corrupt=None,
+                         on_non_dict=None, mode=0o600, return_result=False):
+    """锁内读-改-写 config.json。
+
+    on_corrupt(exc) / on_non_dict(data) 是损坏与顶层非 dict 的处置钩子：
+    - 抛异常 → 原样上抛（钩子自己负责提示）
+    - 返回 False → 视为「已处置」，放弃本次写入并返回 False（monitor 口径）
+    - 省略 / 返回其它 → 抛 RuntimeError（文案与旧 api/gui 逐字一致）
+
+    return_result=True 时返回 mutator 的返回值（gui 口径），否则返回是否写入的
+    布尔。锁争用 TimeoutError 原样上抛。
+    """
+    with filelock.file_lock(path + ".lock"):
+        if _config_refusal(path, expect_fingerprint,
+                           damaged_fingerprint) is not None:
+            return False
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            config = {}   # 首跑：还没有配置文件，从空配置开始写是正常的
+        except (OSError, ValueError) as e:
+            if on_corrupt is not None and on_corrupt(e) is False:
+                return False
+            raise RuntimeError(
+                "config.json 已损坏：本次保存已取消，旧文件未被覆盖")
+        if not isinstance(config, dict):
+            if on_non_dict is not None and on_non_dict(config) is False:
+                return False
+            raise RuntimeError(
+                "config.json 内容非 dict：本次保存已取消，旧文件未被覆盖")
+        result = mutator(config)
+        atomic_write_json(path, config, mode=mode)
+        return result if return_result else True
+
+
+def update_state_locked(path, mutator, *, read_state, tmp_kind="tmp",
+                        on_non_dict=None):
+    """锁内读-改-写 state.json。
+
+    read_state(path) 由调用方注入（engine.load_state_file）——读实现保持单源，
+    同时保住各模块既有的 patch 契约（测试打的是 gui.engine_mod.load_state_file）。
+    on_non_dict(data)：顶层非 dict 的提示钩子（省略即静默按空状态处理）。
+    返回 mutator 的返回值；锁争用 TimeoutError 原样上抛。
+    """
+    with filelock.file_lock(path + ".lock"):
+        state = read_state(path)
+        if not isinstance(state, dict):
+            if on_non_dict is not None:
+                on_non_dict(state)
+            state = {}
+        result = mutator(state)
+        write_state(path, state, tmp_kind=tmp_kind)
+        return result
+
+
+def normalize_email_settings(email):
+    """校验并清洗邮件配置（api/gui 两份逐字相同的原版逻辑）：
+    - 发件邮箱必须是完整地址，否则抛 ValueError
+    - 发件人地址为空或格式不对（如只填 @qq.com）时自动回退为发件邮箱
+    - 收件人逐个校验格式，非法时抛 ValueError
+    返回清洗后的配置字典。"""
+    user = (email.get("username") or "").strip()
+    if not EMAIL_RE.match(user):
+        raise ValueError("发件邮箱格式不正确：「%s」" % user)
+    from_addr = (email.get("from") or "").strip()
+    if not EMAIL_RE.match(from_addr):
+        from_addr = user
+    email["username"] = user
+    email["from"] = from_addr
+    to_list = [x.strip() for x in (email.get("to") or []) if x.strip()]
+    bad = [x for x in to_list if not EMAIL_RE.match(x)]
+    if bad:
+        raise ValueError("收件人格式不正确：%s" % "、".join(bad))
+    if not to_list:
+        raise ValueError("请至少填写一个收件人邮箱")
+    email["to"] = to_list
+    return email
+
+
+def read_history_records(path, *, limit=200, on_non_list=None, on_error=None):
+    """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
+    顶层非 list 时走 on_non_list 钩子后按空历史展示（旧代码切片在 try 外，
+    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            history = json.load(f)
+        if not isinstance(history, list):
+            if on_non_list is not None:
+                on_non_list(history)
+            return []
+        return list(reversed(history[-limit:]))
+    except Exception as e:
+        if on_error is not None:
+            on_error(e)
+        return []
+

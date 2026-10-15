@@ -42,10 +42,10 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `ui/index.html` + `ui/app.js` + `ui/style.css` | 主窗 87 / 1671 / 960 行 | **唯一界面（纯 HTML/CSS/JS，无框架）**：顶栏（会话胶囊 / 监控开关 / 窗口键：置顶 · 小窗 · 最小化 · 最大化 · 关闭）+ 侧边栏 = 监控任务 / 抢票任务 / 乘车人 / 历史 / 设置 + 主区 + 底部全局日志。渲染、轮询、外观设置全在 app.js |
 | `ui/mini.html` + `ui/mini.js` + `ui/mini.css` | 小窗 3 文件 | **抢票小窗（B7 第二步）**：460×420 无边框，只显示账号 / 进行中任务 / 抢票日志；打开时主窗隐藏，关闭自动还原。外观经 `--appear` 启动参数继承主窗 |
 | `electron/main.js` + `electron/preload.js` | 221 / 27 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
-| `api.py` | 1262 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停、日志泵、抢票定时调度、config/state 原子写 |
-| `launcher.py` | 1168 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
-| `gui.py` | 4323 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
-| `monitor.py` | 1133 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
+| `api.py` | 1222 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停、日志泵、抢票定时调度、config/state 原子写 |
+| `launcher.py` | 1164 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
+| `gui.py` | 4296 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
+| `monitor.py` | 1140 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
 
 ### 核心链路
 

@@ -1,6 +1,10 @@
 # 项目全面检查与测试报告
 
-日期:2026-10-06  ·  基线:a8b4b57(含并行会话的在途改动)  ·  测试套件:`tests/test_all.py`(47 项,标准库 unittest,`python tests/test_all.py` 可复跑)
+日期:2026-10-06  ·  基线:a8b4b57(含并行会话的在途改动)
+
+> **2026-10-16 复核：本报告是历史存档**——第一~九节的结论与其成因分析保留价值，但**已不是当前事实基线**。
+> 现状：`tests/test_all.py` 为 **711 项**（skipped=15），`python tests/test_all.py` 全绿；架构、文件清单、文件行数以 `HANDOFF.md` 为准，业务规则以 `RULES.md` 为准。
+> 本轮复核增量见文末「十、2026-10-16 复核增量」。
 
 ## 一、测试执行概况
 
@@ -23,15 +27,16 @@
 ## 三、结构与依赖
 
 - 依赖图(AST 级提取):`ticket/passengers/notify/logutil`(基础层)← `order/browser_order`(下单层)← `engine`(调度层)← `gui/launcher/monitor`(界面层)。**无循环依赖**。分层合理,GUI 不直接碰网络下单细节。
+- 2026-10-14 起的实际架构：`ui/`(HTML/CSS/JS) + `api.py`(JSON-RPC 后端) + `electron/`(壳)；`gui.py`(Tkinter) 已降级为 legacy，仅因 `tests/test_all.py` 引用而保留。
 - `notify → passengers` 的依赖仅为 SMTP 授权码 DPAPI 加解密,方向正确。
-- `_demo_pri.py`、`_pri_test.py` 为本地草稿(已被 .gitignore 的 `_*` 规则排除),建议确认无用后删除。
+- `_demo_pri.py`、`_pri_test.py` 为本地草稿(已被 .gitignore 的 `_*` 规则排除),建议确认无用后删除。（2026-10-16 复核：仓库内已无这两个文件，建议已执行。）
 
 ## 四、配置文件审计
 
 - 全部 10 个 JSON(config/config.example/launcher_config/launcher_config.example/grab_tasks/state/order_history/station_kind/station_name/station_index)解析通过;真实 passengers.json 为 DPAPI 密文且完整。
-- **[P2] 仓库缺 README.md / requirements.txt / LICENSE**(git ls-files 证实)。依赖实际为 `requests`(必需)、`playwright`(浏览器下单)、`cryptography`(非 Windows 加密兜底)——不写 requirements.txt,新机器部署全靠猜。
-- **[P3] config.example.json 未文档化两个代码会读的键**:`order_mode`(http/browser)与 `browser_headless`。模板补上即可。
-- **[P3] SMTP 授权码迁移未完成**:notify.py 已支持 DPAPI 加密(`dpapi1:` 前缀),但现网 config.json 里的授权码仍是明文——在通知设置界面点一次"保存"即自动加密。旧明文在迁移前照常工作(向后兼容已测)。
+- ~~**[P2] 仓库缺 README.md / requirements.txt / LICENSE**~~ **已解决(2026-10-16 复核)**：README.md、requirements.txt、requirements-dev.txt、LICENSE 均已在库(git ls-files 证实)。历史事实：依赖为 `requests`(必需)、`playwright`(浏览器下单)、`cryptography`(非 Windows 加密兜底)。
+- ~~**[P3] config.example.json 未文档化两个代码会读的键**~~ **已解决**：模板已含 `order_mode`(http/browser)与 `browser_headless`。
+- **[P3] SMTP 授权码迁移未完成**:notify.py 已支持 DPAPI 加密(`dpapi1:` 前缀),但现网 config.json 里的授权码仍是明文——在通知设置界面点一次"保存"即自动加密。旧明文在迁移前照常工作(向后兼容已测)。**2026-10-16 复核仍成立**（config.json 里 password 仍是明文，等用户在设置页点一次保存）。
 
 ## 五、性能
 
@@ -56,3 +61,14 @@ Windows 优先(msvcrt 跨进程锁、DPAPI),非 Windows 路径均有降级:锁�
 ## 九、并行工作提示
 
 检查进行期间检测到另一会话的大功能改动在途(无座按车型同价改判、首选席别、车次席别明细,见 RULES.md 新增条目)。本报告的测试套件已在该在途代码上跑通,间接验证了其与既有逻辑的兼容性;涉及 launcher.py/passengers.py 的本轮修复留在工作树,待该功能收口后一并提交。
+
+## 十、2026-10-16 复核增量
+
+本轮代码变更（不在原报告检查范围内，单独记录以免与上文混淆）：
+
+- **config/state 家族跨文件重复已收敛**（HANDOFF 待办项）：`load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records` 原先在 `api.py`、`gui.py`、`monitor.py` 各有一份，现机械层单源到 `appcommon.py`（新分节「config.json 共享 plumbing」）。各前端的**策略差异以参数或回调注入，未拉平**：monitor 的坏档指纹拒写(`damaged_fingerprint`)与 CLI print、gui 的 messagebox 与 `return_result=True`、api 的 stderr 出口、state.json 的 `tmp_kind`(apisave/guisave/monsave)。
+- **邮箱正则统一取严格口径**：旧 `api.EMAIL_RE` 是宽松版，会让 gui 拒收的地址从桌面版设置页落进 config.json；现四处同源 `appcommon.EMAIL_RE`。
+- **`state_file` / `history_file` 路径解析单源**：`appcommon.state_path_of / history_path_of`，api / gui / monitor / launcher 四处统一。
+- **RULES.md 第七节门禁订正**：launcher.py 实测 1168 行（旧文「约 3000 行」）、其 `python launcher.py` 兼容条款失效（已无 `__main__`）、`browser_order._order_impl` 实测 599 行（`browser_order.py:726`→`:1324`）。
+- 回归：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 711 tests, OK (skipped=15)**。
+

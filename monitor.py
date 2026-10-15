@@ -57,38 +57,41 @@ _DAMAGED_STAMP = None
 
 
 def load_config():
+    """读 config.json。解析与降级策略单源在 appcommon.read_config_or_empty，
+    这里只负责 CLI 的提示文案与 Task 92a 的损坏指纹登记。"""
     global _DAMAGED_STAMP
     _DAMAGED_STAMP = None
-    try:
-        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
-            cfg = json.load(f)
-    except FileNotFoundError:
+
+    def _missing(_e):
         # 首跑无配置文件：不打 traceback，给友好引导后返回空配置。
         # 各调用方均已按空配置降级（.get/.setdefault），菜单[1]仍可创建
         # 首个任务并落盘——此处若 sys.exit 会把首个任务创建流程一并杀死，故不退出。
         print("  未找到 config.json，请先在菜单 [1] 创建任务。")
-        return {}
-    except (OSError, ValueError) as e:
+
+    def _broken(e):
         # Task 92a: 损坏的 config.json（非法 JSON/非 UTF-8/读取失败；
         # JSONDecodeError 与 UnicodeDecodeError 均为 ValueError 子类）。
         # 记错后降级为空配置：菜单可用、不 traceback；记录损坏指纹，
         # save_config / update_config_locked 绝不覆写该文件（证据保留）。
+        global _DAMAGED_STAMP
         print("  [警告] config.json 已损坏（%s），已降级为空配置运行；"
               "本次不会覆盖原文件，请修复或删除它后再操作。" % e)
         _DAMAGED_STAMP = _config_stamp()
-        return {}
-    if not isinstance(cfg, dict):
+
+    def _non_dict(_data):
         # Task 92a: 顶层非对象（如手改成列表/字符串）——与非法 JSON 同等处理。
+        global _DAMAGED_STAMP
         print("  [警告] config.json 顶层不是对象，已降级为空配置运行；"
               "本次不会覆盖原文件，请修复或删除它后再操作。")
         _DAMAGED_STAMP = _config_stamp()
-        return {}
-    return cfg
+
+    return appcommon.read_config_or_empty(
+        CONFIG_PATH, missing=_missing, broken=_broken, non_dict=_non_dict)
 
 
 # 乐观并发检查的哨兵：save_config 的 expect_stamp 取此值表示"不检查"
 #（旧调用方式）；None 是合法指纹，表示"load 时文件不存在"。
-_STAMP_UNSET = object()
+_STAMP_UNSET = appcommon._STAMP_UNSET  # 全库同一哨兵对象
 
 
 def _config_stamp():
@@ -126,26 +129,26 @@ def save_config(config, expect_stamp=_STAMP_UNSET):
     无论 expect_stamp 为何都拒绝写入并返回 False（证据保留）。
     """
     # 原子写 + 跨进程锁：与 launcher/gui 的读-改-写互斥（config.json.lock）
-    # Task 66: config.json 含 SMTP 授权码等密钥，落盘 0600
+    # 锁与守卫的机械层单源在 appcommon.write_config_locked；这里只保留 CLI 文案。
     try:
-        with filelock.file_lock(CONFIG_PATH + ".lock"):
-            if _DAMAGED_STAMP is not None and _config_stamp() == _DAMAGED_STAMP:
-                # Task 92a: load 时发现的损坏文件仍在原地——绝不覆写证据，
-                # 放弃本次保存（若文件已被外部修复，指纹变化会落到下面的
-                # Task 87 分支，同样安全放弃）。
-                print("  [警告] config.json 已损坏，本次未覆盖原文件；"
-                      "请先修复或删除它后再保存。")
-                return False
-            if expect_stamp is not _STAMP_UNSET \
-                    and _config_stamp() != expect_stamp:
-                # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
-                print("  检测到 config.json 在编辑期间被其他程序修改，"
-                      "本次保存已放弃（未覆盖对方的修改），请重新进入菜单操作。")
-                return False
-            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
-            return True
+        reason = appcommon.write_config_locked(
+            CONFIG_PATH, config,
+            expect_fingerprint=expect_stamp,
+            damaged_fingerprint=_DAMAGED_STAMP)
     except TimeoutError:
         _lock_timeout_abort()
+    if reason == "damaged":
+        # Task 92a: load 时发现的损坏文件仍在原地——绝不覆写证据，放弃本次保存
+        #（若文件已被外部修复，指纹变化会落到 stale 分支，同样安全放弃）。
+        print("  [警告] config.json 已损坏，本次未覆盖原文件；"
+              "请先修复或删除它后再保存。")
+        return False
+    if reason == "stale":
+        # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
+        print("  检测到 config.json 在编辑期间被其他程序修改，"
+              "本次保存已放弃（未覆盖对方的修改），请重新进入菜单操作。")
+        return False
+    return True
 
 
 def update_config_locked(mutator):
@@ -157,17 +160,24 @@ def update_config_locked(mutator):
     注意：不要在 mutator 里做交互式输入——锁内长时间占用会堵住 launcher
     的下单写路径；交互式菜单仍用 load_config/save_config（写侧已加锁）。
     """
+    def _refuse_corrupt(exc):
+        # Task 92a: 损坏的 config.json——绝不覆写证据，放弃本次写入（返回 False
+        # 让 appcommon 收手）。调用方据 False 收敛后续流程。
+        print("  [警告] config.json 已损坏（%s），本次未覆盖原文件；"
+              "请先修复或删除它后再操作。" % exc)
+        return False
+
+    def _refuse_non_dict(_data):
+        print("  [警告] config.json 顶层不是对象，本次未覆盖原文件；"
+              "请先修复或删除它后再操作。")
+        return False
+
     try:
-        with filelock.file_lock(CONFIG_PATH + ".lock"):
-            config = load_config()
-            if _DAMAGED_STAMP is not None:
-                # Task 92a: 损坏的 config.json——绝不覆写证据，放弃本次写入。
-                # load_config 已打印警告；调用方据 False 收敛后续流程。
-                return False
-            mutator(config)
-            # Task 66: config.json 含密钥，落盘 0600
-            appcommon.atomic_write_json(CONFIG_PATH, config, mode=0o600)
-            return True
+        return appcommon.update_config_locked(
+            CONFIG_PATH, mutator,
+            damaged_fingerprint=_DAMAGED_STAMP,
+            on_corrupt=_refuse_corrupt,
+            on_non_dict=_refuse_non_dict)
     except TimeoutError:
         _lock_timeout_abort()
 
@@ -178,14 +188,11 @@ def update_state_locked(mutator):
     mutator(state) 就地修改读到的 dict；返回其返回值。
     路径解析沿用 gui.save_state 的口径（config 的 state_file，默认 state.json）。
     """
-    config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    path = appcommon.state_path_of(load_config(), HERE)
     try:
-        with filelock.file_lock(path + ".lock"):
-            state = engine_mod.load_state_file(path)
-            result = mutator(state)
-            appcommon.write_state(path, state, tmp_kind="monsave")
-            return result
+        return appcommon.update_state_locked(
+            path, mutator,
+            read_state=engine_mod.load_state_file, tmp_kind="monsave")
     except TimeoutError:
         _lock_timeout_abort()
 

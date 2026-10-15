@@ -56,7 +56,7 @@ adaptive — Windows 桌面应用（Electron 壳 + Python 3.12 后端，JSON-RPC
 
 ## Evidence on Hand
 
-- 源码：`ui/app.js` + `ui/index.html` + `ui/style.css`（当前界面）、`api.py`（RPC 端点，1262 行）、`electron/main.js`（壳）、gui.py（4323 行，**已停用的 Tkinter 界面**，仅因 tests 深度引用而保留）、launcher.py（1168 行，纯业务）、monitor.py、ticket.py、engine.py、order.py、browser_order.py、appcommon.py 等。
+- 源码：`ui/app.js` + `ui/index.html` + `ui/style.css`（当前界面）、`api.py`（RPC 端点，1222 行）、`electron/main.js`（壳）、gui.py（4296 行，**已停用的 Tkinter 界面**，仅因 tests 深度引用而保留）、launcher.py（1164 行，纯业务）、monitor.py、ticket.py、engine.py、order.py、browser_order.py、appcommon.py 等。
 - 文档：README.md（模块地图/机制/合规）、RULES.md（实测结论）、HANDOFF.md（0.9 节=本次重构记录）。
 - 截图：无留档（旧版视觉截图已随 2026-10-15 根目录清理移除；需要时用 CDP `Page.captureScreenshot` 现拍当前界面）。
 - 无品牌资产、无对外商用素材；不得虚构用户评价、价格、市场数据。
