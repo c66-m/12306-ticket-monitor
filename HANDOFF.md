@@ -157,15 +157,15 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 - 旧位置 C:\develep\deepseek harness\工作目录\12306-probe 已删除（robocopy 复制 → 校验 MISSING=0 → 验证通过 → 删源）。
 - 嵌套评审 worktree p1-review：**2026-10-15 已用 `git worktree remove` 移除**（内容早已并入 main），`git worktree list` 现只剩主树 190a919 [main]。同理 `_undo_backup/`、`_ann/`、根 `node_modules/` 均已删除。
 - remote：https://github.com/c66-m/12306-ticket-monitor.git
-- 分支/HEAD（2026-10-16 本轮结束实测）：main = **60f4947**，origin/main = **190a919** → **ahead 4**（本地领先，未推送）。
-  待推送的 4 个：`190a919` → `3f683ff`（docs: 交接文档校正）→ `671324a`（docs: PRODUCT.md 行数校正）→ `0695c70`（docs: HANDOFF 待办段同步）；再叠上本轮 1 个收敛 commit。
+- 分支/HEAD（2026-10-16 本轮结束实测）：main = **92370ed**，origin/main = **190a919** → **ahead 5**（本地领先，未推送）。
+  待推送的 5 个：`190a919` → `3f683ff`（docs: 交接文档校正）→ `671324a`（docs: PRODUCT.md 行数校正）→ `0695c70`（docs: HANDOFF 待办段同步）→ `92370ed`（refactor: config/state 收敛，见 §0.98）。
   上一轮记的「ahead 8 未推送」已过时（那 8 个均已推送）；但**「与 origin 完全同步 / ahead 0」也已过时**——是否 push 是外向操作，待裁决。
 - 工作树：共 **60 个跟踪文件**。历史在途改动**已全部提交**，包括：Electron 三件套（api.py / ui/ / electron/）、
   5 个过期 md 与 .scratch/（按用户裁决删除后一并提交）、launcher_widgets.py（已删除）、
   `web-dashboard/preview-*.png`（190a919 入库，`.gitignore` 已开白名单 `!web-dashboard/preview-*.png`）。
   新目录 web-dashboard/、runs/、tools/clean_profile.py 均已入库（见 §0.97）。
   __pycache__/ 按 .gitignore 忽略，本地存在但不入库。
-  **当前未提交项（2026-10-16 本轮）**：10 个文件的修改（HANDOFF / RULES / README / PRODUCT / api.py / appcommon.py / gui.py / launcher.py / monitor.py / tests/TEST_REPORT.md），见 §0.98；尚未 commit。
+  **工作树干净**：本轮 10 个文件的改动（HANDOFF / RULES / README / PRODUCT / api.py / appcommon.py / gui.py / launcher.py / monitor.py / tests/TEST_REPORT.md）已随 `92370ed` 提交，见 §0.98。
 - fix/p1-critical（e4a090a）已并入 main（git merge-base --is-ancestor e4a090a main → true），本地无该分支、仅远程存在。
 - 桌面快捷方式：C:\Users\Admini\Desktop\12306车票监控系统.lnk → C:\develep\产物\12306\启动桌面版.bat
   （不变，但 bat 内容已改为启动 Electron，见第 0.95 节）。
@@ -338,7 +338,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 12. 下一次开工第一步建议
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
-2. git status -sb 看 HEAD 与本文件第 1 节的记录是否一致（当前 60f4947 / origin 190a919 → ahead 4，是否 push 待裁决）
+2. git status -sb 看 HEAD 与本文件第 1 节的记录是否一致（当前 92370ed / origin 190a919 → ahead 5，是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
 4. python -X utf8 tests\test_all.py（预期 711 OK / skipped=15）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
