@@ -13753,6 +13753,91 @@ class TestTask121CtrlCScanB6(TempDirCase):
         self.assertNotIn("不可解密", text)
 
 
+class TestTask122TickLabelB6(TempDirCase):
+    """Task 122 (B6-5)：gui App.tick 标签冻结（P3×1，Task 117 reviewer
+    follow-up）。
+
+    tick 的引擎标签计数 loop：{"name": ["x"]} 等手改 JSON 的坏名穿过
+    _sanitize_config_shapes → state.get(name) 直接 TypeError → 被
+    `except Exception: pass` 吞掉 → 「引擎：运行中（N 个任务）」标签冻结
+    在旧数字（与 2.2.11 _render_history 的"静默全灭"同类）。按 114/116/117
+    口径用共享 _skip_unhashable_task_name 做 warn+skip。
+    """
+
+    def _reset_unhashable_warned(self):
+        if hasattr(gui, "_UNHASHABLE_NAME_WARNED"):
+            gui._UNHASHABLE_NAME_WARNED.clear()
+
+    def _app(self):
+        # tick 只碰这几个属性；__new__ 免 Tk 初始化（Task 117 同技巧）。
+        app = gui.MonitorApp.__new__(gui.MonitorApp)
+        app.engine_thread = mock.Mock()
+        app.engine_thread.is_alive.return_value = True
+        app.engine_label = mock.Mock()
+        app.root = mock.Mock()
+        app._acct_time = time.time()
+        app.refresh_account = mock.Mock()
+        app.refresh_tasks = mock.Mock()
+        return app
+
+    def _label_texts(self, app):
+        return [c.kwargs.get("text") for c in
+                app.engine_label.config.call_args_list]
+
+    def test_tick_skips_unhashable_name(self):
+        # P3：改前 state.get(["x"]) 直接 TypeError，被 except Exception: pass
+        # 吞掉 → engine_label.config 从不执行，标签冻结在旧数字。
+        # 应 warn+跳过坏条目，好任务照常计数。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"},
+                 {"name": "good", "from": "BJ", "to": "SH"}]
+        app = self._app()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks":
+                                             {"good":
+                                              {"status": "monitoring"}}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                app.tick()  # 改前 TypeError 被吞，标签不变
+        self.assertTrue(any("哈希" in m for m in logs.output),
+                        "必须明确记 warning 指出任务名不可哈希")
+        self.assertIn("引擎：运行中（1 个任务）", self._label_texts(app))
+
+    def test_tick_unhashable_warns_once(self):
+        # tick 是 2 秒定时回调：同一损坏条目只记一次 warning，不刷屏。
+        self._reset_unhashable_warned()
+        tasks = [{"name": ["x"], "from": "BJ", "to": "SH"}]
+        app = self._app()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                app.tick()
+                app.tick()
+                app.tick()
+        pins = [m for m in logs.output if "哈希" in m]
+        self.assertEqual(len(pins), 1)
+        self.assertIn("引擎：运行中（0 个任务）", self._label_texts(app))
+
+    def test_tick_all_good_unchanged(self):
+        # 正向对照：全合法任务时原行为不变（2 活跃 + 1 暂停 → 2 个任务）。
+        # 改前即绿，对照。
+        self._reset_unhashable_warned()
+        tasks = [{"name": "a"}, {"name": "b"}, {"name": "c"}]
+        app = self._app()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {
+                                   "a": {"status": "monitoring"},
+                                   "b": {"status": "retrying"},
+                                   "c": {"status": "paused"}}}):
+            app.tick()
+        self.assertIn("引擎：运行中（2 个任务）", self._label_texts(app))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

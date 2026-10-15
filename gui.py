@@ -3595,9 +3595,16 @@ class MonitorApp:
             try:
                 tasks = load_config().get("tasks") or []
                 state = load_state().get("tasks", {})
-                n = sum(1 for t in tasks
-                        if state.get(t.get("name"), {}).get("status")
-                        in engine_mod.ACTIVE_STATUSES)
+                n = 0
+                for t in tasks:
+                    # Task 122：不可哈希任务名 → warn+跳过（114/116/117 口径）。
+                    # 旧代码的 state.get(t.get("name")) 在此直接 TypeError，
+                    # 被外层 except Exception: pass 吞掉后标签冻结在旧数字。
+                    if _skip_unhashable_task_name(t, "引擎标签"):
+                        continue
+                    if state.get(t.get("name"), {}).get("status") \
+                            in engine_mod.ACTIVE_STATUSES:
+                        n += 1
                 self.engine_label.config(text="引擎：运行中（%d 个任务）" % n)
             except Exception:
                 pass
