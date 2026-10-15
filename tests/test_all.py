@@ -14789,6 +14789,68 @@ class TestTask130EngineShapesB8(TempDirCase):
         self.assertEqual(e.config["notify"], {"email": {"enabled": True}})
 
 
+class TestTask130ReworkClassifySites(TempDirCase):
+    """Task 130 返工：engine.py:1183（dup 分支）/:1258（ambiguous 分支）的
+    classify_with_time 调用点把 task.get("passenger_names") 原值直传 →
+    order.py:164 _classify_orders 的 set(passenger_names or []) 遇真值
+    非可迭代（如手改 "passenger_names": 5）抛 TypeError，逃出 _run_task →
+    无限 loud backoff（与 2.2.1 同后果类；brief 字面范围只列了
+    p_names/dedup_key，reviewer 独立扫描发现本残留）。
+
+    口径：与 Task 130 的 2.2.1 修复一致——非可迭代真值按缺失处理（→ []）；
+    裸字符串豁免（§4）；falsy 值行为不变。
+    """
+
+    def _run_task_capture_classify(self, passenger_names, order_ticket_ret):
+        e = make_engine(self.tmp)
+        t = task_of(passenger_names=passenger_names)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        captured = {}
+
+        def fake_classify(date, train, pns, not_before_ts=None, session=None):
+            captured["passenger_names"] = pns
+            return ("none", "", "无", None)
+
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=order_ticket_ret), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               side_effect=fake_classify), \
+             mock.patch.object(engine_mod.appcommon, "upsert_order"), \
+             mock.patch.object(engine_mod.appcommon, "append_history"):
+            e._run_task(t)
+        return captured
+
+    def test_dup_branch_int_shape_guarded(self):
+        # RED（旧代码）：:1183 把 5 原样传给 classify_with_time →
+        # _classify_orders 内 set(5) 抛 TypeError。
+        captured = self._run_task_capture_classify(
+            5, (False, "m", {"reason": "dup"}))
+        self.assertEqual(captured["passenger_names"], [])
+
+    def test_ambiguous_branch_int_shape_guarded(self):
+        # RED（旧代码）：:1258 把 5 原样传给 classify_with_time。
+        captured = self._run_task_capture_classify(
+            5, (False, "m", {"reason": "ambiguous"}))
+        self.assertEqual(captured["passenger_names"], [])
+
+    def test_helper_shapes(self):
+        # RED（旧代码）：helper 不存在 → AttributeError。
+        h = engine_mod._iterable_passenger_names
+        self.assertEqual(h(5), [])
+        self.assertEqual(h(["张三"]), ["张三"])
+        self.assertEqual(h("张三"), "张三")  # 裸字符串豁免（§4）
+        self.assertEqual(h(None), [])
+
+    def test_clean_list_passthrough(self):
+        # 正向对照：干净输入原样透传（新旧代码都通过）。
+        captured = self._run_task_capture_classify(
+            ["张三"], (False, "m", {"reason": "dup"}))
+        self.assertEqual(captured["passenger_names"], ["张三"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

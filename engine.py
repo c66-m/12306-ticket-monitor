@@ -382,6 +382,19 @@ def future_dates(task, today=None):
     return kept, expired
 
 
+def _iterable_passenger_names(pn_raw):
+    """passenger_names 容器形状守卫（Task 130 2.2.1 返工：reviewer 独立扫描
+    发现的同家族残留——engine.py:1183/:1258 的 classify_with_time 调用点
+    把原值直传 → order.py:164 _classify_orders 的 set(passenger_names or [])
+    遇真值非可迭代抛 TypeError）。
+
+    与 p_names/dedup_key 的内联守卫同口径：真值非可迭代（如手改成数字 5）
+    按缺失处理 → []；裸字符串保持原样（§4 豁免，逐字符迭代旧行为不变）；
+    falsy 值行为与旧代码一致（or [] → []）。
+    """
+    return pn_raw if isinstance(pn_raw, (list, tuple, str)) else []
+
+
 def dedup_key(task, date, train_code, seat_name, passenger_names):
     """防重复唯一键：区间|日期|车次|席别|乘车人组合（排序后拼接）。
 
@@ -1180,7 +1193,8 @@ class MonitorEngine(object):
                     elif result_msg == "dup":
                         # 本地记录仅作线索:以 12306 官方接口的订单状态为准决策
                         cls, ono, raw, recent = order_mod.classify_with_time(
-                            date, train_code, task.get("passenger_names") or [],
+                            date, train_code,
+                            _iterable_passenger_names(task.get("passenger_names")),
                             not_before_ts=attempt_ts)
                         okey = "%s|%s" % (date, train_code)
                         LOG.info("[防重核查] 任务「%s」%s %s 官方查询结果=%s %s",
@@ -1255,7 +1269,8 @@ class MonitorEngine(object):
                             # 订单已生成且下单时间对得上=本次成功；确认无订单=安全重试；
                             # 其余（查不到/更早旧单/其它行程挡路）=保守停任务，防重复下单。
                             cls, ono, raw, recent = order_mod.classify_with_time(
-                                date, train_code, task.get("passenger_names") or [],
+                                date, train_code,
+                                _iterable_passenger_names(task.get("passenger_names")),
                                 not_before_ts=attempt_ts)
                             if cls == "unpaid" and recent:
                                 self.state["dedup"][key] = "SUBMITTED"
