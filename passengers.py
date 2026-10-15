@@ -360,6 +360,42 @@ def _decrypt(enc_name, data_text):
     return data_text
 
 
+def _coerce_passenger_id_field(entry, field, path):
+    """证件字段值级归一（Task 145 R11-S3-2/R11-S4-1，Task 133 同口径）。
+
+    - str（含 ""）→ 原样保留
+    - bool → 永不是合法证件字段 → warn + ""
+    - 真值数字（int/float）→ str(value)（数字漏引号的手改失误；
+      round-6 2.2.2 已接受向量）
+    - 0/0.0/None/缺键 → 保持旧行为（缺值态；_mask_id 与
+      ID_TYPE_NAMES.get 均安全，不 warn）
+    - 其余（含真值非 str 如 ["1"]/{...}，以及 falsy 但不可哈希的 []/{}）
+      → warn + ""（[]/{} 虽 falsy 但不可哈希，ID_TYPE_NAMES.get 会
+      TypeError——"falsy 安全"对该形状不成立；Task 138→R10-S3-1 同一教训）
+    警告只记字段名+类型，不打印原值（id_no 可能是真实证件号；
+    Task 118/124/135 PII 口径）。
+    """
+    v = entry.get(field)
+    if isinstance(v, str):
+        return
+    if isinstance(v, bool):
+        LOG.warning("[警告] 乘车人文件 %s 的条目 %s 字段为布尔值"
+                    "（类型：%s），已按空处理",
+                    path, field, type(v).__name__)
+        entry[field] = ""
+        return
+    if isinstance(v, (int, float)):
+        if v:
+            entry[field] = str(v)
+        return
+    if v is None:
+        return
+    LOG.warning("[警告] 乘车人文件 %s 的条目 %s 字段形状非法"
+                "（类型：%s），已按空处理",
+                path, field, type(v).__name__)
+    entry[field] = ""
+
+
 def _sanitize_passenger_entries(entries, path):
     """过滤乘车人条目中的非 dict 脏数据（Task 112 P2，与 Task 104 同口径）。
 
@@ -375,6 +411,11 @@ def _sanitize_passenger_entries(entries, path):
     （[]/{}）同样不可哈希，一并剔除；空字符串名是 str，保留（零漂移）。
     警告只记类型，不打印原值（name 可能是 ["张三"] 含真实姓名，
     Task 118/124/135 PII 口径）。
+
+    Task 145（R11-S3-2/R11-S4-1）：dict 条目内的 id_type_code/id_no 字段
+    形状也归一——数字转 str（漏引号手改）/ bool 与真值非 str（含 falsy 但
+    不可哈希的 []/{}）→ warn + 按空。下游 gui.py:2013 ID_TYPE_NAMES.get /
+    :2014/:1572 _mask_id 做 dict-key/len/slice 操作，脏形状直接 TypeError。
     """
     if not isinstance(entries, list):
         # Task 118 2.1.3：%r 整个 passengers 节进日志会把真实姓名落盘
@@ -399,6 +440,10 @@ def _sanitize_passenger_entries(entries, path):
                             "（类型：%s），已跳过",
                             path, type(name).__name__)
                 continue
+            # Task 145（R11-S3-2/R11-S4-1）：id_type_code/id_no 值级归一
+            # （与 Task 141 同一漏斗一次收敛）。
+            _coerce_passenger_id_field(e, "id_type_code", path)
+            _coerce_passenger_id_field(e, "id_no", path)
             clean.append(e)
         else:
             # Task 118 2.1.3：%r 原样打印脏条目会把真实姓名落盘（Task 112 引入

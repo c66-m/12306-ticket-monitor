@@ -16728,6 +16728,122 @@ class TestTask144GuiHistoryRecordShapes(TempDirCase):
         self.assertEqual(pax, ["", "张三、李四", "张三"])
 
 
+class TestTask145IdFieldShapes(TempDirCase):
+    """Task 145（B12-2）：gui 证件字段形状 bundle（P3×1）。
+
+    R11-S3-2/R11-S4-1 — gui.py _mask_id（:2137）未做 str() 硬化 +
+        :2013 ID_TYPE_NAMES.get 未守不可哈希 id_type_code：passengers.json
+        脏 id_no/id_type_code（name 合法，穿过 Task 141 的 name 归一）→
+        TypeError。修复：路线 (a)——_sanitize_passenger_entries 值级归一
+        （Task 133 同口径：数字转 str / 真值非 str → warn + 按空；
+        falsy 不可哈希 []/{} 一并归空——"falsy 安全"对该形状不成立，
+        Task 138→R10-S3-1 同一教训）。
+    """
+
+    def _san(self, entries):
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            out = pax_mod._sanitize_passenger_entries(entries, "p.json")
+        return out, "\n".join(logs.output)
+
+    def test_id_no_number_coerced_to_str(self):
+        # RED：改前数字 id_no 原样放行 → gui _mask_id 的 len(int) TypeError。
+        # 数字漏引号是良性手改，静默转字符串（monitor.py Task 126 同口径），不 warn。
+        with self.assertNoLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(
+                [{"name": "张三", "id_no": 110101199001011234}], "p.json")
+        self.assertEqual(out[0]["id_no"], "110101199001011234")
+
+    def test_id_no_unhashable_list_emptied(self):
+        # RED：改前 ["1",...] 原样放行 → _mask_id 的 list[:3]+"*" TypeError。
+        # PII：id_no 可能是真实证件号，只记类型不打印原值。
+        out, logged = self._san([{"name": "张三", "id_no": ["1"] * 10}])
+        self.assertEqual(out[0]["id_no"], "")
+        self.assertNotIn("110101", logged)
+        self.assertIn("list", logged)
+
+    def test_id_type_code_unhashable_emptied(self):
+        # RED：改前 ["1"] 原样放行 → ID_TYPE_NAMES.get 的 TypeError。
+        out, logged = self._san([{"name": "张三", "id_type_code": ["1"]}])
+        self.assertEqual(out[0]["id_type_code"], "")
+        self.assertIn("list", logged)
+
+    def test_id_type_code_falsy_unhashable_emptied(self):
+        # []/{} 为 falsy 但不可哈希 → .get 照样 TypeError（brief 的
+        # "falsy 安全"对该形状不成立，Task 138→R10-S3-1 同一教训）。
+        out, _ = self._san([{"name": "张三", "id_type_code": []},
+                            {"name": "李四", "id_type_code": {}}])
+        self.assertEqual(out[0]["id_type_code"], "")
+        self.assertEqual(out[1]["id_type_code"], "")
+
+    def test_id_type_code_number_coerced(self):
+        # 数字证件类型码 → 转字符串（"1"=二代身份证），静默转换不 warn。
+        with self.assertNoLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(
+                [{"name": "张三", "id_type_code": 1}], "p.json")
+        self.assertEqual(out[0]["id_type_code"], "1")
+
+    def test_id_no_bool_emptied(self):
+        # bool 永不是合法证件字段（str(True)="True" 无意义）。
+        out, _ = self._san([{"name": "张三", "id_no": True}])
+        self.assertEqual(out[0]["id_no"], "")
+
+    def test_falsy_and_missing_kept_no_warning(self):
+        # 对照：None/0/"" /缺键保持旧行为（_mask_id 与 .get 均安全），不 warn。
+        entries = [{"name": "张三", "id_no": None, "id_type_code": None},
+                   {"name": "李四", "id_no": 0},
+                   {"name": "王五"}]
+        with self.assertNoLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(entries, "p.json")
+        self.assertIsNone(out[0]["id_no"])
+        self.assertIsNone(out[0]["id_type_code"])
+        self.assertEqual(out[1]["id_no"], 0)
+        self.assertNotIn("id_no", out[2])
+        self.assertNotIn("id_type_code", out[2])
+
+    def test_clean_entries_unchanged_no_warning(self):
+        # 对照：干净条目零漂移，不 warn。
+        entries = [{"name": "张三", "id_type_code": "1",
+                    "id_no": "110101199001011234", "mobile": "13800138000"}]
+        with self.assertNoLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(entries, "p.json")
+        self.assertEqual(out, entries)
+
+    def test_gui_crash_sites_safe_after_funnel(self):
+        # 集成：漏斗输出在 gui.py:2013（ID_TYPE_NAMES.get）/:2014/:1572
+        # （_mask_id）的调用形状下不再崩溃。
+        dirty = [{"name": "张三", "id_type_code": ["1"],
+                  "id_no": ["1"] * 10},
+                 {"name": "李四", "id_type_code": 1,
+                  "id_no": 110101199001011234},
+                 {"name": "王五", "id_type_code": [],
+                  "id_no": None}]
+        with self.assertLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(dirty, "p.json")
+        for p in out:
+            label = pax_mod.ID_TYPE_NAMES.get(p.get("id_type_code"), "?")
+            masked = gui._mask_id(p.get("id_no"))
+            self.assertIsInstance(label, str)
+            self.assertIsInstance(masked, str)
+
+    def test_load_passengers_integration(self):
+        # 集成：手改明文 passengers.json → load_passengers → 脏证件字段已归一。
+        path = os.path.join(self.tmp, "p.json")
+        box = {"enc": "none", "data": json.dumps([
+            {"name": "张三", "id_type_code": ["1"],
+             "id_no": 110101199001011234},
+            {"name": "李四", "id_type_code": "1",
+             "id_no": "110101199001011234"},
+        ])}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(box, f)
+        with self.assertLogs("monitor", level="WARNING"):
+            out = pax_mod.load_passengers(path)
+        self.assertEqual(out[0]["id_type_code"], "")
+        self.assertEqual(out[0]["id_no"], "110101199001011234")
+        self.assertEqual(out[1]["id_type_code"], "1")
+        self.assertEqual(out[1]["id_no"], "110101199001011234")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
