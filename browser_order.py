@@ -1779,7 +1779,12 @@ def main():
     args = sys.argv[1:]
     cmd = args[0] if args else "check"
     if cmd == "login":
-        sys.exit(0 if login() else 1)
+        try:
+            ok = login()
+        except KeyboardInterrupt:
+            print("[中断] 用户取消了浏览器登录。")
+            sys.exit(1)
+        sys.exit(0 if ok else 1)
     if cmd == "check":
         ok, who = check_session(headless=True)  # 走 exclusive，不跟别的进程抢 profile
         print(("[有效] %s" % who) if ok else ("[无效] %s" % who))

@@ -14957,6 +14957,69 @@ class TestTask131LauncherPiiB8(TempDirCase):
                           TestTask124PiiConvergeB7._WARN_REPR_ALLOW)
 
 
+class TestTask132BrowserOrderMainKiB8(TempDirCase):
+    """Task 132 (B8-4)：Ctrl+C bundle（P3×1）。
+
+    2.2.4 browser_order.py main() 的 login 分支：直接
+    `python browser_order.py login` CLI 在最长 300s 人工登录等待中按
+    Ctrl+C → KeyboardInterrupt 逃出 login() → traceback + 退出码 130，
+    违背 Task 65c 干净退出码口径。修复：login 分支加
+    except KeyboardInterrupt（打印 [中断] → 退出码 1，与 Task 128 口径一致）。
+    作用域仅直接 CLI 路径；login() 内部本次不碰。
+    """
+
+    def _run_main(self, argv):
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+             contextlib.redirect_stdout(buf):
+            try:
+                browser_order.main()
+            except SystemExit as e:
+                return e.code, buf.getvalue()
+            return "NO_EXIT", buf.getvalue()
+
+    def _no_kb_interrupt(self, fn):
+        # 旧代码下 Ctrl+C 会逃出 main()；直接让它逃出会杀掉整个 runner
+        # （exit=130），故在测试内捕获并转为普通 FAIL（Task 113 同口径）。
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C 抛出了 KeyboardInterrupt（应优雅退出，不抛 traceback）")
+
+    def test_login_ctrl_c_prints_interrupt_and_exits_1(self):
+        # RED on old code: login 的 Ctrl+C 穿透 main()，抛 traceback（exit 130）。
+        with mock.patch.object(browser_order, "login",
+                               side_effect=KeyboardInterrupt):
+            code, out = self._no_kb_interrupt(
+                lambda: self._run_main(["browser_order.py", "login"]))
+        self.assertEqual(code, 1)
+        self.assertIn("[中断]", out)
+
+    def test_login_success_exits_0(self):
+        # 正向对照：正常成功仍退出码 0，无 [中断]（新旧代码都通过）。
+        with mock.patch.object(browser_order, "login", return_value=True):
+            code, out = self._run_main(["browser_order.py", "login"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("[中断]", out)
+
+    def test_login_failure_exits_1(self):
+        # 正向对照：正常失败仍退出码 1，无 [中断]（新旧代码都通过）。
+        with mock.patch.object(browser_order, "login", return_value=False):
+            code, out = self._run_main(["browser_order.py", "login"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("[中断]", out)
+
+    def test_non_login_branch_untouched(self):
+        # 范围对照：KI 守卫仅在 login 分支；check 分支行为不变。
+        with mock.patch.object(browser_order, "check_session",
+                               return_value=(True, "user1")):
+            code, out = self._run_main(["browser_order.py", "check"])
+        self.assertEqual(code, 0)
+        self.assertIn("[有效]", out)
+        self.assertNotIn("[中断]", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
