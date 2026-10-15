@@ -14,25 +14,17 @@ import logging
 import os
 import re
 
+import appcommon
+
 # 日志留存天数：超过该天数的 <prefix>_YYYYMMDD.log 在打开新一天文件时自动清理，
 # 长期运行不再把磁盘写满。只删匹配命名规则且超期的文件，不碰当天文件。
 LOG_RETENTION_DAYS = 30
 
 
-def _beijing_tz():
-    """北京时间时区。
-
-    与 order._beijing_tz() 同语义（ZoneInfo("Asia/Shanghai")，Windows 无 tzdata
-    时退化为固定 +8；北京无夏令时，恒等）。不直接复用 order 的是避免日志
-    基础设施反向依赖业务模块（order 会拉起 requests）；架构 Task 20 会收敛
-    为全仓库统一入口。
-    """
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo("Asia/Shanghai")
-    except Exception:
-        return datetime.timezone(datetime.timedelta(hours=8),
-                                 name="Asia/Shanghai")
+# 口径单源在 appcommon.beijing_tz（Task 20 的收敛目标已落地）。原先复制一份是
+# 为避免日志基础设施反向依赖业务模块 order（order 会拉起 requests）；appcommon
+# 只依赖标准库 + filelock，无此问题。
+_beijing_tz = appcommon.beijing_tz
 
 
 _BEIJING_TZ = _beijing_tz()

@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
-"""
-12306 车票监控与自动购票系统 —— 桌面版（照片风格改造，Tkinter，无第三方依赖）
+"""12306 车票监控与自动购票系统 —— 极简单窗口版（Tkinter，无第三方 UI 依赖）。
 
-界面采用参考照片的 12306 手机风格：蓝色主色、白色卡片、大字标题、每项功能单独一行。
+【legacy / 已停用】2026-10-14 起界面为 Electron 版（ui/ + api.py + electron/），本文件不再是任何入口，
+新功能一律改 ui/app.js。保留原因：tests/test_all.py 有 120+ 处引用（GrabTaskForm/GrabTab/NewTaskDialog/
+PassengerDialog/QueryHistoryDialog 及其 patch 目标），且 TestConfigKeys._PRODUCT_FILES 把它列为产品文件；
+移动或删除会连带推翻该测试基线。仅作功能参照与回归测试对象维护，不再新增界面能力。
 
-两种创建任务方式
-    1. 新建任务（查后选）—— TaskWizard 四步向导：
-       ① 查询页（出发/到达/日期/交换/历史路线 → 查询车票）
-       ② 车次结果页（日期栏/筛选/排序/车次卡片 + 席别点选，数据来自 12306 官方接口）
-       ③ 乘车人选择页（12306 账号乘车人 + 本地加密库，勾选/全选）
-       ④ 确认页（行程卡/开关项/提示条 → 创建任务并启动监控）
-    2. 直接监视（免查询）—— QuickMonitorDialog：
-       直接填写 日期 + 车次 + 席别 + 乘车人 → 一键创建任务并开始监视
+2026-10-13 界面重构（推翻旧玻璃拟态 UI 与「监控/抢票」双窗口架构）：
+    - 单窗口 + 页签：监控任务 / 抢票任务 / 查票 / 乘车人 / 历史 / 设置 + 底部全局日志
+    - 全部原生 ttk 控件：无图片、无动画、无自定义绘制、无主题引擎
+    - launcher.py 只保留抢票业务（Grabber 等），全部界面收敛到本文件
+
+功能（全保留）：
+    监控任务    新建（单表单）/ 编辑（暂停态）/ 启动 / 暂停 / 恢复 / 取消 / 重置 / 删除
+    抢票任务    任务库（新建 / 改名 / 删除）+ 每任务编辑（行程 / 日期 / 车次 / 席别 /
+                首选席别规则 / 乘车人 / 开抢时间 / 提醒 / 预热 / 预设 / 历史记录 / 定位）
+    查票        免登录实时余票查询，可一键用查询条件创建监控任务
+    乘车人      加密库增删改 / 设为默认
+    历史        购票记录（order_history.json）
+    设置        邮件通知（SMTP）/ 登录会话（检查 / 重新登录）/ 引擎与更新
 
 启动
     双击「启动桌面版.bat」，或：python gui.py
@@ -21,7 +28,6 @@
     - 不绕过验证码、不执行支付（订单提交成功后停留在未支付状态）
 """
 
-import calendar
 import datetime
 import json
 import logging
@@ -33,13 +39,13 @@ import sys
 import threading
 import time
 import uuid
+from tkinter import messagebox, simpledialog, ttk
+
+import tkinter as tk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
 
 import appcommon
 import engine as engine_mod
@@ -56,25 +62,21 @@ CONFIG_PATH = os.path.join(HERE, "config.json")
 # 席别勾选列表：唯一定义在 ticket.py（含动卧），此处只引用
 SEAT_CHOICES = list(ticket.SEAT_CHOICES)
 
-BLUE = "#4A90E2"
-BLUE_DARK = "#3D7ED9"
-BLUE_LIGHT = "#E8F1FC"
-ORANGE = "#FA8C16"
-ORANGE_LIGHT = "#FFF4E0"
-BG = "#F5F7FA"
-CARD = "#FFFFFF"
-TEXT = "#1F2129"
-GRAY = "#8A94A6"
-BORDER = "#E5E9F0"
-FONT = "Microsoft YaHei UI"
-
+# 状态色（语义色，无主题引擎；涨红跌绿不涉及，仅成功/警示/失败三档）
 STATUS_COLOR = {
-    "monitoring": "#1a7f37",
+    "monitoring": "#0969da",
     "retrying": "#d97706",
-    "success": "#0969da",
-    "failed": "#cf222e",
-    "paused": "#9a6700",
+    "paused": "#6e7781",
     "cancelled": "#6e7781",
+    "success": "#1a7f37",
+    "failed": "#cf222e",
+}
+
+# 全局日志按事件标签着色（沿用旧 launcher 的事件分级；纯 Text tag，无自定义绘制）
+LOG_COLOR = {
+    "[有票]": "#d97706", "[抢到]": "#0969da", "[错误]": "#cf222e",
+    "[会话]": "#6e7781", "[运行]": "#57606a", "[提醒]": "#9a6700", "[更新]": "#8250df",
+    "[自动]": "#cf222e", "[启动]": "#0961da", "[停止]": "#6e7781", "[提示]": "#8250df",
 }
 
 # ----------------------------- 日志（文件 + 界面队列） -----------------------------
@@ -124,7 +126,7 @@ def load_config():
     UnicodeDecodeError 逃出崩启动，[] 等非 dict 则在下游 .get() 处崩）。"""
     global _CONFIG_CORRUPT_WARNED
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError):
         if not _CONFIG_CORRUPT_WARNED:
@@ -143,6 +145,9 @@ def load_config():
 
 def _lock_timeout_abort():
     """file_lock 锁争用超时的统一出口：记日志、给用户明确提示，再上抛友好异常。
+
+    与 monitor._lock_timeout_abort 同名不同语义（那边是 CLI print，不弹窗），
+    勿合并——RULES.md:47「各写方的防护语义是参数不是噪音」。
 
     调用方多为 Tk 回调：弹窗已告知用户"文件被占用，稍后重试"，Tk 打印
     traceback 但界面存活——不崩；用户稍后重试该操作即可。
@@ -213,7 +218,7 @@ def update_config_locked(mutator):
     try:
         with filelock.file_lock(CONFIG_PATH + ".lock"):
             try:
-                with open(CONFIG_PATH, encoding="utf-8") as f:
+                with open(CONFIG_PATH, encoding="utf-8-sig") as f:
                     config = json.load(f)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 LOG.warning("config.json 已损坏，拒绝覆盖写入：%s", CONFIG_PATH)
@@ -339,29 +344,10 @@ def _resolve_saved_dates(orig_text, non_contig, orig_dates, orig_range, raw_text
     return appcommon.parse_date_range(raw_text)
 
 
-def _display_trains(raw):
-    """展示用车次归一化（Task 89a/b）：与 engine.normalize_trains 同口径
-    （裸字符串如 "G101" 按单个车次处理，绝不逐字符拆；非法形状视为空；
-    条目 strip().upper()），但不记日志——展示/对话框路径高频调用，
-    防刷日志；真正的配置形状警告由引擎侧 Task 68 负责。"""
-    if isinstance(raw, str):
-        raw = [raw]
-    elif not isinstance(raw, (list, tuple)):
-        raw = []
-    return [t.strip().upper() for t in raw
-            if isinstance(t, str) and t.strip()]
-
-
-def _display_seat_types(raw):
-    """展示用席别归一化（Task 103c）：裸字符串（如 "二等座"）按单个席别处理，
-    绝不逐字符拆；非法形状视为空。与 _display_trains 同口径（不记日志——
-    展示/对话框路径高频调用；真正的配置形状警告由引擎侧负责）。注：席别为
-    中文名，不做 strip/upper（与 engine.normalize_seat_types 一致）。"""
-    if isinstance(raw, str):
-        return [raw]
-    if not isinstance(raw, (list, tuple)):
-        return []
-    return [s for s in raw if isinstance(s, str)]
+# 展示归一化单源在 appcommon（原两处内联实现迁走，语义不变）；别名保留，
+# gui 内调用点与测试 pin 不变。
+_display_trains = appcommon.display_trains
+_display_seat_types = appcommon.display_seat_types
 
 
 def _build_edited_task(task, *, from_name, to_name, dates, date_range, trains,
@@ -497,42 +483,6 @@ def start_async_poller(root):
         pass
 
 
-def apply_style(root):
-    style = ttk.Style(root)
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-    try:
-        launcher.install_tick_indicator(style)   # clam 的选中是叉，换成对勾
-    except Exception:
-        LOG.exception("复选框对勾样式安装失败")
-    style.configure(".", font=(FONT, 10))
-    style.configure("TFrame", background=BG)
-    style.configure("TLabel", background=BG)
-    style.configure("White.TFrame", background=CARD)
-    style.configure("White.TLabel", background=CARD)
-    style.configure("Gray.TLabel", background=BG, foreground=GRAY)
-    style.configure("Blue.TFrame", background=BLUE)
-    style.configure("Blue.TLabel", background=BLUE, foreground="white")
-    style.configure("Title.TLabel", background=BLUE, foreground="white",
-                    font=(FONT, 13, "bold"))
-    style.configure("Sub.TLabel", background=BLUE, foreground="#DCEAFB", font=(FONT, 9))
-    style.configure("Treeview", font=(FONT, 10), rowheight=26, background=CARD,
-                    fieldbackground=CARD)
-    style.configure("Treeview.Heading", font=(FONT, 10, "bold"))
-    style.configure("Blue.TButton", background=BLUE, foreground="white",
-                    font=(FONT, 11, "bold"), padding=(16, 8), borderwidth=0)
-    style.map("Blue.TButton",
-              background=[("active", BLUE_DARK), ("disabled", "#A9C6EA")])
-    style.configure("Light.TButton", background=CARD, foreground=BLUE,
-                    font=(FONT, 10), padding=(10, 5), borderwidth=0)
-    style.map("Light.TButton", background=[("active", BLUE_LIGHT)])
-    style.configure("White.TButton", background=CARD, foreground=TEXT,
-                    font=(FONT, 10), padding=(10, 5))
-    style.map("White.TButton", background=[("active", "#F0F2F5")])
-
-
 def station_key(name):
     common = ("北京", "上海", "广州", "深圳", "杭州", "南京", "武汉",
               "成都", "重庆", "西安", "郑州", "长沙")
@@ -542,14 +492,46 @@ def station_key(name):
     return (1, 0, name)
 
 
-# ----------------------------- 车站选择 -----------------------------
+# ----------------------------- 车站输入与选择 -----------------------------
 
-class StationPicker(tk.Toplevel):
-    def __init__(self, master, on_pick):
+class StationEntry(ttk.Frame):
+    """车站输入框：一个普通 Entry + 「选」按钮（弹出车站搜索框）。
+
+    保留旧 StationsEntry 的 get()/set()/history 接口（抢票表单历史预热用）。"""
+
+    def __init__(self, master, width=14, history=None, **kw):
+        super().__init__(master, **kw)
+        self.var = tk.StringVar()
+        self.entry = ttk.Entry(self, textvariable=self.var, width=width)
+        self.entry.pack(side="left")
+        ttk.Button(self, text="选", width=3, command=self.pick).pack(
+            side="left", padx=(2, 0))
+        self.history = [h for h in (history or []) if h]
+
+    def get(self):
+        return self.var.get().strip()
+
+    def set(self, value):
+        self.var.set(value or "")
+
+    def set_history(self, items):
+        self.history = [h for h in (items or []) if h]
+
+    def pick(self):
+        def on_pick(name):
+            self.set(name)
+        StationPickerDialog(self, on_pick, history=self.history)
+
+
+class StationPickerDialog(tk.Toplevel):
+    """车站搜索：输入站名/拼音简拼/全拼/电报码，双击选择。"""
+
+    def __init__(self, master, on_pick, history=None):
         super().__init__(master)
-        self.title("选择车站")
-        self.geometry("360x480")
         self.on_pick = on_pick
+        self.title("选择车站")
+        self.geometry("360x460")
+        self.transient(master.winfo_toplevel())
         try:
             self.name2code, self.code2name = ticket.load_station_map()
         except Exception as e:
@@ -557,7 +539,9 @@ class StationPicker(tk.Toplevel):
             self.destroy()
             return
         self.all_names = sorted(self.name2code.keys(), key=station_key)
-        ttk.Label(self, text="输入站名关键字（如：北京 / 虹桥 / 广州南）：").pack(
+        self.history = [h for h in (history or []) if h]
+
+        ttk.Label(self, text="输入站名 / 拼音简拼 / 全拼 / 电报码：").pack(
             anchor="w", padx=10, pady=(10, 2))
         self.entry = ttk.Entry(self)
         self.entry.pack(fill="x", padx=10)
@@ -565,21 +549,33 @@ class StationPicker(tk.Toplevel):
         ttk.Label(self, text="匹配结果（双击选择）：").pack(anchor="w", padx=10, pady=(8, 2))
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        self.listbox = tk.Listbox(frame, font=(FONT, 11))
+        self.listbox = tk.Listbox(frame)
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=sb.set)
         self.listbox.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.listbox.bind("<Double-Button-1>", self.choose)
+        self.listbox.bind("<Return>", self.choose)
         ttk.Button(self, text="选定", command=self.choose).pack(pady=(0, 10))
         self.on_type()
         self.entry.focus_set()
+        self.grab_set()
 
     def on_type(self, _evt=None):
         kw = self.entry.get().strip()
-        cands = [n for n in self.all_names if kw in n][:100]
         self.listbox.delete(0, "end")
-        for n in cands:
+        if not kw:
+            for n in self.history[:8]:
+                self.listbox.insert("end", n)
+            return
+        try:
+            items = launcher.search_stations(kw, limit=100)
+        except Exception:
+            items = []
+        names = [it["name"] for it in items if isinstance(it, dict)]
+        if not names:
+            names = [n for n in self.all_names if kw in n][:100]
+        for n in names:
             self.listbox.insert("end", n)
 
     def choose(self, _evt=None):
@@ -589,1984 +585,7 @@ class StationPicker(tk.Toplevel):
             self.destroy()
 
 
-class StationField(tk.Frame):
-    """一行：标签 + 车站名输入框 + [选择] 按钮。"""
-
-    def __init__(self, master, label, big=False):
-        super().__init__(master, bg=CARD)
-        tk.Label(self, text=label, bg=CARD, fg=GRAY, font=(FONT, 10),
-                 width=6, anchor="w").pack(side="left")
-        self.entry = tk.Entry(self, width=12, font=(FONT, 16 if big else 11, "bold"
-                                                    if big else "normal"),
-                              fg=TEXT, relief="flat", bg=CARD,
-                              highlightthickness=1,
-                              highlightbackground=BORDER,
-                              highlightcolor=BLUE, justify="center")
-        self.entry.pack(side="left", padx=(0, 4), ipady=4)
-        tk.Button(self, text="选择", command=self.pick, font=(FONT, 9),
-                  bg=BLUE, fg="white", activebackground=BLUE_DARK,
-                  activeforeground="white", relief="flat", padx=10,
-                  cursor="hand2").pack(side="left")
-
-    def pick(self):
-        def on_pick(name):
-            self.entry.delete(0, "end")
-            self.entry.insert(0, name)
-        StationPicker(self, on_pick)
-
-    def get(self):
-        return self.entry.get().strip()
-
-
-# ----------------------------- 日历表格式日期选择器 -----------------------------
-
-class CalendarPicker(tk.Toplevel):
-    """点击日期输入框弹出日历表，点选日期即回填。
-    support_range=True 时支持两次点选（起点~终点）组成日期范围，如 2026-10-07~2026-10-09。"""
-
-    WEEK_HEAD = ("一", "二", "三", "四", "五", "六", "日")
-
-    def __init__(self, master, support_range=False, on_pick=None, max_span_days=None):
-        super().__init__(master)
-        self.title("选择日期")
-        self.resizable(False, False)
-        self.configure(bg=CARD)
-        self.support_range = support_range
-        self.on_pick = on_pick
-        self.max_span_days = max_span_days  # 区间起点~终点最多相差多少天（None=不限制）
-        self.start = None
-        self.end = None
-        today = datetime.date.today()
-        self.year, self.month = today.year, today.month
-
-        head = tk.Frame(self, bg=CARD)
-        head.pack(fill="x", padx=8, pady=8)
-        tk.Button(head, text="‹", command=self._shift(-1), bg=CARD, fg=BLUE,
-                  font=(FONT, 12, "bold"), relief="flat", cursor="hand2",
-                  width=2).pack(side="left")
-        self.title_lbl = tk.Label(head, text="", bg=CARD, fg=TEXT,
-                                  font=(FONT, 12, "bold"))
-        self.title_lbl.pack(side="left", expand=True)
-        tk.Button(head, text="›", command=self._shift(1), bg=CARD, fg=BLUE,
-                  font=(FONT, 12, "bold"), relief="flat", cursor="hand2",
-                  width=2).pack(side="left")
-        tk.Button(head, text="今天", command=self._goto_today, bg=BLUE_LIGHT, fg=BLUE,
-                  relief="flat", font=(FONT, 9), cursor="hand2").pack(side="left", padx=(8, 0))
-
-        self.grid = tk.Frame(self, bg=CARD)
-        self.grid.pack(padx=8)
-        for i, w in enumerate(self.WEEK_HEAD):
-            tk.Label(self.grid, text=w, bg=CARD, fg=GRAY, font=(FONT, 9),
-                     width=3).grid(row=0, column=i, padx=1, pady=2)
-        self.day_btns = {}
-        self.status = tk.Label(self, text="", bg=CARD, fg=BLUE, font=(FONT, 9))
-        self.status.pack(pady=(2, 4))
-
-        btns = tk.Frame(self, bg=CARD)
-        btns.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="确定", style="Blue.TButton",
-                   command=self._confirm).pack(side="right", padx=4)
-        ttk.Button(btns, text="取消", style="White.TButton",
-                   command=self.destroy).pack(side="right")
-
-        self._render()
-
-    def _shift(self, delta):
-        def go():
-            m = self.month + delta
-            y = self.year
-            if m < 1:
-                y, m = y - 1, 12
-            if m > 12:
-                y, m = y + 1, 1
-            self.year, self.month = y, m
-            self._render()
-        return go
-
-    def _goto_today(self):
-        t = datetime.date.today()
-        self.year, self.month = t.year, t.month
-        self._render()
-
-    def _render(self):
-        self.title_lbl.config(text="%d 年 %d 月" % (self.year, self.month))
-        for b in self.day_btns.values():
-            b.destroy()
-        self.day_btns = {}
-        today = datetime.date.today()
-        first_weekday = datetime.date(self.year, self.month, 1).weekday()  # 0=周一
-        days_in_month = calendar.monthrange(self.year, self.month)[1]
-        row, col = 1, first_weekday
-        for day in range(1, days_in_month + 1):
-            d = datetime.date(self.year, self.month, day)
-            btn = tk.Button(self.grid, text=str(day), width=3, relief="flat",
-                            font=(FONT, 9), cursor="hand2",
-                            command=lambda dd=d: self._pick(dd))
-            btn.grid(row=row, column=col, padx=1, pady=1)
-            self.day_btns[day] = btn
-            col += 1
-            if col > 6:
-                col = 0
-                row += 1
-        self._paint_selection()
-        self._update_status()
-
-    def _pick(self, d):
-        if self.support_range:
-            if self.start is None or (self.start and self.end):
-                self.start, self.end = d, None
-            elif d < self.start:
-                self.start, self.end = d, None
-            elif self.max_span_days and (d - self.start).days > self.max_span_days:
-                # 超出允许跨度：以新点击日期为起点重新选择
-                self.start, self.end = d, None
-                self._paint_selection()
-                self.status.config(text="跨越不能超过 %d 天，已重新以 %s 为起点"
-                                   % (self.max_span_days, d.isoformat()))
-                return
-            else:
-                self.end = d
-        else:
-            self.start, self.end = d, None
-        self._paint_selection()
-        self._update_status()
-
-    def _paint_selection(self):
-        today = datetime.date.today()
-        for day, btn in self.day_btns.items():
-            d = datetime.date(self.year, self.month, day)
-            if self.end and self.start and self.start <= d <= self.end:
-                btn.config(bg=BLUE, fg="white")
-            elif d == self.start:
-                btn.config(bg=BLUE, fg="white")
-            elif d == today:
-                btn.config(bg=BLUE_LIGHT, fg=BLUE)
-            else:
-                btn.config(bg=CARD, fg=(GRAY if d.weekday() >= 5 else TEXT))
-
-    def _update_status(self):
-        if self.start is None:
-            self.status.config(text="请点击选择日期%s" % (
-                "（再点一次结束日期组成范围）" if self.support_range else ""))
-        elif self.end:
-            self.status.config(text="已选：%s ~ %s" % (
-                self.start.isoformat(), self.end.isoformat()))
-        else:
-            self.status.config(text="已选：%s%s" % (
-                self.start.isoformat(),
-                "（可再点结束日期）" if self.support_range else ""))
-
-    def _confirm(self):
-        if self.start is None:
-            messagebox.showwarning("提示", "请先选择日期", parent=self)
-            return
-        value = self.start.isoformat()
-        if self.end:
-            value = "%s~%s" % (self.start.isoformat(), self.end.isoformat())
-        if self.on_pick:
-            self.on_pick(value)
-        self.destroy()
-
-
-def attach_calendar(entry, support_range=False, parent=None, max_span_days=None):
-    """点击日期输入框弹出日历表选择日期（范围支持时两次点选=起点~终点）。"""
-    entry.config(cursor="hand2")
-
-    def open_calendar(_evt=None):
-        CalendarPicker(parent or entry.winfo_toplevel(), support_range=support_range,
-                       max_span_days=max_span_days,
-                       on_pick=lambda v: entry.delete(0, "end") or entry.insert(0, v))
-
-    entry.bind("<Button-1>", open_calendar)
-
-
-# ----------------------------- 可滚动区域 -----------------------------
-
-class ScrollFrame(ttk.Frame):
-    def __init__(self, master, height=None):
-        super().__init__(master)
-        self.canvas = tk.Canvas(self, bg=CARD, highlightthickness=0, height=height)
-        vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vsb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        self.inner = ttk.Frame(self.canvas, style="White.TFrame")
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>",
-                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfigure(self._win, width=e.width))
-        # 滚轮绑到所属 Toplevel（add 叠加，不占全局 bind_all 槽位），由指针位置
-        # 决定滚哪个滚动区：多窗口/多滚动区并存时互不抢占、也不会把别的窗口滚跑
-        self.winfo_toplevel().bind("<MouseWheel>", self._wheel, add="+")
-
-    def _wheel(self, e):
-        try:
-            w = self.winfo_containing(e.x_root, e.y_root)
-            while w is not None and w is not self.canvas:
-                w = w.master
-            if w is None:
-                return  # 指针不在本滚动区上：不接管，别的滚动区/控件自己处理
-            if self.canvas.winfo_exists():
-                self.canvas.yview_scroll(int(-e.delta / 120), "units")
-        except tk.TclError:
-            pass  # 窗口/控件销毁竞态
-        except Exception:
-            return
-
-    def clear(self):
-        for w in self.inner.winfo_children():
-            w.destroy()
-        self.refresh_region()
-
-    def refresh_region(self):
-        """强制刷新滚动区域：清空/重渲染后调用，防止内容更新后 scrollregion
-        未同步导致下方卡片被裁切看不到。"""
-        self.canvas.configure(scrollregion=(0, 0, 0, 0))
-        self.inner.update_idletasks()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-
-# ----------------------------- 新建任务向导（四步） -----------------------------
-
-class TaskWizard(tk.Toplevel):
-    def __init__(self, app, on_created=None):
-        super().__init__(app.root)
-        self.app = app
-        self.on_created = on_created
-        self.title("新建监控任务")
-        self.geometry("520x780")
-        self.minsize(480, 700)
-        self.configure(bg=CARD)
-        try:
-            self.name2code, self.code2name = ticket.load_station_map()
-        except Exception as e:
-            messagebox.showerror("错误", "车站代码表加载失败：%s" % e, parent=self)
-            self.destroy()
-            return
-
-        self.sel = {}            # (train_code, seat) -> {"info": ..., "count": n}
-        self.seat_buttons = {}
-        self.seat_counts = {}   # (date, train_code, seat) -> 该日该席别余票数
-        self.query_date = ""
-        self.monitor_dates = []  # 要监控的全部日期（单日或区间展开）
-        self.dates_rows = {}     # 日期 -> 解析后的车次列表
-        self.active_date = None  # 第二步当前查看的日期
-        self.passengers = []     # [{"name","type","id_masked","source","is_default"}]
-        self.pass_vars = {}
-        self.sel_passengers = set()
-        self._pass_loaded = False
-        self.step_no = 0
-        self.auto_var = tk.BooleanVar(value=True)
-        self.stop_var = tk.BooleanVar(value=True)
-        self.notify_var = tk.BooleanVar(value=True)
-        self.prio_var = tk.IntVar(value=5)
-        self.purpose_var = tk.StringVar(value="ADULT")
-
-        # 顶部蓝色导航条
-        header = tk.Frame(self, bg=BLUE)
-        header.pack(fill="x")
-        tk.Label(header, text="新建监控任务", bg=BLUE, fg="white",
-                 font=(FONT, 14, "bold"), pady=10).pack(side="left", padx=16)
-        self.step_label = tk.Label(header, text="1/4 查询车票", bg=BLUE, fg="#DCEAFB",
-                                   font=(FONT, 10))
-        self.step_label.pack(side="right", padx=16)
-
-        # 内容区
-        self.body = tk.Frame(self, bg=CARD)
-        self.body.pack(fill="both", expand=True)
-        self.frames = []
-        self.frames.append(self._build_step1())
-        self.frames.append(self._build_step2())
-        self.frames.append(self._build_step3())
-        self.frames.append(self._build_step4())
-
-        # 底部操作条
-        self.footer = tk.Frame(self, bg=BG)
-        self.footer.pack(fill="x", side="bottom")
-        self.prev_btn = ttk.Button(self.footer, text="← 上一步", style="White.TButton",
-                                   command=self.prev_step)
-        self.prev_btn.pack(side="left", padx=12, pady=8)
-        self.next_btn = None  # 每步各自的下一步按钮
-
-        self.show_step(0)
-
-    # ---------------- 通用 ----------------
-
-    def show_step(self, n):
-        for f in self.frames:
-            f.pack_forget()
-        self.frames[n].pack(fill="both", expand=True)
-        self.step_no = n
-        self.step_label.config(text="{0}/4 {1}".format(
-            n + 1, ["查询车票", "选择车次", "选择乘车人", "确认创建"][n]))
-        self.prev_btn.config(state=("normal" if n > 0 else "disabled"))
-        if n == 2 and not self._pass_loaded:
-            self._load_passengers()
-        if n == 3:
-            self._refresh_confirm()
-
-    def prev_step(self):
-        if self.step_no > 0:
-            self.show_step(self.step_no - 1)
-
-    def quick_date(self, offset):
-        d = datetime.date.today() + datetime.timedelta(days=offset)
-        self.date_var.set(d.isoformat())
-
-    # ---------------- 第一步：查询页 ----------------
-
-    def _build_step1(self):
-        f = tk.Frame(self.body, bg=CARD)
-        tk.Label(f, text="查询车票", bg=CARD, fg=TEXT,
-                 font=(FONT, 18, "bold")).pack(pady=(20, 4))
-        tk.Label(f, text="先查询车次，再选择要监视的车次和席别",
-                 bg=CARD, fg=GRAY, font=(FONT, 10)).pack(pady=(0, 16))
-
-        row = tk.Frame(f, bg=CARD)
-        row.pack(fill="x", padx=28)
-        tk.Label(row, text="出发站", bg=CARD, fg=GRAY, font=(FONT, 10),
-                 width=6, anchor="w").pack(side="left")
-        self.from_field = launcher.StationEntry(row, width=14)
-        self.from_field.pack(side="left", padx=(4, 6))
-        tk.Button(row, text="⇄", command=self.swap_stations, bg=BLUE, fg="white",
-                  activebackground=BLUE_DARK, activeforeground="white",
-                  font=(FONT, 12, "bold"), relief="flat", width=3,
-                  cursor="hand2").pack(side="left", padx=10, ipady=6)
-        tk.Label(row, text="到达站", bg=CARD, fg=GRAY, font=(FONT, 10),
-                 width=6, anchor="w").pack(side="left")
-        self.to_field = launcher.StationEntry(row, width=14)
-        self.to_field.pack(side="left")
-
-        date_row = tk.Frame(f, bg=CARD)
-        date_row.pack(fill="x", padx=28, pady=(18, 6))
-        tk.Label(date_row, text="乘车日期", bg=CARD, fg=GRAY,
-                 font=(FONT, 10)).pack(side="left")
-        tk.Label(date_row, text="从", bg=CARD, fg=GRAY,
-                 font=(FONT, 10)).pack(side="left", padx=(4, 2))
-        self.date_var = tk.StringVar()
-        self.date_entry = tk.Entry(date_row, textvariable=self.date_var, width=11,
-                                   justify="center", font=(FONT, 12, "bold"),
-                                   relief="flat", highlightthickness=1,
-                                   highlightbackground=BORDER, highlightcolor=BLUE)
-        self.date_entry.pack(side="left", ipady=3)
-        attach_calendar(self.date_entry)
-        tk.Label(date_row, text="到", bg=CARD, fg=GRAY,
-                 font=(FONT, 10)).pack(side="left", padx=6)
-        self.date_end_var = tk.StringVar()
-        self.date_end_entry = tk.Entry(date_row, textvariable=self.date_end_var, width=11,
-                                       justify="center", font=(FONT, 12),
-                                       relief="flat", highlightthickness=1,
-                                       highlightbackground=BORDER, highlightcolor=BLUE)
-        self.date_end_entry.pack(side="left", ipady=3)
-        attach_calendar(self.date_end_entry)
-        quick_row = tk.Frame(f, bg=CARD)
-        quick_row.pack(fill="x", padx=28, pady=(0, 2))
-        for text, off in (("今天", 0), ("明天", 1), ("后天", 2)):
-            tk.Button(quick_row, text=text, command=lambda o=off: self.quick_date(o),
-                      bg=BLUE_LIGHT, fg=BLUE, activebackground="#D6E8FA",
-                      relief="flat", font=(FONT, 9), padx=8,
-                      cursor="hand2").pack(side="left", padx=2)
-        tk.Label(f, text="「从」必填；「到」留空 = 只监视那一天，填了 = 监视从到连续区间（最多相差 5 天）",
-                 bg=CARD, fg=GRAY, font=(FONT, 9)).pack(anchor="w", padx=28)
-
-        opt_row = tk.Frame(f, bg=CARD)
-        opt_row.pack(fill="x", padx=28, pady=(4, 2))
-        tk.Checkbutton(opt_row, text="余票命中后自动下单（不支付）", variable=self.auto_var,
-                       bg=CARD, activebackground=CARD, fg=TEXT,
-                       font=(FONT, 10)).pack(side="left")
-
-        type_row = tk.Frame(f, bg=CARD)
-        type_row.pack(fill="x", padx=28, pady=4)
-        tk.Label(type_row, text="票种：", bg=CARD, fg=GRAY, font=(FONT, 10)).pack(side="left")
-        tk.Radiobutton(type_row, text="成人票", value="ADULT", variable=self.purpose_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10),
-                       cursor="hand2").pack(side="left", padx=(0, 10))
-        tk.Radiobutton(type_row, text="学生票", value="0X00", variable=self.purpose_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10),
-                       cursor="hand2").pack(side="left")
-
-        tk.Button(f, text="查 询 车 票", command=self.do_query, bg=BLUE, fg="white",
-                  activebackground=BLUE_DARK, activeforeground="white",
-                  font=(FONT, 14, "bold"), relief="flat", pady=12,
-                  cursor="hand2").pack(fill="x", padx=28, pady=(14, 4))
-        self.query_hint = tk.Label(f, text="", bg=CARD, fg=GRAY, font=(FONT, 9))
-        self.query_hint.pack()
-
-        # 历史路线
-        tk.Label(f, text="最近用过的路线：", bg=CARD, fg=GRAY,
-                 font=(FONT, 9)).pack(anchor="w", padx=28, pady=(18, 4))
-        self.hist_frame = tk.Frame(f, bg=CARD)
-        self.hist_frame.pack(fill="x", padx=28)
-        self._render_history()
-        return f
-
-    def _render_history(self):
-        for w in self.hist_frame.winfo_children():
-            w.destroy()
-        pairs, seen = [], set()
-        try:
-            for t in (load_config().get("tasks") or []):
-                key = (t.get("from"), t.get("to"))
-                if key[0] and key[1] and key not in seen:
-                    seen.add(key)
-                    pairs.append(key)
-        except Exception:
-            pass
-        if not pairs:
-            tk.Label(self.hist_frame, text="（暂无）", bg=CARD, fg=GRAY).pack(anchor="w")
-            return
-        for fr, to in pairs[-6:]:
-            tk.Button(self.hist_frame, text="{0} ⇄ {1}".format(fr, to),
-                      command=lambda a=fr, b=to: self.fill_stations(a, b),
-                      bg=CARD, fg=BLUE, activebackground=BLUE_LIGHT,
-                      activeforeground=BLUE, relief="flat", font=(FONT, 9),
-                      highlightthickness=1, highlightbackground=BORDER,
-                      padx=10, pady=4, cursor="hand2").pack(side="left", padx=3, pady=2)
-
-    def fill_stations(self, fr, to):
-        self.from_field.set(fr)
-        self.to_field.set(to)
-
-    def swap_stations(self):
-        a = self.from_field.get()
-        b = self.to_field.get()
-        self.from_field.set(b)
-        self.to_field.set(a)
-
-    def do_query(self):
-        from_name, to_name = self.from_field.get(), self.to_field.get()
-        if from_name not in self.name2code or to_name not in self.name2code:
-            messagebox.showwarning("提示", "请先通过「选择」确定有效的出发站/到达站", parent=self)
-            return
-        if from_name == to_name:
-            messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
-            return
-        # 解析乘车日期：只填「从」= 单日；「到」也填 = 连续区间（appcommon 单点口径）
-        try:
-            dates, _date_range = appcommon.parse_date_range(
-                self.date_var.get().strip(), self.date_end_var.get().strip())
-        except ValueError as e:
-            messagebox.showwarning("提示", str(e), parent=self)
-            return
-        self.monitor_dates = list(dates)   # appcommon 返回的已是 ISO 字符串
-        self.query_date = self.monitor_dates[0]
-        self.query_hint.config(text="正在查询 %d 天车次  %s → %s ..."
-                               % (len(self.monitor_dates), from_name, to_name))
-
-        # Tk 变量只能在主线程读：先取值再进子线程（worker 里调 get() 会跨线程访问 Tcl）
-        purpose = self.purpose_var.get()
-
-        def do_query():
-            out = {}
-            for d in self.monitor_dates:
-                rows = ticket.query_tickets(self.name2code[from_name],
-                                            self.name2code[to_name], d, purpose)
-                out[d] = rows
-            return self.code2name, out, from_name, to_name
-
-        def on_done(res, err):
-            self.query_hint.config(text="")
-            if err:
-                self.query_hint.config(text="查询失败：%s" % err, fg="#cf222e")
-                return
-            code2name, dates_rows, from_name, to_name = res
-            self.from_name, self.to_name = from_name, to_name
-            self.dates_rows = {d: [ticket.parse_row(r, code2name) for r in rows]
-                               for d, rows in dates_rows.items()}
-            self.sel = {}
-            self.seat_buttons = {}
-            self.seat_counts = {}
-            self.active_date = self.monitor_dates[0] if self.monitor_dates else None
-            self.render_date_tabs()
-            self.render_cards()
-            self.show_step(1)
-
-        run_async(self, do_query, on_done)
-
-    # ---------------- 第二步：车次结果页 ----------------
-
-    def _build_step2(self):
-        f = tk.Frame(self.body, bg=CARD)
-        tk.Label(f, text="选择车次与席别", bg=CARD, fg=TEXT,
-                 font=(FONT, 15, "bold")).pack(pady=(12, 2))
-        tk.Label(f, text="点上方日期切换查看该日车次；点击席别加入监视（无票的席别也可先选上，等放票）",
-                 bg=CARD, fg=GRAY, font=(FONT, 9)).pack()
-        self.date_tab_bar = tk.Frame(f, bg=CARD)
-        self.date_tab_bar.pack(fill="x", padx=14, pady=(6, 0))
-        bar2 = tk.Frame(f, bg=CARD)
-        bar2.pack(fill="x", padx=14, pady=6)
-        self.filter_gt = tk.BooleanVar(value=False)
-        self.filter_kt = tk.BooleanVar(value=False)
-        self.filter_ticket = tk.BooleanVar(value=False)
-        tk.Checkbutton(bar2, text="只看高铁/动车", variable=self.filter_gt,
-                       bg=CARD, activebackground=CARD, font=(FONT, 9),
-                       command=self.render_cards).pack(side="left")
-        tk.Checkbutton(bar2, text="只看普速", variable=self.filter_kt,
-                       bg=CARD, activebackground=CARD, font=(FONT, 9),
-                       command=self.render_cards).pack(side="left", padx=6)
-        tk.Checkbutton(bar2, text="只看有票", variable=self.filter_ticket,
-                       bg=CARD, activebackground=CARD, font=(FONT, 9),
-                       command=self.render_cards).pack(side="left", padx=6)
-        self.sort_mode = tk.StringVar(value="time")
-        self.sort_dur_btn = tk.Button(bar2, text="历时最短", command=lambda: self.set_sort("dur"),
-                                      bg=CARD, fg=GRAY, activebackground=BLUE_LIGHT,
-                                      relief="flat", font=(FONT, 9), cursor="hand2")
-        self.sort_dur_btn.pack(side="right", padx=4)
-        self.sort_time_btn = tk.Button(bar2, text="发时最早", command=lambda: self.set_sort("time"),
-                                       bg=CARD, fg=BLUE, activebackground=BLUE_LIGHT,
-                                       relief="flat", font=(FONT, 9), cursor="hand2")
-        self.sort_time_btn.pack(side="right")
-        self._paint_sort()
-
-        self.cards_area = ScrollFrame(f, height=330)
-        self.cards_area.pack(fill="both", expand=True, padx=14)
-
-        bottom = tk.Frame(f, bg=CARD)
-        bottom.pack(fill="x", padx=14, pady=6)
-        self.sel_label = tk.Label(bottom, text="已选 0 个席别", bg=CARD, fg=GRAY,
-                                  font=(FONT, 10))
-        self.sel_label.pack(side="left")
-        self.next_btn2 = tk.Button(bottom, text="下一步：选择乘车人 →", bg=BLUE,
-                                   fg="white", activebackground=BLUE_DARK,
-                                   activeforeground="white", relief="flat",
-                                   font=(FONT, 11, "bold"), pady=8, padx=18,
-                                   state="disabled", cursor="hand2",
-                                   command=lambda: self.show_step(2))
-        self.next_btn2.pack(side="right")
-        return f
-
-    def set_sort(self, mode):
-        self.sort_mode.set(mode)
-        self._paint_sort()
-        self.render_cards()
-
-    def _paint_sort(self):
-        for btn, m in ((self.sort_time_btn, "time"), (self.sort_dur_btn, "dur")):
-            active = (self.sort_mode.get() == m)
-            btn.config(fg=(BLUE if active else GRAY),
-                       font=(FONT, 9, "bold" if active else "normal"))
-
-    def _duration_min(self, dur):
-        try:
-            hh, mm = ((dur or "00:00").split(":"))[:2]
-            return int(hh) * 60 + int(mm)
-        except Exception:
-            return 10 ** 9
-
-    def _filtered_rows(self, rows):
-        if self.filter_gt.get():
-            rows = [r for r in rows if r["train_code"][:1] in ("G", "D", "C")]
-        if self.filter_kt.get():
-            rows = [r for r in rows if r["train_code"][:1] not in ("G", "D", "C")]
-        if self.filter_ticket.get():
-            rows = [r for r in rows if r["available_seats"]]
-        if self.sort_mode.get() == "dur":
-            rows = sorted(rows, key=lambda r: self._duration_min(r["duration"]))
-        else:
-            rows = sorted(rows, key=lambda r: r["start_time"] or "99:99")
-        return rows
-
-    @staticmethod
-    def _date_title(d):
-        """日期分组标题：2026-10-06 星期二"""
-        wd = "一二三四五六日"[datetime.date.fromisoformat(d).weekday()]
-        return "%s 星期%s" % (d, wd)
-
-    def render_date_tabs(self):
-        """顶部日期按钮行：点哪个日期，下面显示哪个日期的车次。"""
-        for w in self.date_tab_bar.winfo_children():
-            w.destroy()
-        for d in self.monitor_dates:
-            wd = "一二三四五六日"[datetime.date.fromisoformat(d).weekday()]
-            active = (d == self.active_date)
-            tk.Button(self.date_tab_bar, text="%s\n周%s" % (d[5:], wd),
-                      command=lambda dd=d: self.select_date(dd),
-                      bg=(BLUE if active else CARD),
-                      fg=("white" if active else TEXT),
-                      activebackground=BLUE_LIGHT, activeforeground=BLUE,
-                      relief="flat", font=(FONT, 9, "bold" if active else "normal"),
-                      padx=10, pady=3, cursor="hand2").pack(side="left", padx=2, pady=2)
-
-    def select_date(self, d):
-        if d == self.active_date:
-            return
-        self.active_date = d
-        self.render_date_tabs()
-        self.render_cards()
-
-    def render_cards(self):
-        self.cards_area.clear()
-        # 清空后的旧按钮引用会指向已销毁控件（切换日期时调用 config 会抛错），必须重建
-        self.seat_buttons = {}
-        self.seat_counts = {}
-        rows = self._filtered_rows(
-            self.dates_rows.get(self.active_date) or [])
-        if self.active_date:
-            tk.Label(self.cards_area.inner, text="{0} · {1} 个车次".format(
-                self._date_title(self.active_date), len(rows)),
-                bg=CARD, fg=GRAY, font=(FONT, 9)).pack(anchor="w")
-        if not rows:
-            tk.Label(self.cards_area.inner, text="没有符合条件的车次",
-                     bg=CARD, fg=GRAY, font=(FONT, 12)).pack(pady=40)
-        for info in rows:
-            self._build_card(self.active_date, info)
-        LOG.info("[向导] 第2步 渲染日期 %s：%d 个车次", self.active_date, len(rows))
-        self.cards_area.refresh_region()
-        self._update_sel_label()
-
-    def _build_card(self, d, info):
-        code = info["train_code"]
-        card = tk.Frame(self.cards_area.inner, bg=CARD, highlightthickness=1,
-                        highlightbackground=BORDER)
-        card.pack(fill="x", pady=4)
-        # 顶部：时间 车次 时间 历时
-        top = tk.Frame(card, bg=CARD)
-        top.pack(fill="x", padx=10, pady=(8, 2))
-        tk.Label(top, text=info["start_time"] or "--:--", bg=CARD, fg=TEXT,
-                 font=(FONT, 15, "bold")).pack(side="left")
-        kind = "高铁/动车" if code[:1] in ("G", "D", "C") else "普速"
-        mid_txt = "{0}  {1}".format(code, kind)
-        tk.Label(top, text="—— " + mid_txt + " ——", bg=CARD, fg=GRAY,
-                 font=(FONT, 9)).pack(side="left", padx=8)
-        tk.Label(top, text=info["arrive_time"] or "--:--", bg=CARD, fg=TEXT,
-                 font=(FONT, 15, "bold")).pack(side="left")
-        tk.Label(top, text="历时 {0}".format(info["duration"] or "-"), bg=CARD,
-                 fg=GRAY, font=(FONT, 9)).pack(side="right")
-        # 站点行
-        tk.Label(card, text="{0} → {1}".format(info["from_name"], info["to_name"]),
-                 bg=CARD, fg=GRAY, font=(FONT, 9)).pack(anchor="w", padx=10)
-        # 席别按钮（有票=蓝色可点，无票=灰色仍可点选加入监视）
-        seat_row = tk.Frame(card, bg=CARD)
-        seat_row.pack(fill="x", padx=10, pady=(4, 8))
-        for idx, seat in enumerate(SEAT_CHOICES):
-            count = info["available_seats"].get(seat, "")
-            btn = tk.Button(seat_row, text="{0}\n{1}".format(seat, count or "无"),
-                            command=lambda c=code, s=seat, i=info, dd=d: self.toggle_seat(dd, c, s, i),
-                            font=(FONT, 8), relief="flat", bd=0, width=9,
-                            pady=4, cursor="hand2")
-            btn.grid(row=idx // 6, column=idx % 6)
-            self.seat_buttons[(d, code, seat)] = btn
-            self.seat_counts[(d, code, seat)] = count
-            self._paint_seat(d, code, seat, count)
-
-    def _paint_seat(self, d, code, seat, count=None):
-        # 每个日期的席别按钮独立高亮（不同日期可勾选不同席别）
-        btn = self.seat_buttons.get((d, code, seat))
-        if btn is None or not btn.winfo_exists():
-            return
-        if count is None:
-            count = self.seat_counts.get((d, code, seat), "")
-        if (d, code, seat) in self.sel:
-            btn.config(bg=BLUE, fg="white", activebackground=BLUE_DARK,
-                       activeforeground="white")
-        elif count:
-            btn.config(bg=BLUE_LIGHT, fg=BLUE, activebackground="#D6E8FA",
-                       activeforeground=BLUE)
-        else:
-            btn.config(bg=CARD, fg="#C0C7D1", activebackground="#F0F2F5",
-                       activeforeground=GRAY)
-
-    def toggle_seat(self, d, code, seat, info):
-        key = (d, code, seat)
-        if key in self.sel:
-            del self.sel[key]
-        else:
-            avail = (info or {}).get("available_seats") or {}
-            self.sel[key] = {"info": info, "count": avail.get(seat, "")}
-        self._paint_seat(d, code, seat)
-        self._update_sel_label()
-
-    def _update_sel_label(self):
-        trains = sorted({c for (_d, c, _s) in self.sel})
-        seats = sorted({s for (_d, _c, s) in self.sel})
-        self.sel_label.config(text="已选 {0} 趟车 · {1} 种席别  {2}{3}".format(
-            len(trains), len(seats), "/".join(trains), "　" + "/".join(seats)))
-        if self.sel:
-            self.next_btn2.config(state="normal")
-        else:
-            self.next_btn2.config(state="disabled")
-
-    # ---------------- 第三步：乘车人选择 ----------------
-
-    def _build_step3(self):
-        f = tk.Frame(self.body, bg=CARD)
-        tk.Label(f, text="选择乘车人", bg=CARD, fg=TEXT,
-                 font=(FONT, 15, "bold")).pack(pady=(12, 2))
-        tk.Label(f, text="优先取下单账号内已保存的乘车人（本地加密库作为补充）",
-                 bg=CARD, fg=GRAY, font=(FONT, 9)).pack()
-
-        bar = tk.Frame(f, bg=CARD)
-        bar.pack(fill="x", padx=14, pady=4)
-        tk.Button(bar, text="全选", command=self.pass_all, bg=BLUE_LIGHT, fg=BLUE,
-                  activebackground="#D6E8FA", relief="flat", font=(FONT, 9),
-                  cursor="hand2").pack(side="left", padx=2)
-        tk.Button(bar, text="全不选", command=self.pass_none, bg="#F0F2F5", fg=TEXT,
-                  activebackground="#E3E6EB", relief="flat", font=(FONT, 9),
-                  cursor="hand2").pack(side="left", padx=2)
-        self.pass_count_label = tk.Label(bar, text="已选 0 人", bg=CARD, fg=BLUE,
-                                         font=(FONT, 10, "bold"))
-        self.pass_count_label.pack(side="right")
-        self.pass_hint = tk.Label(f, text="加载中...", bg=CARD, fg=GRAY, font=(FONT, 9))
-        self.pass_hint.pack(anchor="w", padx=14)
-
-        self.pass_area = ScrollFrame(f, height=380)
-        self.pass_area.pack(fill="both", expand=True, padx=14, pady=6)
-
-        bottom = tk.Frame(f, bg=CARD)
-        bottom.pack(fill="x", padx=14, pady=8)
-        tk.Label(bottom, text="不选则自动使用默认乘车人 / 账号常用乘车人",
-                 bg=CARD, fg=GRAY, font=(FONT, 9)).pack(side="left")
-        tk.Button(bottom, text="下一步：确认创建 →", bg=BLUE, fg="white",
-                  activebackground=BLUE_DARK, activeforeground="white",
-                  relief="flat", font=(FONT, 11, "bold"), pady=8, padx=18,
-                  cursor="hand2", command=lambda: self.show_step(3)).pack(side="right")
-        return f
-
-    def _load_passengers(self):
-        def do_load():
-            account = []
-            try:
-                if (load_config().get("order_mode") or "http") == "browser":
-                    sess = order_mod.session_from_browser_state()
-                else:
-                    sess = order_mod.load_session(
-                        load_config().get("session_cookies_file"))
-                ok, _who = order_mod.check_login(sess)
-                if ok:
-                    account = order_mod.get_passengers(sess)
-            except Exception:
-                pass
-            local = passengers_mod.load_passengers()
-            return account, local
-
-        def on_done(res, err):
-            account, local = res or ([], [])
-            merged = {}
-            for p in account:
-                if p.get("name"):
-                    merged[p["name"]] = {
-                        "name": p["name"],
-                        "type": p.get("type_name") or ("成人" if p.get("is_adult", True) else "非成人"),
-                        "id_masked": _mask_id(p.get("id_no")),
-                        "source": "账号",
-                        "is_default": False,
-                    }
-            for p in local:
-                name = p.get("name")
-                if not name or name in merged:
-                    continue
-                merged[name] = {
-                    "name": name,
-                    "type": "成人" if p.get("is_adult", True) else "非成人",
-                    "id_masked": _mask_id(p.get("id_no")),
-                    "source": "本地",
-                    "is_default": bool(p.get("is_default")),
-                }
-            self.passengers = list(merged.values())
-            self._pass_loaded = True
-            self._render_passengers()
-            if not self.passengers:
-                self.pass_hint.config(
-                    text="未取到乘车人：请先在主窗口「乘车人管理」添加，或「登录会话」登录 12306",
-                    fg=ORANGE)
-
-        run_async(self, do_load, on_done)
-
-    def _render_passengers(self):
-        self.pass_area.clear()
-        self.pass_vars = {}
-        for p in self.passengers:
-            var = tk.BooleanVar(value=bool(p.get("is_default")))
-            self.pass_vars[p["name"]] = (var, p)
-            row = tk.Frame(self.pass_area.inner, bg=CARD, highlightthickness=1,
-                           highlightbackground=BORDER)
-            row.pack(fill="x", pady=2)
-            tk.Checkbutton(row, variable=var,
-                           command=lambda n=p["name"]: self._on_pass_toggle(n),
-                           bg=CARD, activebackground=CARD, cursor="hand2").pack(side="left", padx=4)
-            name_lbl = tk.Label(row, text=p["name"], bg=CARD, fg=TEXT,
-                                font=(FONT, 12, "bold"))
-            name_lbl.pack(side="left", padx=(2, 8))
-            tk.Label(row, text="【{0}】".format(p["type"]), bg=CARD, fg=GRAY,
-                     font=(FONT, 9)).pack(side="left")
-            tk.Label(row, text=p["id_masked"], bg=CARD, fg=GRAY,
-                     font=(FONT, 10)).pack(side="left", padx=8)
-            tk.Label(row, text=p["source"], bg=("#F0F7FF" if p["source"] == "账号" else "#FFF4E0"),
-                     fg=(BLUE if p["source"] == "账号" else "#B26A00"),
-                     font=(FONT, 8)).pack(side="right", padx=8, ipadx=6)
-        self._on_pass_toggle(None, refresh_only=True)
-
-    def _on_pass_toggle(self, name, refresh_only=False):
-        self.sel_passengers = {n for n, (v, _p) in self.pass_vars.items() if v.get()}
-        self.pass_count_label.config(text="已选 {0} 人".format(len(self.sel_passengers)))
-
-    def pass_all(self):
-        for name, (var, _p) in self.pass_vars.items():
-            var.set(True)
-        self._on_pass_toggle(None, refresh_only=True)
-
-    def pass_none(self):
-        for name, (var, _p) in self.pass_vars.items():
-            var.set(False)
-        self._on_pass_toggle(None, refresh_only=True)
-
-    # ---------------- 第四步：确认页 ----------------
-
-    def _build_step4(self):
-        f = tk.Frame(self.body, bg=CARD)
-        tk.Label(f, text="确认创建监控任务", bg=CARD, fg=TEXT,
-                 font=(FONT, 15, "bold")).pack(pady=(12, 6))
-
-        tip = tk.Frame(f, bg=ORANGE_LIGHT, highlightthickness=1,
-                       highlightbackground="#F5D9A8")
-        tip.pack(fill="x", padx=14, pady=(0, 8))
-        tk.Label(tip, text="创建后将进入监控队列：每 30~60 秒查询一次余票，命中即自动提交订单（不执行支付）。",
-                 bg=ORANGE_LIGHT, fg="#B26A00", font=(FONT, 9), justify="left",
-                 wraplength=440).pack(anchor="w", padx=10, pady=8)
-
-        self.summary_card = tk.Frame(f, bg=CARD, highlightthickness=1,
-                                     highlightbackground=BORDER)
-        self.summary_card.pack(fill="x", padx=14, pady=4)
-        self.summary_label = tk.Label(self.summary_card, bg=CARD, fg=TEXT,
-                                      font=(FONT, 10), justify="left", anchor="w")
-        self.summary_label.pack(fill="x", padx=12, pady=10)
-
-        opt_frame = tk.Frame(f, bg=CARD)
-        opt_frame.pack(fill="x", padx=14, pady=6)
-        self._switch(opt_frame, "自动下单", "余票命中后自动提交订单（不支付）", self.auto_var)
-        self._switch(opt_frame, "成功后停止", "一次下单成功后自动停止本任务（防止重复购买）", self.stop_var)
-        self._switch(opt_frame, "邮件通知", "下单成功后发送邮件通知详情", self.notify_var)
-
-        prio_row = tk.Frame(f, bg=CARD)
-        prio_row.pack(fill="x", padx=14, pady=4)
-        tk.Label(prio_row, text="任务优先级（1~10，越大越优先）：", bg=CARD,
-                 font=(FONT, 10)).pack(anchor="w")
-        prio_pick = tk.Frame(f, bg=CARD)
-        prio_pick.pack(fill="x", padx=14, pady=(2, 4))
-        for v in range(1, 11):
-            tk.Radiobutton(prio_pick, text=str(v), value=v, variable=self.prio_var,
-                           bg=CARD, activebackground=CARD, font=(FONT, 9),
-                           indicatoron=False, selectcolor=BLUE,
-                           cursor="hand2").pack(side="left", padx=1)
-
-        ttk.Button(f, text="创建任务并启动监控", style="Blue.TButton",
-                   command=lambda: self.create_task(start_now=True)).pack(
-            fill="x", padx=14, pady=(12, 4))
-        ttk.Button(f, text="仅创建任务（稍后手动启动）", style="White.TButton",
-                   command=lambda: self.create_task(start_now=False)).pack(
-            fill="x", padx=14, pady=2)
-        return f
-
-    @staticmethod
-    def _switch(parent, title, desc, var):
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=3)
-        tk.Label(row, text=title, bg=CARD, fg=TEXT, width=10, anchor="w",
-                 font=(FONT, 10)).pack(side="left")
-        tk.Label(row, text=desc, bg=CARD, fg=GRAY, font=(FONT, 9)).pack(side="left")
-        # 标准勾选框：选中即打勾 ✓
-        tk.Checkbutton(row, variable=var, bg=CARD, activebackground=CARD,
-                       cursor="hand2").pack(side="right")
-
-    def _refresh_confirm(self):
-        date_text = "、".join(self.monitor_dates) if self.monitor_dates else ""
-        trains = sorted({c for (_d, c, _s) in self.sel})
-        pnames = sorted(self.sel_passengers)
-        # 席别按日列出（不同日期可不同）
-        seat_lines = []
-        for d in self.monitor_dates:
-            sd = sorted({s for (dd, _c, s) in self.sel if dd == d})
-            seat_lines.append("%s：%s" % (d, "、".join(sd) or "（未选）"))
-        seat_text = "\n".join(seat_lines) or "（未选）"
-        self.summary_label.config(text=(
-            "区间：{0} → {1}\n"
-            "日期：{2}\n"
-            "车次：{3}\n"
-            "席别（按日）：\n{4}\n"
-            "乘车人：{5}"
-        ).format(self.from_name, self.to_name, date_text,
-                 "、".join(trains) or "（未选）",
-                 seat_text,
-                 "、".join(pnames) if pnames else "默认/账号常用乘车人"))
-
-    def create_task(self, start_now):
-        trains = sorted({c for (_d, c, _s) in self.sel})
-        seats = sorted({s for (_d, _c, s) in self.sel})
-        if not trains or not seats:
-            messagebox.showwarning("提示", "请先选择要监视的车次和席别", parent=self)
-            return
-        names = sorted(self.sel_passengers)
-        if self.auto_var.get() and not names:
-            # 自动下单需要乘车人；提示但允许继续（将使用默认/账号常用乘车人）
-            messagebox.showinfo("提示",
-                                "未勾选乘车人：下单时将自动使用默认乘车人 / 账号常用乘车人。",
-                                parent=self)
-        # 按日独立的席别选择：{日期: [席别...]}
-        seats_by_date = {}
-        for d in self.monitor_dates:
-            sd = sorted({s for (dd, _c, s) in self.sel if dd == d})
-            seats_by_date[d] = sd
-        name = "{0}-{1} {2} {3}".format(
-            self.from_name, self.to_name, "/".join(trains), "/".join(seats))
-        task = {
-            "name": name,
-            "uid": uuid.uuid4().hex,
-            "from": self.from_name,
-            "to": self.to_name,
-            "dates": list(self.monitor_dates),
-            "date_range": [],
-            "trains": trains,
-            "seat_types": seats,
-            "seats_by_date": seats_by_date,
-            "auto_order": bool(self.auto_var.get()),
-            "stop_after_order": bool(self.stop_var.get()),
-            "passenger_names": names,
-            "priority": int(self.prio_var.get()),
-            "purpose_code": self.purpose_var.get(),
-            "notify_channels": ["email"] if self.notify_var.get() else [],
-        }
-        update_config_locked(lambda config: config.setdefault("tasks", []).append(task))
-        mark_task_created(self.app, task, start_now)
-        if self.on_created:
-            self.on_created()
-        self.destroy()
-        if start_now:
-            self.app.start_engine()
-            messagebox.showinfo("完成",
-                                "任务「{0}」已创建，监控已启动。\n命中余票将自动提交订单并邮件通知。".format(name),
-                                parent=self.app.root)
-        else:
-            messagebox.showinfo("完成",
-                                "任务「{0}」已创建。\n在主窗口点击「▶ 启动监控」即可开始。".format(name),
-                                parent=self.app.root)
-
-
-# ----------------------------- 直接监视（免查询） -----------------------------
-
-class QuickMonitorDialog(tk.Toplevel):
-    """第二种建任务方式：直接填日期+车次+席别+乘车人，一键开始监视。"""
-
-    def __init__(self, app, on_created=None):
-        super().__init__(app.root)
-        self.app = app
-        self.on_created = on_created
-        self.title("直接监视（免查询）")
-        self.geometry("460x640")
-        self.configure(bg=CARD)
-        try:
-            self.name2code, self.code2name = ticket.load_station_map()
-        except Exception as e:
-            messagebox.showerror("错误", "车站代码表加载失败：%s" % e, parent=self)
-            self.destroy()
-            return
-
-        header = tk.Frame(self, bg=BLUE)
-        header.pack(fill="x")
-        tk.Label(header, text="直接监视", bg=BLUE, fg="white",
-                 font=(FONT, 14, "bold"), pady=10).pack(side="left", padx=16)
-        tk.Label(header, text="免查询 · 直接填车次", bg=BLUE, fg="#DCEAFB",
-                 font=(FONT, 9)).pack(side="right", padx=16)
-
-        body = tk.Frame(self, bg=CARD)
-        body.pack(fill="both", expand=True, padx=18)
-
-        self.from_field = StationField(body, "出发站", big=True)
-        self.from_field.pack(fill="x", pady=6)
-        self.to_field = StationField(body, "到达站", big=True)
-        self.to_field.pack(fill="x", pady=6)
-
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=6)
-        tk.Label(row, text="乘车日期", bg=CARD, fg=GRAY, width=8,
-                 anchor="w").pack(side="left")
-        self.date_var = tk.StringVar()
-        self.date_entry = tk.Entry(row, textvariable=self.date_var, width=30,
-                                   font=(FONT, 10))
-        self.date_entry.pack(side="left")
-        attach_calendar(self.date_entry, support_range=True,
-                       max_span_days=appcommon.MAX_DATE_SPAN_DAYS)
-        tk.Label(body, text="单日：2026-10-06　范围：2026-10-06~2026-10-08",
-                 bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
-
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=6)
-        tk.Label(row, text="车次", bg=CARD, fg=GRAY, width=8,
-                 anchor="w").pack(side="left")
-        self.trains_var = tk.StringVar()
-        tk.Entry(row, textvariable=self.trains_var, width=30,
-                 font=(FONT, 10)).pack(side="left")
-        tk.Label(body, text="多个车次用逗号分隔，如：G547,K225（留空=监控全部车次）",
-                 bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
-
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=6)
-        tk.Label(row, text="票种", bg=CARD, fg=GRAY, width=8, anchor="w").pack(side="left")
-        self.purpose_var = tk.StringVar(value="ADULT")
-        tk.Radiobutton(row, text="成人票", value="ADULT", variable=self.purpose_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10),
-                       cursor="hand2").pack(side="left", padx=(0, 10))
-        tk.Radiobutton(row, text="学生票", value="0X00", variable=self.purpose_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10),
-                       cursor="hand2").pack(side="left")
-
-        tk.Label(body, text="监控席别（可多选 Ctrl/Shift）：", bg=CARD, fg=GRAY,
-                 font=(FONT, 9)).pack(anchor="w")
-        frame = tk.Frame(body, bg=CARD)
-        frame.pack(fill="x")
-        self.seat_list = tk.Listbox(frame, height=5, selectmode="multiple",
-                                    font=(FONT, 10), relief="flat",
-                                    highlightthickness=1, highlightbackground=BORDER)
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.seat_list.yview)
-        self.seat_list.configure(yscrollcommand=sb.set)
-        self.seat_list.pack(side="left", fill="x", expand=True)
-        sb.pack(side="right", fill="y")
-        for s in SEAT_CHOICES:
-            self.seat_list.insert("end", s)
-
-        tk.Label(body, text="乘车人（不选=默认/账号常用）：", bg=CARD, fg=GRAY,
-                 font=(FONT, 9)).pack(anchor="w", pady=(8, 0))
-        self.passenger_items = []
-        self.psg_list = tk.Listbox(body, height=3, selectmode="multiple", font=(FONT, 10),
-                                   relief="flat", highlightthickness=1,
-                                   highlightbackground=BORDER)
-        self.psg_list.pack(fill="x")
-        for p in passengers_mod.load_passengers():
-            label = "{0}{1}".format(p.get("name"), "（默认）" if p.get("is_default") else "")
-            self.psg_list.insert("end", label)
-            self.passenger_items.append(p.get("name"))
-
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=8)
-        tk.Label(row, text="优先级", bg=CARD, fg=GRAY, width=8,
-                 anchor="w").pack(side="left")
-        self.prio_var = tk.IntVar(value=5)
-        for v in range(1, 11):
-            tk.Radiobutton(row, text=str(v), value=v, variable=self.prio_var,
-                           bg=CARD, activebackground=CARD, font=(FONT, 8),
-                           indicatoron=False, selectcolor=BLUE,
-                           cursor="hand2").pack(side="left", padx=1)
-
-        self.auto_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(body, text="余票命中后自动下单（不支付）", variable=self.auto_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10)).pack(anchor="w")
-        self.stop_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(body, text="一次下单成功后自动停止本任务", variable=self.stop_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10)).pack(anchor="w")
-
-        ttk.Button(self, text="创建任务并立即开始监视", style="Blue.TButton",
-                   command=lambda: self.create(start_now=True)).pack(
-            fill="x", padx=18, pady=(6, 2))
-        ttk.Button(self, text="仅创建任务", style="White.TButton",
-                   command=lambda: self.create(start_now=False)).pack(
-            fill="x", padx=18, pady=(0, 10))
-
-    def _parse_dates(self):
-        return appcommon.parse_date_range(self.date_var.get().strip())
-
-    def create(self, start_now):
-        from_name, to_name = self.from_field.get(), self.to_field.get()
-        if from_name not in self.name2code or to_name not in self.name2code:
-            messagebox.showwarning("提示", "请先通过「选择」确定有效的出发站/到达站", parent=self)
-            return
-        if from_name == to_name:
-            messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
-            return
-        try:
-            dates, date_range = self._parse_dates()
-        except ValueError as e:
-            messagebox.showwarning("提示", "日期格式错误：%s" % e, parent=self)
-            return
-        seats = [self.seat_list.get(i) for i in self.seat_list.curselection()]
-        if not seats:
-            messagebox.showwarning("提示", "请至少选择一个席别", parent=self)
-            return
-        trains = [t.strip() for t in
-                  self.trains_var.get().replace("，", ",").split(",") if t.strip()]
-        passengers = [self.passenger_items[i] for i in self.psg_list.curselection()]
-        name = "{0}-{1} {2} {3}".format(
-            from_name, to_name, "/".join(trains) if trains else "全部车次",
-            "/".join(seats))
-        task = {
-            "name": name,
-            "uid": uuid.uuid4().hex,
-            "from": from_name,
-            "to": to_name,
-            "dates": dates,
-            "date_range": date_range,
-            "trains": trains,
-            "seat_types": seats,
-            "auto_order": bool(self.auto_var.get()),
-            "stop_after_order": bool(self.stop_var.get()),
-            "passenger_names": passengers,
-            "priority": int(self.prio_var.get()),
-            "purpose_code": self.purpose_var.get(),
-            "notify_channels": ["email"],
-        }
-        update_config_locked(lambda config: config.setdefault("tasks", []).append(task))
-        mark_task_created(self.app, task, start_now)
-        if self.on_created:
-            self.on_created()
-        self.destroy()
-        if start_now:
-            self.app.start_engine()
-            messagebox.showinfo("完成", "任务「%s」已创建，监控已启动。" % name,
-                                parent=self.app.root)
-        else:
-            messagebox.showinfo("完成", "任务「%s」已创建，可稍后启动监控。" % name,
-                                parent=self.app.root)
-
-
-# ----------------------------- 乘车人管理 -----------------------------
-
-def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
-    """保存乘车人；磁盘盒子不可解密被拒写时弹 error 提示并返回 False。
-
-    Task 80(b)：save_passengers 的拒写（return False）原来三处裸调无人处理，
-    GUI 会显示"完成"/刷新列表，但磁盘未写，重启后修改丢失。此处失败弹
-    error（与 save_passengers 内的 LOG.error 口径一致），调用方不再显示
-    "完成"、不再刷新列表。
-
-    Task 89(c)：expect_stamp 传入时做乐观并发检查（与 Task 88d/monitor 同口径）；
-    编辑期间被外部修改导致放弃保存时弹 warning（不覆盖对方修改），返回 False。
-    不传 expect_stamp 时保持 Task 80 行为（直接写）。
-    """
-    if passengers_mod.save_passengers(passengers, expect_stamp=expect_stamp):
-        return True
-    if expect_stamp is not passengers_mod._STAMP_UNSET \
-            and passengers_mod.passengers_stamp() != expect_stamp:
-        # 乐观并发放弃：save_passengers 已在锁内检出指纹变化并打印警告；
-        # GUI 侧再给一次明确提示（不静默），调用方负责重载最新数据。
-        messagebox.showwarning("保存已放弃",
-                               "乘车人数据在您编辑期间被其他程序修改，本次保存已放弃，\n"
-                               "未覆盖对方的修改。请基于最新数据重新操作。",
-                               parent=parent)
-        return False
-    messagebox.showerror("保存失败",
-                         "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
-                         "已拒绝覆盖以保护原数据。\n"
-                         "请在原机器解密后迁移，或使用 --force 放弃旧数据。",
-                         parent=parent)
-    return False
-
-
-class PassengerDialog(tk.Toplevel):
-    def __init__(self, master, on_changed=None):
-        super().__init__(master)
-        self.title("乘车人管理（加密存储）")
-        self.geometry("640x500")
-        self.on_changed = on_changed
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=12, pady=8)
-        ttk.Label(body, text="乘车人列表（证件号/手机号加密保存，显示时脱敏）：").pack(anchor="w")
-        frame = ttk.Frame(body)
-        frame.pack(fill="both", expand=True, pady=4)
-        self.listbox = tk.Listbox(frame, font=(FONT, 10))
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=sb.set)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.refresh()
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="添加", command=lambda: self.edit(None)).pack(side="left", padx=4)
-        ttk.Button(btns, text="编辑", command=lambda: self.edit(self.selected())).pack(side="left", padx=4)
-        ttk.Button(btns, text="删除", command=self.remove).pack(side="left", padx=4)
-        ttk.Button(btns, text="设为默认", command=self.set_default).pack(side="left", padx=4)
-        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="right")
-
-    def refresh(self):
-        self.passengers = passengers_mod.load_passengers()
-        # Task 89c：记下 load 时的字节指纹，供保存时做乐观并发检查
-        #（本对话框打开期间若被外部修改，保存时警告并放弃，不静默覆写）。
-        self._pax_stamp = passengers_mod.passengers_stamp()
-        self.listbox.delete(0, "end")
-        for p in self.passengers:
-            self.listbox.insert("end", "{0}{1}  证件:{2} {3}".format(
-                p.get("name"), "【默认】" if p.get("is_default") else "",
-                passengers_mod.ID_TYPE_NAMES.get(p.get("id_type_code"), "?"),
-                _mask_id(p.get("id_no"))))
-
-    def selected(self):
-        sel = self.listbox.curselection()
-        return sel[0] if sel else None
-
-    def _save_passengers_or_refresh(self, parent):
-        """保存 self.passengers（Task 89c：Task 88d 同口径的乐观并发检查）。
-
-        成功 → (True, "ok")。指纹变化（本对话框打开期间被外部修改）→
-        重载最新数据+警告，返回 (False, "stale")，调用方放弃本次保存
-        （编辑子框由调用方关闭，用户基于最新数据重做）。不可解密盒子/
-        锁超时 → error，返回 (False, "refused")（不重载，不丢内存数据）。
-        """
-        if _save_passengers_or_warn(self.passengers, parent, self._pax_stamp):
-            return True, "ok"
-        if passengers_mod.passengers_stamp() != self._pax_stamp:
-            # 外部写入导致放弃：重载最新数据+新指纹。
-            self.refresh()
-            return False, "stale"
-        return False, "refused"
-
-    def edit(self, index):
-        p = self.passengers[index] if index is not None else None
-        dlg = tk.Toplevel(self)
-        dlg.title("添加乘车人" if p is None else "编辑乘车人")
-        dlg.geometry("440x320")
-        body = ttk.Frame(dlg)
-        body.pack(fill="both", expand=True, padx=12, pady=10)
-
-        def row(label, widget):
-            r = ttk.Frame(body)
-            r.pack(fill="x", pady=3)
-            ttk.Label(r, text=label, width=10).pack(side="left")
-            widget.pack(side="left", fill="x", expand=True)
-            return r
-
-        name_var = tk.StringVar(value=(p or {}).get("name", ""))
-        row("姓名", ttk.Entry(body, textvariable=name_var))
-        type_var = tk.StringVar(value=(p or {}).get("id_type_code", "1"))
-        combo = ttk.Combobox(body, textvariable=type_var, state="readonly", width=26)
-        combo["values"] = ["%s - %s" % (k, v) for k, v in passengers_mod.ID_TYPE_NAMES.items()]
-        combo.set("1 - 二代身份证")
-        row("证件类型", combo)
-        id_var = tk.StringVar(value=(p or {}).get("id_no", ""))
-        id_entry = ttk.Entry(body, textvariable=id_var, show="*")
-        id_row = row("证件号码", id_entry)
-        # 小眼睛：证件号默认掩码，点一下切明文、再点还原
-        id_visible = tk.BooleanVar(value=False)
-
-        def _toggle_id():
-            id_entry.configure(show="" if id_visible.get() else "*")
-            eye_btn.config(text="🙈" if id_visible.get() else "👁")
-
-        eye_btn = ttk.Button(id_row, text="👁", width=3, command=_toggle_id)
-        eye_btn.pack(side="left", padx=(6, 0))
-        mobile_var = tk.StringVar(value=(p or {}).get("mobile", ""))
-        row("手机号", ttk.Entry(body, textvariable=mobile_var))
-        default_var = tk.BooleanVar(value=bool((p or {}).get("is_default")))
-        ttk.Checkbutton(body, text="设为默认乘车人（自动下单优先使用）",
-                        variable=default_var).pack(anchor="w", pady=3)
-        adult_var = tk.BooleanVar(value=bool((p or {}).get("is_adult", True)))
-        ttk.Checkbutton(body, text="成人（学生/儿童请取消勾选）",
-                        variable=adult_var).pack(anchor="w", pady=3)
-
-        def save():
-            name = name_var.get().strip()
-            if not name:
-                messagebox.showwarning("提示", "姓名不能为空", parent=dlg)
-                return
-            code = type_var.get().split(" ")[0].strip()
-            data = {"name": name, "id_type_code": code,
-                    "id_no": id_var.get().strip(), "mobile": mobile_var.get().strip(),
-                    "is_default": bool(default_var.get()), "is_adult": bool(adult_var.get())}
-            if index is None:
-                self.passengers.append(data)
-            else:
-                self.passengers[index].update(data)
-            ok, reason = self._save_passengers_or_refresh(dlg)
-            if not ok:
-                if reason == "stale":
-                    # 数据已重载为最新：关闭编辑框，用户基于最新数据重做
-                    dlg.destroy()
-                return
-            self.refresh()
-            if self.on_changed:
-                self.on_changed()
-            dlg.destroy()
-
-        btns = ttk.Frame(dlg)
-        btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="保存", command=save).pack(side="right", padx=6)
-        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right")
-
-    def remove(self):
-        idx = self.selected()
-        if idx is None:
-            messagebox.showwarning("提示", "请先选择乘车人", parent=self)
-            return
-        if messagebox.askyesno("确认", "确定删除乘车人「%s」？" % self.passengers[idx].get("name"),
-                               parent=self):
-            del self.passengers[idx]
-            ok, _ = self._save_passengers_or_refresh(self)
-            if not ok:
-                return
-            self.refresh()
-
-    def set_default(self):
-        idx = self.selected()
-        if idx is None:
-            messagebox.showwarning("提示", "请先选择乘车人", parent=self)
-            return
-        for p in self.passengers:
-            p["is_default"] = False
-        self.passengers[idx]["is_default"] = True
-        ok, _ = self._save_passengers_or_refresh(self)
-        if not ok:
-            return
-        self.refresh()
-        messagebox.showinfo("完成", "已将「%s」设为默认乘车人" % self.passengers[idx].get("name"),
-                            parent=self)
-
-
-def _mask_id(id_no):
-    if not id_no or len(id_no) < 8:
-        return id_no or ""
-    return id_no[:3] + "*" * (len(id_no) - 7) + id_no[-4:]
-
-
-# ----------------------------- 购票历史 -----------------------------
-
-HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
-                        "failed": "下单失败", "hit_no_order": "命中未下单",
-                        "ambiguous": "结果待人工核对"}
-
-
-def read_history_records(limit=200):
-    """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
-    顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
-    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
-    path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
-    try:
-        with open(path, encoding="utf-8") as f:
-            history = json.load(f)
-        if not isinstance(history, list):
-            LOG.warning("order_history.json 顶层不是列表（%s），按空历史展示：%s",
-                        type(history).__name__, path)
-            return []
-        return list(reversed(history[-limit:]))
-    except Exception:
-        return []
-
-
-class HistoryDialog(tk.Toplevel):
-    RESULT_LABEL = HISTORY_RESULT_LABEL
-
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("购票历史与通知记录")
-        self.geometry("960x520")
-        cols = ("time", "task", "train", "date", "route", "seat",
-                "passengers", "order_no", "result")
-        heads = ("时间", "任务", "车次", "日期", "区间", "席别",
-                 "乘车人", "订单号", "结果")
-        widths = (130, 150, 60, 90, 120, 70, 110, 110, 70)
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=10, pady=8)
-        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
-        for c, h, w in zip(cols, heads, widths):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="center")
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        ttk.Button(self, text="关闭", command=self.destroy).pack(pady=8)
-        self.load()
-
-    def load(self):
-        for r in read_history_records():
-            self.tree.insert("", "end", values=(
-                r.get("time", ""), r.get("task", ""), r.get("train", ""),
-                r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
-                r.get("seat", ""), "、".join(r.get("passengers") or []),
-                r.get("order_no", ""),
-                self.RESULT_LABEL.get(r.get("result"), r.get("result", ""))))
-
-
-# ----------------------------- 通知设置 -----------------------------
-
-class NotifyFormMixin:
-    """邮件通知表单公共实现（NotifyDialog 与 NotifyPanel 共用，勿两处各改一份）。
-
-    子类先把 self.email 指到 config 里的 email 字典，再调 _build_notify_fields；
-    collect/save/test 三个方法两边完全一致，统一放这里。"""
-
-    def _build_notify_fields(self, body, hint_wraplength):
-        def row(label, var, show=None, width=34):
-            r = ttk.Frame(body)
-            r.pack(fill="x", pady=4)
-            ttk.Label(r, text=label, width=12).pack(side="left")
-            ttk.Entry(r, textvariable=var, width=width, show=show).pack(
-                side="left", fill="x", expand=True)
-            return r
-
-        self.enabled_var = tk.BooleanVar(value=bool(self.email.get("enabled", True)))
-        ttk.Checkbutton(body, text="启用邮件通知", variable=self.enabled_var).pack(anchor="w", pady=2)
-        self.host_var = tk.StringVar(value=self.email.get("smtp_host", "smtp.qq.com"))
-        row("SMTP 服务器", self.host_var)
-        self.port_var = tk.StringVar(value=str(self.email.get("smtp_port", 465)))
-        row("端口", self.port_var, width=10)
-        self.user_var = tk.StringVar(value=self.email.get("username", ""))
-        row("发件邮箱", self.user_var)
-        try:
-            _pw = notify_mod.secret_of(self.email.get("password", ""))
-        except notify_mod.SecretDecryptError:
-            # Task 60b：损坏的密文不再吞成空串；显示留空并提示用户重输
-            LOG.warning("[配置] 邮箱授权码解密失败，已清空显示（请重新输入授权码）")
-            _pw = ""
-        self.pwd_var = tk.StringVar(value=_pw)
-        row("邮箱授权码", self.pwd_var, show="*")
-        self.from_var = tk.StringVar(value=self.email.get("from", ""))
-        row("发件人地址", self.from_var)
-        self.to_var = tk.StringVar(value=",".join(self.email.get("to") or []))
-        row("收件人", self.to_var)
-        ttk.Label(body, text="收件人多个用逗号分隔；发件人地址留空则默认同发件邮箱；QQ/163 邮箱需在邮箱设置中开启 SMTP 服务并生成授权码",
-                  foreground=GRAY, wraplength=hint_wraplength).pack(anchor="w", pady=4)
-
-    def collect(self):
-        self.email.update({
-            "enabled": bool(self.enabled_var.get()),
-            "smtp_host": self.host_var.get().strip(),
-            "smtp_port": int(self.port_var.get().strip() or 465),
-            "username": self.user_var.get().strip(),
-            "password": notify_mod.protect_secret(self.pwd_var.get().strip()),
-            "from": self.from_var.get().strip(),
-            "to": [x.strip() for x in self.to_var.get().replace("，", ",").split(",")
-                   if x.strip()],
-        })
-        return normalize_email_settings(self.email)
-
-    def save(self):
-        try:
-            email = self.collect()
-        except ValueError as e:
-            messagebox.showwarning("无法保存", str(e), parent=self)
-            return
-        def _save_email(c):
-            c.setdefault("notify", {})["email"] = email
-
-        update_config_locked(_save_email)
-        messagebox.showinfo("完成", "通知设置已保存", parent=self)
-
-    def test(self):
-        try:
-            email = self.collect()
-        except ValueError as e:
-            messagebox.showwarning("无法发送", str(e), parent=self)
-            return
-
-        def do_test():
-            return notify_mod.send_email(email, "测试邮件：12306 监控系统",
-                                         "这是一封测试邮件，收到说明邮件通知可用。")
-
-        def on_done(res, err):
-            if err:
-                messagebox.showerror("失败", "测试发送异常：%s" % err, parent=self)
-            else:
-                ok, msg = res
-                (messagebox.showinfo if ok else messagebox.showerror)("测试结果", msg, parent=self)
-
-        run_async(self, do_test, on_done)
-
-
-class NotifyDialog(NotifyFormMixin, tk.Toplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("邮件通知设置（SMTP）")
-        self.geometry("500x420")
-        cfg = load_config()
-        self.email = cfg.setdefault("notify", {}).setdefault("email", {})
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=12, pady=10)
-        self._build_notify_fields(body, hint_wraplength=460)
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="保存", command=self.save).pack(side="right", padx=6)
-        ttk.Button(btns, text="发送测试邮件", command=self.test).pack(side="right", padx=6)
-
-
-# ----------------------------- 登录会话 -----------------------------
-
-def _relogin_ok_via_script(script):
-    """运行 capture_session.py 做重登：仅当退出码为 0 返回 True。
-
-    旧代码 subprocess.run(...) 后 ok = True 硬编码——退出码非 0（登录失败）
-    也被当成成功，侧边栏误置"已登录"。超时同样视为失败返回 False，
-    不挂死、不抛到界面。
-    Task 99a：超时必须覆盖脚本实际总耗时（MAX_WAIT_SEC 等待 + Edge 启动
-    开销 + 最终验证），否则用户在等待末尾登录成功会被误判"运行超时"。
-    """
-    try:
-        import capture_session as _cs
-        timeout = _cs.GUI_SUBPROCESS_TIMEOUT
-    except Exception:
-        timeout = 420  # 与 GUI_SUBPROCESS_TIMEOUT(=MAX_WAIT_SEC+120) 同值兜底
-    try:
-        proc = subprocess.run([sys.executable, script], cwd=HERE, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        LOG.error("重新登录失败：capture_session.py 运行超时（%ss）", timeout)
-        return False
-    ok = proc.returncode == 0
-    if not ok:
-        LOG.error("重新登录失败：capture_session.py 退出码 %s", proc.returncode)
-    return ok
-
-
-class SessionDialog(tk.Toplevel):
-    def __init__(self, master, app=None):
-        super().__init__(master)
-        self.app = app          # MonitorApp：把登录态同步给侧边栏/小窗
-        self.title("登录会话")
-        self.geometry("520x440")
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=12, pady=10)
-        self.status_label = ttk.Label(body, text="正在检查会话状态...")
-        self.status_label.pack(anchor="w", pady=2)
-
-        ttk.Label(body, text="账号已保存的乘车人（下单时可选用）：").pack(anchor="w", pady=(8, 2))
-        frame = ttk.Frame(body)
-        frame.pack(fill="both", expand=True)
-        self.p_list = tk.Listbox(frame, font=(FONT, 10))
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.p_list.yview)
-        self.p_list.configure(yscrollcommand=sb.set)
-        self.p_list.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=12, pady=10)
-        ttk.Button(btns, text="重新登录（弹出浏览器）", command=self.relogin).pack(side="left", padx=4)
-        ttk.Button(btns, text="刷新", command=self.check).pack(side="left", padx=4)
-        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="right")
-        self.check()
-
-    def check(self):
-        def do_check():
-            if (load_config().get("order_mode") or "http") == "browser":
-                # 浏览器模式：会话以 .browser_profile 为准
-                import browser_order
-                if browser_order.busy():
-                    # 登录窗口/下单还开着，抢锁只会超时。别把"没轮到"说成"已失效"。
-                    return None, "浏览器忙（登录或下单进行中），稍后再刷新", []
-                ok, who = browser_order.check_session(timeout=6)
-                passengers = []
-                if ok:
-                    # 乘车人列表用浏览器 Cookie 组会话取（浏览器模式的登录态
-                    # 在 .browser_profile，session_cookies.json 是过期的旧载体）
-                    try:
-                        sess = order_mod.session_from_browser_state()
-                        passengers = order_mod.get_passengers(sess)
-                    except Exception:
-                        passengers = []
-                return ok, who, passengers
-
-            sess = order_mod.load_session(load_config().get("session_cookies_file"))
-            ok, who = order_mod.check_login(sess)
-            passengers = order_mod.get_passengers(sess) if ok else []
-            return ok, who, passengers
-
-        def on_done(res, err):
-            if err:
-                self.status_label.config(text="会话检查失败：%s" % err)
-                return
-            ok, who, passengers = res
-            if ok is None:
-                self.status_label.config(text=str(who))
-                return
-            self.status_label.config(
-                text="会话有效（%s）" % who if ok else "会话失效：%s（请重新登录）" % who)
-            # 同步侧边栏/小窗：免得弹窗说已登录、左上角还挂着未登录
-            if self.app is not None:
-                self.app._set_account(
-                    ("已登录 %s" % who) if ok else "未登录", bool(ok))
-            self.p_list.delete(0, "end")
-            for p in passengers:
-                self.p_list.insert("end", "%s（%s）" % (
-                    p["name"], p.get("type_name") or ("成人" if p.get("is_adult", True) else "非成人")))
-
-        self.status_label.config(text="正在检查会话状态...")
-        run_async(self, do_check, on_done)
-
-    def relogin(self):
-        script = os.path.join(HERE, "capture_session.py")
-        self.status_label.config(text="浏览器已打开，请在弹出的窗口中完成登录（最多 5 分钟）...")
-        self.p_list.delete(0, "end")
-        self.p_list.insert("end", "登录完成后会自动刷新，稍候即可")
-
-        def worker():
-            ok = False
-            try:
-                if (load_config().get("order_mode") or "http") == "browser":
-                    # 浏览器模式：登录态要落进 .browser_profile，capture_session.py
-                    # 只写 session_cookies.json，两条路不通用。
-                    import browser_order
-                    ok = bool(browser_order.login())
-                else:
-                    # capture_session.py 若挂住不能永久卡住重登线程；
-                    # 按退出码判定成败：失败不再被当成功
-                    ok = _relogin_ok_via_script(script)
-            except Exception as e:
-                LOG.error("重新登录失败: %s", e)
-            # 跨线程调 after 违反 Tk 规则，走与 run_async 相同的队列
-            _RESULT_QUEUE.put((self, lambda _res, _err: self._after_relogin(ok), None, None))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _after_relogin(self, ok):
-        """登录流程一结束就先把界面切成已登录，不等下一次会话体检。
-
-        浏览器模式下引擎体检是 20 分钟一次，只靠它的话，用户明明刚在浏览器里
-        登录成功，侧边栏还要再挂十几分钟「未登录」。"""
-        if ok and self.app is not None:
-            self.app._set_account("已登录", True)
-            self.app._acct_time = time.time()
-        self.check()
-
-
-# ----------------------------- 余票速查 -----------------------------
-
-class QuickCheckDialog(tk.Toplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("余票速查（免登录）")
-        self.geometry("880x520")
-        try:
-            self.name2code, self.code2name = ticket.load_station_map()
-        except Exception as e:
-            messagebox.showerror("错误", "车站代码表加载失败：%s" % e, parent=self)
-            self.destroy()
-            return
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=12, pady=8)
-        self.from_field = StationField(top, "出发站")
-        self.from_field.pack(side="left", padx=4)
-        self.to_field = StationField(top, "到达站")
-        self.to_field.pack(side="left", padx=4)
-        ttk.Label(top, text="日期").pack(side="left", padx=(8, 2))
-        self.date_var = tk.StringVar(value=datetime.date.today().isoformat())
-        self.date_entry = ttk.Entry(top, textvariable=self.date_var, width=12)
-        self.date_entry.pack(side="left")
-        attach_calendar(self.date_entry)
-        ttk.Button(top, text="查询", command=self.query).pack(side="left", padx=8)
-
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=12, pady=4)
-        cols = ("train", "route", "time", "duration", "seats")
-        heads = ("车次", "区间", "时间", "历时", "余票")
-        widths = (80, 160, 130, 70, 340)
-        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
-        for c, h, w in zip(cols, heads, widths):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="w" if c == "seats" else "center")
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        self.status = ttk.Label(self, text="")
-        self.status.pack(anchor="w", padx=12, pady=(0, 8))
-
-    def query(self):
-        from_name, to_name = self.from_field.get(), self.to_field.get()
-        date = self.date_var.get().strip()
-        if from_name not in self.name2code or to_name not in self.name2code:
-            messagebox.showwarning("提示", "请选择有效的车站", parent=self)
-            return
-        if from_name == to_name:
-            messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
-            return
-        self.status.config(text="查询中...")
-        self.tree.delete(*self.tree.get_children())
-
-        def do_query():
-            rows = ticket.query_tickets(self.name2code[from_name],
-                                        self.name2code[to_name], date)
-            out = []
-            for row in rows:
-                info = ticket.parse_row(row, self.code2name)
-                seats = " ".join("{0}({1})".format(k, v)
-                                 for k, v in info["available_seats"].items()) \
-                    or "暂无可视余票"
-                out.append((info["train_code"],
-                            "%s-%s" % (info["from_name"], info["to_name"]),
-                            "%s-%s" % (info["start_time"], info["arrive_time"]),
-                            info["duration"], seats))
-            return out
-
-        def on_done(res, err):
-            if err:
-                self.status.config(text="")
-                messagebox.showerror("查询失败", str(err), parent=self)
-                return
-            for row in res:
-                self.tree.insert("", "end", values=row)
-            self.status.config(text="共 %d 趟" % len(res))
-
-        run_async(self, do_query, on_done)
-
-
-# ----------------------------- 启动监控（选择任务） -----------------------------
-
-class StartMonitorDialog(tk.Toplevel):
-    """启动监控时选择要运行哪些任务；已启动的任务标记「已启动」并锁定勾选。"""
-
-    def __init__(self, app):
-        super().__init__(app.root)
-        self.app = app
-        self.title("启动监控（选择任务）")
-        self.geometry("560x500")
-        self.configure(bg=CARD)
-
-        header = tk.Frame(self, bg=BLUE)
-        header.pack(fill="x")
-        tk.Label(header, text="启动监控", bg=BLUE, fg="white",
-                 font=(FONT, 14, "bold"), pady=10).pack(side="left", padx=16)
-        tk.Label(header, text="勾选要监控的任务", bg=BLUE, fg="#DCEAFB",
-                 font=(FONT, 9)).pack(side="right", padx=16)
-
-        self.running = bool(app.engine_thread and app.engine_thread.is_alive())
-        tip_text = ("引擎正在运行：已启动的任务自动锁定；新勾选的任务会自动纳入，取消勾选转为「已暂停」。"
-                    if self.running else "勾选要启动的任务，点击「启动所选任务」开始监控。")
-        tk.Label(self, text=tip_text, bg="#FFF4E0", fg="#B26A00",
-                 font=(FONT, 9), justify="left", wraplength=500).pack(
-            fill="x", padx=12, pady=8)
-
-        self.task_rows = tk.Frame(self, bg=CARD)
-        self.task_rows.pack(fill="both", expand=True, padx=14)
-
-        config = load_config()
-        state = _state_tasks_dict()
-        self.vars = {}
-        tasks = config.get("tasks") or []
-        if not tasks:
-            tk.Label(self.task_rows, text="暂无任务，请先创建任务。", bg=CARD, fg=GRAY,
-                     font=(FONT, 11)).pack(pady=30)
-        for idx, t in enumerate(tasks):
-            name = t.get("name") or ""
-            st = state.get(name, {}).get("status", "paused")
-            active = st in engine_mod.ACTIVE_STATUSES
-            started = self.running and active
-            var = tk.BooleanVar(value=active)
-            self.vars[idx] = var
-
-            row = tk.Frame(self.task_rows, bg=CARD, highlightthickness=1,
-                           highlightbackground=BORDER)
-            row.pack(fill="x", pady=3)
-            cb = tk.Checkbutton(row, variable=var, bg=CARD, activebackground=CARD,
-                                cursor="hand2",
-                                state=("disabled" if started else "normal"))
-            cb.pack(side="left", padx=6)
-            info = tk.Frame(row, bg=CARD)
-            info.pack(side="left", fill="x", expand=True)
-            tk.Label(info, text=name, bg=CARD, fg=TEXT,
-                     font=(FONT, 11, "bold"), anchor="w").pack(fill="x")
-            sub = "{0} → {1}   {2}   {3}  优先级 {4}".format(
-                t.get("from", ""), t.get("to", ""),
-                format_dates(t),
-                "/".join(_display_trains(t.get("trains"))) or "全部车次",
-                t.get("priority", 5))
-            tk.Label(info, text=sub, bg=CARD, fg=GRAY, font=(FONT, 9),
-                     anchor="w").pack(fill="x")
-            if started:
-                tk.Label(row, text="已启动", bg=BLUE_LIGHT, fg=BLUE,
-                         font=(FONT, 10, "bold"), padx=8).pack(side="right", padx=10)
-            else:
-                color = STATUS_COLOR.get(st, TEXT)
-                tk.Label(row, text=engine_mod.STATUS_LABELS.get(st, st),
-                         bg=CARD, fg=color, font=(FONT, 10)).pack(side="right", padx=10)
-
-        btns = tk.Frame(self, bg=BG)
-        btns.pack(fill="x", side="bottom")
-        ttk.Button(btns, text="启动所选任务", style="Blue.TButton",
-                   command=self.apply_start).pack(side="right", padx=12, pady=8)
-        ttk.Button(btns, text="关闭", style="White.TButton",
-                   command=self.destroy).pack(side="right")
-
-    def apply_start(self):
-        if not any(v.get() for v in self.vars.values()):
-            messagebox.showwarning("未选择任务",
-                                   "请至少勾选一个要启动的任务。\n全部取消勾选相当于不启动任何监控。",
-                                   parent=self)
-            return
-        config = load_config()
-        eng = self.app.get_ops_engine()
-        for idx, t in enumerate(config.get("tasks") or []):
-            var = self.vars.get(idx)
-            if var is None:
-                continue
-            st = eng.task_status(t)
-            if var.get():
-                if st not in engine_mod.ACTIVE_STATUSES:
-                    eng.set_task_status(t, "monitoring", "由启动对话框启用", force=True)
-            else:
-                if st in engine_mod.ACTIVE_STATUSES:
-                    eng.set_task_status(t, "paused", "在启动对话框中取消勾选")
-        self.app.refresh_tasks()
-        self.app.start_engine()
-        self.app.refresh_tasks()
-        self.destroy()
-
-
-# ----------------------------- 侧边栏 -----------------------------
-
-SIDEBAR_WIDTH = 190
-SIDEBAR_COLLAPSED = 58
-
-
-class SidebarPanel(tk.Frame):
-    """左侧导航栏：账号状态区 + 四项导航（管理信息含子项"乘车人信息"），支持展开/收起。"""
-
-    def __init__(self, master, app):
-        super().__init__(master, bg=CARD, width=SIDEBAR_WIDTH)
-        self.pack_propagate(False)
-        self.app = app
-        self.expanded = True
-        self.submenu_open = True
-        self.active_key = "tasks"
-        self.items = {}
-
-        # 顶部账号状态（点击可切换账号）
-        self.acc = tk.Frame(self, bg=CARD, cursor="hand2")
-        self.acc.pack(fill="x", pady=(10, 2))
-        self.avatar = tk.Label(self.acc, text="客", bg=BLUE, fg="white",
-                               font=(FONT, 11, "bold"), width=3)
-        self.avatar.pack(side="left", padx=(10, 6))
-        self.account_text = tk.Label(self.acc, text="未登录", bg=CARD, fg=GRAY,
-                                     font=(FONT, 10, "bold"), anchor="w")
-        self.account_text.pack(side="left", fill="x", expand=True)
-        self.account_arrow = tk.Label(self.acc, text="›", bg=CARD, fg=GRAY,
-                                      font=(FONT, 12))
-        self.account_arrow.pack(side="left", padx=(0, 10))
-        for w in (self.acc, self.avatar, self.account_text, self.account_arrow):
-            w.bind("<Button-1>", lambda e: self.app.open_session())
-
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=8)
-        self.nav = tk.Frame(self, bg=CARD)
-        self.nav.pack(fill="both", expand=True, pady=4)
-
-        # 导航项（固定顺序）
-        self._add_item("tasks", "▤", "任务状态", lambda: self.app.show_page("tasks"))
-        self._add_item("grab", "⚡", "抢票任务", lambda: self.app.show_page("grab"))
-        self._add_item("history", "◷", "购票历史", lambda: self.app.show_page("history"))
-        self._add_item("notify", "✉", "通知设置", lambda: self.app.show_page("notify"))
-
-        self._apply_visuals()
-
-    def _add_item(self, key, icon, text, cmd, sub=False):
-        lbl = tk.Label(self.nav, bg=CARD, fg=TEXT, font=(FONT, 10),
-                       anchor="w", cursor="hand2", padx=12, pady=9)
-        lbl.bind("<Button-1>", lambda e, c=cmd: c())
-        self.items[key] = (lbl, icon, text, sub)
-
-    def set_active(self, key):
-        self.active_key = key
-        self._apply_visuals()
-
-    def set_expanded(self, expanded):
-        if self.expanded == expanded:
-            return
-        self.expanded = expanded
-        self.config(width=SIDEBAR_WIDTH if expanded else SIDEBAR_COLLAPSED)
-        if expanded:
-            self.account_text.pack(side="left", fill="x", expand=True)
-            self.account_arrow.pack(side="left", padx=(0, 10))
-            self.avatar.pack(side="left", padx=(10, 6))
-        else:
-            self.account_text.pack_forget()
-            self.account_arrow.pack_forget()
-        self._apply_visuals()
-
-    def set_account(self, text, logged_in):
-        if self.expanded:
-            self.account_text.config(text=text, fg=(TEXT if logged_in else GRAY))
-        self.avatar.config(text="✓" if logged_in else "客",
-                           bg=("#1a7f37" if logged_in else BLUE))
-
-    def _apply_visuals(self):
-        # 先全部卸载，再按固定顺序重装（保证隐藏/展开后顺序不变）
-        for _key, (lbl, _i, _t, _s) in self.items.items():
-            lbl.pack_forget()
-        for key, (lbl, icon, text, sub) in self.items.items():
-            if sub and (not self.expanded or not self.submenu_open):
-                continue
-            if self.expanded:
-                prefix = "    " if sub else ""
-                lbl.config(text="{0}  {1}{2}".format(icon, prefix, text),
-                           anchor="w", padx=12)
-            else:
-                lbl.config(text=icon, anchor="w", padx=18)
-            if key == self.active_key:
-                lbl.config(bg=BLUE, fg="white", font=(FONT, 10, "bold"))
-            else:
-                lbl.config(bg=CARD, fg=TEXT, font=(FONT, 10))
-            lbl.pack(fill="x", pady=1)
-
-
-# ----------------------------- 购票历史页 -----------------------------
-
-class HistoryPanel(ttk.Frame):
-    RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
-                    "failed": "下单失败", "hit_no_order": "命中未下单"}
-
-    def __init__(self, master, app):
-        super().__init__(master)
-        self.app = app
-        head = ttk.Frame(self)
-        head.pack(fill="x", pady=(4, 2))
-        ttk.Label(head, text="购票历史与通知记录：", font=(FONT, 11, "bold")).pack(side="left")
-        ttk.Button(head, text="刷新", style="White.TButton", command=self.load).pack(side="right")
-
-        cols = ("time", "task", "train", "date", "route", "seat",
-                "passengers", "order_no", "result")
-        heads = ("时间", "任务", "车次", "日期", "区间", "席别",
-                 "乘车人", "订单号", "结果")
-        widths = (130, 150, 60, 90, 110, 70, 110, 110, 70)
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
-        for c, h, w in zip(cols, heads, widths):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="w" if c in ("time", "task", "route",
-                                                             "passengers") else "center")
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        self.load()
-
-    def load(self):
-        self.tree.delete(*self.tree.get_children())
-        for r in read_history_records():
-            self.tree.insert("", "end", values=(
-                r.get("time", ""), r.get("task", ""), r.get("train", ""),
-                r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
-                r.get("seat", ""), "、".join(r.get("passengers") or []),
-                r.get("order_no", ""),
-                self.RESULT_LABEL.get(r.get("result"), r.get("result", ""))))
-
-
-# ----------------------------- 通知设置页 -----------------------------
-
-class NotifyPanel(NotifyFormMixin, ttk.Frame):
-    def __init__(self, master, app):
-        super().__init__(master)
-        self.app = app
-        cfg = load_config()
-        self.email = cfg.setdefault("notify", {}).setdefault("email", {})
-        head = ttk.Frame(self)
-        head.pack(fill="x", pady=(4, 2))
-        ttk.Label(head, text="邮件通知设置（SMTP 授权码）：", font=(FONT, 11, "bold")).pack(side="left")
-
-        body = ttk.Frame(self, padding=8)
-        body.pack(fill="both", expand=True)
-        self._build_notify_fields(body, hint_wraplength=640)
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", pady=8)
-        ttk.Button(btns, text="保存", style="Blue.TButton", command=self.save).pack(side="right", padx=6)
-        ttk.Button(btns, text="发送测试邮件", style="White.TButton", command=self.test).pack(side="right", padx=6)
-
-
-# ----------------------------- 任务状态页 -----------------------------
+# ----------------------------- 监控任务页 -----------------------------
 
 class TaskPage(ttk.Frame):
     """任务状态页：显示所有已创建任务；「已暂停」状态的选中任务可再编辑。"""
@@ -2582,25 +601,29 @@ class TaskPage(ttk.Frame):
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x", pady=(4, 6))
-        ttk.Button(toolbar, text="新建任务（查后选）", style="Blue.TButton",
+        ttk.Button(toolbar, text="＋ 新建任务",
                    command=app.open_wizard).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="直接监视（免查询）", style="Light.TButton",
-                   command=app.open_quick_monitor).pack(side="left", padx=3)
-        app.start_btn = ttk.Button(toolbar, text="▶ 启动监控", style="Blue.TButton",
-                                   command=app.open_start_dialog)
-        app.start_btn.pack(side="left", padx=3)
-        app.stop_btn = ttk.Button(toolbar, text="■ 停止监控", style="White.TButton",
-                                  command=app.stop_engine, state="disabled")
-        app.stop_btn.pack(side="left", padx=3)
-        self.edit_btn = ttk.Button(toolbar, text="编辑任务", style="White.TButton",
+        ttk.Button(toolbar, text="启动监控…",
+                   command=app.open_start_dialog).pack(side="left", padx=3)
+        self.edit_btn = ttk.Button(toolbar, text="编辑任务",
                                    command=self.edit_selected, state="disabled")
         self.edit_btn.pack(side="left", padx=3)
-        ttk.Button(toolbar, text="余票速查", style="White.TButton",
+        ttk.Button(toolbar, text="暂停", width=6,
+                   command=lambda: self._op_selected("paused")).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="恢复", width=6,
+                   command=lambda: self._op_selected("monitoring")).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="取消任务", width=8,
+                   command=lambda: self._op_selected("cancelled")).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="重置防重", width=8,
+                   command=lambda: self._op_selected("reset")).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="删除任务", width=8,
+                   command=lambda: self._op_selected("delete")).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="余票速查",
                    command=app.open_quick_check).pack(side="right", padx=3)
 
         ttk.Label(self, text="说明：右键任务可进行 编辑 / 暂停 / 恢复 / 取消 / 重置 / 删除 操作；"
                              "任务处于「已暂停」状态时可再编辑。",
-                  foreground="#B26A00", font=(FONT, 9)).pack(anchor="w", pady=(0, 4))
+                  foreground="#9a6700").pack(anchor="w", pady=(0, 6))
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True)
@@ -2616,7 +639,7 @@ class TaskPage(ttk.Frame):
         for st, color in STATUS_COLOR.items():
             self.tree.tag_configure(st, foreground=color)
         self.tree.tag_configure("started", foreground="#1a7f37")
-        self.tree.tag_configure("stopped", foreground="#8A94A6")
+        self.tree.tag_configure("stopped", foreground="#6e7781")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -2708,12 +731,16 @@ class TaskPage(ttk.Frame):
         else:
             self.edit_btn.config(state="disabled")
 
-    def edit_selected(self):
+    def _selected_task(self):
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("提示", "请先在列表中选择一个任务", parent=self)
-            return
+            return None
         task, _st = self._task_by_iid.get(sel[0], (None, None))
+        return task
+
+    def edit_selected(self):
+        task = self._selected_task()
         if task is None:
             return
         # 实时从 state.json 读取最新状态，避免使用过期缓存导致误判
@@ -2721,10 +748,16 @@ class TaskPage(ttk.Frame):
             "status", "paused")
         if fresh != "paused":
             messagebox.showwarning("提示",
-                                   "只有「已暂停」的任务可以编辑。\n请先右键该任务并选择「暂停监控」。",
+                                   "只有「已暂停」的任务可以编辑。\n请先点「暂停」再编辑。",
                                    parent=self)
             return
         TaskEditDialog(self.app, task, on_saved=self.app.refresh_tasks)
+
+    def _op_selected(self, action):
+        task = self._selected_task()
+        if task is None:
+            return
+        self._op(task, action)
 
     # ----------------------------- 右键菜单 -----------------------------
 
@@ -2756,24 +789,24 @@ class TaskPage(ttk.Frame):
         menu.tk_popup(evt.x_root, evt.y_root)
 
     def _op(self, task, action):
-        """右键菜单的操作执行器。"""
+        """右键菜单/工具条的操作执行器。"""
         name = task.get("name") or ""
         eng = self.app.get_ops_engine()
         info = None
         try:
             if action == "paused":
-                eng.set_task_status(task, "paused", "右键菜单暂停")
+                eng.set_task_status(task, "paused", "手动暂停")
                 info = "任务「%s」已暂停。" % name
             elif action == "monitoring":
-                eng.set_task_status(task, "monitoring", "右键菜单恢复", force=True)
+                eng.set_task_status(task, "monitoring", "手动恢复", force=True)
                 info = "任务「%s」已恢复监控。" % name
             elif action == "cancelled":
                 if messagebox.askyesno("确认", "确定取消任务「%s」？取消后不再监控。" % name, parent=self):
-                    eng.set_task_status(task, "cancelled", "右键菜单取消")
+                    eng.set_task_status(task, "cancelled", "手动取消")
             elif action == "reset":
                 if messagebox.askyesno("确认", "确定重置「%s」并清除其防重下单记录？" % name, parent=self):
                     eng.empty_task_dedup(task)
-                    eng.set_task_status(task, "monitoring", "右键菜单重置", force=True)
+                    eng.set_task_status(task, "monitoring", "手动重置", force=True)
             elif action == "delete":
                 if messagebox.askyesno("确认", "确定从配置中删除任务「%s」？" % name, parent=self):
                     delete_task_everywhere(self.app, task)
@@ -2782,6 +815,260 @@ class TaskPage(ttk.Frame):
         # 先刷新列表再弹窗，减小阻塞期间被旧状态覆盖的窗口
         if info:
             messagebox.showinfo("完成", info, parent=self)
+
+
+# ----------------------------- 新建监控任务（单表单） -----------------------------
+
+class NewTaskDialog(tk.Toplevel):
+    """新建监控任务：单个平铺表单（替代旧四步向导与「直接监视」两套入口）。
+
+    填 出发/到达/日期/车次/席别/首选席别/乘车人/选项 → 写入监控系统任务表。
+    「查后选」流程走查票页：查询 → 用查询条件创建任务（本对话框会预填）。"""
+
+    def __init__(self, app, on_created=None, prefill=None):
+        super().__init__(app.root)
+        self.app = app
+        self.on_created = on_created
+        self.title("新建监控任务")
+        self.geometry("560x760")
+        self.minsize(520, 640)
+        self.seat_vars = {}
+        self.pax_vars = {}
+        try:
+            self.name2code, self.code2name = ticket.load_station_map()
+        except Exception as e:
+            messagebox.showerror("错误", "车站代码表加载失败：%s" % e, parent=self)
+            self.destroy()
+            return
+        self._build()
+        prefill = prefill or {}
+        if prefill.get("from"):
+            self.from_ent.set(prefill.get("from"))
+        if prefill.get("to"):
+            self.to_ent.set(prefill.get("to"))
+        if prefill.get("date"):
+            self.date_var.set(prefill.get("date"))
+        if prefill.get("trains"):
+            self.trains_var.set(",".join(_display_trains(prefill.get("trains"))))
+        self._update_seat_pri_hint()
+        self.transient(app.root)
+        self.grab_set()
+
+    def _build(self):
+        # 行程
+        tf = ttk.LabelFrame(self, text=" 行程 ", padding=8)
+        tf.pack(fill="x", padx=10, pady=(10, 4))
+        r0 = ttk.Frame(tf)
+        r0.pack(fill="x")
+        ttk.Label(r0, text="出发").pack(side="left")
+        hist = []
+        try:
+            hist = launcher.load_launcher_config().get("station_history") or []
+        except Exception:
+            hist = []
+        self.from_ent = StationEntry(r0, width=12, history=hist)
+        self.from_ent.pack(side="left", padx=4)
+        ttk.Button(r0, text="⇄", width=3, command=self._swap).pack(side="left", padx=2)
+        ttk.Label(r0, text="到达").pack(side="left", padx=(8, 0))
+        self.to_ent = StationEntry(r0, width=12, history=hist)
+        self.to_ent.pack(side="left", padx=4)
+
+        r1 = ttk.Frame(tf)
+        r1.pack(fill="x", pady=(8, 0))
+        ttk.Label(r1, text="乘车日期").pack(side="left")
+        self.date_var = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.date_var, width=13).pack(side="left", padx=4)
+        ttk.Label(r1, text="到").pack(side="left", padx=(6, 0))
+        self.date_to_var = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.date_to_var, width=13).pack(side="left", padx=4)
+        ttk.Label(r1, text="车次").pack(side="left", padx=(10, 0))
+        self.trains_var = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.trains_var).pack(side="left", padx=4, fill="x",
+                                                         expand=True)
+        ttk.Label(tf, text="日期：单日 2026-10-06；范围填「到」即可（跨度≤5天，共 6 天）。"
+                           "车次逗号分隔，留空=监控全部车次",
+                  foreground="#57606a").pack(anchor="w", pady=(4, 0))
+
+        # 票种
+        pf = ttk.LabelFrame(self, text=" 票种 ", padding=8)
+        pf.pack(fill="x", padx=10, pady=4)
+        self.purpose_var = tk.StringVar(value="ADULT")
+        ttk.Radiobutton(pf, text="成人票", value="ADULT",
+                        variable=self.purpose_var).pack(side="left", padx=(0, 16))
+        ttk.Radiobutton(pf, text="学生票", value="0X00",
+                        variable=self.purpose_var).pack(side="left")
+
+        # 席别
+        sf = ttk.LabelFrame(self, text=" 监控席别（至少选一个） ", padding=8)
+        sf.pack(fill="x", padx=10, pady=4)
+        pro = ttk.Frame(sf)
+        pro.grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(pro, text="首选席别").pack(side="left")
+        self.seat_pri_var = tk.StringVar(value="")
+        ttk.Entry(pro, textvariable=self.seat_pri_var, width=18).pack(side="left", padx=4)
+        ttk.Label(pro, text="逗号分隔，先填的先抢；可指定车次：K1969=硬卧（只作用该趟车）；"
+                            "无座=硬座，认不出按硬座",
+                  foreground="#57606a").pack(side="left")
+        self.seat_pri_hint = ttk.Label(sf, foreground="#57606a")
+        self.seat_pri_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 4))
+        self.seat_pri_var.trace_add("write", lambda *_a: self._update_seat_pri_hint())
+        for i, s in enumerate(SEAT_CHOICES):
+            v = tk.BooleanVar(value=(s == "硬座"))
+            self.seat_vars[s] = v
+            ttk.Checkbutton(sf, text=s, variable=v,
+                            command=self._update_seat_pri_hint).grid(
+                row=i // 4 + 2, column=i % 4, sticky="w", padx=(0, 8))
+
+        # 乘车人
+        gf = ttk.LabelFrame(self, text=" 乘车人（不选=下单时用默认乘车人） ", padding=8)
+        gf.pack(fill="x", padx=10, pady=4)
+        try:
+            plist = passengers_mod.load_passengers()
+        except Exception:
+            plist = []
+        self.pax_frame = ttk.Frame(gf)
+        self.pax_frame.pack(fill="x")
+        if not plist:
+            ttk.Label(self.pax_frame, text="（乘车人库为空，可在「乘车人」页添加）",
+                      foreground="#57606a").pack(side="left")
+        for p in plist:
+            name = p.get("name") or ""
+            if not name:
+                continue
+            v = tk.BooleanVar(value=bool(p.get("is_default")))
+            self.pax_vars[name] = v
+            label = name + ("（默认）" if p.get("is_default") else "")
+            ttk.Checkbutton(self.pax_frame, text=label, variable=v).pack(
+                side="left", padx=(0, 12))
+
+        # 选项
+        of = ttk.LabelFrame(self, text=" 选项 ", padding=8)
+        of.pack(fill="x", padx=10, pady=4)
+        r2 = ttk.Frame(of)
+        r2.pack(fill="x")
+        ttk.Label(r2, text="优先级").pack(side="left")
+        self.prio_var = tk.IntVar(value=5)
+        ttk.Spinbox(r2, from_=1, to=10, textvariable=self.prio_var,
+                    width=5).pack(side="left", padx=4)
+        ttk.Label(r2, text="（1-10，数字越大越先抢）",
+                  foreground="#57606a").pack(side="left")
+        self.auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(of, text="余票命中后自动下单（不支付）",
+                        variable=self.auto_var).pack(anchor="w")
+        self.stop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(of, text="一次下单成功后自动停止本任务",
+                        variable=self.stop_var).pack(anchor="w")
+        self.notify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(of, text="下单成功后发送邮件通知",
+                        variable=self.notify_var).pack(anchor="w")
+
+        # 按钮
+        bf = ttk.Frame(self)
+        bf.pack(fill="x", padx=10, pady=(8, 10))
+        ttk.Button(bf, text="创建并开始监控",
+                   command=lambda: self.create(start_now=True)).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(bf, text="仅创建任务",
+                   command=lambda: self.create(start_now=False)).pack(
+            side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(bf, text="取消", command=self.destroy).pack(side="left", padx=(8, 0))
+
+    def _swap(self):
+        a, b = self.from_ent.get(), self.to_ent.get()
+        self.from_ent.set(b)
+        self.to_ent.set(a)
+
+    def _update_seat_pri_hint(self):
+        """「首选席别」输入框的即时解析反馈（含 车次=席别 专属规则）。"""
+        checked = [s for s, v in self.seat_vars.items() if v.get()]
+        trains = [t.strip().upper() for t in
+                  re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
+        text, bad = ticket.seat_priority_feedback(self.seat_pri_var.get(),
+                                                  checked=checked, trains=trains)
+        self.seat_pri_hint.configure(text=text,
+                                     foreground="#cf222e" if bad else "#57606a")
+
+    def _parse_dates(self):
+        return appcommon.parse_date_range(self.date_var.get().strip(),
+                                          self.date_to_var.get().strip())
+
+    def create(self, start_now):
+        from_name, to_name = self.from_ent.get(), self.to_ent.get()
+        if from_name not in self.name2code or to_name not in self.name2code:
+            messagebox.showwarning("提示", "出发站/到达站无效，请通过「选」按钮选择有效站名",
+                                   parent=self)
+            return
+        if from_name == to_name:
+            messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
+            return
+        try:
+            dates, date_range = self._parse_dates()
+        except ValueError as e:
+            messagebox.showwarning("提示", "日期格式错误：%s" % e, parent=self)
+            return
+        seats = [s for s, v in self.seat_vars.items() if v.get()]
+        if not seats:
+            messagebox.showwarning("提示", "请至少选择一个席别", parent=self)
+            return
+        if self.auto_var.get():
+            # 开着自动下单时，剔除不支持下单的席别（与抢票路径同一条规则）。
+            bad = [s for s in seats if s not in ticket.SEAT_NAME_TO_CODE]
+            if bad:
+                seats = [s for s in seats if s in ticket.SEAT_NAME_TO_CODE]
+                self.app.log_line("[提醒] 席别 %s 暂不支持自动下单，已从该监控任务移除"
+                                  % "、".join(bad))
+            if not seats:
+                messagebox.showwarning(
+                    "提示", "勾选的席别暂不支持自动下单。\n"
+                    "可改选其他席别，或关掉「自动下单」只做有票提醒。", parent=self)
+                return
+        trains = [t.strip().upper() for t in
+                  re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
+        passengers = [n for n, v in self.pax_vars.items() if v.get()]
+        pri_raw = self.seat_pri_var.get().strip()
+        # Task 96b：Spinbox 手输非数字时 tk.IntVar.get() 抛 TclError →
+        # 友好提示并用安全默认值 5。
+        try:
+            prio = self.prio_var.get()
+        except (tk.TclError, ValueError, TypeError):
+            messagebox.showwarning("优先级无效", "优先级请输入 1-10 的数字，已使用默认值 5。",
+                                   parent=self)
+            prio = 5
+        task = launcher.build_monitor_task(
+            from_name, to_name, dates, date_range, trains, seats, passengers,
+            self.purpose_var.get(), self.auto_var.get(), self.stop_var.get(),
+            prio, pax_purpose={}, seat_priority=pri_raw)
+        task["notify_channels"] = ["email"] if self.notify_var.get() else []
+        if pri_raw:
+            parsed = ticket.seat_rules_parse(pri_raw)
+            summary = []
+            for tr, ss in parsed["rules"].items():
+                summary.append("%s=%s" % (tr, "/".join(ss)))
+            if parsed["bare"]:
+                summary.append("其余车次：%s" % "/".join(parsed["bare"]))
+            for warn in parsed["warnings"]:
+                self.app.log_line("[提醒] 首选席别：%s" % warn)
+            if summary:
+                self.app.log_line("[运行] 监控任务席别规则：%s" % "；".join(summary))
+        try:
+            name = launcher.append_monitor_task(task, start_now)
+        except Exception as e:
+            messagebox.showerror("创建失败", "写入监控系统配置失败：%s" % e, parent=self)
+            return
+        self.app.log_line("[运行] 已创建监控任务「%s」%s" % (
+            name, "，监控中" if start_now else "，未启动"))
+        if self.on_created:
+            self.on_created()
+        self.destroy()
+        if start_now:
+            self.app.start_engine()
+            messagebox.showinfo("完成",
+                                "任务「%s」已创建并开始监视。\n命中余票将自动提交订单。"
+                                % name, parent=self.app.root)
+        else:
+            messagebox.showinfo("完成",
+                                "任务「%s」已创建。\n在「监控任务」页点「启动监控…」即可开始。"
+                                % name, parent=self.app.root)
 
 
 # ----------------------------- 编辑任务（暂停态） -----------------------------
@@ -2795,8 +1082,7 @@ class TaskEditDialog(tk.Toplevel):
         self.task = task
         self.on_saved = on_saved
         self.title("编辑任务")
-        self.geometry("480x660")
-        self.configure(bg=CARD)
+        self.geometry("520x700")
         try:
             self.name2code, self.code2name = ticket.load_station_map()
         except Exception as e:
@@ -2804,22 +1090,22 @@ class TaskEditDialog(tk.Toplevel):
             self.destroy()
             return
 
-        header = tk.Frame(self, bg=BLUE)
-        header.pack(fill="x")
-        tk.Label(header, text="编辑任务", bg=BLUE, fg="white",
-                 font=(FONT, 14, "bold"), pady=10).pack(side="left", padx=16)
-        tk.Label(header, text=task.get("name", ""), bg=BLUE, fg="#DCEAFB",
-                 font=(FONT, 9)).pack(side="right", padx=16)
+        ttk.Label(self, text="编辑任务：%s" % (task.get("name", "")),
+                  font=("", 11, "bold")).pack(anchor="w", padx=14, pady=(10, 4))
 
-        body = tk.Frame(self, bg=CARD)
-        body.pack(fill="both", expand=True, padx=18)
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=14)
 
-        self.from_field = StationField(body, "出发站", big=True)
-        self.from_field.pack(fill="x", pady=6)
-        self.from_field.entry.insert(0, task.get("from", ""))
-        self.to_field = StationField(body, "到达站", big=True)
-        self.to_field.pack(fill="x", pady=6)
-        self.to_field.entry.insert(0, task.get("to", ""))
+        r0 = ttk.Frame(body)
+        r0.pack(fill="x", pady=4)
+        ttk.Label(r0, text="出发").pack(side="left")
+        self.from_field = StationEntry(r0, width=12)
+        self.from_field.pack(side="left", padx=4)
+        self.from_field.set(task.get("from", ""))
+        ttk.Label(r0, text="到达").pack(side="left", padx=(8, 0))
+        self.to_field = StationEntry(r0, width=12)
+        self.to_field.pack(side="left", padx=4)
+        self.to_field.set(task.get("to", ""))
 
         dates = engine_mod.expand_dates(task)
         # Task 75d：记下原始日期配置与展示文本；非连续多日如实列出，
@@ -2830,100 +1116,77 @@ class TaskEditDialog(tk.Toplevel):
             if isinstance(task.get("date_range"), list) else []
         self._date_text_orig, self._date_non_contig = _date_display_text(dates)
         date_text = self._date_text_orig
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=6)
-        tk.Label(row, text="乘车日期", bg=CARD, fg=GRAY, width=8,
-                 anchor="w").pack(side="left")
+        r1 = ttk.Frame(body)
+        r1.pack(fill="x", pady=4)
+        ttk.Label(r1, text="乘车日期").pack(side="left")
         self.date_var = tk.StringVar(value=date_text)
-        self.date_entry = tk.Entry(row, textvariable=self.date_var, width=30,
-                                   font=(FONT, 10))
-        self.date_entry.pack(side="left")
-        attach_calendar(self.date_entry, support_range=True,
-                       max_span_days=appcommon.MAX_DATE_SPAN_DAYS)
-        tk.Label(body, text="单日：2026-10-07　范围：2026-10-07~2026-10-09",
-                 bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
-
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=6)
-        tk.Label(row, text="车次", bg=CARD, fg=GRAY, width=8,
-                 anchor="w").pack(side="left")
+        ttk.Entry(r1, textvariable=self.date_var, width=26).pack(side="left", padx=4)
+        ttk.Label(r1, text="车次").pack(side="left", padx=(10, 0))
         self.trains_var = tk.StringVar(
             value=",".join(_display_trains(task.get("trains"))))
-        tk.Entry(row, textvariable=self.trains_var, width=30, font=(FONT, 10)).pack(side="left")
-        tk.Label(body, text="多个车次用逗号分隔；留空=监控全部车次",
-                 bg=CARD, fg=GRAY, font=(FONT, 8)).pack(anchor="w", pady=(0, 4))
+        ttk.Entry(r1, textvariable=self.trains_var).pack(side="left", padx=4,
+                                                         fill="x", expand=True)
+        ttk.Label(body, text="单日：2026-10-06　范围：2026-10-06~2026-10-09；"
+                             "车次逗号分隔，留空=监控全部车次",
+                  foreground="#57606a").pack(anchor="w", pady=(0, 4))
 
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=6)
-        tk.Label(row, text="票种", bg=CARD, fg=GRAY, width=8, anchor="w").pack(side="left")
+        r2 = ttk.Frame(body)
+        r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="票种").pack(side="left")
         self.purpose_var = tk.StringVar(value=task.get("purpose_code") or "ADULT")
-        tk.Radiobutton(row, text="成人票", value="ADULT", variable=self.purpose_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10),
-                       cursor="hand2").pack(side="left", padx=(0, 10))
-        tk.Radiobutton(row, text="学生票", value="0X00", variable=self.purpose_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10),
-                       cursor="hand2").pack(side="left")
+        ttk.Radiobutton(r2, text="成人票", value="ADULT",
+                        variable=self.purpose_var).pack(side="left", padx=(8, 16))
+        ttk.Radiobutton(r2, text="学生票", value="0X00",
+                        variable=self.purpose_var).pack(side="left")
 
-        tk.Label(body, text="监控席别（Ctrl/Shift 多选）：", bg=CARD, fg=GRAY,
-                 font=(FONT, 9)).pack(anchor="w")
-        self.seat_list = tk.Listbox(body, height=5, selectmode="multiple",
-                                    font=(FONT, 10), relief="flat",
-                                    highlightthickness=1, highlightbackground=BORDER)
+        ttk.Label(body, text="监控席别（Ctrl/Shift 多选）：").pack(anchor="w", pady=(6, 0))
+        self.seat_list = tk.Listbox(body, height=6, selectmode="multiple")
         self.seat_list.pack(fill="x")
         for s in SEAT_CHOICES:
             self.seat_list.insert("end", s)
-        # Task 103c：展示用归一化——裸字符串按单个席别（旧代码逐字符拆后
-        # s in SEAT_CHOICES 恒失败 → 已存席别显示为未选中）。
+        # Task 103c：展示用归一化——裸字符串按单个席别。
         for s in _display_seat_types(task.get("seat_types")):
             if s in SEAT_CHOICES:
                 self.seat_list.selection_set(SEAT_CHOICES.index(s))
 
-        tk.Label(body, text="乘车人（不选=默认/账号常用）：", bg=CARD, fg=GRAY,
-                 font=(FONT, 9)).pack(anchor="w", pady=(8, 0))
+        ttk.Label(body, text="乘车人（不选=默认/账号常用）：").pack(anchor="w", pady=(8, 0))
         self.psg_items = []
-        self.psg_list = tk.Listbox(body, height=3, selectmode="multiple", font=(FONT, 10),
-                                   relief="flat", highlightthickness=1,
-                                   highlightbackground=BORDER)
+        self.psg_list = tk.Listbox(body, height=4, selectmode="multiple")
         self.psg_list.pack(fill="x")
         for p in passengers_mod.load_passengers():
             label = "{0}{1}".format(p.get("name"), "（默认）" if p.get("is_default") else "")
             self.psg_list.insert("end", label)
             self.psg_items.append(p.get("name"))
-        # Task 106：展示用归一化——裸字符串按单个姓名处理（旧代码逐字符拆后
-        # n in self.psg_items 恒失败 → 已存乘车人显示为未选中）。
+        # Task 106：展示用归一化——裸字符串按单个姓名处理。
         for n in _display_seat_types(task.get("passenger_names")):
             if n in self.psg_items:
                 self.psg_list.selection_set(self.psg_items.index(n))
 
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x", pady=8)
-        tk.Label(row, text="优先级", bg=CARD, fg=GRAY, width=8,
-                 anchor="w").pack(side="left")
+        r3 = ttk.Frame(body)
+        r3.pack(fill="x", pady=8)
+        ttk.Label(r3, text="优先级").pack(side="left")
         self.prio_var = tk.IntVar(value=int(task.get("priority") or 5))
-        for v in range(1, 11):
-            tk.Radiobutton(row, text=str(v), value=v, variable=self.prio_var,
-                           bg=CARD, activebackground=CARD, font=(FONT, 8),
-                           indicatoron=False, selectcolor=BLUE,
-                           cursor="hand2").pack(side="left", padx=1)
+        ttk.Spinbox(r3, from_=1, to=10, textvariable=self.prio_var,
+                    width=5).pack(side="left", padx=4)
+        ttk.Label(r3, text="（1-10，越大越先抢）", foreground="#57606a").pack(side="left")
 
         self.auto_var = tk.BooleanVar(value=bool(task.get("auto_order", True)))
-        tk.Checkbutton(body, text="余票命中后自动下单（不支付）", variable=self.auto_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10)).pack(anchor="w")
+        ttk.Checkbutton(body, text="余票命中后自动下单（不支付）",
+                        variable=self.auto_var).pack(anchor="w")
         self.stop_var = tk.BooleanVar(value=bool(task.get("stop_after_order", True)))
-        tk.Checkbutton(body, text="一次下单成功后自动停止本任务", variable=self.stop_var,
-                       bg=CARD, activebackground=CARD, font=(FONT, 10)).pack(anchor="w")
+        ttk.Checkbutton(body, text="一次下单成功后自动停止本任务",
+                        variable=self.stop_var).pack(anchor="w")
 
-        btns = tk.Frame(self, bg=BG)
-        btns.pack(fill="x", side="bottom")
-        ttk.Button(btns, text="保存修改", style="Blue.TButton",
-                   command=self.save).pack(side="right", padx=12, pady=8)
-        ttk.Button(btns, text="取消", style="White.TButton",
-                   command=self.destroy).pack(side="left", padx=12, pady=8)
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=14, pady=10)
+        ttk.Button(btns, text="保存修改", command=self.save).pack(side="right", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
 
     def save(self):
         from_name, to_name = self.from_field.get(), self.to_field.get()
         if from_name not in self.name2code or to_name not in self.name2code:
-            messagebox.showwarning("提示", "请先通过「选择」确定有效的出发站/到达站", parent=self)
+            messagebox.showwarning("提示", "出发站/到达站无效，请通过「选」按钮选择有效站名",
+                                   parent=self)
             return
         if from_name == to_name:
             messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
@@ -2943,6 +1206,10 @@ class TaskEditDialog(tk.Toplevel):
         trains = [t.strip() for t in
                   self.trains_var.get().replace("，", ",").split(",") if t.strip()]
         passengers = [self.psg_items[i] for i in self.psg_list.curselection()]
+        try:
+            prio = self.prio_var.get()
+        except (tk.TclError, ValueError, TypeError):
+            prio = 5
 
         new_task = _build_edited_task(
             self.task, from_name=from_name, to_name=to_name,
@@ -2950,8 +1217,9 @@ class TaskEditDialog(tk.Toplevel):
             seat_types=seats, passengers=passengers,
             auto_order=bool(self.auto_var.get()),
             stop_after_order=bool(self.stop_var.get()),
-            priority=int(self.prio_var.get()),
+            priority=int(prio),
             purpose_code=self.purpose_var.get())
+
         def _replace_task(config):
             uid = self.task.get("uid")
             for i, t in enumerate(config.get("tasks") or []):
@@ -2965,11 +1233,2389 @@ class TaskEditDialog(tk.Toplevel):
         if self.on_saved:
             self.on_saved()
         self.destroy()
-        messagebox.showinfo("完成", "任务「%s」已更新。\n在主界面启动监控后按新参数运行。" % new_task["name"],
-                            parent=self.app.root)
+        messagebox.showinfo("完成", "任务「%s」已更新。\n在主界面启动监控后按新参数运行。"
+                            % new_task["name"], parent=self.app.root)
 
 
-# ----------------------------- 主窗口 -----------------------------
+# ----------------------------- 启动监控（选择任务） -----------------------------
+
+class StartMonitorDialog(tk.Toplevel):
+    """启动监控时选择要运行哪些任务；已启动的任务标记「已启动」并锁定勾选。"""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("启动监控（选择任务）")
+        self.geometry("600x520")
+
+        self.running = bool(app.engine_thread and app.engine_thread.is_alive())
+        tip_text = ("引擎正在运行：已启动的任务自动锁定；新勾选的任务会自动纳入，"
+                    "取消勾选转为「已暂停」。"
+                    if self.running else "勾选要启动的任务，点击「启动所选任务」开始监控。")
+        ttk.Label(self, text=tip_text, foreground="#9a6700",
+                  wraplength=560, justify="left").pack(fill="x", padx=12, pady=8)
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=14)
+
+        self.vars = {}
+        config = load_config()
+        state = _state_tasks_dict()
+        tasks = config.get("tasks") or []
+        if not tasks:
+            ttk.Label(body, text="暂无任务，请先创建任务。").pack(pady=30)
+        for idx, t in enumerate(tasks):
+            name = t.get("name") or ""
+            st = state.get(name, {}).get("status", "paused")
+            active = st in engine_mod.ACTIVE_STATUSES
+            started = self.running and active
+            var = tk.BooleanVar(value=active)
+            self.vars[idx] = var
+
+            row = ttk.Frame(body)
+            row.pack(fill="x", pady=3)
+            cb = ttk.Checkbutton(row, variable=var,
+                                 state=("disabled" if started else "normal"))
+            cb.pack(side="left", padx=6)
+            info = ttk.Frame(row)
+            info.pack(side="left", fill="x", expand=True)
+            ttk.Label(info, text=name, font=("", 10, "bold")).pack(anchor="w")
+            sub = "{0} → {1}   {2}   {3}   优先级 {4}".format(
+                t.get("from", ""), t.get("to", ""),
+                format_dates(t),
+                "/".join(_display_trains(t.get("trains"))) or "全部车次",
+                t.get("priority", 5))
+            ttk.Label(info, text=sub, foreground="#57606a").pack(anchor="w")
+            if started:
+                ttk.Label(row, text="已启动", foreground="#0969da").pack(side="right", padx=10)
+            else:
+                ttk.Label(row, text=engine_mod.STATUS_LABELS.get(st, st),
+                          foreground=STATUS_COLOR.get(st, "")).pack(side="right", padx=10)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", side="bottom")
+        ttk.Button(btns, text="启动所选任务",
+                   command=self.apply_start).pack(side="right", padx=12, pady=8)
+        ttk.Button(btns, text="关闭",
+                   command=self.destroy).pack(side="right")
+
+    def apply_start(self):
+        if not any(v.get() for v in self.vars.values()):
+            messagebox.showwarning("未选择任务",
+                                   "请至少勾选一个要启动的任务。\n全部取消勾选相当于不启动任何监控。",
+                                   parent=self)
+            return
+        config = load_config()
+        eng = self.app.get_ops_engine()
+        for idx, t in enumerate(config.get("tasks") or []):
+            var = self.vars.get(idx)
+            if var is None:
+                continue
+            st = eng.task_status(t)
+            if var.get():
+                if st not in engine_mod.ACTIVE_STATUSES:
+                    eng.set_task_status(t, "monitoring", "由启动对话框启用", force=True)
+            else:
+                if st in engine_mod.ACTIVE_STATUSES:
+                    eng.set_task_status(t, "paused", "在启动对话框中取消勾选")
+        self.app.refresh_tasks()
+        self.app.start_engine()
+        self.app.refresh_tasks()
+        self.destroy()
+
+
+# ----------------------------- 历史查询记录 -----------------------------
+
+class QueryHistoryDialog(tk.Toplevel):
+    """历史查询记录：双击一条即填回行程。"""
+    def __init__(self, master, items, on_pick):
+        super().__init__(master)
+        # Task 74g：构造时即过滤掉非 dict 条目（逐条记 warning），保证
+        # self.items 与列表框行号 1:1 对齐；否则 _pick 会按错位索引取错条目。
+        rows = []
+        for it in items:
+            text = launcher._history_item_text(it)
+            if text is None:
+                continue
+            rows.append((it, text))
+        self.items = [it for it, _text in rows]
+        self.on_pick = on_pick
+        self.title("历史查询记录")
+        self.geometry("380x320")
+        self.transient(master.winfo_toplevel())
+        body = ttk.Frame(self, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="双击一条记录填回行程：", foreground="#6e7781").pack(anchor="w")
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True, pady=(6, 0))
+        sb = ttk.Scrollbar(wrap, command=lambda *a: self.lb.yview(*a))
+        self.lb = tk.Listbox(wrap, yscrollcommand=sb.set, activestyle="none")
+        sb.pack(side="right", fill="y")
+        self.lb.pack(side="left", fill="both", expand=True)
+        for _it, text in rows:
+            self.lb.insert("end", text)
+        self.lb.bind("<Double-Button-1>", self._pick)
+        self.lb.bind("<Return>", self._pick)
+        if self.items:
+            self.lb.selection_set(0)
+        self.lb.focus_set()
+
+    def _pick(self, _e=None):
+        sel = self.lb.curselection()
+        if sel:
+            self.on_pick(self.items[sel[0]])
+        self.destroy()
+
+
+# ----------------------------- 查票页（免登录） -----------------------------
+
+class QuickCheckTab(ttk.Frame):
+    """余票速查：免登录查询实时余票；可用查询条件一键创建监控任务。"""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        try:
+            self.name2code, self.code2name = ticket.load_station_map()
+        except Exception as e:
+            messagebox.showerror("错误", "车站代码表加载失败：%s" % e, parent=self)
+            self.name2code, self.code2name = {}, {}
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=8)
+        ttk.Label(top, text="出发").pack(side="left")
+        self.from_ent = StationEntry(top, width=13)
+        self.from_ent.pack(side="left", padx=4)
+        ttk.Button(top, text="⇄", width=3, command=self._swap).pack(side="left", padx=2)
+        ttk.Label(top, text="到达").pack(side="left", padx=(6, 0))
+        self.to_ent = StationEntry(top, width=13)
+        self.to_ent.pack(side="left", padx=4)
+        ttk.Label(top, text="日期").pack(side="left", padx=(8, 2))
+        self.date_var = tk.StringVar(value=datetime.date.today().isoformat())
+        ttk.Entry(top, textvariable=self.date_var, width=12).pack(side="left")
+        ttk.Button(top, text="查询", command=self.query).pack(side="left", padx=8)
+        ttk.Button(top, text="用此条件创建监控任务",
+                   command=self._create_task).pack(side="left")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=4)
+        cols = ("train", "route", "time", "duration", "seats")
+        heads = ("车次", "区间", "时间", "历时", "余票")
+        widths = (80, 160, 130, 70, 340)
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w" if c == "seats" else "center")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.status = ttk.Label(self, text="")
+        self.status.pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _swap(self):
+        a, b = self.from_ent.get(), self.to_ent.get()
+        self.from_ent.set(b)
+        self.to_ent.set(a)
+
+    def _create_task(self):
+        prefill = {"from": self.from_ent.get(), "to": self.to_ent.get(),
+                   "date": self.date_var.get().strip()}
+        self.app.open_wizard(prefill=prefill)
+
+    def query(self):
+        from_name, to_name = self.from_ent.get(), self.to_ent.get()
+        date = self.date_var.get().strip()
+        if from_name not in self.name2code or to_name not in self.name2code:
+            messagebox.showwarning("提示", "请选择有效的车站", parent=self)
+            return
+        if from_name == to_name:
+            messagebox.showwarning("提示", "出发站与到达站不能相同", parent=self)
+            return
+        self.status.config(text="查询中...")
+        self.tree.delete(*self.tree.get_children())
+
+        def do_query():
+            rows = ticket.query_tickets(self.name2code[from_name],
+                                        self.name2code[to_name], date)
+            out = []
+            for row in rows:
+                info = ticket.parse_row(row, self.code2name)
+                seats = " ".join("{0}({1})".format(k, v)
+                                 for k, v in info["available_seats"].items()) \
+                    or "暂无可视余票"
+                out.append((info["train_code"],
+                            "%s-%s" % (info["from_name"], info["to_name"]),
+                            "%s-%s" % (info["start_time"], info["arrive_time"]),
+                            info["duration"], seats))
+            return out
+
+        def on_done(res, err):
+            if err:
+                self.status.config(text="")
+                messagebox.showerror("查询失败", str(err), parent=self)
+                return
+            for row in res:
+                self.tree.insert("", "end", values=row)
+            self.status.config(text="共 %d 趟" % len(res))
+
+        run_async(self, do_query, on_done)
+
+
+# ----------------------------- 乘车人 -----------------------------
+
+def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
+    """保存乘车人；磁盘盒子不可解密被拒写时弹 error 提示并返回 False。
+
+    Task 80(b)：save_passengers 的拒写（return False）原来三处裸调无人处理，
+    GUI 会显示"完成"/刷新列表，但磁盘未写，重启后修改丢失。此处失败弹
+    error（与 save_passengers 内的 LOG.error 口径一致），调用方不再显示
+    "完成"、不再刷新列表。
+
+    Task 89(c)：expect_stamp 传入时做乐观并发检查（与 Task 88d/monitor 同口径）；
+    编辑期间被外部修改导致放弃保存时弹 warning（不覆盖对方修改），返回 False。
+    不传 expect_stamp 时保持 Task 80 行为（直接写）。
+    """
+    if passengers_mod.save_passengers(passengers, expect_stamp=expect_stamp):
+        return True
+    if expect_stamp is not passengers_mod._STAMP_UNSET \
+            and passengers_mod.passengers_stamp() != expect_stamp:
+        # 乐观并发放弃：save_passengers 已在锁内检出指纹变化并打印警告；
+        # GUI 侧再给一次明确提示（不静默），调用方负责重载最新数据。
+        messagebox.showwarning("保存已放弃",
+                               "乘车人数据在您编辑期间被其他程序修改，本次保存已放弃，\n"
+                               "未覆盖对方的修改。请基于最新数据重新操作。",
+                               parent=parent)
+        return False
+    messagebox.showerror("保存失败",
+                         "乘车人数据保存失败：磁盘上的已有数据在本机不可解密，"
+                         "已拒绝覆盖以保护原数据。\n"
+                         "请在原机器解密后迁移，或使用 --force 放弃旧数据。",
+                         parent=parent)
+    return False
+
+
+class PassengerPanel(ttk.Frame):
+    """乘车人管理页：列表 + 添加 / 编辑 / 删除 / 设为默认（加密存储，展示打码）。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        ttk.Label(self, text="乘车人列表（证件号/手机号加密保存，显示时脱敏）：").pack(
+            anchor="w", padx=12, pady=(10, 2))
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=12, pady=4)
+        self.listbox = tk.Listbox(frame)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="添加", command=lambda: self.edit(None)).pack(side="left", padx=4)
+        ttk.Button(btns, text="编辑", command=lambda: self.edit(self.selected())).pack(side="left", padx=4)
+        ttk.Button(btns, text="删除", command=self.remove).pack(side="left", padx=4)
+        ttk.Button(btns, text="设为默认", command=self.set_default).pack(side="left", padx=4)
+        ttk.Label(btns, text="默认乘车人在抢票/监控未勾选时优先使用",
+                  foreground="#57606a").pack(side="left", padx=10)
+        self.refresh()
+
+    def refresh(self):
+        self.passengers = passengers_mod.load_passengers()
+        # Task 89c：记下 load 时的字节指纹，供保存时做乐观并发检查
+        #（本页面打开期间若被外部修改，保存时警告并放弃，不静默覆写）。
+        self._pax_stamp = passengers_mod.passengers_stamp()
+        self.listbox.delete(0, "end")
+        for p in self.passengers:
+            self.listbox.insert("end", "{0}{1}  证件:{2} {3}".format(
+                p.get("name"), "【默认】" if p.get("is_default") else "",
+                passengers_mod.ID_TYPE_NAMES.get(p.get("id_type_code"), "?"),
+                _mask_id(p.get("id_no"))))
+
+    def selected(self):
+        sel = self.listbox.curselection()
+        return sel[0] if sel else None
+
+    def _save_passengers_or_refresh(self, parent):
+        """保存 self.passengers（Task 89c：Task 88d 同口径的乐观并发检查）。
+
+        成功 → (True, "ok")。指纹变化（本页面打开期间被外部修改）→
+        重载最新数据+警告，返回 (False, "stale")，调用方放弃本次保存。
+        不可解密盒子/锁超时 → error，返回 (False, "refused")（不重载，不丢内存数据）。
+        """
+        if _save_passengers_or_warn(self.passengers, parent, self._pax_stamp):
+            return True, "ok"
+        if self._pax_stamp is not passengers_mod._STAMP_UNSET \
+                and passengers_mod.passengers_stamp() != self._pax_stamp:
+            # 外部写入导致放弃：重载最新数据+新指纹。
+            # （expect_stamp 为哨兵值时本就没有乐观检查，不存在"被外部修改"。）
+            self.refresh()
+            return False, "stale"
+        return False, "refused"
+
+    def edit(self, index):
+        p = self.passengers[index] if index is not None else None
+        dlg = tk.Toplevel(self)
+        dlg.title("添加乘车人" if p is None else "编辑乘车人")
+        dlg.geometry("460x340")
+        dlg.transient(self.winfo_toplevel())
+        body = ttk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+
+        def row(label, widget):
+            r = ttk.Frame(body)
+            r.pack(fill="x", pady=3)
+            ttk.Label(r, text=label, width=10).pack(side="left")
+            widget.pack(side="left", fill="x", expand=True)
+            return r
+
+        name_var = tk.StringVar(value=(p or {}).get("name", ""))
+        row("姓名", ttk.Entry(body, textvariable=name_var))
+        type_var = tk.StringVar(value=(p or {}).get("id_type_code", "1"))
+        combo = ttk.Combobox(body, textvariable=type_var, state="readonly", width=26)
+        combo["values"] = ["%s - %s" % (k, v) for k, v in passengers_mod.ID_TYPE_NAMES.items()]
+        if type_var.get() not in [c.split(" ")[0] for c in combo["values"]]:
+            combo.set("1 - 二代身份证")
+        else:
+            for c in combo["values"]:
+                if c.split(" ")[0] == type_var.get():
+                    combo.set(c)
+                    break
+        row("证件类型", combo)
+        id_var = tk.StringVar(value=(p or {}).get("id_no", ""))
+        id_entry = ttk.Entry(body, textvariable=id_var, show="*")
+        id_row = row("证件号码", id_entry)
+        id_visible = tk.BooleanVar(value=False)
+
+        def _toggle_id():
+            id_entry.configure(show="" if id_visible.get() else "*")
+
+        ttk.Button(id_row, text="显示", width=5, command=lambda: (
+            id_visible.set(not id_visible.get()), _toggle_id())).pack(side="left", padx=(6, 0))
+        mobile_var = tk.StringVar(value=(p or {}).get("mobile", ""))
+        row("手机号", ttk.Entry(body, textvariable=mobile_var))
+        default_var = tk.BooleanVar(value=bool((p or {}).get("is_default")))
+        ttk.Checkbutton(body, text="设为默认乘车人（自动下单优先使用）",
+                        variable=default_var).pack(anchor="w", pady=3)
+        adult_var = tk.BooleanVar(value=bool((p or {}).get("is_adult", True)))
+        ttk.Checkbutton(body, text="成人（学生/儿童请取消勾选）",
+                        variable=adult_var).pack(anchor="w", pady=3)
+
+        def save():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning("提示", "姓名不能为空", parent=dlg)
+                return
+            code = type_var.get().split(" ")[0].strip()
+            data = {"name": name, "id_type_code": code,
+                    "id_no": id_var.get().strip(), "mobile": mobile_var.get().strip(),
+                    "is_default": bool(default_var.get()), "is_adult": bool(adult_var.get())}
+            if index is None:
+                self.passengers.append(data)
+            else:
+                self.passengers[index].update(data)
+            ok, reason = self._save_passengers_or_refresh(dlg)
+            if not ok:
+                if reason == "stale":
+                    # 数据已重载为最新：关闭编辑框，用户基于最新数据重做
+                    dlg.destroy()
+                return
+            self.refresh()
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill="x", padx=12, pady=10)
+        ttk.Button(btns, text="保存", command=save).pack(side="right", padx=6)
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right")
+
+    def remove(self):
+        idx = self.selected()
+        if idx is None:
+            messagebox.showwarning("提示", "请先选择乘车人", parent=self)
+            return
+        if messagebox.askyesno("确认", "确定删除乘车人「%s」？" % self.passengers[idx].get("name"),
+                               parent=self):
+            del self.passengers[idx]
+            ok, _ = self._save_passengers_or_refresh(self)
+            if not ok:
+                return
+            self.refresh()
+
+    def set_default(self):
+        idx = self.selected()
+        if idx is None:
+            messagebox.showwarning("提示", "请先选择乘车人", parent=self)
+            return
+        for p in self.passengers:
+            p["is_default"] = False
+        self.passengers[idx]["is_default"] = True
+        ok, _ = self._save_passengers_or_refresh(self)
+        if not ok:
+            return
+        self.refresh()
+        messagebox.showinfo("完成", "已将「%s」设为默认乘车人" % self.passengers[idx].get("name"),
+                            parent=self)
+
+
+# 口径单源在 appcommon.mask_id_partial（与 launcher_utils.mask_id 是两种口径，
+# 勿混用）；别名保留，调用点与测试 pin 不变。
+_mask_id = appcommon.mask_id_partial
+
+
+# ----------------------------- 购票历史 -----------------------------
+
+HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
+                        "failed": "下单失败", "hit_no_order": "命中未下单",
+                        "ambiguous": "结果待人工核对"}
+
+
+def read_history_records(limit=200):
+    """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
+    顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
+    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
+    path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            history = json.load(f)
+        if not isinstance(history, list):
+            LOG.warning("order_history.json 顶层不是列表（%s），按空历史展示：%s",
+                        type(history).__name__, path)
+            return []
+        return list(reversed(history[-limit:]))
+    except Exception:
+        return []
+
+
+class HistoryTab(ttk.Frame):
+    """购票历史与通知记录（含「记录已通知」的空通知结果）。"""
+
+    RESULT_LABEL = HISTORY_RESULT_LABEL
+
+    def __init__(self, master, app=None):
+        super().__init__(master)
+        self.app = app
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text="购票历史（最新在前）").pack(side="left")
+        ttk.Button(top, text="刷新", command=self.refresh).pack(side="right")
+
+        cols = ("time", "task", "train", "date", "route", "seat",
+                "passengers", "order_no", "result")
+        heads = ("时间", "任务", "车次", "日期", "区间", "席别",
+                 "乘车人", "订单号", "结果")
+        widths = (130, 150, 60, 90, 120, 70, 110, 110, 70)
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="center")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.refresh()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        for r in read_history_records():
+            self.tree.insert("", "end", values=(
+                r.get("time", ""), r.get("task", ""), r.get("train", ""),
+                r.get("date", ""), "%s-%s" % (r.get("from", ""), r.get("to", "")),
+                r.get("seat", ""), "、".join(r.get("passengers") or []),
+                r.get("order_no", ""),
+                self.RESULT_LABEL.get(r.get("result"), r.get("result", ""))))
+
+
+# ----------------------------- 设置页（通知 / 会话） -----------------------------
+
+class SettingsTab(ttk.Frame):
+    """设置：邮件通知（SMTP）与登录会话（检查 / 重新登录 / 账号乘车人）。"""
+
+    def __init__(self, master, app=None):
+        super().__init__(master)
+        self.app = app
+
+        # ---------------- 邮件通知 ----------------
+        nf = ttk.LabelFrame(self, text=" 邮件通知（SMTP） ", padding=8)
+        nf.pack(fill="x", padx=10, pady=(10, 4))
+        cfg = load_config()
+        self.email = cfg.setdefault("notify", {}).setdefault("email", {})
+        self._build_notify_fields(nf)
+
+        # ---------------- 登录会话 ----------------
+        sf = ttk.LabelFrame(self, text=" 登录会话 ", padding=8)
+        sf.pack(fill="both", expand=True, padx=10, pady=4)
+        self.status_label = ttk.Label(sf, text="会话状态未检查")
+        self.status_label.pack(anchor="w", pady=2)
+        ttk.Label(sf, text="账号已保存的乘车人（下单时可选用）：").pack(anchor="w", pady=(8, 2))
+        frame = ttk.Frame(sf)
+        frame.pack(fill="both", expand=True)
+        self.p_list = tk.Listbox(frame, height=6)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.p_list.yview)
+        self.p_list.configure(yscrollcommand=sb.set)
+        self.p_list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        btns = ttk.Frame(sf)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="检查会话", command=self.check).pack(side="left", padx=4)
+        ttk.Button(btns, text="重新登录（弹出浏览器）", command=self.relogin).pack(side="left", padx=4)
+
+    # ---- 邮件通知表单（原 NotifyFormMixin 单点实现，勿两处各改一份） ----
+
+    def _build_notify_fields(self, body):
+        def row(label, var, show=None, width=34):
+            r = ttk.Frame(body)
+            r.pack(fill="x", pady=4)
+            ttk.Label(r, text=label, width=12).pack(side="left")
+            ttk.Entry(r, textvariable=var, width=width, show=show).pack(
+                side="left", fill="x", expand=True)
+            return r
+
+        self.enabled_var = tk.BooleanVar(value=bool(self.email.get("enabled", True)))
+        ttk.Checkbutton(body, text="启用邮件通知", variable=self.enabled_var).pack(anchor="w", pady=2)
+        self.host_var = tk.StringVar(value=self.email.get("smtp_host", "smtp.qq.com"))
+        row("SMTP 服务器", self.host_var)
+        self.port_var = tk.StringVar(value=str(self.email.get("smtp_port", 465)))
+        row("端口", self.port_var, width=10)
+        self.user_var = tk.StringVar(value=self.email.get("username", ""))
+        row("发件邮箱", self.user_var)
+        try:
+            _pw = notify_mod.secret_of(self.email.get("password", ""))
+        except notify_mod.SecretDecryptError:
+            # Task 60b：损坏的密文不再吞成空串；显示留空并提示用户重输
+            LOG.warning("[配置] 邮箱授权码解密失败，已清空显示（请重新输入授权码）")
+            _pw = ""
+        self.pwd_var = tk.StringVar(value=_pw)
+        row("邮箱授权码", self.pwd_var, show="*")
+        self.from_var = tk.StringVar(value=self.email.get("from", ""))
+        row("发件人地址", self.from_var)
+        self.to_var = tk.StringVar(value=",".join(self.email.get("to") or []))
+        row("收件人", self.to_var)
+        ttk.Label(body, text="收件人多个用逗号分隔；发件人地址留空则默认同发件邮箱；"
+                             "QQ/163 邮箱需在邮箱设置中开启 SMTP 服务并生成授权码",
+                  foreground="#57606a", wraplength=560).pack(anchor="w", pady=4)
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(btns, text="保存通知设置", command=self.save).pack(side="left", padx=4)
+        ttk.Button(btns, text="发送测试邮件", command=self.test).pack(side="left", padx=4)
+
+    def collect(self):
+        self.email.update({
+            "enabled": bool(self.enabled_var.get()),
+            "smtp_host": self.host_var.get().strip(),
+            "smtp_port": int(self.port_var.get().strip() or 465),
+            "username": self.user_var.get().strip(),
+            "password": notify_mod.protect_secret(self.pwd_var.get().strip()),
+            "from": self.from_var.get().strip(),
+            "to": [x.strip() for x in self.to_var.get().replace("，", ",").split(",")
+                   if x.strip()],
+        })
+        return normalize_email_settings(self.email)
+
+    def save(self):
+        try:
+            email = self.collect()
+        except ValueError as e:
+            messagebox.showwarning("无法保存", str(e), parent=self)
+            return
+
+        def _save_email(c):
+            c.setdefault("notify", {})["email"] = email
+
+        update_config_locked(_save_email)
+        messagebox.showinfo("完成", "通知设置已保存", parent=self)
+
+    def test(self):
+        try:
+            email = self.collect()
+        except ValueError as e:
+            messagebox.showwarning("无法发送", str(e), parent=self)
+            return
+
+        def do_test():
+            return notify_mod.send_email(email, "测试邮件：12306 监控系统",
+                                         "这是一封测试邮件，收到说明邮件通知可用。")
+
+        def on_done(res, err):
+            if err:
+                messagebox.showerror("失败", "测试发送异常：%s" % err, parent=self)
+            else:
+                ok, msg = res
+                (messagebox.showinfo if ok else messagebox.showerror)("测试结果", msg, parent=self)
+
+        run_async(self, do_test, on_done)
+
+    # ---- 登录会话 ----
+
+    def check(self):
+        self.status_label.config(text="正在检查会话状态...")
+
+        def do_check():
+            if (load_config().get("order_mode") or "http") == "browser":
+                # 浏览器模式：会话以 .browser_profile 为准
+                import browser_order
+                if browser_order.busy():
+                    # 登录窗口/下单还开着，抢锁只会超时。别把"没轮到"说成"已失效"。
+                    return None, "浏览器忙（登录或下单进行中），稍后再刷新", []
+                ok, who = browser_order.check_session(timeout=6)
+                passengers = []
+                if ok:
+                    # 乘车人列表用浏览器 Cookie 组会话取（浏览器模式的登录态
+                    # 在 .browser_profile，session_cookies.json 是过期的旧载体）
+                    try:
+                        sess = order_mod.session_from_browser_state()
+                        passengers = order_mod.get_passengers(sess)
+                    except Exception:
+                        passengers = []
+                return ok, who, passengers
+
+            sess = order_mod.load_session(load_config().get("session_cookies_file"))
+            ok, who = order_mod.check_login(sess)
+            passengers = order_mod.get_passengers(sess) if ok else []
+            return ok, who, passengers
+
+        def on_done(res, err):
+            if err:
+                self.status_label.config(text="会话检查失败：%s" % err)
+                return
+            ok, who, passengers = res
+            if ok is None:
+                self.status_label.config(text=str(who))
+                return
+            self.status_label.config(
+                text="会话有效（%s）" % who if ok else "会话失效：%s（请重新登录）" % who)
+            if self.app is not None:
+                self.app._set_account(
+                    ("已登录 %s" % who) if ok else "未登录", bool(ok))
+            self.p_list.delete(0, "end")
+            for p in passengers:
+                self.p_list.insert("end", "%s（%s）" % (
+                    p["name"], p.get("type_name") or ("成人" if p.get("is_adult", True) else "非成人")))
+
+        run_async(self, do_check, on_done)
+
+    def relogin(self):
+        script = os.path.join(HERE, "capture_session.py")
+        self.status_label.config(text="浏览器已打开，请在弹出的窗口中完成登录（最多 5 分钟）...")
+        self.p_list.delete(0, "end")
+        self.p_list.insert("end", "登录完成后会自动刷新，稍候即可")
+
+        def worker():
+            ok = False
+            try:
+                if (load_config().get("order_mode") or "http") == "browser":
+                    # 浏览器模式：登录态要落进 .browser_profile，capture_session.py
+                    # 只写 session_cookies.json，两条路不通用。
+                    import browser_order
+                    ok = bool(browser_order.login())
+                else:
+                    # capture_session.py 若挂住不能永久卡住重登线程；
+                    # 按退出码判定成败：失败不再被当成功
+                    ok = _relogin_ok_via_script(script)
+            except Exception as e:
+                LOG.error("重新登录失败: %s", e)
+            # 跨线程调 after 违反 Tk 规则，走与 run_async 相同的队列
+            _RESULT_QUEUE.put((self, lambda _res, _err: self._after_relogin(ok), None, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_relogin(self, ok):
+        """登录流程一结束就先把界面切成已登录，不等下一次会话体检。"""
+        if ok and self.app is not None:
+            self.app._set_account("已登录", True)
+            self.app._acct_time = time.time()
+        self.check()
+
+
+def _relogin_ok_via_script(script):
+    """运行 capture_session.py 做重登：仅当退出码为 0 返回 True。
+
+    旧代码 subprocess.run(...) 后 ok = True 硬编码——退出码非 0（登录失败）
+    也被当成成功，侧边栏误置"已登录"。超时同样视为失败返回 False，
+    不挂死、不抛到界面。
+    Task 99a：超时必须覆盖脚本实际总耗时（MAX_WAIT_SEC 等待 + Edge 启动
+    开销 + 最终验证），否则用户在等待末尾登录成功会被误判"运行超时"。
+    """
+    try:
+        import capture_session as _cs
+        timeout = _cs.GUI_SUBPROCESS_TIMEOUT
+    except Exception:
+        timeout = 420  # 与 GUI_SUBPROCESS_TIMEOUT(=MAX_WAIT_SEC+120) 同值兜底
+    try:
+        proc = subprocess.run([sys.executable, script], cwd=HERE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        LOG.error("重新登录失败：capture_session.py 运行超时（%ss）", timeout)
+        return False
+    ok = proc.returncode == 0
+    if not ok:
+        LOG.error("重新登录失败：capture_session.py 退出码 %s", proc.returncode)
+    return ok
+
+
+# ----------------------------- 抢票任务页 -----------------------------
+
+GRAB_STATUS_LABELS = {
+    "idle": "就绪",
+    "running": "抢票中",
+    "ok": "已抢到",
+    "stopped": "已停止",
+}
+
+
+class GrabTab(ttk.Frame):
+    """抢票任务管理：任务列表 + 每任务编辑表单（选中即切换），可多任务并行抢票。
+
+    替代旧「任务管理器 + 每任务独立窗口」两层结构：每个任务一份 GrabTaskForm
+    （懒创建、常驻），表单自己跑 _tick（倒计时 / 提醒 / 到点自动开抢），
+    是否显示都不影响运行。"""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.tasks = launcher.load_grab_tasks()
+        self.forms = {}         # tid -> GrabTaskForm
+        self._tv_iid = {}       # tree iid -> task
+        self._refreshing = False
+        self._deleting_tids = set()  # 删除中的任务：收尾期间不再重建表单
+        self._build()
+        self._refresh_list()
+        self._select_first()
+        self.after(800, self._tick)
+
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Button(top, text="＋ 新建任务", command=self._new_task).pack(side="left", padx=2)
+        ttk.Button(top, text="改名", command=lambda: self._rename_task(self._selected_tid())).pack(
+            side="left", padx=2)
+        ttk.Button(top, text="删除", command=lambda: self._delete_task(self._selected_tid())).pack(
+            side="left", padx=2)
+        ttk.Button(top, text="测试会话", command=self._test_session).pack(side="left", padx=2)
+        ttk.Label(top, text="每个任务独立配置、可同时抢多个车次/日期；选中任务后在下方面板编辑。",
+                  foreground="#57606a").pack(side="left", padx=10)
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="x", padx=8)
+        cols = ("name", "route", "date", "trains", "status")
+        heads = ("任务名称", "区间", "日期", "车次", "状态")
+        widths = (140, 170, 170, 180, 80)
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings", height=6)
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="center")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="x", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select())
+
+        # 表单宿主（简单滚动容器：窗口高度不够时可滚）
+        host = ttk.Frame(self)
+        host.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self._canvas = tk.Canvas(host, highlightthickness=0)
+        hsb = ttk.Scrollbar(host, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=hsb.set)
+        hsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self.form_host = ttk.Frame(self._canvas)
+        self._win = self._canvas.create_window((0, 0), window=self.form_host, anchor="nw")
+        self.form_host.bind("<Configure>", lambda e: self._canvas.configure(
+            scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfigure(
+            self._win, width=e.width))
+        self.winfo_toplevel().bind("<MouseWheel>", self._on_wheel, add="+")
+
+    def _on_wheel(self, e):
+        """指针在本页表单区时滚表单；车次表/任务列表有自己的滚动，不抢。"""
+        try:
+            node = self.winfo_containing(e.x_root, e.y_root)
+        except Exception:
+            return
+        while node is not None:
+            if isinstance(node, ttk.Treeview):
+                return
+            if node is self._canvas or node is self.form_host:
+                try:
+                    self._canvas.yview_scroll(int(-e.delta / 120), "units")
+                except Exception:
+                    pass
+                return
+            node = getattr(node, "master", None)
+
+    # ---- 任务列表 ----
+
+    def _find(self, tid):
+        for t in self.tasks:
+            if t.get("id") == tid:
+                return t
+        return None
+
+    def _selected_tid(self):
+        for i in self.tree.selection():
+            t = self._tv_iid.get(i)
+            if t is not None:
+                return t.get("id")
+        return None
+
+    def _refresh_list(self):
+        # 重入保护：表单构造/关闭过程中会经 _upsert_task 回调到这里；
+        # 嵌套重入直接返回，由最外层刷新统一收口（避免表单重复创建）。
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            keep = self._selected_tid()
+            self.tree.delete(*self.tree.get_children())
+            self._tv_iid = {}
+            self._ensure_forms()
+            self._prune_forms()
+            for t in self.tasks:
+                try:
+                    self._add_row(t)
+                except Exception as e:
+                    LOG.warning("抢票任务条目异常，已跳过展示：%r（%s）", t, e)
+            if keep is not None and any(t.get("id") == keep for t in self.tasks):
+                self._select_tid(keep)
+            else:
+                self._select_first()
+        finally:
+            self._refreshing = False
+
+    def _add_row(self, task):
+        # Task 96c/104：grab_tasks.json 脏条目（非 dict）→ task.get 致列表崩；
+        # 入口已 sanitize，这里再防一手：记 warning 后跳过展示，不崩。
+        if not isinstance(task, dict):
+            LOG.warning("抢票任务条目非 dict，已跳过展示：%r" % (task,))
+            return
+        trains = _display_trains(task.get("trains"))
+        iid = self.tree.insert("", "end", values=(
+            task.get("name") or "未命名",
+            "%s → %s" % (task.get("from") or "?", task.get("to") or "?"),
+            (task.get("date") or "?") + ("~%s" % task["date_to"] if task.get("date_to") else ""),
+            "/".join(trains) or "全部",
+            GRAB_STATUS_LABELS.get(task.get("status") or "idle", ("就绪"))))
+        self._tv_iid[iid] = task
+
+    def _ensure_forms(self):
+        for t in self.tasks:
+            tid = t.get("id")
+            if tid is None or tid in self.forms or tid in self._deleting_tids:
+                continue
+            try:
+                self.forms[tid] = GrabTaskForm(self.form_host, self, t)
+            except Exception as e:
+                LOG.exception("抢票任务表单创建失败（%s）：%s", tid, e)
+
+    def _prune_forms(self):
+        alive = {t.get("id") for t in self.tasks if isinstance(t, dict)}
+        for tid in list(self.forms):
+            if tid not in alive:
+                f = self.forms.pop(tid)
+                try:
+                    f.close(stop_thread=True)
+                except Exception:
+                    pass
+                try:
+                    f.destroy()
+                except Exception:
+                    pass
+
+    def _select_first(self):
+        children = self.tree.get_children()
+        if children:
+            self.tree.selection_set(children[0])
+            self._on_select()
+
+    def _select_tid(self, tid):
+        for iid, t in self._tv_iid.items():
+            if t.get("id") == tid:
+                self.tree.selection_set(iid)
+                self._on_select()
+                return
+        self._on_select()
+
+    def _on_select(self):
+        tid = self._selected_tid()
+        for t2, f in self.forms.items():
+            try:
+                if t2 == tid:
+                    f.pack(fill="both", expand=True)
+                else:
+                    f.pack_forget()
+            except Exception:
+                pass
+        self._current_tid = tid
+
+    # ---- 任务操作 ----
+
+    def _new_task(self):
+        # 名字序号取现存最大号 +1：删除任务后新建不再出现重名（两个"任务 2"）
+        seqs = []
+        for t in self.tasks:
+            m = re.match(r"任务\s*(\d+)$", (t.get("name") or "").strip())
+            if m:
+                seqs.append(int(m.group(1)))
+        task = launcher.new_grab_task((max(seqs) if seqs else 0) + 1)
+        self.tasks.append(task)
+        launcher.save_grab_tasks(self.tasks)
+        self._refresh_list()
+        self._select_tid(task["id"])
+        self._put_log("[任务] 已创建「%s」" % task["name"])
+
+    def _rename_task(self, tid):
+        task = self._find(tid)
+        if task is None:
+            messagebox.showinfo("重命名任务", "请先在列表里选中要改名的任务",
+                                parent=self.winfo_toplevel())
+            return
+        name = simpledialog.askstring("重命名任务", "新的任务名：",
+                                      parent=self.winfo_toplevel(),
+                                      initialvalue=task.get("name") or "")
+        if not name:
+            return
+        task["name"] = name.strip() or task.get("name")
+        launcher.save_grab_tasks(self.tasks)
+        form = self.forms.get(tid)
+        if form is not None:
+            form.task_name = task["name"]
+        self._refresh_list()
+        self._put_log("[任务] 已重命名为「%s」" % task["name"])
+
+    def _delete_task(self, tid):
+        task = self._find(tid)
+        if task is None:
+            messagebox.showinfo("删除任务", "请先在列表里选中要删除的任务",
+                                parent=self.winfo_toplevel())
+            return
+        if not messagebox.askyesno("删除任务", "确定删除抢票任务「%s」？" % (task.get("name") or "未命名"),
+                                   parent=self.winfo_toplevel()):
+            return
+        form = self.forms.pop(tid, None)
+        if form is not None:
+            try:
+                # 必须走表单自己的 close（停抢票线程 -> join -> 同步界面编辑）；
+                # 直接 destroy 会把运行中的抢票线程晾在后台，可能为已删任务下单
+                self._deleting_tids.add(tid)  # 收尾期间禁止重建这张表单
+                form.close(stop_thread=True)
+            except Exception as e:
+                self._put_log("[警告] 删除任务时关闭表单异常：%s" % e)
+            finally:
+                self._deleting_tids.discard(tid)
+            try:
+                form.destroy()
+            except Exception:
+                pass
+        self.tasks = [t for t in self.tasks if t.get("id") != tid]
+        launcher.save_grab_tasks(self.tasks)
+        self._refresh_list()
+        self._select_first()
+        self._put_log("[任务] 已删除「%s」" % task.get("name"))
+
+    def _upsert_task(self, lc):
+        """任务表单保存回调：按 id 写回任务库并刷新列表。"""
+        tid = lc.get("id")
+        for i, t in enumerate(self.tasks):
+            if t.get("id") == tid:
+                self.tasks[i] = lc
+                break
+        else:
+            self.tasks.append(lc)
+        launcher.save_grab_tasks(self.tasks)
+        self._refresh_list()
+
+    def _on_window_closed(self, tid):
+        """关任务前的状态修正（保留「已抢到」，其余归「就绪」）——与旧实现同口径。"""
+        for t in self.tasks:
+            if t.get("id") == tid:
+                if t.get("status") != "ok":
+                    t["status"] = "idle"
+        launcher.save_grab_tasks(self.tasks)
+        self._refresh_list()
+        self._put_log("[任务] 「%s」已停止并保存配置"
+                      % next((t.get("name") for t in self.tasks if t.get("id") == tid), "?"))
+
+    # ---- 定时刷新 / 日志 / 会话 ----
+
+    def _tick(self):
+        try:
+            for iid, task in list(self._tv_iid.items()):
+                try:
+                    if not self.tree.exists(iid):
+                        continue
+                except Exception:
+                    continue
+                form = self.forms.get(task.get("id"))
+                if form is not None and form.grabber is not None \
+                        and form.grabber.is_alive():
+                    label = "抢票中"
+                else:
+                    label = GRAB_STATUS_LABELS.get(task.get("status") or "idle", "就绪")
+                self.tree.set(iid, "status", label)
+        finally:
+            try:
+                self.after(800, self._tick)
+            except tk.TclError:
+                pass
+
+    def _put_log(self, line):
+        self.app.log_line(line)
+
+    def _test_session(self):
+        self._put_log("[会话] 正在校验登录状态…")
+
+        def worker():
+            # 子线程不能直接碰 Tk：结果走 launcher 日志队列，由主线程轮询显示
+            try:
+                ok, who = launcher.browser_order.check_session()
+                launcher.log("[会话] 校验结果：%s（%s）" % ("已登录" if ok else "未登录", who))
+            except Exception as e:
+                launcher.log("[错误] 会话校验异常：%s" % e)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def close_all(self):
+        """程序退出前收尾：逐任务停抢票线程并保存配置。"""
+        for tid, form in list(self.forms.items()):
+            try:
+                form.close(stop_thread=True)
+            except Exception as e:
+                LOG.warning("抢票任务收尾失败（%s）：%s", tid, e)
+        try:
+            launcher.save_grab_tasks(self.tasks)
+        except Exception:
+            pass
+
+
+class GrabTaskForm(ttk.Frame):
+    """单个抢票任务的编辑表单（原 LauncherApp 行为等价物，嵌入式朴素控件）。
+
+    每个任务一份实例，常驻（不显示也照跑 _tick：倒计时/提醒/到点自动开抢）。
+    日志统一走全局日志区（launcher 日志队列），不再有任务级日志窗。"""
+
+    def __init__(self, master, tab, task):
+        super().__init__(master)
+        self.app = tab.app
+        self.tab = tab
+        self._top = self.app.root        # 蜂鸣/弹窗宿主（与旧接口同名，便于测试）
+        self._mp = self.app.root
+        self.task = task
+        self.tid = task.get("id")
+        self.task_name = task.get("name") or ""
+        self.lc = dict(launcher._DEFAULT_LC)
+        self.lc.update(task)
+        self._save_cfg = self._save_lc
+        self.grabber = None
+        self.armed = False
+        self.auto_fired = False
+        self.reminded = False
+        self._auto_vfail_last_msg = None
+        self.pax_vars = {}
+        self.pax_purpose_vars = {}
+        self.seat_vars = {}
+        self.update_info = None
+        self._monitor_mtime = 0.0
+        self._pax_mtime = 0.0
+        self.dataq = queue.Queue()
+        self._querying = False
+        self._last_query_ts = 0.0
+        self._train_infos = []
+        self._sel_keys = set()
+        self._tv_iids = {}
+        self._syncing_sel = False
+
+        self._build()
+        self._sync_from_lc()
+        self.after(500, self._tick)
+        self.after(1200, self._check_update_async)
+        self.after(2500, self._warm_station_kinds)
+
+    def _warm_station_kinds(self):
+        """启动后预热常用车站的高铁/普速标注（历史站 + 当前出发/到达）。
+
+        放后台线程跑：车站代码表/索引缓存缺失时要联网下载（可达 20 秒），
+        在主线程会把界面整个冻住。Tk 变量读取先在主线程完成再进线程。"""
+        names = [self.from_ent.get(), self.to_ent.get()]
+        names.extend(self.from_ent.history[:6])
+        names.extend(self.to_ent.history[:6])
+
+        def worker():
+            try:
+                n2c, _c2n = ticket.load_station_map()
+                launcher.get_station_index()  # 一并预热车站拼音索引（首次要下载）
+                codes = []
+                for n in names:
+                    c = n2c.get((n or "").strip())
+                    if c and c not in codes:
+                        codes.append(c)
+                if codes and launcher.request_station_kinds(codes):
+                    launcher.log("[车站] 正在后台识别常用车站类型（高铁 / 普速）")
+            except Exception as e:
+                launcher.log("[提醒] 常用车站类型预热失败：%s" % e)
+
+        threading.Thread(target=worker, daemon=True, name="station-warm").start()
+
+    # ---- 界面构建：行程/车次/席别/乘车人/开抢 ----
+
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        self.title_lbl = ttk.Label(top, text="任务：%s" % self.task_name,
+                                   font=("", 11, "bold"))
+        self.title_lbl.pack(side="left", padx=4)
+        self.update_lbl = ttk.Label(top, text="", foreground="#8250df", cursor="hand2")
+        self.update_lbl.pack(side="right", padx=6)
+
+        # 乘车人
+        pf = ttk.LabelFrame(self, text=" 乘车人（勾选参与抢票；票种按人选择） ", padding=8)
+        pf.pack(fill="x", pady=(4, 0))
+        self.pax_box = ttk.Frame(pf)
+        self.pax_box.pack(side="left", fill="x", expand=True)
+        ttk.Button(pf, text="新增/编辑", command=self._edit_pax).pack(side="right")
+
+        # 行程
+        tf = ttk.LabelFrame(self, text=" 行程（车站支持拼音简拼 / 全拼 / 汉字 / 代码搜索） ", padding=8)
+        tf.pack(fill="x", pady=(4, 0))
+        r0 = ttk.Frame(tf)
+        r0.pack(fill="x")
+        ttk.Label(r0, text="常用行程").pack(side="left")
+        self.preset_cb = ttk.Combobox(r0, state="readonly", width=26)
+        self.preset_cb.pack(side="left", padx=6)
+        self.preset_cb.bind("<<ComboboxSelected>>", self._load_preset)
+        ttk.Button(r0, text="载入", command=self._load_preset).pack(side="left", padx=2)
+        ttk.Button(r0, text="存为预设", command=self._save_preset).pack(side="left", padx=2)
+        ttk.Button(r0, text="删除预设", command=self._delete_preset).pack(side="left", padx=2)
+
+        r1 = ttk.Frame(tf)
+        r1.pack(fill="x", pady=(6, 0))
+        ttk.Label(r1, text="出发").pack(side="left")
+        self.from_ent = StationEntry(r1, width=12, history=self.lc.get("station_history"))
+        self.from_ent.pack(side="left", padx=(4, 2))
+        ttk.Button(r1, text="⇄", width=3, command=self._swap_stations).pack(side="left", padx=2)
+        ttk.Label(r1, text="到达").pack(side="left", padx=(6, 0))
+        self.to_ent = StationEntry(r1, width=12, history=self.lc.get("station_history"))
+        self.to_ent.pack(side="left", padx=(4, 4))
+        ttk.Button(r1, text="定位", width=5, command=self._locate).pack(side="left")
+        ttk.Label(r1, text="车次留空=全部；日期「到」留空=只查那一天（区间最多相差 5 天，共 6 天）",
+                  foreground="#57606a").pack(side="left", padx=(10, 0))
+
+        r2 = ttk.Frame(tf)
+        r2.pack(fill="x", pady=(6, 0))
+        ttk.Label(r2, text="乘车日期").pack(side="left")
+        ttk.Label(r2, text="从").pack(side="left", padx=(6, 2))
+        self.date_var = tk.StringVar()
+        ttk.Entry(r2, textvariable=self.date_var, width=12).pack(side="left")
+        ttk.Label(r2, text="到").pack(side="left", padx=(6, 2))
+        self.date_to_var = tk.StringVar()
+        ttk.Entry(r2, textvariable=self.date_to_var, width=12).pack(side="left")
+        ttk.Label(r2, text="车次").pack(side="left", padx=(12, 0))
+        self.trains_var = tk.StringVar()
+        ttk.Entry(r2, textvariable=self.trains_var, width=18).pack(side="left", padx=(4, 0))
+        ttk.Button(r2, text="历史记录", command=self._show_query_history).pack(side="left", padx=(8, 0))
+
+        # 车次列表
+        qf = ttk.LabelFrame(self, text=" 车次列表（查询实时余票，Ctrl/Shift 多选车次） ", padding=8)
+        qf.pack(fill="x", pady=(4, 0))
+        q0 = ttk.Frame(qf)
+        q0.pack(fill="x")
+        self.query_btn = ttk.Button(q0, text="查询车次 (F5)", command=lambda: self.query_trains())
+        self.query_btn.pack(side="left")
+        self.query_state = ttk.Label(q0, text="", foreground="#57606a")
+        self.query_state.pack(side="left", padx=8)
+        ttk.Button(q0, text="清空列表", command=self._clear_train_rows).pack(side="right")
+        # 余票自动刷新：默认 2 秒/次、默认开启（控制界面不暴露；变量仍驱动 _tick）
+        self.refresh_sec_var = tk.IntVar(value=2)
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+
+        q1 = ttk.Frame(qf)
+        q1.pack(fill="x", pady=(6, 0))
+        self.filter_emu_var = tk.BooleanVar(value=False)
+        self.filter_putong_var = tk.BooleanVar(value=False)
+        self.filter_avail_var = tk.BooleanVar(value=False)
+        self.sort_var = tk.StringVar(value="dep")
+        for _txt, _var in (("只看高铁动车", self.filter_emu_var),
+                           ("只看普速", self.filter_putong_var),
+                           ("只看有票", self.filter_avail_var)):
+            ttk.Checkbutton(q1, text=_txt, variable=_var,
+                            command=self._refresh_train_view).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(q1, text="历时最短", value="dur", variable=self.sort_var,
+                        command=self._refresh_train_view).pack(side="right")
+        ttk.Radiobutton(q1, text="发时最早", value="dep", variable=self.sort_var,
+                        command=self._refresh_train_view).pack(side="right", padx=(12, 0))
+        self.sel_state = ttk.Label(q1, text="已选 0 趟车 · 0 种席别", foreground="#0969da")
+        self.sel_state.pack(side="left", padx=(16, 0))
+
+        tvf = ttk.Frame(qf)
+        tvf.pack(fill="x", pady=(6, 0))
+        tv_cols = ("train", "route", "time", "duration", "seats")
+        tv_heads = ("车次", "出发-到达", "时间", "历时", "余票")
+        tv_widths = (70, 160, 110, 70, 420)
+        self.train_tree = ttk.Treeview(tvf, columns=tv_cols, show="headings",
+                                       height=6, selectmode="extended")
+        for c, h, w in zip(tv_cols, tv_heads, tv_widths):
+            self.train_tree.heading(c, text=h)
+            self.train_tree.column(c, width=w, anchor="w" if c == "seats" else "center")
+        tv_sb = ttk.Scrollbar(tvf, orient="vertical", command=self.train_tree.yview)
+        self.train_tree.configure(yscrollcommand=tv_sb.set)
+        self.train_tree.pack(side="left", fill="x", expand=True)
+        tv_sb.pack(side="right", fill="y")
+        self.train_tree.bind("<<TreeviewSelect>>", self._on_trains_selected)
+
+        # 席别
+        self.sf = ttk.LabelFrame(self, text=" 席别（查询后可按车次实际余票刷新） ", padding=8)
+        self.sf.pack(fill="x", pady=(4, 0))
+        self.seat_detail_lbl = ttk.Label(self.sf, text="", foreground="#57606a", justify="left")
+        self.seat_detail_lbl.pack(fill="x", pady=(0, 4))
+        t0 = ttk.Frame(self.sf)
+        t0.pack(fill="x")
+        ttk.Label(t0, text="首选席别").pack(side="left")
+        self.seat_pri_var = tk.StringVar()
+        ttk.Entry(t0, textvariable=self.seat_pri_var, width=18).pack(side="left", padx=(4, 6))
+        ttk.Label(t0, text="可填 硬座/无座/二等座/软卧/硬卧 等，逗号分隔，先填的先抢；"
+                           "可指定车次：K225=硬座/无座, K1969=硬卧（只作用该趟车，∩勾选）；"
+                           "无座=硬座，认不出按硬座",
+                  foreground="#57606a").pack(side="left")
+        self.seat_pri_hint = ttk.Label(self.sf, foreground="#57606a")
+        self.seat_pri_hint.pack(fill="x", pady=(2, 4))
+        self.seat_pri_var.trace_add("write", self._on_seat_pri_change)
+        self.seat_box = ttk.Frame(self.sf)
+        self.seat_box.pack(fill="x")
+        self._rebuild_seats()
+        self._on_seat_pri_change()
+
+        # 开抢时间
+        ef = ttk.LabelFrame(self, text=" 开抢时间 ", padding=8)
+        ef.pack(fill="x", pady=(4, 0))
+        r0e = ttk.Frame(ef)
+        r0e.pack(fill="x")
+        ttk.Label(r0e, text="到点自动开抢").pack(side="left")
+        self.start_var = tk.StringVar()
+        self.start_var.trace_add("write", self._on_start_change)
+        ttk.Entry(r0e, textvariable=self.start_var, width=21).pack(side="left", padx=(6, 6))
+        ttk.Label(r0e, text="提前").pack(side="left")
+        self.remind_var = tk.IntVar(value=10)
+        ttk.Spinbox(r0e, from_=0, to=120, textvariable=self.remind_var, width=4).pack(
+            side="left", padx=4)
+        ttk.Label(r0e, text="分钟提醒").pack(side="left")
+        ttk.Label(r0e, text="（格式如 2026-10-09 17:00:00）", foreground="#57606a").pack(
+            side="left", padx=(6, 0))
+        self.countdown_lbl = ttk.Label(r0e, text="", font=("", 10, "bold"),
+                                       foreground="#cf222e")
+        self.countdown_lbl.pack(side="left", padx=(10, 0))
+        r1e = ttk.Frame(ef)
+        r1e.pack(fill="x", pady=(4, 0))
+        ttk.Label(r1e, text="开抢前").pack(side="left")
+        self.warm_var = tk.IntVar(value=10)
+        ttk.Spinbox(r1e, from_=0, to=30, textvariable=self.warm_var, width=4).pack(
+            side="left", padx=4)
+        ttk.Label(r1e, text="分钟登录预热（到点立即填单下单，0=不预热）").pack(side="left")
+
+        # 主按钮 + 状态
+        bf = ttk.Frame(self)
+        bf.pack(fill="x", pady=(8, 0))
+        self.go_btn = ttk.Button(bf, text="立 即 抢 票", command=self.toggle_grab)
+        self.go_btn.pack(side="left", fill="x", expand=True)
+        ttk.Button(bf, text="新建监控任务", command=self.open_new_monitor_task).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(bf, text="测试会话", command=self._test_session).pack(side="left", padx=(8, 0))
+
+        stf = ttk.Frame(self)
+        stf.pack(fill="x", pady=(6, 4))
+        ttk.Label(stf, text="状态：").pack(side="left")
+        self.status_lbl = ttk.Label(stf, text="就绪")
+        self.status_lbl.pack(side="left")
+
+        # 快捷键：F5 查车次 / Ctrl+Enter 开抢或停止 / Ctrl+L 定位
+        self.bind("<F5>", lambda e: self.query_trains())
+        self.bind("<Control-Return>", lambda e: self.toggle_grab())
+        self.bind("<Control-l>", lambda e: self._locate())
+
+    # ---- 数据同步 ----
+
+    def _save_lc(self, lc):
+        """保存回调（任务级）：写回任务库；任务库中现在存的就是 lc。"""
+        lc["id"] = self.tid
+        lc["name"] = self.task_name
+        lc["status"] = lc.get("status") or "idle"
+        self.tab._upsert_task(lc)
+        self.task = lc
+
+    def _sync_from_lc(self):
+        lc = self.lc
+        hist = lc.get("station_history") or []
+        self.from_ent.set_history(hist)
+        self.to_ent.set_history(hist)
+        self.from_ent.set(lc.get("from") or "")
+        self.to_ent.set(lc.get("to") or "")
+        self.trains_var.set(",".join(_display_trains(lc.get("trains"))))
+        self.date_var.set(lc.get("date") or (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+        self.date_to_var.set(lc.get("date_to") or "")
+        for s, v in self.seat_vars.items():
+            v.set(s in _display_seat_types(lc.get("seat_types")))
+        self.seat_pri_var.set(str(lc.get("seat_priority") or ""))
+        self.start_var.set(lc.get("start_time") or "")
+        # Task 96d：launcher_config.json 脏值不崩任务表单——非数字用安全默认值，
+        # presets 非 dict 条目跳过，均记 warning。
+        try:
+            self.remind_var.set(int(lc.get("remind_minutes") or 10))
+        except (ValueError, TypeError):
+            self._put_log("[警告] 配置 remind_minutes 非法（%r），已用默认值 10"
+                          % (lc.get("remind_minutes"),))
+            self.remind_var.set(10)
+        try:
+            self.warm_var.set(max(0, min(30, int(lc.get("warm_minutes") or 10))))
+        except (ValueError, TypeError):
+            self._put_log("[警告] 配置 warm_minutes 非法（%r），已用默认值 10"
+                          % (lc.get("warm_minutes"),))
+            self.warm_var.set(10)
+        names = []
+        for p in (lc.get("presets") or []):
+            if not isinstance(p, dict):
+                self._put_log("[警告] 配置 presets 条目非 dict，已跳过：%r" % (p,))
+                continue
+            names.append(p.get("name") or "")
+        self.preset_cb.configure(values=names)
+        if names:
+            self.preset_cb.current(0)
+        self._refresh_pax()
+        if launcher.merge_trains_from_monitor(self.lc, self._save_cfg):
+            self.trains_var.set(",".join(self.lc["trains"]))
+        try:
+            self._monitor_mtime = os.path.getmtime(os.path.join(HERE, "config.json"))
+        except OSError:
+            pass
+        try:
+            self._pax_mtime = os.path.getmtime(os.path.join(HERE, "passengers.json"))
+        except OSError:
+            pass
+        st = launcher.parse_dt(self.lc.get("start_time") or "")
+        self.armed = bool(st and st > datetime.datetime.now())
+        self.auto_fired = False
+        self._auto_vfail_last_msg = None
+        self.reminded = False
+
+    def _ui_to_lc(self, save=True):
+        lc = self.lc
+        lc["from"] = self.from_ent.get()
+        lc["to"] = self.to_ent.get()
+        lc["trains"] = [t.strip().upper() for t in re.split(r"[,，\s]+", self.trains_var.get()) if t.strip()]
+        lc["seat_types"] = [s for s, v in self.seat_vars.items() if v.get()]
+        lc["seat_priority"] = self.seat_pri_var.get().strip()
+        lc["date"] = self.date_var.get().strip()
+        lc["date_to"] = self.date_to_var.get().strip()
+        lc["start_time"] = self.start_var.get().strip()
+        # Spinbox 手输非数字时回退默认值（与 _tick 的 warm_var 兜底同口径），
+        # 否则 int() 抛 ValueError/TclError，只有控制台 traceback
+        try:
+            lc["remind_minutes"] = max(0, min(120, int(self.remind_var.get() or 10)))
+        except Exception:
+            lc["remind_minutes"] = 10
+        try:
+            lc["warm_minutes"] = max(0, min(30, int(self.warm_var.get() or 10)))
+        except Exception:
+            lc["warm_minutes"] = 10
+        lc["passenger_names"] = [n for n, v in self.pax_vars.items() if v.get()]
+        if self.pax_purpose_vars:
+            lc["pax_purpose"] = {
+                n: (launcher.LABEL_TO_PURPOSE.get(v.get()) or "ADULT")
+                for n, v in self.pax_purpose_vars.items()}
+        # 兼容监控引擎 / 旧配置：全局口径 = 勾选乘车人的余票查询口径
+        lc["purpose_code"] = launcher.purpose_of(lc)
+        hist = list(lc.get("station_history") or [])
+        for stn in (lc["from"], lc["to"]):
+            if stn and stn not in hist:
+                hist.insert(0, stn)
+        lc["station_history"] = hist[:20]
+        if save:
+            self._save_cfg(lc)
+
+    def _refresh_pax(self):
+        cur_sel = {n for n, v in self.pax_vars.items() if v.get()}
+        cur_pp = {n: v.get() for n, v in self.pax_purpose_vars.items()}
+        for w in self.pax_box.winfo_children():
+            w.destroy()
+        self.pax_vars.clear()
+        self.pax_purpose_vars.clear()
+        try:
+            plist = passengers_mod.load_passengers()
+        except Exception as e:
+            plist = []
+            self._put_log("[错误] 乘车人读取失败：%s" % e)
+        if not plist:
+            ttk.Label(self.pax_box, text="（未添加乘车人，点右侧按钮添加）",
+                      foreground="#57606a").pack(side="left")
+            return
+        sel = cur_sel or self.lc.get("passenger_names") or passengers_mod.default_names() or [plist[0]["name"]]
+        saved = self.lc.get("pax_purpose") or {}
+        default_code = self.lc.get("purpose_code") or "ADULT"
+        for p in plist:
+            name = p["name"]
+            row = ttk.Frame(self.pax_box)
+            row.pack(side="left", padx=(0, 14))
+            v = tk.BooleanVar(value=name in sel)
+            self.pax_vars[name] = v
+            label = "%s · %s" % (name, launcher.mask_id(p.get("id_no")))
+            if p.get("mobile"):
+                label += " · " + launcher.mask_mobile(p.get("mobile"))
+            ttk.Checkbutton(row, text=label, variable=v).pack(side="left")
+            # 票种按人：优先本次界面值 > 已保存值 > 全局兜底
+            code = (launcher.LABEL_TO_PURPOSE.get(cur_pp.get(name) or "")
+                    or saved.get(name) or default_code)
+            pv = tk.StringVar(value=launcher.PURPOSE_LABELS.get(code) or "成人票")
+            self.pax_purpose_vars[name] = pv
+            cb = ttk.Combobox(row, textvariable=pv, width=6, state="readonly",
+                              values=["成人票", "学生票"])
+            cb.pack(side="left", padx=(4, 0))
+            cb.bind("<<ComboboxSelected>>", self._on_pax_purpose_change)
+
+    # ---- 车次查询与席别联动 ----
+
+    def _on_seat_pri_change(self, *_a):
+        """「首选席别」输入框的即时解析反馈（含 车次=席别 专属规则）。"""
+        checked = [s for s, v in self.seat_vars.items() if v.get()]
+        text, bad = ticket.seat_priority_feedback(self.seat_pri_var.get(), checked=checked)
+        self.seat_pri_hint.configure(text=text,
+                                     foreground="#cf222e" if bad else "#57606a")
+
+    def _rebuild_seats(self, available=None, allnames=None, houbu=False):
+        """重建席别勾选区。
+
+        available=None：显示全量可选席别（SEAT_OPTIONS）。
+        allnames 非空（选中了车次）：按该车实际提供的全部席别显示 —— **含当前无票的**，
+            抢票时可以把暂时无票的席别勾上，放票/退票回流后按勾选顺序抢。
+        available={席别: 余票}：带余票数；无票的标「无」，该车可候补时标「候补」。
+        勾选策略：优先保留原勾选；原勾选与新列表无交集时自动勾第一个可购席别。"""
+        keep = {s for s, v in self.seat_vars.items() if v.get()}
+        for w in self.seat_box.winfo_children():
+            w.destroy()
+        self.seat_vars = {}
+        avail = available or {}
+        if allnames:
+            names = list(allnames)
+            names += sorted((s for s in avail if s not in names),
+                            key=lambda x: launcher.SEAT_ORDER.get(x, 99))
+            self.sf.configure(text=" 席别（该车次共 %d 种席别，%d 种有票；无票的也能勾，"
+                                   "放票/退票回流后按勾选顺序抢） "
+                              % (len(names), len([s for s in names if avail.get(s)])))
+        else:
+            names = [s for s in launcher.SEAT_OPTIONS if available is None or s in avail]
+            names += sorted((s for s in avail if s not in launcher.SEAT_OPTIONS),
+                            key=lambda x: launcher.SEAT_ORDER.get(x, 99))
+            if available is not None:
+                self.sf.configure(text=" 席别（已按所选车次刷新：%d 种可购席别） " % len(names))
+            else:
+                self.sf.configure(text=" 席别（查询并选中车次后可按该车实际余票刷新；票价以官方下单页为准） ")
+        if not names:
+            ttk.Label(self.seat_box, text="（该车次暂无可购席别）",
+                      foreground="#57606a").grid(row=0, column=0, sticky="w")
+            return
+        # Task 103b：展示用归一化——裸字符串按单个席别。
+        default = set(_display_seat_types(self.lc.get("seat_types")))
+        chosen = [s for s in names if s in keep] or [s for s in names if s in default] or [names[0]]
+        for i, s in enumerate(names):
+            v = tk.BooleanVar(value=s in chosen)
+            self.seat_vars[s] = v
+            val = avail.get(s)
+            if val:
+                label = "%s · %s" % (s, val)
+            elif allnames or available is not None:
+                label = "%s · %s" % (s, "候补" if houbu else "无")
+            else:
+                label = s
+            if s not in ticket.SEAT_NAME_TO_CODE:
+                label += "（不能自动下单）"
+            ttk.Checkbutton(self.seat_box, text=label, variable=v).grid(
+                row=i // 6, column=i % 6, sticky="w", padx=(0, 6), pady=1)
+        if (allnames or available is not None) and not (keep & set(names)):
+            self._put_log("[席别] 该车次%s与原勾选无交集，已自动勾选 %s"
+                          % ("席别" if allnames else "可购席别", chosen[0]))
+
+    def _sync_inputs(self):
+        """把界面行程输入落到 lc 并做基本校验（查询车次用，不弹窗）。"""
+        self._ui_to_lc()
+        lc = self.lc
+        if not lc.get("from") or not lc.get("to"):
+            return False
+        return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", lc.get("date") or ""))
+
+    def query_trains(self, silent=False):
+        """拉取实时余票填充车次列表（后台线程，界面不卡）。"""
+        if self._querying:
+            if not silent:
+                self._put_log("[提醒] 上一次查询还在进行中…")
+            return
+        if not self._sync_inputs():
+            if silent:
+                self._put_log("[提醒] 行程信息不完整，本轮跳过余票自动刷新")
+            else:
+                messagebox.showwarning("参数不完整",
+                                       "请填写出发站 / 到达站，日期格式 YYYY-MM-DD",
+                                       parent=self._mp)
+            return
+        self._querying = True
+        self._last_query_ts = time.time()
+        self.query_btn.configure(state="disabled")
+        self.query_state.configure(text="查询中…", foreground="#d97706")
+        lc = dict(self.lc)
+        _pm = lc.get("pax_purpose") or {}
+        _ptxt = "、".join(
+            # Task 88c：日志里的乘车人姓名打码；学生票后缀保留（非 PII）。
+            "%s%s" % (launcher._mask_one_name(n),
+                      "（学生票）" if _pm.get(n) == "0X00" else "")
+            for n in (lc.get("passenger_names") or [])) or "账号默认乘车人"
+        self._put_log("[查询] %s → %s %s（乘车人：%s；余票口径 %s）…" % (
+            lc.get("from"), lc.get("to"), lc.get("date"), _ptxt,
+            launcher.PURPOSE_LABELS.get(launcher.purpose_of(lc)) or "成人票"))
+        threading.Thread(target=self._query_work, args=(lc,), daemon=True,
+                         name="train-query").start()
+
+    def _query_work(self, lc):
+        try:
+            name2code, code2name = ticket.load_station_map()
+            fc, tc = name2code.get(lc.get("from")), name2code.get(lc.get("to"))
+            if not fc or not tc:
+                # 新开车站可能不在本地缓存里：后台强制刷新一次，下次可查到
+                ticket.note_station_missing(lc.get("from") if not fc else lc.get("to"))
+                raise RuntimeError("车站无法识别：%s / %s" % (lc.get("from"), lc.get("to")))
+            infos = []
+            for dt in launcher.resolve_dates(lc):
+                rows = ticket.query_tickets(fc, tc, dt, purpose=launcher.purpose_of(lc))
+                for r in rows:
+                    info = ticket.parse_row(r, code2name, dt)
+                    info["_date"] = dt
+                    infos.append(info)
+            self.dataq.put(("trains", infos))
+        except Exception as e:
+            self.dataq.put(("trains_err", "%s: %s" % (type(e).__name__, e)))
+
+    def _apply_train_rows(self, infos):
+        self._querying = False
+        self.query_btn.configure(state="normal")
+        self._train_infos = list(infos)
+        self._refresh_train_view(log=True)
+        self._remember_query()
+        launcher.learn_station_kinds(infos)
+
+    def _refresh_train_view(self, log=False):
+        """按筛选 / 排序条件重建车次列表。"""
+        infos = list(getattr(self, "_train_infos", []))
+        only_emu = self.filter_emu_var.get()
+        only_putong = self.filter_putong_var.get()
+        if only_emu and not only_putong:
+            infos = [i for i in infos if launcher.is_emu(i.get("train_code"))]
+        elif only_putong and not only_emu:
+            infos = [i for i in infos if not launcher.is_emu(i.get("train_code"))]
+        if self.filter_avail_var.get():
+            infos = [i for i in infos if i.get("available_seats")]
+        if self.sort_var.get() == "dur":
+            infos.sort(key=lambda x: ((x.get("_date") or ""), x.get("duration") or "99:99:99"))
+        else:
+            infos.sort(key=lambda x: ((x.get("_date") or ""), x.get("start_time") or "99:99"))
+        total_all = len(getattr(self, "_train_infos", []))
+        # 重建车次表（保留选中车次：按 key = 日期@车次）
+        self._syncing_sel = True
+        try:
+            self.train_tree.delete(*self.train_tree.get_children())
+            self._tv_iids = {}
+            for info in infos:
+                code = info.get("train_code") or "?"
+                key = "%s@%s" % (info.get("_date") or "", code)
+                seats = info.get("available_seats") or {}
+                seat_txt = " ".join("%s %s" % (k, v) for k, v in seats.items()) or "无"
+                iid = self.train_tree.insert("", "end", values=(
+                    code,
+                    "%s-%s" % (info.get("from_name") or "", info.get("to_name") or ""),
+                    "%s-%s" % (info.get("start_time") or "--:--",
+                               info.get("arrive_time") or "--:--"),
+                    info.get("duration") or "-", seat_txt))
+                self._tv_iids[iid] = info
+                if key in self._sel_keys:
+                    self.train_tree.selection_add(iid)
+        finally:
+            self._syncing_sel = False
+        hit = [i for i in infos if i.get("available_seats")]
+        if infos and len(infos) != total_all:
+            state_txt = "%d/%d 趟 · 有票 %d 趟" % (len(infos), total_all, len(hit))
+        else:
+            state_txt = "%d 趟 · 有票 %d 趟" % (len(infos), len(hit))
+        self.query_state.configure(text=state_txt,
+                                   foreground="#1a7f37" if hit else "#57606a")
+        # 选中车次联动席别区（重建后按当前选中重新求并集）
+        self._on_trains_selected()
+        if log:
+            if hit:
+                self._put_log("[查询] %d 趟车里 %d 趟有票：%s" % (
+                    len(infos), len(hit), " ".join(i["train_code"] for i in hit[:10])))
+            else:
+                self._put_log("[查询] 共 %d 趟，暂无可购余票" % len(infos))
+
+    def _on_trains_selected(self, _e=None):
+        """车次选中变化：把选中车次写回车次框，并按并集余票刷新席别区。"""
+        if getattr(self, "_syncing_sel", False):
+            return
+        if not hasattr(self, "seat_box"):
+            return          # _build 尚未建好席别区
+        infos = [self._tv_iids[i] for i in self.train_tree.selection()
+                 if i in self._tv_iids]
+        keys = set()
+        merged = {}
+        allnames = []
+        houbu = False
+        for i in infos:
+            code = i.get("train_code") or "?"
+            keys.add("%s@%s" % (i.get("_date") or "", code))
+            for k, v in (i.get("available_seats") or {}).items():
+                merged.setdefault(k, v)
+            for n in (i.get("seats_all") or []):
+                if n not in allnames:
+                    allnames.append(n)
+            if i.get("houbu"):
+                houbu = True
+        self._sel_keys = keys
+        order = {n: idx for idx, n in enumerate(ticket.SEAT_SHOW_ORDER)}
+        allnames.sort(key=lambda x: order.get(x, 99))
+        codes = [i.get("train_code") for i in infos if i.get("train_code")]
+        self.trains_var.set(",".join(codes))
+        # 选中车次后席别区按「该车提供的全部席别」刷新（含无票），抢票时也能勾
+        self._rebuild_seats(merged if merged else None, allnames, houbu)
+        self._render_seat_detail(infos)
+        self.sel_state.configure(text="已选 %d 趟车 · %d 种席别（%d 种有票）"
+                                 % (len(codes), len(allnames),
+                                    len([s for s in allnames if merged.get(s)])))
+        if codes:
+            self._put_log("[选择] 已选 %d 趟车（%s）：全部席别 %d 种 —— %s" % (
+                len(codes), ",".join(codes), len(allnames),
+                " · ".join("%s %s" % (n, merged.get(n) or ("候补" if houbu else "无"))
+                           for n in allnames)))
+
+    # 车型 → 常见席别参考（没选车次时显示；选中车次后按该车实际席别码串显示）
+    KIND_SEAT_HINT = ("G 高铁：商务座/特等座/一等座/二等座/无座    "
+                      "D 动车：商务座/一等座/二等座/动卧（一等卧·二等卧）/无座    "
+                      "C 城际：一等座/二等座（部分商务座）/无座    "
+                      "Z·T·K 普速：软卧/硬卧/软座/硬座/无座")
+
+    def _render_seat_detail(self, infos):
+        """车次列表下方：列出选中车次的全部席别（含无票）。"""
+        if not hasattr(self, "seat_detail_lbl"):
+            return
+        infos = [i for i in infos if i]
+        if not infos:
+            self.seat_detail_lbl.configure(text="该车全部席别：（选中车次后列出这趟车提供的全部席别，无票也列）\n"
+                                                "车型参考　" + self.KIND_SEAT_HINT)
+            return
+        merged = {}
+        names = []
+        for i in infos:
+            for n in (i.get("seats_all") or []):
+                if n not in names:
+                    names.append(n)
+            for k, v in (i.get("available_seats") or {}).items():
+                merged.setdefault(k, v)
+                if k not in names:
+                    names.append(k)
+        order = {n: idx for idx, n in enumerate(ticket.SEAT_SHOW_ORDER)}
+        names.sort(key=lambda x: order.get(x, 99))
+        hit = [n for n in names if merged.get(n)]
+        codes = [i.get("train_code") or "?" for i in infos]
+        kinds = []
+        for c in codes:
+            k = launcher.train_kind(c)
+            if k and k not in kinds:
+                kinds.append(k)
+        houbu = any(i.get("houbu") for i in infos)
+        head = "该车全部席别：%s（%s）　共 %d 种席别，有票 %d 种%s" % (
+            "、".join(codes), "、".join(kinds), len(names), len(hit),
+            "　售完可候补" if houbu else "")
+        parts = []
+        for n in names:
+            v = merged.get(n)
+            if v:
+                parts.append("%s %s" % (n, v))
+            elif houbu:
+                parts.append("%s 候补" % n)
+            else:
+                parts.append("%s 无" % n)
+        lines = [head]
+        for i in range(0, len(parts), 8):
+            lines.append("　".join(parts[i:i + 8]))
+        self.seat_detail_lbl.configure(text="\n".join(lines))
+
+    def _apply_train_error(self, err):
+        self._querying = False
+        self.query_btn.configure(state="normal")
+        self.query_state.configure(text="查询失败", foreground="#cf222e")
+        self._put_log("[错误] 车次查询失败：%s" % err)
+
+    def _on_pax_purpose_change(self, *_):
+        """某个乘车人的票种改了：立刻落盘，并提示余票口径可能随之变化。"""
+        self._ui_to_lc()
+        lc = self.lc
+        pm = lc.get("pax_purpose") or {}
+        picked = [n for n, v in self.pax_vars.items() if v.get()]
+        txt = "、".join("%s=%s" % (n, launcher.PURPOSE_LABELS.get(pm.get(n)) or "成人票")
+                        for n in picked) or "未勾选乘车人"
+        self._put_log("[票种] %s；余票口径 %s（建议重新查询车次）" % (
+            txt, launcher.PURPOSE_LABELS.get(launcher.purpose_of(lc)) or "成人票"))
+
+    def _clear_train_rows(self):
+        self._train_infos = []
+        self._sel_keys = set()
+        self.train_tree.delete(*self.train_tree.get_children())
+        self._tv_iids = {}
+        self.query_state.configure(text="", foreground="#57606a")
+        self.sel_state.configure(text="已选 0 趟车 · 0 种席别")
+        self._rebuild_seats()
+        self._render_seat_detail([])
+
+    def _swap_stations(self):
+        a, b = self.from_ent.get(), self.to_ent.get()
+        self.from_ent.set(b)
+        self.to_ent.set(a)
+        if a or b:
+            self._put_log("[行程] 已交换出发/到达：%s → %s" % (b or "?", a or "?"))
+
+    def _remember_query(self):
+        """记录本次查询到历史（去重、最多 10 条）。"""
+        lc = self.lc
+        item = {"from": lc.get("from") or "", "to": lc.get("to") or "",
+                "date": lc.get("date") or ""}
+        if not (item["from"] and item["to"]):
+            return
+        hist = [h for h in (lc.get("query_history") or [])
+                if not (isinstance(h, dict)
+                        and h.get("from") == item["from"] and h.get("to") == item["to"]
+                        and h.get("date") == item["date"])]
+        hist.insert(0, item)
+        lc["query_history"] = hist[:10]
+        self._save_cfg(lc)
+
+    def _show_query_history(self):
+        hist = self.lc.get("query_history") or []
+        if not hist:
+            messagebox.showinfo("历史查询记录", "还没有查询记录。", parent=self._mp)
+            return
+        QueryHistoryDialog(self, hist, self._apply_history)
+
+    def _apply_history(self, item):
+        self.from_ent.set(item.get("from") or "")
+        self.to_ent.set(item.get("to") or "")
+        self.date_var.set(item.get("date") or "")
+        self.date_to_var.set("")
+        self._put_log("[历史] 已填入 %s → %s %s" % (
+            item.get("from"), item.get("to"), item.get("date")))
+
+    def _auto_refresh_trains(self):
+        """余票自动刷新（在 _tick 里按间隔触发）。"""
+        if not self.auto_refresh_var.get() or self._querying or self.grabber:
+            return
+        try:
+            gap = max(2, int(self.refresh_sec_var.get() or 2))
+        except (tk.TclError, ValueError):
+            gap = 2
+        if time.time() - self._last_query_ts >= gap:
+            self.query_trains(silent=True)
+
+    # ---- 定时器 ----
+
+    def _notify_nonmodal(self, title, msg):
+        """非模态提醒窗：Toplevel，不 grab、不 wait_window，不阻塞 _tick 的 after 链。
+
+        无人值守时自动开抢必须能继续；用户回来点"知道了"关掉即可。
+        重复提醒不堆窗口：新窗出现前先关掉旧窗。
+        """
+        try:
+            old = getattr(self, "_remind_win", None)
+            if old is not None:
+                try:
+                    if old.winfo_exists():
+                        old.destroy()
+                except tk.TclError:
+                    pass
+        except Exception:
+            pass
+        try:
+            top = tk.Toplevel(self._mp)
+        except tk.TclError:
+            return
+        try:
+            top.title(title)
+            top.resizable(False, False)
+            # 依附主窗口（任务栏不单独占位）+ 置顶，保证提醒可见
+            top.transient(self._mp)
+            top.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        ttk.Label(top, text=msg, justify="left", wraplength=380).pack(padx=18, pady=(14, 8))
+        ttk.Button(top, text="知道了", command=top.destroy).pack(pady=(0, 14))
+        try:
+            # 居中到主窗口
+            top.update_idletasks()
+            x = self._mp.winfo_x() + (self._mp.winfo_width() - top.winfo_reqwidth()) // 2
+            y = self._mp.winfo_y() + (self._mp.winfo_height() - top.winfo_reqheight()) // 2
+            top.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+        except tk.TclError:
+            pass
+        # 注意：绝不能在这里 grab_set()/wait_window()——那会重新变成模态，冻住 _tick。
+        self._remind_win = top
+
+    def _tick(self):
+        try:
+            self._sync_monitor()
+            self._sync_pax()
+            self._drain()
+            self._auto_refresh_trains()
+            now = datetime.datetime.now()
+            g = self.grabber
+            if g and not g.is_alive():
+                self.grabber = None
+                ok, msg = g.result if g.result else (False, "已停止")
+                self.go_btn.configure(text="立 即 抢 票", state="normal")
+                if ok:
+                    self.auto_fired = True
+                    self._set_status("ok", "抢票成功！")
+                    # 成功状态落盘：否则重启后任务库里显示"就绪"，已抢到的事被抹掉
+                    self.lc["status"] = "ok"
+                    try:
+                        self._save_cfg(self.lc)
+                    except Exception:
+                        pass
+                    try:
+                        self._top.bell()
+                    except Exception:
+                        pass
+                else:
+                    self._set_status("idle", msg or "已停止")
+            if not self.grabber:
+                st = launcher.parse_dt(self.start_var.get().strip())
+                if st:
+                    diff = (st - now).total_seconds()
+                    lead = 0
+                    try:
+                        lead = max(0, int(self.warm_var.get() or 10)) * 60
+                    except Exception:
+                        pass
+                    if diff > lead:
+                        _cd = "距开抢 %s" % launcher.fmt_countdown(diff)
+                        _cd = ("⏰ " + _cd) if self.armed else ("⚠ 自动抢未启用 · " + _cd)
+                        self.countdown_lbl.configure(text=_cd)
+                        # remind/warm 手输非数字时回退（与 warm_var 兜底同口径），
+                        # 否则 _tick 每 500ms 抛一次 TclError/ValueError 刷控制台
+                        try:
+                            remind = int(self.remind_var.get() or 0)
+                        except Exception:
+                            remind = 0
+                        if self.armed and not self.reminded and remind > 0 and diff <= remind * 60:
+                            self.reminded = True
+                            self._put_log("[提醒] 距离开抢不到 %d 分钟！" % remind)
+                            try:
+                                self._top.bell()
+                            except Exception:
+                                pass
+                            # 非模态提醒：模态弹窗会冻住 _tick 的 after 链，
+                            # 无人值守时自动开抢永远到不了
+                            self._notify_nonmodal("开抢提醒", "距离开抢不到 %d 分钟！\n开抢时间：%s" % (
+                                remind, st.strftime("%Y-%m-%d %H:%M:%S")))
+                    else:
+                        if self.armed and not self.auto_fired and (now - st).total_seconds() <= max(90, lead):
+                            self.countdown_lbl.configure(text="已到点，自动开抢！")
+                            if lead > 0:
+                                self._put_log("[自动] 进入预热窗口（开抢前 %d 分钟）：先登录并保持浏览器，到点立即下单" % int(lead / 60))
+                            else:
+                                self._put_log("[自动] 已到点，自动开始抢票（%s）" % st.strftime("%H:%M:%S"))
+                            self._put_log("[提示] 抢票在后台运行，浏览器无窗口，请勿关闭本窗口")
+                            try:
+                                self._top.bell()
+                            except Exception:
+                                pass
+                            self.start_grab(auto=True)
+                        elif self.armed and not self.auto_fired:
+                            self.armed = False
+                            self.countdown_lbl.configure(text="开抢时间已过，请手动开抢")
+                        elif diff > 0:
+                            # 还没到点（只是进入了预热窗口）：照常显示倒计时，
+                            # 别提前十分钟就喊"开抢时间已过"
+                            self.countdown_lbl.configure(text="距开抢 %s" % launcher.fmt_countdown(diff))
+                        else:
+                            self.countdown_lbl.configure(text="开抢时间已过")
+                else:
+                    self.countdown_lbl.configure(text="未设置开抢时间")
+        finally:
+            try:
+                self.after(500, self._tick)
+            except tk.TclError:
+                pass  # 表单已销毁，停止循环
+
+    # ---- 与监控系统实时联动 ----
+
+    def _sync_monitor(self):
+        """config.json 有变化时，把监控系统新加的车次合并进来。"""
+        path = os.path.join(HERE, "config.json")
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return
+        if mt == self._monitor_mtime:
+            return
+        self._monitor_mtime = mt
+        if launcher.merge_trains_from_monitor(self.lc, self._save_cfg):
+            self.trains_var.set(",".join(self.lc["trains"]))
+
+    def _sync_pax(self):
+        """passengers.json 有变化（监控系统增删改乘车人）时刷新勾选区。"""
+        path = os.path.join(HERE, "passengers.json")
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return
+        if mt == self._pax_mtime:
+            return
+        self._pax_mtime = mt
+        self._refresh_pax()
+
+    def _drain(self):
+        try:
+            while True:
+                kind, payload = self.dataq.get_nowait()
+                if kind == "trains":
+                    self._apply_train_rows(payload)
+                elif kind == "trains_err":
+                    self._apply_train_error(payload)
+        except queue.Empty:
+            pass
+
+    def _put_log(self, line):
+        self.app.log_line(line)
+
+    def _set_status(self, color_key, text):
+        colors = {"running": "#d97706", "ok": "#1a7f37", "idle": "#6e7781"}
+        try:
+            self.status_lbl.configure(text=text, foreground=colors.get(color_key, "#6e7781"))
+        except Exception:
+            pass
+
+    # ---- 抢票控制 ----
+
+    def _validate(self, auto=False):
+        lc = self.lc
+        if not lc.get("from") or not lc.get("to"):
+            return self._validate_fail("参数不完整", "请填写出发站和到达站", auto)
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", lc.get("date") or ""):
+            return self._validate_fail("参数不完整", "日期格式应为 YYYY-MM-DD", auto)
+        if not lc.get("seat_types"):
+            return self._validate_fail("参数不完整", "请至少勾选一种席别", auto)
+        if not lc.get("passenger_names"):
+            if auto:
+                # 无人值守无法确认"使用默认乘车人"，fail closed：跳过本次开抢
+                return self._validate_fail("未选乘车人", "未勾选乘车人，自动开抢已跳过", auto)
+            if not messagebox.askyesno("未选乘车人", "未勾选乘车人，将使用账号默认乘车人，继续？", parent=self._mp):
+                return False
+        return True
+
+    def _validate_fail(self, title, msg, auto):
+        """校验失败提示：手动弹模态框；自动只 bell+日志（无人值守弹模态会冻住主线程）。"""
+        if auto:
+            # Task 74d：同一种失败原因每个 armed 会话只 bell+日志一次
+            # （否则 500ms 一次蜂鸣/日志刷屏）；失败原因变化时重新提示，
+            # 保证用户修正第一个问题后，第二个失败原因仍然可见。校验通过后重置。
+            if msg != getattr(self, "_auto_vfail_last_msg", None):
+                try:
+                    self._top.bell()
+                except Exception:
+                    pass
+                self._auto_vfail_last_msg = msg
+                self._put_log("[自动开抢] 校验失败：%s（修正配置后将自动重试）" % msg)
+            return False
+        messagebox.showwarning(title, msg, parent=self._mp)
+        return False
+
+    def toggle_grab(self):
+        if self.grabber and self.grabber.is_alive():
+            self.stop_grab()
+        else:
+            self.start_grab()
+
+    def start_grab(self, auto=False):
+        if self.grabber and self.grabber.is_alive():
+            return True  # 已在运行：视为已触发，避免 _tick 反复调用
+        # 先同步界面到内存做校验，校验通过才落盘：失败时不写 grab_tasks.json，
+        # 否则 _tick 每 500ms 重试一次就全量重写一次磁盘文件
+        self._ui_to_lc(save=False)
+        if not self._validate(auto=auto):
+            return False
+        self._save_cfg(self.lc)
+        if auto:
+            # Task 55b：_validate() 通过之后才置位；失败时保持 False，
+            # 下个 _tick 会重试（之前提前置位会缴械整点自动开抢且无重试）。
+            self.auto_fired = True
+            self._auto_vfail_last_msg = None
+        try:
+            self.grabber = launcher.Grabber(dict(self.lc))
+            self.grabber.start()
+        except Exception as e:
+            # 线程启动失败（极罕见）：回滚置位，允许下个 _tick 重试
+            self.grabber = None
+            if auto:
+                self.auto_fired = False
+            self._put_log("[启动] 抢票线程启动失败：%s" % e)
+            return False
+        self._set_status("running", "抢票中…（后台运行，无窗口）")
+        self.go_btn.configure(text="停 止")
+        self._put_log("[启动] 开始抢票：%s → %s %s，车次 %s" % (
+            self.lc.get("from"), self.lc.get("to"), self.lc.get("date"),
+            "、".join(_display_trains(self.lc.get("trains"))) or "全部"))
+        return True
+
+    def stop_grab(self):
+        if self.grabber:
+            self.grabber.stop()
+            self._put_log("[停止] 已请求停止抢票")
+            self._set_status("idle", "已请求停止，等待当前操作结束…")
+            self.go_btn.configure(state="disabled")
+
+    def close(self, stop_thread=True):
+        """停止抢票线程并把界面编辑同步回任务（落盘一次）。
+
+        删除任务前 / 程序退出前调用；「已抢到」状态不抹除（其余归「就绪」）。"""
+        if stop_thread and self.grabber:
+            try:
+                self.grabber.stop()
+                # 等收尾（WarmSession 关浏览器、释放 profile 锁），避免留下孤儿浏览器
+                self.grabber.join(timeout=15)
+            except Exception:
+                pass
+            self.grabber = None
+        try:
+            self._ui_to_lc(save=False)
+        except Exception:
+            pass
+        if self.lc.get("status") != "ok":
+            self.lc["status"] = "idle"
+        try:
+            self._save_cfg(self.lc)
+        except Exception:
+            pass
+
+    # ---- 会话 / 定位 / 更新 ----
+
+    def open_new_monitor_task(self):
+        """打开「新建监控任务」对话框（任务写入监控系统的任务表）。"""
+        NewTaskDialog(self.app, on_created=self.app.refresh_tasks,
+                      prefill={"from": self.from_ent.get(), "to": self.to_ent.get(),
+                               "date": self.date_var.get().strip(),
+                               "trains": _display_trains(self.trains_var.get().replace("，", ",").split(","))})
+
+    def _test_session(self):
+        self._put_log("[会话] 正在校验登录状态…")
+
+        def worker():
+            # 子线程不能直接碰 Tk：结果走 launcher 日志队列，由主线程轮询显示
+            try:
+                ok, who = launcher.browser_order.check_session()
+                launcher.log("[会话] 校验结果：%s（%s）" % ("已登录" if ok else "未登录", who))
+            except Exception as e:
+                launcher.log("[错误] 会话校验异常：%s" % e)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _locate(self):
+        self._put_log("[运行] 正在定位当前 IP 位置…")
+
+        def worker():
+            launcher.log("[提醒] 当前位置：%s" % launcher.ip_locate())
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _check_update_async(self):
+        def worker():
+            try:
+                res = launcher.check_update(self.lc)
+            except Exception:
+                return
+            self.update_info = (res[1], res[2], res[3]) if res[0] else None
+            try:
+                self.after(0, self._show_update)
+            except RuntimeError:
+                pass  # 已关闭，忽略
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update(self):
+        if self.update_info:
+            ver, notes, url = self.update_info
+            self.update_lbl.configure(text="新版本 v%s 可用，点击查看" % ver)
+            self.update_lbl.bind("<Button-1>", lambda e: messagebox.showinfo(
+                "版本更新", "新版本：v%s\n\n%s\n\n下载地址：%s" % (ver, notes or "（无说明）", url or "（未提供）"),
+                parent=self._mp))
+
+    # ---- 预设 ----
+
+    def _current_preset(self):
+        sel = self.preset_cb.get().strip()
+        for p in self.lc.get("presets") or []:
+            if not isinstance(p, dict):
+                continue
+            if (p.get("name") or "") == sel:
+                return p
+        return None
+
+    def _load_preset(self, _event=None):
+        p = self._current_preset()
+        if not p:
+            return
+        self.from_ent.set(p.get("from") or "")
+        self.to_ent.set(p.get("to") or "")
+        self.trains_var.set(",".join(_display_trains(p.get("trains"))))
+        # Task 106：裸字符串按单个席别精确匹配，杜绝子串误判。
+        for s, v in self.seat_vars.items():
+            v.set(s in _display_seat_types(p.get("seat_types")))
+        self.seat_pri_var.set(str(p.get("seat_priority") or ""))
+        self.date_var.set(p.get("date") or "")
+        self._put_log("[运行] 已载入常用行程「%s」" % p.get("name"))
+
+    def _save_preset(self):
+        self._ui_to_lc()
+        name = simpledialog.askstring("存为预设", "给这个常用行程起个名字：",
+                                      parent=self._mp,
+                                      initialvalue=self.preset_cb.get())
+        if not name:
+            return
+        entry = {
+            "name": name.strip(),
+            "from": self.lc.get("from"),
+            "to": self.lc.get("to"),
+            # Task 103a：写回前归一化——裸字符串按单值处理，绝不 list() 逐字符拆。
+            "trains": launcher._normalize_trains(self.lc.get("trains"), self._put_log),
+            "seat_types": launcher._normalize_seat_types(self.lc.get("seat_types"),
+                                                         self._put_log),
+            "seat_priority": self.lc.get("seat_priority") or "",
+            "date": self.lc.get("date") or "",
+        }
+        presets = [p for p in (self.lc.get("presets") or [])
+                   if not isinstance(p, dict) or (p.get("name") or "") != entry["name"]]
+        presets.append(entry)
+        self.lc["presets"] = presets
+        self._save_cfg(self.lc)
+        self.preset_cb.configure(values=[p["name"] for p in presets])
+        self.preset_cb.set(entry["name"])
+        self._put_log("[运行] 常用行程「%s」已保存" % entry["name"])
+
+    def _delete_preset(self):
+        p = self._current_preset()
+        if not p:
+            messagebox.showinfo("删除预设", "请先在下拉框里选中要删除的行程", parent=self._mp)
+            return
+        if messagebox.askyesno("删除预设", "确定删除常用行程「%s」？" % p.get("name"), parent=self._mp):
+            self.lc["presets"] = [x for x in (self.lc.get("presets") or []) if x is not p]
+            self._save_cfg(self.lc)
+            self.preset_cb.configure(values=[x.get("name") or "" for x in self.lc["presets"]
+                                             if isinstance(x, dict)])
+            self.preset_cb.set("")
+            self._put_log("[运行] 常用行程「%s」已删除" % p.get("name"))
+
+    # ---- 乘车人编辑 ----
+
+    def _edit_pax(self):
+        PassengerDialog(self.app, on_saved=self._pax_saved_by_dialog)
+
+    def _pax_saved_by_dialog(self):
+        self._refresh_pax()
+        try:
+            self._pax_mtime = os.path.getmtime(os.path.join(HERE, "passengers.json"))
+        except OSError:
+            pass
+
+    # ---- 收尾 ----
+
+    def _on_start_change(self, *_):
+        st = launcher.parse_dt(self.start_var.get())
+        self.armed = bool(st and st > datetime.datetime.now())
+        self.auto_fired = False
+        self._auto_vfail_last_msg = None
+        self.reminded = False
+
+
+class PassengerDialog(tk.Toplevel):
+    """乘车人快速编辑（抢票表单内弹窗）：一行列表 + 表单，保存走加密库。"""
+
+    def __init__(self, master, on_saved=None):
+        super().__init__(master)
+        self.on_saved = on_saved
+        self.title("乘车人信息")
+        self.geometry("440x360")
+        self.transient(master.winfo_toplevel() if master is not None else None)
+        self.grab_set()
+        try:
+            self.plist = passengers_mod.load_passengers()
+        except Exception as e:
+            self.plist = []
+            messagebox.showwarning("读取失败", "乘车人数据读取失败：%s" % e, parent=self)
+        # Task 90：记下 load 时的字节指纹，供保存时做乐观并发检查
+        self._pax_stamp = passengers_mod.passengers_stamp()
+
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        r0 = ttk.Frame(f)
+        r0.pack(fill="x")
+        ttk.Label(r0, text="选择").pack(side="left")
+        self.pick = ttk.Combobox(r0, state="readonly", width=24,
+                                 values=[p.get("name") or "" for p in self.plist])
+        self.pick.pack(side="left", padx=6)
+        self.pick.bind("<<ComboboxSelected>>", self._load)
+        ttk.Button(r0, text="删除此人", command=self._delete).pack(side="left", padx=6)
+
+        self.name_var = tk.StringVar()
+        self.id_var = tk.StringVar()
+        self.mob_var = tk.StringVar()
+        self.type_var = tk.StringVar(value="二代身份证")
+        self.adult_var = tk.BooleanVar(value=True)
+        self.default_var = tk.BooleanVar(value=False)
+
+        g = ttk.Frame(f)
+        g.pack(fill="both", expand=True)
+        self.id_entry = ttk.Entry(g, textvariable=self.id_var, width=26, show="*")
+        grid = [
+            ("姓名", ttk.Entry(g, textvariable=self.name_var, width=26)),
+            ("证件类型", ttk.Combobox(g, textvariable=self.type_var, width=23,
+                                      values=list(passengers_mod.ID_TYPE_NAMES.values()),
+                                      state="readonly")),
+            ("证件号", self.id_entry),
+            ("手机号", ttk.Entry(g, textvariable=self.mob_var, width=26)),
+        ]
+        for i, (lab, w) in enumerate(grid):
+            ttk.Label(g, text=lab).grid(row=i + 1, column=0, sticky="e", pady=4)
+            w.grid(row=i + 1, column=1, sticky="w", padx=6, pady=4)
+        # 小眼睛：证件号默认掩码，点一下切明文、再点还原
+        self._id_visible = False
+        self.eye_btn = ttk.Button(g, text="显示", width=5, command=self._toggle_id_show)
+        self.eye_btn.grid(row=3, column=2, sticky="w", padx=(0, 2))
+        ttk.Checkbutton(g, text="成人票", variable=self.adult_var).grid(row=5, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(g, text="设为默认乘车人", variable=self.default_var).grid(row=6, column=1, sticky="w")
+
+        bf = ttk.Frame(g)
+        bf.grid(row=7, column=0, columnspan=3, pady=(10, 0))
+        ttk.Button(bf, text="保 存", command=self._save).pack(side="left", padx=6)
+        ttk.Button(bf, text="关 闭", command=self.destroy).pack(side="left", padx=6)
+
+        if self.plist:
+            self.pick.current(0)
+            self._load()
+
+    def _toggle_id_show(self):
+        self._id_visible = not self._id_visible
+        self.id_entry.configure(show="" if self._id_visible else "*")
+        self.eye_btn.configure(text="隐藏" if self._id_visible else "显示")
+
+    def _load(self, _event=None):
+        name = self.pick.get().strip()
+        for p in self.plist:
+            if (p.get("name") or "") == name:
+                self.name_var.set(p.get("name") or "")
+                self.id_var.set(p.get("id_no") or "")
+                self.mob_var.set(p.get("mobile") or "")
+                for code, lab in passengers_mod.ID_TYPE_NAMES.items():
+                    if str(p.get("id_type_code")) == str(code):
+                        self.type_var.set(lab)
+                self.adult_var.set(bool(p.get("is_adult", True)))
+                self.default_var.set(bool(p.get("is_default")))
+                return
+
+    def _refresh_plist(self):
+        """重载最新乘车人数据并更新指纹/下拉框（Task 90：乐观并发放弃后调用）。"""
+        self.plist = passengers_mod.load_passengers()
+        self._pax_stamp = passengers_mod.passengers_stamp()
+        self.pick.configure(values=[p.get("name") or "" for p in self.plist])
+
+    def _save_passengers_or_refresh(self, parent):
+        """保存 self.plist（Task 90：乐观并发检查）。
+
+        成功 → (True, "ok")。指纹变化（打开期间被外部修改）→
+        重载最新数据+警告，返回 (False, "stale")，调用方放弃本次保存。
+        不可解密盒子/锁超时 → error，返回 (False, "refused")。
+        """
+        if _save_passengers_or_warn(self.plist, parent, self._pax_stamp):
+            # Task 96a 回归修复（Task 90 遗漏）：成功保存后刷新指纹，否则同一
+            # 会话第二次保存必误报"被外部修改"。
+            self._pax_stamp = passengers_mod.passengers_stamp()
+            return True, "ok"
+        if self._pax_stamp is not passengers_mod._STAMP_UNSET \
+                and passengers_mod.passengers_stamp() != self._pax_stamp:
+            # 外部写入导致放弃：重载最新数据+新指纹。
+            # （expect_stamp 为哨兵值时本就没有乐观检查，不存在"被外部修改"。）
+            self._refresh_plist()
+            return False, "stale"
+        return False, "refused"
+
+    def _delete(self):
+        name = self.pick.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno("删除乘车人", "确定删除「%s」？" % name, parent=self):
+            return
+        self.plist = [p for p in self.plist if (p.get("name") or "") != name]
+        try:
+            ok, _ = self._save_passengers_or_refresh(self)
+            if not ok:
+                return
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e), parent=self)
+            return
+        self.pick.configure(values=[p.get("name") or "" for p in self.plist])
+        self.pick.set("")
+        self._notify_saved()
+
+    def _save(self):
+        name = self.name_var.get().strip()
+        id_no = self.id_var.get().strip()
+        if not name or not id_no:
+            messagebox.showwarning("信息不完整", "姓名和证件号不能为空", parent=self)
+            return
+        if self.default_var.get():
+            for p in self.plist:
+                p["is_default"] = False
+        rec = {
+            "name": name,
+            "id_type_code": self._type_code(),
+            "id_no": id_no,
+            "mobile": self.mob_var.get().strip(),
+            "is_default": bool(self.default_var.get()),
+            "is_adult": bool(self.adult_var.get()),
+        }
+        replaced = False
+        for i, p in enumerate(self.plist):
+            if (p.get("name") or "") == name:
+                self.plist[i] = rec
+                replaced = True
+                break
+        if not replaced:
+            self.plist.append(rec)
+        try:
+            ok, _ = self._save_passengers_or_refresh(self)
+            if not ok:
+                return
+        except Exception as e:
+            messagebox.showerror("保存失败", "加密保存失败：%s" % e, parent=self)
+            return
+        self.pick.configure(values=[p.get("name") or "" for p in self.plist])
+        self.pick.set(name)
+        self._notify_saved()
+        messagebox.showinfo("已保存", "乘车人「%s」已加密保存" % name, parent=self)
+
+    def _type_code(self):
+        lab = self.type_var.get()
+        for code, name in passengers_mod.ID_TYPE_NAMES.items():
+            if name == lab:
+                return code
+        return "1"
+
+    def _notify_saved(self):
+        if self.on_saved:
+            try:
+                self.on_saved()
+            except Exception:
+                pass
+
 
 # ----------------------------- 小窗模式 -----------------------------
 
@@ -2977,8 +3623,6 @@ class TaskEditDialog(tk.Toplevel):
 # 引擎启动横幅、每轮 [运行] 播报、[查询重试]、[配置] 同步之类全部过滤。
 MINI_LOG_TAGS = ("[有票]", "[抢到]", "[错误]", "[冷却]", "[防重]",
                  "[跳过]", "[会话]", "[状态]")
-
-MINI_STAT_COLOR = STATUS_COLOR  # 与任务页状态色同一份（改色只改 STATUS_COLOR）
 
 MINI_LOG_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d+ \[\w+\] (.*)$")
@@ -2998,59 +3642,43 @@ class MiniWindow(tk.Toplevel):
         self.app = app
         self.primed = False
         self.pinned = False
-        self._wrap = 0
-        self._wrap_labels = []
         self._last_sig = None
 
         self.title("12306 抢票小窗")
         self.geometry("460x420")
         self.minsize(340, 260)
-        self.configure(bg=BG)
-        # 点 × 关闭小窗：隐藏小窗并恢复主窗口（回到打开小窗前的界面）
         self.protocol("WM_DELETE_WINDOW", self.close_mini)
 
-        head = tk.Frame(self, bg=BLUE)
+        head = ttk.Frame(self, padding=(8, 6))
         head.pack(fill="x")
-        tk.Label(head, text="抢票小窗", bg=BLUE, fg="white",
-                 font=(FONT, 11, "bold")).pack(side="left", padx=12, pady=8)
+        ttk.Label(head, text="抢票小窗", font=("", 10, "bold")).pack(side="left")
+        self.pin_btn = ttk.Button(head, text="置顶", width=6, command=self.toggle_pin)
+        self.pin_btn.pack(side="right")
+        self.acct_label = ttk.Label(head, text="检查中...")
+        self.acct_label.pack(side="right", padx=(0, 8))
 
-        self.pin_btn = tk.Button(head, text="置顶", command=self.toggle_pin,
-                                 bg=BLUE, fg="white", activebackground=BLUE_DARK,
-                                 activeforeground="white", relief="flat", bd=0,
-                                 font=(FONT, 9), cursor="hand2")
-        self.pin_btn.pack(side="right", padx=(0, 12))
+        self.task_box = ttk.Frame(self)
+        self.task_box.pack(fill="x", pady=(2, 4))
 
-        self.acct_label = tk.Label(head, text="检查中...", bg=BLUE, fg="white",
-                                   font=(FONT, 10))
-        self.acct_label.pack(side="right", padx=(0, 6))
-        self.acct_dot = tk.Label(head, text="●", bg=BLUE, fg="#DCEAFB",
-                                 font=(FONT, 9))
-        self.acct_dot.pack(side="right")
-
-        # 任务区：只有状态标识 + 备注
-        self.task_box = tk.Frame(self, bg=BG)
-        self.task_box.pack(fill="x", pady=(6, 4))
-
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=10)
-
-        log_wrap = tk.Frame(self, bg=BG)
-        log_wrap.pack(fill="both", expand=True, padx=10, pady=(4, 8))
-        self.log_text = scrolledtext.ScrolledText(
-            log_wrap, state="disabled", wrap="word", font=("Consolas", 9),
-            bg=CARD, relief="flat", highlightthickness=0)
-        self.log_text.pack(fill="both", expand=True)
+        log_wrap = ttk.Frame(self)
+        log_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.log_text = tk.Text(log_wrap, state="disabled", wrap="word",
+                                font=("Consolas", 9))
+        sb = ttk.Scrollbar(log_wrap, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
         self.log_text.tag_configure("hit", foreground="#d97706")
         self.log_text.tag_configure("bought", foreground="#0969da")
         self.log_text.tag_configure("err", foreground="#cf222e")
-        self.log_text.tag_configure("misc", foreground=GRAY)
-
-        self.bind("<Configure>", self._on_resize)
 
     # ---- 登录状态 ----
 
     def set_account(self, text, logged_in):
-        self.acct_label.config(text=text or "未登录")
-        self.acct_dot.config(fg=("#5AE08A" if logged_in else "#DCEAFB"))
+        try:
+            self.acct_label.config(text=text or "未登录")
+        except Exception:
+            pass
 
     # ---- 任务区 ----
 
@@ -3078,60 +3706,20 @@ class MiniWindow(tk.Toplevel):
         if sig == self._last_sig:
             return
         self._last_sig = sig
-
         for w in self.task_box.winfo_children():
             w.destroy()
-        self._wrap_labels = []
-
         if not rows:
-            tk.Label(self.task_box, text="暂无正在进行的任务", bg=BG, fg=GRAY,
-                     font=(FONT, 10)).pack(anchor="w", padx=14, pady=8)
+            ttk.Label(self.task_box, text="暂无正在进行的任务").pack(anchor="w", padx=14, pady=8)
             return
-
         for name, st, msg in rows:
-            color = MINI_STAT_COLOR.get(st, GRAY)
-            card = tk.Frame(self.task_box, bg=CARD)
-            card.pack(fill="x", padx=10, pady=3)
-            tk.Frame(card, bg=color, width=3).pack(side="left", fill="y")
-            inner = tk.Frame(card, bg=CARD)
-            inner.pack(side="left", fill="x", expand=True, padx=9, pady=7)
-
-            top = tk.Frame(inner, bg=CARD)
-            top.pack(fill="x")
-            tk.Label(top, text="●", bg=CARD, fg=color,
-                     font=(FONT, 9)).pack(side="left")
-            tk.Label(top, text=engine_mod.STATUS_LABELS.get(st, st), bg=CARD,
-                     fg=color, font=(FONT, 10, "bold")).pack(side="left", padx=(4, 0))
-
-            self._wrap_labels.append(
-                self._mklabel(inner, name, TEXT, (FONT, 10), pady=(3, 0)))
+            row = ttk.Frame(self.task_box)
+            row.pack(fill="x", padx=10, pady=2)
+            ttk.Label(row, text=engine_mod.STATUS_LABELS.get(st, st),
+                      foreground=STATUS_COLOR.get(st, "")).pack(side="left")
+            ttk.Label(row, text=name, wraplength=220, justify="left").pack(side="left", padx=8)
             if msg:
-                self._wrap_labels.append(
-                    self._mklabel(inner, msg, GRAY, (FONT, 9)))
-
-        self._apply_wrap(self._wrap or max(180, self.winfo_width() - 80))
-
-    def _mklabel(self, parent, text, fg, font, pady=0):
-        lbl = tk.Label(parent, text=text, bg=CARD, fg=fg, font=font,
-                       anchor="w", justify="left")
-        lbl.pack(fill="x", pady=pady)
-        return lbl
-
-    def _apply_wrap(self, w):
-        self._wrap = w
-        for lbl in self._wrap_labels:
-            try:
-                lbl.config(wraplength=w)
-            except Exception:
-                pass
-
-    def _on_resize(self, evt):
-        if evt.widget is not self:
-            return
-        w = max(180, evt.width - 80)
-        if abs(w - self._wrap) < 12:
-            return
-        self._apply_wrap(w)
+                ttk.Label(row, text=msg, foreground="#57606a",
+                          wraplength=260, justify="left").pack(side="left")
 
     # ---- 日志 ----
 
@@ -3142,7 +3730,6 @@ class MiniWindow(tk.Toplevel):
         tstamp, msg = m.group(1), m.group(2)
         if not any(tag in msg for tag in MINI_LOG_TAGS):
             return
-
         if "[抢到]" in msg:
             tag = "bought"
         elif "[有票]" in msg:
@@ -3150,8 +3737,7 @@ class MiniWindow(tk.Toplevel):
         elif "[错误]" in msg:
             tag = "err"
         else:
-            tag = "misc"
-
+            tag = None
         self.log_text.config(state="normal")
         self.log_text.insert("end", "%s  %s\n" % (tstamp, msg), tag)
         self.log_text.see("end")
@@ -3176,8 +3762,7 @@ class MiniWindow(tk.Toplevel):
             self.attributes("-topmost", self.pinned)
         except Exception:
             pass
-        self.pin_btn.config(text="已置顶" if self.pinned else "置顶",
-                            bg=(BLUE_DARK if self.pinned else BLUE))
+        self.pin_btn.config(text="已置顶" if self.pinned else "置顶")
 
     def hide(self):
         """程序化隐藏小窗（不恢复主窗口）。"""
@@ -3192,128 +3777,124 @@ class MiniWindow(tk.Toplevel):
             pass
 
 
+# ----------------------------- 主窗口 -----------------------------
+
 class MonitorApp:
     def __init__(self, root):
         self.root = root
         root.title("12306 车票监控与自动购票系统（桌面版）")
-        root.geometry("1200x800")
-        root.minsize(940, 660)
-        apply_style(root)
-        try:
-            root.tk.call("tk", "scaling", 1.15)
-        except Exception:
-            pass
+        root.geometry("1240x820")
+        root.minsize(980, 680)
 
         self.stop_event = None
         self.engine_thread = None
         self.live_engine = None
         self._acct_time = 0.0
         self.mini = None
+        self._session_dead_warned = False
 
-        # 蓝色顶部栏：侧边栏开关 + 标题 + 引擎状态
-        header = tk.Frame(root, bg=BLUE)
-        header.pack(fill="x")
-        self.toggle_btn = tk.Button(header, text="☰", command=self.toggle_sidebar,
-                                    bg=BLUE, fg="white", activebackground=BLUE_DARK,
-                                    activeforeground="white", relief="flat",
-                                    font=(FONT, 13, "bold"), bd=0, cursor="hand2",
-                                    width=3)
-        self.toggle_btn.pack(side="left", padx=(10, 4), pady=6)
-        tk.Label(header, text="12306 车票监控与自动购票系统", bg=BLUE, fg="white",
-                 font=(FONT, 14, "bold"), pady=12).pack(side="left", padx=4)
-        self.engine_label = tk.Label(header, text="引擎：未运行", bg=BLUE, fg="#DCEAFB",
-                                     font=(FONT, 10))
-        self.engine_label.pack(side="right", padx=16)
-        tk.Button(header, text="小窗模式", command=self.open_mini,
-                  bg=BLUE_DARK, fg="white", activebackground=BLUE,
-                  activeforeground="white", relief="flat", bd=0,
-                  font=(FONT, 10), cursor="hand2", padx=10).pack(
-                      side="right", padx=(0, 12), pady=8)
+        # ---------------- 顶部工具条 ----------------
+        bar = ttk.Frame(root, padding=(8, 6))
+        bar.pack(fill="x")
+        self.start_btn = ttk.Button(bar, text="▶ 启动监控", command=self.start_engine)
+        self.start_btn.pack(side="left", padx=(0, 4))
+        self.stop_btn = ttk.Button(bar, text="■ 停止监控", command=self.stop_engine,
+                                   state="disabled")
+        self.stop_btn.pack(side="left", padx=4)
+        self.engine_label = ttk.Label(bar, text="● 引擎：未运行")
+        self.engine_label.pack(side="left", padx=12)
+        self.acct_label = ttk.Label(bar, text="账号：未检查")
+        self.acct_label.pack(side="left", padx=12)
+        ttk.Button(bar, text="清空日志", command=self.clear_log).pack(side="right", padx=3)
+        ttk.Button(bar, text="小窗模式", command=self.open_mini).pack(side="right", padx=3)
+        ttk.Button(bar, text="重新登录", command=self.open_session).pack(side="right", padx=3)
 
-        body = tk.Frame(root, bg=BG)
-        body.pack(fill="both", expand=True)
-
-        # 左侧边栏
-        self.sidebar = SidebarPanel(body, self)
-        self.sidebar.pack(side="left", fill="y")
-
-        # 右侧：内容页 + 底部日志
-        right = tk.Frame(body, bg=BG)
-        right.pack(side="left", fill="both", expand=True)
-        self.content = tk.Frame(right, bg=BG)
-        self.content.pack(fill="both", expand=True, padx=10, pady=(8, 2))
-
+        # ---------------- 页签 ----------------
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=(2, 4))
         self.pages = {}
-        self.pages["tasks"] = TaskPage(self.content, self)
-        self.pages["history"] = HistoryPanel(self.content, self)
-        self.pages["notify"] = NotifyPanel(self.content, self)
-        # 抢票任务：多任务管理器（每个任务独立窗口、独立配置，可并行抢票）
-        self.pages["grab"] = launcher.TaskManagerPanel(self.content)
-        self.pages["grab"].configure(bg=BG)
+        self.pages["tasks"] = TaskPage(self.nb, self)
+        self.nb.add(self.pages["tasks"], text="监控任务")
+        self.pages["grab"] = GrabTab(self.nb, self)
+        self.nb.add(self.pages["grab"], text="抢票任务")
+        self.pages["query"] = QuickCheckTab(self.nb, self)
+        self.nb.add(self.pages["query"], text="查票")
+        self.pages["pax"] = PassengerPanel(self.nb)
+        self.nb.add(self.pages["pax"], text="乘车人")
+        self.pages["history"] = HistoryTab(self.nb, self)
+        self.nb.add(self.pages["history"], text="历史")
+        self.pages["settings"] = SettingsTab(self.nb, self)
+        self.nb.add(self.pages["settings"], text="设置")
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.task_page = self.pages["tasks"]
 
-        log_head = tk.Frame(right, bg=BG)
-        log_head.pack(fill="x", padx=10, pady=(6, 2))
-        tk.Label(log_head, text="运行日志：", bg=BG, fg=GRAY,
-                 font=(FONT, 10)).pack(side="left")
-        tk.Button(log_head, text="清空日志", command=self.clear_log, bg=BG, fg=BLUE,
-                  activebackground=BG, activeforeground=BLUE, relief="flat",
-                  font=(FONT, 9), cursor="hand2").pack(side="right")
-        log_frame = tk.Frame(right, bg=BG)
-        log_frame.pack(fill="both", expand=False, padx=10, pady=(0, 8))
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=9, state="disabled", wrap="word",
-            font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True)
-        self.log_text.tag_configure("ERROR", foreground="#cf222e")
-        self.log_text.tag_configure("WARNING", foreground="#9a6700")
+        # ---------------- 运行日志 ----------------
+        logf = ttk.LabelFrame(root, text=" 运行日志 ", padding=4)
+        logf.pack(fill="x", padx=8, pady=(0, 8))
+        wrap = ttk.Frame(logf)
+        wrap.pack(fill="both", expand=True)
+        self.log_text = tk.Text(wrap, height=10, state="disabled", wrap="word",
+                                font=("Consolas", 9))
+        log_sb = ttk.Scrollbar(wrap, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_sb.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_sb.pack(side="right", fill="y")
+        for tag, color in LOG_COLOR.items():
+            self.log_text.tag_configure(tag, foreground=color)
+        self.log_text.tag_configure("__level_error", foreground="#cf222e")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.bind("<Configure>", self._on_resize)
-        self.root.bind("<Control-m>", lambda _e: self.open_mini())
         start_async_poller(self.root)
         self.show_page("tasks")
         self.refresh_account()
         self.poll_log()
         self.root.after(2000, self.tick)
 
-    # ----------------------------- 侧边栏与页面 -----------------------------
+    # ----------------------------- 工具条 / 状态 -----------------------------
+
+    def set_engine(self, text, color=None):
+        try:
+            self.engine_label.configure(text=text)
+        except Exception:
+            pass
+
+    def _on_tab_changed(self, _e=None):
+        try:
+            cur = self.nb.select()
+            page = self.nb.nametowidget(cur)
+        except Exception:
+            return
+        try:
+            if page is self.pages.get("tasks"):
+                self.task_page.refresh()
+            elif page is self.pages.get("grab"):
+                self.pages["grab"]._refresh_list()
+            elif page is self.pages.get("history"):
+                self.pages["history"].refresh()
+            elif page is self.pages.get("pax"):
+                self.pages["pax"].refresh()
+        except Exception:
+            LOG.exception("页签刷新失败（不影响下一轮）")
 
     def show_page(self, key):
         if key not in self.pages:
             return
-        for page in self.pages.values():
-            page.pack_forget()
-        self.pages[key].pack(fill="both", expand=True)
-        mapping = {"tasks": "tasks", "history": "history", "notify": "notify",
-                   "grab": "grab"}
-        self.sidebar.set_active(mapping[key])
-
-    def toggle_sidebar(self):
-        self._auto_collapsed = False
-        self.sidebar.set_expanded(not self.sidebar.expanded)
-
-    def _on_resize(self, evt):
-        # 响应式：窗口过窄时自动收起侧边栏，变宽后自动展开
-        if evt.widget is not self.root:
-            return
-        if evt.width < 980 and self.sidebar.expanded \
-                and not getattr(self, "_auto_collapsed", False):
-            self._auto_collapsed = True
-            self.sidebar.set_expanded(False)
-        elif evt.width >= 1000 and not self.sidebar.expanded \
-                and getattr(self, "_auto_collapsed", False):
-            self._auto_collapsed = False
-            self.sidebar.set_expanded(True)
+        try:
+            self.nb.select(self.pages[key])
+        except Exception:
+            pass
 
     def _set_account(self, text, logged_in):
-        """登录态的唯一出口：侧边栏与小窗一起更新，两边不会再显示打架。"""
-        self.sidebar.set_account(text, logged_in)
+        """登录态的唯一出口：顶部账号标签与小窗一起更新，两边不会再显示打架。"""
+        try:
+            self.acct_label.configure(text="账号：%s" % (text or "未登录"))
+        except Exception:
+            pass
         if self.mini is not None and self.mini.winfo_exists():
             self.mini.set_account(text, logged_in)
 
     def refresh_account(self):
-        """异步校验登录会话，更新侧边栏账号状态（已登录时显示手机尾号后四位）。
+        """异步校验登录会话，更新顶部账号状态（已登录时显示手机尾号后四位）。
 
         浏览器模式下不再在这里自查：真实会话在 .browser_profile 里，而这里
         只会去验已弃用的 session_cookies.json，结果显示的是假的"已登录"。
@@ -3333,8 +3914,6 @@ class MonitorApp:
 
             def on_done_browser(res, err):
                 # 浏览器忙（res=None）或校验本身失败（err）：都保持现有显示。
-                # 之前这两种情况一律落到"未登录"，于是刚在浏览器里登录成功，
-                # 侧边栏却是"未登录"——典型的误报。
                 if res is None:
                     if err is not None:
                         LOG.debug("会话校验未完成：%s", err)
@@ -3394,13 +3973,13 @@ class MonitorApp:
         self.engine_thread.start()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.engine_label.config(text="引擎：运行中")
+        self.set_engine("● 引擎：运行中")
         self.refresh_tasks()
 
     def stop_engine(self):
         if self.stop_event is not None:
             self.stop_event.set()
-        self.engine_label.config(text="引擎：正在停止...")
+        self.set_engine("● 引擎：正在停止…")
         self.stop_btn.config(state="disabled")
 
     def tick(self):
@@ -3409,7 +3988,7 @@ class MonitorApp:
             self.stop_event = None
             self.start_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
-            self.engine_label.config(text="引擎：已停止")
+            self.set_engine("● 引擎：已停止")
         elif self.engine_thread and self.engine_thread.is_alive():
             try:
                 tasks = load_config().get("tasks") or []
@@ -3417,7 +3996,7 @@ class MonitorApp:
                 n = sum(1 for t in tasks
                         if state.get(t.get("name"), {}).get("status")
                         in engine_mod.ACTIVE_STATUSES)
-                self.engine_label.config(text="引擎：运行中（%d 个任务）" % n)
+                self.set_engine("● 引擎：运行中（%d 个任务）" % n)
             except Exception:
                 pass
         # 浏览器模式的校验要开一次浏览器，间隔放宽到 3 分钟
@@ -3446,6 +4025,31 @@ class MonitorApp:
 
     # ----------------------------- 日志 -----------------------------
 
+    def _insert_log(self, record):
+        tag = None
+        if "[ERROR]" in record or "[FATAL]" in record:
+            tag = "__level_error"
+        else:
+            for t in LOG_COLOR:
+                if t in record:
+                    tag = t
+                    break
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", record + "\n", tag)
+        if float(self.log_text.index("end-1c")) > 3000.0:
+            self.log_text.delete("1.0", "1000.0")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def log_line(self, line):
+        """界面内直接落一行日志（主线程调用；抢票表单/对话框用）。"""
+        try:
+            self._insert_log(line)
+        except Exception:
+            pass
+        if self.mini is not None and self.mini.winfo_exists():
+            self.mini.feed_log(line)
+
     def poll_log(self):
         # 单条日志处理异常（如控件被销毁的 TclError）不能逃出循环，
         # 否则 after 轮询链断掉，主日志/小窗/会话失效弹窗全部静默停摆
@@ -3466,17 +4070,19 @@ class MonitorApp:
                         "已登录 {0}".format(m.group(1)) if m else "已登录", True)
                 if self.mini is not None and self.mini.winfo_exists():
                     self.mini.feed_log(record)
-                self.log_text.config(state="normal")
-                tag = None
-                if "[ERROR]" in record or "[FATAL]" in record:
-                    tag = "ERROR"
-                elif "[WARNING]" in record:
-                    tag = "WARNING"
-                self.log_text.insert("end", record + "\n", tag)
-                if float(self.log_text.index("end-1c")) > 3000.0:
-                    self.log_text.delete("1.0", "100.0")
-                self.log_text.see("end")
-                self.log_text.config(state="disabled")
+                self._insert_log(record)
+            except Exception:
+                pass
+        # 抢票业务日志（launcher 模块的专用队列）
+        while True:
+            try:
+                record = launcher.LOGQ.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if self.mini is not None and self.mini.winfo_exists():
+                    self.mini.feed_log(record)
+                self._insert_log(record)
             except Exception:
                 pass
         try:
@@ -3524,8 +4130,7 @@ class MonitorApp:
         def _run():
             ok = _relogin_ok_via_script(os.path.join(HERE, "capture_session.py"))
             _RESULT_QUEUE.put((self.root,
-                               lambda _r, _e: self._after_warn_relogin(ok),
-                               None, None))
+                               lambda _r, _e: self._after_warn_relogin(ok), None, None))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3544,28 +4149,32 @@ class MonitorApp:
         if self.mini is not None and self.mini.winfo_exists():
             self.mini.clear_log()
 
-    # ----------------------------- 对话框 -----------------------------
+    # ----------------------------- 对话框 / 页签入口 -----------------------------
 
-    def open_wizard(self):
-        TaskWizard(self, on_created=self.refresh_tasks)
+    def open_wizard(self, prefill=None):
+        NewTaskDialog(self, on_created=self.refresh_tasks, prefill=prefill)
+
+    def open_quick_monitor(self, prefill=None):
+        NewTaskDialog(self, on_created=self.refresh_tasks, prefill=prefill)
 
     def open_start_dialog(self):
         StartMonitorDialog(self)
-
-    def open_quick_monitor(self):
-        QuickMonitorDialog(self, on_created=self.refresh_tasks)
 
     def open_history(self):
         self.show_page("history")
 
     def open_notify(self):
-        self.show_page("notify")
+        self.show_page("settings")
 
     def open_session(self):
-        SessionDialog(self.root, app=self)
+        self.show_page("settings")
+        try:
+            self.pages["settings"].check()
+        except Exception:
+            pass
 
     def open_quick_check(self):
-        QuickCheckDialog(self.root)
+        self.show_page("query")
 
     # ----------------------------- 小窗模式 -----------------------------
 
@@ -3593,15 +4202,14 @@ class MonitorApp:
                 text = ""
             for line in text.splitlines():
                 self.mini.feed_log(line)
-        # 只显示小窗：主窗口隐藏（widget 不销毁，页面/侧边栏状态原样保留）
+        # 只显示小窗：主窗口隐藏（widget 不销毁，页签状态原样保留）
         try:
             self.root.withdraw()
         except Exception:
             pass
 
     def restore_main(self):
-        """小窗关闭后恢复主窗口，回到打开小窗前的界面状态。
-        页面、侧边栏、窗口尺寸等从未改动，仅重新显示并前置。"""
+        """小窗关闭后恢复主窗口，回到打开小窗前的界面状态。"""
         try:
             self.root.deiconify()
             self.root.lift()
@@ -3615,11 +4223,21 @@ class MonitorApp:
                 return
             self.stop_event.set()
             self.engine_thread.join(timeout=5)
+        # 抢票任务收尾：停线程、关浏览器、保存配置
+        try:
+            self.pages["grab"].close_all()
+        except Exception as e:
+            LOG.warning("退出时收尾抢票任务失败：%s", e)
         self.root.destroy()
 
 
+# ----------------------------- 入口 -----------------------------
+
 def _ensure_stdio():
     """pythonw 下没有控制台，sys.stdout / sys.stderr 是 None。
+
+    与 launcher._ensure_stdio 同名不同语义（那边把 stdio 重定向到
+    logs/launcher_stdio.log 供 CLI 用；这里接到 logging）。勿合并。
 
     Playwright 启动浏览器时会往标准输出写日志并调用 flush()，
     在 None 上调用会抛 AttributeError，浏览器进程随即退出（exitCode=21）。
@@ -3663,7 +4281,7 @@ def _config_json_corrupt():
     但顶层不是 dict（Task 75a；Task 94a 补后两种口径——与 load_config 的降级
     口径保持一致，否则 main() 的友好提示与实际行为脱节）。"""
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return True
@@ -3681,6 +4299,11 @@ def main():
         messagebox.showerror("错误", "未找到 config.json（%s）" % CONFIG_PATH)
         root.destroy()
         return
+    try:
+        # 首跑导入：把监控任务里的乘车人名字迁入加密库（老启动器入口的行为）
+        launcher.ensure_passengers()
+    except Exception:
+        pass
     root = tk.Tk()
     if _config_json_corrupt():
         # Task 75a/94a：文件存在但内容损坏——友好提示后按空配置启动
@@ -3697,3 +4320,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

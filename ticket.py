@@ -410,7 +410,7 @@ def _read_json_cache(path):
     import os
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except Exception:
             pass  # 损坏：走重新下载

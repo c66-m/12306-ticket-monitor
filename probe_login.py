@@ -105,6 +105,9 @@ def _mask_pii(text):
 def _mask_scalar(value):
     """单个标量值脱敏：有值则记为 ***，无值（None/空串）原样返回。
 
+    与 browser_order._mask_scalar 同口径（那边以 appcommon 为单源，本文件
+    是刻意零本地依赖的独立诊断脚本，故内联保留）。
+
     用于非 JSON 文本里的显式打印（如 step5 的 username），与 _mask_pii
     的"值抹掉、结构保留"口径一致（Task 78c）。
     """

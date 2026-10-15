@@ -92,23 +92,9 @@ DEDUPE_VALUES = {
 LOG = logging.getLogger("monitor")
 
 
-def _mask_order_no(ono):
-    """订单号脱敏（日志用）：保留前后各 4 位，中间打码；过短则全打码。"""
-    s = str(ono or "")
-    if len(s) <= 8:
-        return "****"
-    return s[:4] + "****" + s[-4:]
-
-
-def _mask_names(names):
-    """乘车人姓名打码（日志用）：保留首字其余打码；['张三','李四'] -> '张*、李*'。"""
-    out = []
-    for n in names or []:
-        n = (n or "").strip()
-        if not n:
-            continue
-        out.append(n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*")
-    return "、".join(out)
+# 口径单源在 appcommon（原实现迁走，语义不变）；别名保留，调用点与测试 pin 不变。
+_mask_order_no = appcommon.mask_order_no
+_mask_names = appcommon.mask_names
 
 _WARNED_PRIORITIES = set()
 
@@ -319,7 +305,7 @@ class MonitorEngine(object):
         """setup_logging=False 时由调用方（如 GUI）自行接管日志处理器。"""
         self.config_path = config_path or os.path.join(HERE, "config.json")
         try:
-            with open(self.config_path, encoding="utf-8") as f:
+            with open(self.config_path, encoding="utf-8-sig") as f:
                 self.config = json.load(f)
         except FileNotFoundError:
             # Task 102：缺 config 文件（python engine.py 裸跑且无配置文件）——
@@ -664,7 +650,7 @@ class MonitorEngine(object):
         if m == getattr(self, "_config_mtime", None):
             return False
         try:
-            with open(self.config_path, encoding="utf-8") as f:
+            with open(self.config_path, encoding="utf-8-sig") as f:
                 new_config = json.load(f)
         except Exception as e:
             # Task 72：解析失败不消费 mtime——否则本次配置变更永久被忽略，
@@ -1585,7 +1571,7 @@ class MonitorEngine(object):
 def load_state_file(path):
     if os.path.exists(path):
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 return json.load(f)
         except Exception:
             return {}

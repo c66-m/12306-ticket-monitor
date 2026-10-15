@@ -57,7 +57,7 @@ GUI_SUBPROCESS_TIMEOUT = MAX_WAIT_SEC + 120
 
 def _order_mode():
     try:
-        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8-sig") as f:
             return json.load(f).get("order_mode") or "http"
     except Exception:
         return "http"
@@ -71,13 +71,17 @@ def _cookie_path(config_path=None):
     回退旧硬编码值 session_cookies.json（Task 69a）。
     """
     try:
-        with open(config_path or os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+        with open(config_path or os.path.join(HERE, "config.json"), encoding="utf-8-sig") as f:
             name = json.load(f).get("session_cookies_file") or "session_cookies.json"
     except Exception:
         name = "session_cookies.json"
     if not isinstance(name, str):
         name = "session_cookies.json"
-    return os.path.join(HERE, name)
+    if os.path.isabs(name):
+        # Windows 上 os.path.join(HERE, '/tmp/x.json') 会拼成 'C:/tmp/x.json'：
+        # 盘符被强加、用户配的绝对路径悄悄变味。绝对路径原样透传。
+        return name
+    return os.path.normpath(os.path.join(HERE, name))
 
 
 def _browser_mode_login():

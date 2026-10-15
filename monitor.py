@@ -19,7 +19,6 @@
 
 import datetime
 import getpass
-import hashlib
 import json
 import os
 import subprocess
@@ -61,7 +60,7 @@ def load_config():
     global _DAMAGED_STAMP
     _DAMAGED_STAMP = None
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except FileNotFoundError:
         # 首跑无配置文件：不打 traceback，给友好引导后返回空配置。
@@ -93,20 +92,22 @@ _STAMP_UNSET = object()
 
 
 def _config_stamp():
-    """config.json 当前内容的字节指纹（sha256 十六进制）。
+    """config.json 当前内容的字节指纹（sha256），读不出返回 None。
 
-    文件不存在或不可读时返回 None。用字节哈希而非 mtime：他进程重写
-    相同内容不误报；任何字节变化必检出。
+    与 api._config_stamp 同义：两份都只是各自 CONFIG_PATH 对
+    appcommon.stat_fingerprint 的绑定，真实现已单源，别再抽一层。
+
+    复用 appcommon.stat_fingerprint（全库唯一的 sha256 内容哈希实现）；
+    用内容哈希而非 mtime：他进程重写相同内容不误报，任何字节变化必检出。
     """
-    try:
-        with open(CONFIG_PATH, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
+    return appcommon.stat_fingerprint(CONFIG_PATH)
 
 
 def _lock_timeout_abort():
     """file_lock 锁争用超时的统一出口：打印明确提示、记日志，再上抛友好异常。
+
+    与 gui._lock_timeout_abort 同名不同语义（那边弹 messagebox，界面进程用），
+    勿合并——RULES.md:47「各写方的防护语义是参数不是噪音」。
 
     CLI 菜单的 main_menu 会接住它并返回主菜单（不崩）；用户稍后重试该操作。
     """
@@ -686,10 +687,9 @@ def _clear_task_state(name):
 
 # ----------------------------- 菜单 4：乘车人管理 -----------------------------
 
-def _mask_id(id_no):
-    if not id_no or len(id_no) < 8:
-        return id_no or ""
-    return id_no[:3] + "*" * (len(id_no) - 7) + id_no[-4:]
+# 口径单源在 appcommon.mask_id_partial（与 launcher_utils.mask_id 是两种口径，
+# 勿混用）；别名保留，调用点不变。
+_mask_id = appcommon.mask_id_partial
 
 
 def menu_passengers():
@@ -830,7 +830,7 @@ def menu_history():
         print("\n  暂无购票历史记录。")
         return
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             history = json.load(f)
     except Exception as e:
         print("  读取历史失败：%s" % e)
@@ -996,7 +996,8 @@ def menu_session():
         else:
             print("  尚未保存浏览器会话。")
     else:
-        cookie_path = os.path.join(HERE, config.get("session_cookies_file", "session_cookies.json"))
+        cookie_path = order_mod.resolve_cookie_path(
+            config.get("session_cookies_file", "session_cookies.json"))
         if os.path.exists(cookie_path):
             try:
                 s = order_mod.load_session(config.get("session_cookies_file", "session_cookies.json"))

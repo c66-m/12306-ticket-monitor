@@ -138,7 +138,7 @@ if __name__ == "__main__":
     # 联调用例：python notify.py
     sys.path.insert(0, ".")
     import json
-    with open("config.json", "r", encoding="utf-8") as f:
+    with open("config.json", "r", encoding="utf-8-sig") as f:
         cfg = json.load(f)
     ok, msg = send_email(cfg["notify"]["email"],
                          "测试邮件：12306 监控系统",

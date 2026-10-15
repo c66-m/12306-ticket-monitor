@@ -37,5 +37,11 @@
   },
   "tasks": [],
   "order_mode": "browser",
-  "browser_headless": false
+  "browser_headless": false,
+  "task_defaults": {
+    "auto_order": true,
+    "stop_after_order": true,
+    "notify": true,
+    "start_now": true
+  }
 }

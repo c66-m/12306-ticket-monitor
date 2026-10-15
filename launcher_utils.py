@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""launcher.py 的纯工具子模块：不引用任何被测试 mock 的符号。
+"""launcher.py 的纯工具子模块：不引用任何被测试 mock 的符号、不依赖 tkinter。
 
-被 mock 的符号（log, HERE, ttk, messagebox, Grabber, 等）保留在 launcher.py 中，
-本模块只包含不被 mock 的全局变量、工具函数和 TrainCard 类。
+被 mock 的符号（log, HERE, Grabber, 等）保留在 launcher.py 中，
+本模块只包含不被 mock 的全局变量与工具函数。
+
+2026-10-13 界面重构：TrainCard（tk.Frame）与复选框图标工具已随旧 UI 删除，
+本模块成为纯业务工具层（无任何 tkinter 依赖）。
 """
+import json
 import re
 import sys
 import uuid
@@ -11,8 +15,7 @@ from datetime import datetime, timedelta
 
 import requests
 
-import tkinter as tk
-
+import appcommon
 import ticket
 
 # ----------------------------- 席别表 -----------------------------
@@ -91,38 +94,6 @@ def _is_soft_fail(msg):
     return any(k in (msg or "") for k in ("系统繁忙", "网络异常", "排队"))
 
 
-# ----------------------------- 复选框图标 -----------------------------
-
-def _make_check_icon(checked, size=14):
-    """内存生成复选框指示器图标（不依赖外部图片文件）：空框 / 框内对勾。"""
-    img = tk.PhotoImage(width=size, height=size)
-    border, fill = "#8A94A6", "#FFFFFF"
-    img.put(fill, to=(0, 0, size, size))
-    img.put(border, to=(0, 0, size, 1))
-    img.put(border, to=(0, size - 1, size, size))
-    img.put(border, to=(0, 1, 1, size - 1))
-    img.put(border, to=(size - 1, 1, size, size - 1))
-    if checked:
-        tick = "#1A73E8"
-        pts = [(3, 6), (4, 7), (5, 8), (6, 9), (7, 8), (8, 7), (9, 6), (10, 4)]
-        for x, y in pts:
-            img.put(tick, to=(x, y, x + 2, y + 2))
-    return img
-
-
-def _patch_tick_layout(items):
-    """把 TCheckbutton 布局里的 indicator element 换成自定义的对勾。"""
-    out = []
-    for name, opts in items:
-        opts = dict(opts)
-        if name == "Checkbutton.indicator":
-            name = "Tick.indicator"
-        if "children" in opts:
-            opts["children"] = _patch_tick_layout(opts["children"])
-        out.append((name, opts))
-    return out
-
-
 # ----------------------------- 抢票任务模板 -----------------------------
 
 def new_grab_task(seq):
@@ -151,32 +122,10 @@ def mask_mobile(m):
     return m
 
 
-def _mask_order_no(no):
-    """订单号脱敏（日志用；与 engine._mask_order_no 同口径）：保留前后各 4 位，
-    中间打码；过短则全打码。"""
-    s = str(no or "")
-    if len(s) <= 8:
-        return "****"
-    return s[:4] + "****" + s[-4:]
-
-
-def _mask_one_name(n):
-    """单个姓名打码（Task 88c：与 _mask_names 同口径的单源）：保留首字其余打码。"""
-    n = (n or "").strip()
-    if not n:
-        return ""
-    return n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*"
-
-
-def _mask_names(names):
-    """乘车人姓名打码（日志用；与 engine._mask_names 同口径）：保留首字其余打码；
-    ['张三','李四'] -> '张*、李*'。"""
-    out = []
-    for n in names or []:
-        m = _mask_one_name(n)
-        if m:
-            out.append(m)
-    return "、".join(out)
+# 脱敏口径单源在 appcommon（原实现迁走，语义不变）；别名保留，调用点与测试 pin 不变。
+_mask_order_no = appcommon.mask_order_no
+_mask_one_name = appcommon.mask_one_name
+_mask_names = appcommon.mask_names
 
 
 _ORDER_NO_RE = re.compile(r"(订单号\s?)([A-Za-z0-9]{4,})")
@@ -195,23 +144,18 @@ def _normalize_seat_types(raw, warn):
     """seat_types 字段归一化（Task 103a；与 engine.normalize_seat_types 同口径）：
     裸字符串（如漏写方括号的 "二等座"）按单个席别处理并记警告，绝不逐字符拆
     （旧代码 list("二等座") 会拆成 ['二','等','座'] 写回污染配置 → 漏单类）；
-    形状非法记警告后忽略；非字符串条目跳过（席别为中文名，不做 strip/upper）。"""
-    if raw is None or raw == "":
-        return []
-    if isinstance(raw, str):
-        warn("[提醒] seat_types 为字符串，已按单个席别处理：%s" % raw)
-        return [raw]
-    if not isinstance(raw, (list, tuple)):
-        warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))
-        return []
-    return [s for s in raw if isinstance(s, str)]
+    形状非法记警告后忽略；非字符串条目跳过（席别为中文名，不做 strip/upper）。
+
+    机械层已收敛到 appcommon.normalize_seat_types；本函数只留「警告文案」这层
+    策略，调用方与测试看到的签名 (raw, warn) 不变。
+    """
+    return appcommon.normalize_seat_types(
+        raw, warn,
+        "[提醒] seat_types 为字符串，已按单个席别处理：%s",
+        "[提醒] seat_types 形状非法，已忽略：%r")
 
 
-def _display_seat_types(raw):
-    """展示用席别归一化（Task 103b）：与 _display_trains 同口径（字符串按单个
-    席别、绝不逐字符拆），但不打日志——展示路径可能高频刷新，畸形值的警告由
-    数据消费路径（engine/launcher 运行链）负责；这里只解决展示。"""
-    return _normalize_seat_types(raw, lambda *a: None)
+_display_seat_types = appcommon.display_seat_types
 
 
 # ----------------------------- 时间工具 -----------------------------
@@ -278,17 +222,27 @@ def fmt_date_tag(date_str):
 # ----------------------------- 位置定位 -----------------------------
 
 def ip_locate(timeout=6):
-    """百度 IP 定位（公开接口，免 key）。返回可读字符串或错误提示。"""
+    """本机 IP 归属地。主用太平洋网络接口（GBK 编码），失败退回 ip-api。返回可读字符串或错误提示。
+
+    2026-10-14：原百度企服接口（qifu-api.baidubce.com）已 404 下线，改为上述两源。
+    """
     try:
-        r = requests.get("https://qifu-api.baidubce.com/ip/local/geo/v1/district",
-                         timeout=timeout)
-        d = r.json()
-        if d.get("code") == "Success":
-            g = d.get("data") or {}
-            parts = [g.get("country", ""), g.get("prov", ""), g.get("city", "")]
+        r = requests.get("https://whois.pconline.com.cn/ipJson.jsp",
+                         params={"json": "true"}, timeout=timeout)
+        d = json.loads(r.content.decode("gbk", "ignore").strip())
+        addr = (d.get("addr") or "").strip()
+        if addr:
+            return addr
+    except Exception:
+        pass
+    try:
+        d = requests.get("http://ip-api.com/json/", params={"lang": "zh-CN"},
+                         timeout=timeout).json()
+        if d.get("status") == "success":
+            parts = [d.get("country", ""), d.get("city", ""), d.get("isp", "")]
             parts = [p for p in parts if p]
-            isp = g.get("isp", "")
-            return ("%s（%s）" % (" ".join(parts), isp)) if isp else " ".join(parts)
+            if parts:
+                return " ".join(parts)
         return "定位失败：%s" % (d.get("message") or d)
     except Exception as e:
         return "定位失败：%s" % e
@@ -299,7 +253,7 @@ def ip_locate(timeout=6):
 def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
                        passengers, purpose_code, auto_order, stop_after_order,
                        priority, pax_purpose=None, seat_priority=None):
-    """按监控系统的任务结构组装任务字典（与 gui.py QuickMonitorDialog 一致）。"""
+    """按监控系统的任务结构组装任务字典（与 gui.py 新建监控任务一致）。"""
     name = "%s-%s %s %s" % (
         from_name, to_name, "/".join(trains) if trains else "全部车次",
         "/".join(seats))
@@ -334,86 +288,3 @@ def _norm_query(text):
     """中文输入容错：全角→半角、剔除全部空白、转小写（长 葛→长葛,ｃｑ→cq）。"""
     t = (text or "").translate(_FW_TRANS)
     return "".join(t.split()).lower()
-
-
-# ----------------------------- 车次卡片 -----------------------------
-
-class TrainCard(tk.Frame):
-    """单趟车卡片：时间 — 车次 类型 — 时间 / 历时 / 区间 / 有票席别摘要，整卡可点选。"""
-
-    def __init__(self, master, info, on_click, selected=False):
-        super().__init__(master, bd=0, bg="#ffffff",
-                         highlightthickness=1, highlightbackground="#d0d7de", cursor="hand2")
-        self.info = info
-        self.on_click = on_click
-        self.key = "%s@%s" % (info.get("_date") or info.get("query_date") or "",
-                              info.get("train_code") or "?")
-        self.selected = False
-        body = tk.Frame(self, bg="#ffffff")
-        body.pack(fill="x", padx=8, pady=3)
-
-        small = (FONT[0], 9)
-        head = tk.Frame(body, bg="#ffffff")
-        head.pack(fill="x")
-        big = (FONT[0], 11, "bold")
-        tk.Label(head, text=info.get("start_time") or "-", font=big, bg="#ffffff").pack(side="left")
-        tk.Label(head, text="——", fg="#8c959f", bg="#ffffff").pack(side="left", padx=5)
-        tk.Label(head, text=info.get("train_code") or "?", font=(FONT[0], 10, "bold"),
-                 fg="#0969da", bg="#ffffff").pack(side="left")
-        tk.Label(head, text=train_kind(info.get("train_code")), fg="#57606a",
-                 bg="#ffffff", font=small).pack(side="left", padx=(4, 0))
-        tk.Label(head, text="——", fg="#8c959f", bg="#ffffff").pack(side="left", padx=5)
-        tk.Label(head, text=info.get("arrive_time") or "-", font=big, bg="#ffffff").pack(side="left")
-        tk.Label(head, text="历时 " + (info.get("duration") or "-"), fg="#57606a",
-                 bg="#ffffff", font=small).pack(side="right")
-
-        sub = tk.Frame(body, bg="#ffffff")
-        sub.pack(fill="x")
-        tk.Label(sub, text="%s → %s" % (info.get("from_name") or "?",
-                                        info.get("to_name") or "?"),
-                 fg="#57606a", bg="#ffffff", font=small).pack(side="left")
-        if info.get("_date"):
-            tk.Label(sub, text="  " + fmt_date_tag(info["_date"]), fg="#8250df",
-                     bg="#ffffff", font=small).pack(side="left")
-        seats = info.get("available_seats") or {}
-        names = list(SEAT_OPTIONS) + [k for k in seats if k not in SEAT_ORDER]
-        avail = [(n, seats.get(n)) for n in names if seats.get(n)]
-        if avail:
-            parts = ["%s %s" % (n, v) for n, v in avail[:5]]
-            if len(avail) > 5:
-                parts.append("…另 %d 席" % (len(avail) - 5))
-            tk.Label(sub, text="    " + " · ".join(parts), fg="#1a7f37",
-                     bg="#ffffff", font=(FONT[0], 9, "bold")).pack(side="left")
-        else:
-            tk.Label(sub, text="    %d 种席别均无票" % len(names), fg="#8c959f",
-                     bg="#ffffff", font=small).pack(side="left")
-
-        self._bind_click_all(self)
-        self.set_selected(selected)
-
-    def _bind_click_all(self, w):
-        w.bind("<Button-1>", self._clicked)
-        for c in w.winfo_children():
-            self._bind_click_all(c)
-
-    def _clicked(self, _e=None):
-        self.on_click(self)
-        return "break"
-
-    def _all_children(self, w):
-        out = []
-        for c in w.winfo_children():
-            out.append(c)
-            out.extend(self._all_children(c))
-        return out
-
-    def set_selected(self, on):
-        self.selected = bool(on)
-        bg = "#eff6ff" if self.selected else "#ffffff"
-        self.configure(highlightbackground="#0969da" if self.selected else "#d0d7de",
-                       highlightthickness=2 if self.selected else 1)
-        for w in [self] + self._all_children(self):
-            try:
-                w.configure(bg=bg)
-            except tk.TclError:
-                pass

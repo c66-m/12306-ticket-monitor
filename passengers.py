@@ -366,7 +366,7 @@ def load_passengers(path=None):
     if not os.path.exists(path):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             box = json.load(f)
     except Exception as e:
         # Task 100d：print 在 GUI 下不可见（Task 80c 同类同模块遗漏）——
@@ -416,7 +416,7 @@ def _is_undecryptable_box(path):
     try:
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             return False
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             box = json.load(f)
         _decrypt(box.get("enc", "none"), box.get("data", "[]"))
         return False
@@ -476,13 +476,6 @@ def default_names(path=None):
     if names:
         return names
     return [p.get("name") for p in passengers if p.get("name")][:1]
-
-
-def find_by_name(name, passengers):
-    for p in passengers:
-        if p.get("name") == name:
-            return p
-    return None
 
 
 if __name__ == "__main__":

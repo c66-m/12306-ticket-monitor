@@ -6,3 +6,6 @@ playwright
 
 # 可选：非 Windows 平台的加密兜底（Windows 用系统 DPAPI，无需此包）
 cryptography
+
+# 2026-10-13 界面重构：旧 UI 的 pillow（圆角/弥散阴影位图）已随 theme.py 删除，
+# 界面全部改为原生 ttk 控件，不再需要 Pillow。

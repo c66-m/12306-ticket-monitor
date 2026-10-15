@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-跨界面共享的基础工具：日期区间解析、原子文件 IO。
+跨界面共享的基础工具：日期区间解析、原子文件 IO、PII 脱敏口径、北京时间。
 
 只收编「无策略差异」的机械层。涉及锁（filelock / _CFG_WRITE_LOCK）、坏档
 时间戳挪档、mtime 二次检测、deepcopy 快照与直写兜底等防护语义全部留在
@@ -9,6 +9,7 @@
 
 import datetime
 import filelock
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,110 @@ import time
 LOG = logging.getLogger("monitor")
 
 MAX_DATE_SPAN_DAYS = 5   # 乘车日期区间最多相差天数（= 6 个日期）
+
+
+# ----------------------------- PII 脱敏 -----------------------------
+# 脱敏口径的单源：engine / order / launcher_utils / browser_order / gui /
+# monitor 曾各持一份同口径实现。口径漂移等于日志泄露，收敛到这里，原模块
+# 保留同名别名，调用点不变。
+
+def mask_order_no(ono):
+    """订单号脱敏（日志用）：保留前后各 4 位，中间打码；过短则全打码。"""
+    s = str(ono or "")
+    if len(s) <= 8:
+        return "****"
+    return s[:4] + "****" + s[-4:]
+
+
+def mask_one_name(n):
+    """单个姓名打码（日志用）：保留首字其余打码。"""
+    n = (n or "").strip()
+    if not n:
+        return ""
+    return n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*"
+
+
+def mask_names(names):
+    """乘车人姓名打码（日志用）：保留首字其余打码；['张三','李四'] -> '张*、李*'。"""
+    out = []
+    for n in names or []:
+        m = mask_one_name(n)
+        if m:
+            out.append(m)
+    return "、".join(out)
+
+
+def mask_id_partial(id_no):
+    """身份证脱敏（界面/日志显示用）：保留前 3 位与后 4 位。
+
+    与 launcher_utils.mask_id 是**两种口径**：这里对长度 < 8 的输入原样返回
+    且不 strip；mask_id 对长度 <= 8 原样返回但先 strip。界面路径用本函数，
+    账号路径用 mask_id，勿互换。
+    """
+    if not id_no or len(id_no) < 8:
+        return id_no or ""
+    return id_no[:3] + "*" * (len(id_no) - 7) + id_no[-4:]
+
+
+# ----------------------------- 北京时间 -----------------------------
+
+def beijing_tz():
+    """北京时间时区：ZoneInfo("Asia/Shanghai")，Windows 无 tzdata 时退化固定 +8。
+
+    北京无夏令时，固定 +8 恒等于 Asia/Shanghai，退化后同样正确。收敛自
+    order._beijing_tz / logutil._beijing_tz（logutil 原先为避免反向依赖业务
+    模块而复制一份，appcommon 只依赖标准库 + filelock，无此顾虑）。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Asia/Shanghai")
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=8),
+                                 name="Asia/Shanghai")
+
+
+# ----------------------------- 展示归一化 -----------------------------
+# trains / seat_types 字段的机械层单源：launcher / launcher_utils / gui 曾各持
+# 一份同口径实现（裸字符串不逐字符拆，是防漏单的关键）。这里只收机械层，
+# 「警告文案」这层策略由调用方以 str_warn / shape_warn 传入——展示路径传
+# lambda *a: None（不打日志，防高频刷新刷屏）。
+
+def normalize_trains(raw, warn, str_warn, shape_warn):
+    """trains 归一化：裸字符串按单个车次处理，绝不逐字符拆；非法形状忽略；
+    非字符串条目跳过。字符串条目 strip().upper()；形状异常时 warn 一次。"""
+    raw = raw or []
+    if isinstance(raw, str):
+        warn(str_warn % raw)
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        warn(shape_warn % (raw,))
+        raw = []
+    return [t.strip().upper() for t in raw
+            if isinstance(t, str) and t.strip()]
+
+
+def display_trains(raw):
+    """展示用 trains 归一化：与 normalize_trains 同口径，不记日志。"""
+    return normalize_trains(raw, lambda *a: None, "%s", "%r")
+
+
+def normalize_seat_types(raw, warn, str_warn, shape_warn):
+    """seat_types 归一化：裸字符串按单个席别处理，绝不逐字符拆；非法形状
+    忽略；非字符串条目跳过。席别是中文名，不做 strip/upper。"""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        warn(str_warn % raw)
+        return [raw]
+    if not isinstance(raw, (list, tuple)):
+        warn(shape_warn % (raw,))
+        return []
+    return [s for s in raw if isinstance(s, str)]
+
+
+def display_seat_types(raw):
+    """展示用 seat_types 归一化：与 normalize_seat_types 同口径，不记日志。"""
+    return normalize_seat_types(raw, lambda *a: None, "%s", "%r")
 
 
 # ----------------------------- 日期区间 -----------------------------
@@ -117,7 +222,7 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
 _TMP_SWEEP_MAX_AGE = 3600  # 残留 tmp 超过 1 小时才删：其它进程正在写的 tmp 一定是新鲜的
 # atomic_write_json 实际使用过的 tmp_kind 全集（Task 81e）：清理正则只认
 # 这些 kind，形如 state.json.bak2024-01 的用户自建文件绝不误删。
-_TMP_SWEEP_KINDS = ("tmp", "launcher", "guisave", "monsave")
+_TMP_SWEEP_KINDS = ("tmp", "launcher", "guisave", "monsave", "apisave")
 
 
 def sweep_stale_tmp(path, max_age_seconds=_TMP_SWEEP_MAX_AGE):
@@ -169,7 +274,7 @@ def read_state_or_none(path):
     # replace 报拒绝访问），短暂退避重试——只影响撞上的那一瞬
     for i in range(5):
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except PermissionError:
             if i == 4:
@@ -192,13 +297,19 @@ def read_state_or_none(path):
 
 
 def stat_fingerprint(path):
-    """文件指纹 (st_mtime_ns, st_size)，供 quarantine_corrupt 做 TOCTOU 守卫。
-    在"读失败"瞬间抓取；文件已消失返回 None。"""
+    """文件内容指纹（sha256 十六进制），供 quarantine_corrupt 做 TOCTOU 守卫。
+    在「读失败」瞬间抓取；文件读不出（不存在/被独占）返回 None。
+
+    必须是内容哈希，不能是 (st_mtime_ns, st_size)：Windows 时钟粒度约 15ms，
+    竞态写方在同一刻换成同样大小的不同内容时 stat 指纹不变，守卫失效会把
+    健康文件误判成坏档挪走（实测：16 字节坏 JSON 被改写成 17 字节健康 JSON，
+    stat 指纹完全相同，守卫形同虚设）。re. 内容哈希与时钟粒度、文件大小无关。
+    """
     try:
-        st = os.stat(path)
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return None
-    return (st.st_mtime_ns, st.st_size)
 
 
 def quarantine_corrupt(path, expected_fingerprint=None):
@@ -247,7 +358,7 @@ def _read_history_list(path):
 
     调用方须处理 None：不得用空列表覆写（可能存在的健康文件）。"""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
     except Exception:
         return None
@@ -259,7 +370,7 @@ def _read_orders_db(path):
 
     调用方须处理 None：不得用空库覆写（可能存在的健康文件）。"""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             db = json.load(f)
     except Exception:
         return None
@@ -291,7 +402,7 @@ def append_history(path, record, keep=500):
             history = []
             if os.path.exists(path):
                 try:
-                    with open(path, encoding="utf-8") as f:
+                    with open(path, encoding="utf-8-sig") as f:
                         history = json.load(f)
                 except Exception as e:
                     decision, bad = _quarantine_decision(path,
@@ -350,7 +461,7 @@ def _load_orders_impl(path):
     if not os.path.exists(path):
         return {"orders": {}}, True
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             db = json.load(f)
     except Exception as e:
         decision, bad = _quarantine_decision(path, stat_fingerprint(path))

@@ -29,6 +29,8 @@ import threading
 import time
 import weakref
 
+import appcommon
+
 try:
     import msvcrt  # Windows 文件字节锁：跨进程互斥靠它
 except ImportError:  # 非 Windows 平台没有 msvcrt，改用 fcntl
@@ -57,12 +59,8 @@ def _log(msg):
 
 # Task 101h：_log 的 PII 脱敏（与 Task 61/65a/84c 同口径）——用户名/乘车人姓名
 # 不再明文进控制台日志。只用于日志路径，不碰下单逻辑与取证结构。
-def _mask_name(n):
-    """单个姓名打码（与 launcher._mask_one_name 同口径）：保留首字其余打码。"""
-    n = (n or "").strip()
-    if not n:
-        return ""
-    return n[0] + "*" * (len(n) - 1) if len(n) > 1 else "*"
+# 姓名口径单源在 appcommon.mask_one_name，别名保留（原实现逐字相同）。
+_mask_name = appcommon.mask_one_name
 
 
 def _mask_scalar(value):
@@ -410,7 +408,7 @@ def launch(p, headless=False, restore=True):
             "/".join(str(c) if c else "chromium" for c in _BROWSER_CHANNELS), "; ".join(errs)))
     if restore and os.path.exists(STATE_PATH):
         try:
-            with open(STATE_PATH, encoding="utf-8") as f:
+            with open(STATE_PATH, encoding="utf-8-sig") as f:
                 saved = json.load(f)
             cookies = saved.get("cookies") if isinstance(saved, dict) else saved
             now = time.time()
@@ -1639,7 +1637,7 @@ def show_timing_report():
         print("还没有下单耗时记录（logs/order_timing.jsonl）")
         return 1
     recs = []
-    with open(p, "r", encoding="utf-8") as f:
+    with open(p, "r", encoding="utf-8-sig") as f:
         for ln in f:
             ln = ln.strip()
             if not ln:

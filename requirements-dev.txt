@@ -7,3 +7,6 @@
 # 以下为可选的开发工具（项目未强制要求）：
 # pytest          # 替代运行器：pytest tests/test_all.py
 # coverage        # 覆盖率：coverage run -m unittest tests.test_all && coverage report
+# ruff            # 静态检查（裸 except / 未定义名）。先只跑 E9,F，勿一次上全规则：
+#                 #   ruff check --select E9,F .
+#                 # 全仓逐字执行 `ruff check .` 会报大量历史风格问题，本仓库暂不追求全绿。

@@ -37,15 +37,9 @@ from capture_session import COOKIE_KEY_SEP, _build_cookie_dict
 LOG = logging.getLogger(__name__)
 
 
-def _mask_order_no(ono):
-    """订单号脱敏（日志用）：保留前后各 4 位，中间打码；过短则全打码。
-
-    与 engine._mask_order_no 同口径（order.py 不能 import engine，会循环依赖）。
-    """
-    s = str(ono or "")
-    if len(s) <= 8:
-        return "****"
-    return s[:4] + "****" + s[-4:]
+# 口径单源在 appcommon（order.py 不能 import engine，会循环依赖）；别名保留，
+# 调用点与既有测试 pin 不变。
+_mask_order_no = appcommon.mask_order_no
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -98,7 +92,15 @@ def _resolve_cookie_path(cookie_path):
     name = name or "session_cookies.json"
     if os.path.isabs(name):
         return name
-    return os.path.join(HERE, name)
+    # normpath：把配置里的 'rel/cookies.json' 归一成 HERE\rel\cookies.json，
+    # 与 capture_session._cookie_path 同口径（同一路径的字面表示必须唯一，
+    # 否则同一个文件会出现两种键、比对/日志/清理各说各话）。
+    return os.path.normpath(os.path.join(HERE, name))
+
+
+# 公开别名：monitor/gui 等调用方不要各自 os.path.join(HERE, ...) 再抄一遍口径，
+# 直接调这里（绝对路径透传、相对路径按脚本目录归一）。
+resolve_cookie_path = _resolve_cookie_path
 
 
 def load_session(cookie_path=None):
@@ -111,7 +113,7 @@ def load_session(cookie_path=None):
     path = _resolve_cookie_path(cookie_path)
     if not os.path.exists(path):
         raise RuntimeError("未找到会话文件 {0}，请先运行：python capture_session.py".format(path))
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         cookies = json.load(f)
 
     s = requests.Session()
@@ -215,15 +217,8 @@ def classify_order_status(date, train, passenger_names, session=None):
     return _classify_orders(date, train, passenger_names, orders)
 
 
-def _beijing_tz():
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo("Asia/Shanghai")
-    except Exception:
-        # Windows 未装 tzdata 包时 ZoneInfo 不可用；北京无夏令时，固定 +8
-        # 恒等于 Asia/Shanghai，退化为此时区偏移同样正确。
-        return datetime.timezone(datetime.timedelta(hours=8), name="Asia/Shanghai")
-
+# 口径单源在 appcommon.beijing_tz（原实现迁走，语义不变）。
+_beijing_tz = appcommon.beijing_tz
 
 _BJ_TZ = _beijing_tz()
 
@@ -313,7 +308,7 @@ def session_from_browser_state(state_path=None):
     if not os.path.exists(path):
         raise RuntimeError("未找到 %s（请先用浏览器方式登录一次）"
                            % os.path.basename(path))
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         saved = json.load(f)
     cookie_list = saved.get("cookies") if isinstance(saved, dict) else saved
     s = requests.Session()
@@ -1036,7 +1031,7 @@ def order_ticket(config, task, ticket, seat_name):
 if __name__ == "__main__":
     # 单独运行：先测会话有效性与乘车人列表
     try:
-        cfg = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8"))
+        cfg = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8-sig"))
         s = load_session(cfg.get("session_cookies_file", "session_cookies.json"))
         ok, who = check_login(s)
         print("会话有效: {0}".format(who) if ok else "会话失效: {0}".format(who))

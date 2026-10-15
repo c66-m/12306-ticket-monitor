@@ -9,6 +9,7 @@ station_kind.json 的实际查询学习，未学习过的标「待识别」，�
     python station_db.py rebuild           # 重建/更新 stations_db.json
     python station_db.py rebuild --force   # 空索引时仍强制落盘（清空旧库，慎用）
     python station_db.py query 长葛     # 命令行速查
+    python station_db.py check            # 校验四份车站文件一致性（漂移非零退出）
 """
 
 import json
@@ -75,10 +76,73 @@ def search(text, limit=20):
     return launcher.search_stations(text, limit=limit)
 
 
+def check():
+    """校验四份车站文件一致性，漂移时返回非零码（重构前基线 / CI 用）。
+
+    硬失败(1)：文件缺失或解析失败；station_name.json / station_index.json /
+    stations_db.json 的 name↔code 集合不一致——三份同源于 station_name.js，
+    任一分叉都说明被单点刷新过，此时迁移消费者或删文件都会丢站。
+    软提示(0)：stations_db.json 的 kind 快照落后于 station_kind.json；
+    rebuild 才收编，滞后是正常中间态，只报数不改退出码。
+    """
+    data = {}
+    for name in ("station_name.json", "station_index.json",
+                 "stations_db.json", "station_kind.json"):
+        try:
+            with open(os.path.join(HERE, name), "r", encoding="utf-8-sig") as f:
+                data[name] = json.load(f)
+        except Exception as e:
+            print("不一致：%s 读取失败：%r" % (name, e))
+            return 1
+    try:
+        pairs = {
+            "station_name.json":
+                set(data["station_name.json"].get("name2code", {}).items()),
+            "station_index.json":
+                {(s["name"], s["code"])
+                 for s in data["station_index.json"].get("stations", [])},
+            "stations_db.json":
+                {(s["name"], s["code"])
+                 for s in data["stations_db.json"].get("stations", [])},
+        }
+    except Exception as e:
+        print("不一致：车站文件格式异常（需人工核对）：%r" % (e,))
+        return 1
+    base = pairs["station_index.json"]
+    drift = 0
+    for name in ("station_name.json", "stations_db.json"):
+        diff = sorted(pairs[name] - base) + sorted(base - pairs[name])
+        drift += len(diff)
+        if diff:
+            print("不一致：%s 相对 station_index.json 差 %d 条" % (name, len(diff)))
+            for n, c in diff[:5]:
+                print("    %s %s" % (n, c))
+    stations = data["stations_db.json"].get("stations", [])
+    kinds = data["station_kind.json"]
+    stale = [s for s in stations
+             if s.get("kind") == "待识别" and kinds.get(s["code"])]
+    if stale:
+        print("提示：stations_db.json 有 %d 站仍标「待识别」而 station_kind.json "
+              "已有答案（rebuild 后收编）：%s"
+              % (len(stale), "、".join("%s=%s" % (s["name"], kinds[s["code"]])
+                                       for s in stale[:5])))
+    if drift:
+        print("name↔code 漂移 %d 处：迁移消费者或删除车站文件前必须先对齐。" % drift)
+        return 1
+    print("车站文件一致性：name↔code 漂移 0 处；stations_db.json %d 站"
+          "（待识别 %d，updated %s）"
+          % (len(stations),
+             sum(1 for s in stations if s.get("kind") == "待识别"),
+             data["stations_db.json"].get("updated")))
+    return 0
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "rebuild":
         rebuild(force="--force" in args[1:])
+    elif args and args[0] in ("check", "--check"):
+        sys.exit(check())
     elif args and args[0] == "query":
         import launcher  # 延迟导入：import station_db 时不拖入 GUI 模块
         for st in search(" ".join(args[1:]) or "", limit=20):

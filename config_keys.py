@@ -6,7 +6,7 @@ CONFIG_KEYS = frozenset({
     "order_retry_delay_seconds", "order_retry_cooldown_seconds", "adaptive",
     "session_cookies_file", "state_file", "history_file", "passengers_file",
     "log_dir", "http_timeout", "notify", "tasks",
-    "order_mode", "browser_headless",
+    "order_mode", "browser_headless", "task_defaults",
 })
 NOTIFY_EMAIL_KEYS = frozenset({
     "enabled", "smtp_host", "smtp_port", "username", "password", "from", "to",
