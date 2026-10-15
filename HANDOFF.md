@@ -252,7 +252,8 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 - verify_session(session) 语义：返回 (ok, who, permanent)；非 JSON 响应重试 3 次，避免把 12306 临时繁忙误判为登录失效。
 
 ## 10. 未决 / 待办（没有授权就别动）
-- ~~main ahead 8：是否 git push~~ **已完成**：HEAD=190a919 已推送，与 origin/main 同步（见第 1 节）。剩余：HANDOFF.md 本轮校正是否提交。
+- ~~main ahead 8：是否 git push~~ **已完成**：HEAD=190a919 已推送，与 origin/main 同步（见第 1 节）。
+- ~~交接文档校正未提交~~ **已完成**：3f683ff（HANDOFF/README）+ 671324a（PRODUCT.md）已提交，工作树干净。**下次 push 时这两个 commit 会一起上去**。
 - ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（711 OK）。
 - 一等卧/二等卧/高级动卧（官方码 I/J/A）是否进下单码表（长期未决）。
 - 重新登录后做一次真实下单核对（核对窗席别 vs 订单详情，需登录实跑）。
