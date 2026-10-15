@@ -157,9 +157,9 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 - 旧位置 C:\develep\deepseek harness\工作目录\12306-probe 已删除（robocopy 复制 → 校验 MISSING=0 → 验证通过 → 删源）。
 - 嵌套评审 worktree p1-review：**2026-10-15 已用 `git worktree remove` 移除**（内容早已并入 main），`git worktree list` 现只剩主树 190a919 [main]。同理 `_undo_backup/`、`_ann/`、根 `node_modules/` 均已删除。
 - remote：https://github.com/c66-m/12306-ticket-monitor.git
-- 分支/HEAD（2026-10-16 本轮结束实测）：main = **92370ed**，origin/main = **190a919** → **ahead 5**（本地领先，未推送）。
-  待推送的 5 个：`190a919` → `3f683ff`（docs: 交接文档校正）→ `671324a`（docs: PRODUCT.md 行数校正）→ `0695c70`（docs: HANDOFF 待办段同步）→ `92370ed`（refactor: config/state 收敛，见 §0.98）。
-  上一轮记的「ahead 8 未推送」已过时（那 8 个均已推送）；但**「与 origin 完全同步 / ahead 0」也已过时**——是否 push 是外向操作，待裁决。
+- 分支/HEAD：**不在此写死 sha，跑命令看实况** —— `git status -sb`、`git log --oneline origin/main..main`。
+  （旧版本这里记了「main = 60f4947 / ahead 4」之类的快照，提交后当场就自指过期，所以删掉；数字类的记录一律现查。）
+  已推送基线：origin/main = **190a919**（2026-10-16 记录）。其后本地新增的是文档订正 + config/state 收敛批次（见 §0.98）。是否 push 是外向操作，**待裁决**。
 - 工作树：共 **60 个跟踪文件**。历史在途改动**已全部提交**，包括：Electron 三件套（api.py / ui/ / electron/）、
   5 个过期 md 与 .scratch/（按用户裁决删除后一并提交）、launcher_widgets.py（已删除）、
   `web-dashboard/preview-*.png`（190a919 入库，`.gitignore` 已开白名单 `!web-dashboard/preview-*.png`）。
@@ -338,7 +338,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 12. 下一次开工第一步建议
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
-2. git status -sb 看 HEAD 与本文件第 1 节的记录是否一致（当前 92370ed / origin 190a919 → ahead 5，是否 push 待裁决）
+2. git status -sb + `git log --oneline origin/main..main` 看实况（本文档不记 sha；是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
 4. python -X utf8 tests\test_all.py（预期 711 OK / skipped=15）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
