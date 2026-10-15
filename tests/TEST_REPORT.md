@@ -69,6 +69,7 @@ Windows 优先(msvcrt 跨进程锁、DPAPI),非 Windows 路径均有降级:锁�
 - **config/state 家族跨文件重复已收敛**（HANDOFF 待办项）：`load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records` 原先在 `api.py`、`gui.py`、`monitor.py` 各有一份，现机械层单源到 `appcommon.py`（新分节「config.json 共享 plumbing」）。各前端的**策略差异以参数或回调注入，未拉平**：monitor 的坏档指纹拒写(`damaged_fingerprint`)与 CLI print、gui 的 messagebox 与 `return_result=True`、api 的 stderr 出口、state.json 的 `tmp_kind`(apisave/guisave/monsave)。
 - **邮箱正则统一取严格口径**：旧 `api.EMAIL_RE` 是宽松版，会让 gui 拒收的地址从桌面版设置页落进 config.json；现四处同源 `appcommon.EMAIL_RE`。
 - **`state_file` / `history_file` 路径解析单源**：`appcommon.state_path_of / history_path_of`，api / gui / monitor / launcher 四处统一。
-- **RULES.md 第七节门禁订正**：launcher.py 实测 1168 行（旧文「约 3000 行」）、其 `python launcher.py` 兼容条款失效（已无 `__main__`）、`browser_order._order_impl` 实测 599 行（`browser_order.py:726`→`:1324`）。
-- 回归：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 711 tests, OK (skipped=15)**。
+- **RULES.md 第七节门禁订正**：launcher.py 实测 1164 行（旧文「约 3000 行」）、其 `python launcher.py` 兼容条款失效（已无 `__main__`）、`browser_order._order_impl` 实测 599 行（`browser_order.py:726`→`:1324`）。
+- **浏览器模式会话失效被误判成瞬时故障（已修）**：12306 踢会话是 302 到 `/otn/passport?redirect=...`（不是 `/login`），落点页是登录门户 HTML，`session_ok` 的 `json.loads` 抛 `JSONDecodeError` 被兜进通用的「校验异常」，而 `engine.py` 用 `startswith("校验异常")` 前缀黑名单把它当瞬时 → 任务永不标 `failed`、无限重试、永不下单。现改为落点/正文门户标志先判（顺序在 `json.loads` 之前）+ 确认失效白名单 `session_failure_is_permanent`。全库只有 engine 用 permanent 做任务状态分支。
+- 回归：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 716 tests, OK (skipped=15)**。
 
