@@ -7577,22 +7577,25 @@ class TestTask75Gui(TempDirCase):
     # ---- (e) 非 dict state 按 {} 处理 ----
 
     def test_update_state_locked_non_dict_state(self):
+        # Task 123（B6-6）：与 monitor Task 120（1.2）同口径——顶层合法但非
+        # dict（如 []）视为损坏：warn + quarantine + 拒绝写入，不再按 {} 继续写
+        # （旧 Task 75e 行为：warn 后按 {} 处理并落盘）。
         cfg = self._write_config(json.dumps({"state_file": "state.json"}))
-        def mutator(state):
-            state.setdefault("tasks", {}).setdefault("t", {})["status"] = "paused"
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            f.write('["x"]')
+        calls = []
         with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui.engine_mod, "load_state_file",
-                               return_value=[]), \
-             mock.patch.object(gui.filelock, "file_lock") as mock_lock, \
-             mock.patch.object(gui.appcommon, "write_state") as mock_write:
-            mock_lock.return_value.__enter__.return_value = None
-            with self.assertLogs(gui.LOG, level="WARNING") as cm:
-                gui.update_state_locked(mutator)
-        # 旧代码：state.setdefault 直接 AttributeError
-        mock_write.assert_called_once()
-        saved = mock_write.call_args[0][1]
-        self.assertEqual(saved, {"tasks": {"t": {"status": "paused"}}})
-        self.assertTrue(any("非 dict" in r.getMessage() for r in cm.records))
+             mock.patch.object(gui, "HERE", self.tmp), \
+             self.assertLogs(gui.LOG, level="WARNING") as cm:
+            ret = gui.update_state_locked(lambda s: calls.append(1))
+        self.assertFalse(ret)
+        self.assertEqual(calls, [])  # mutator 未运行
+        bad = [f for f in os.listdir(self.tmp)
+               if f.startswith("state.json.bad-")]
+        self.assertEqual(len(bad), 1)
+        self.assertFalse(os.path.exists(st))  # 已挪走，未被覆写
+        self.assertTrue(any("已损坏" in r.getMessage() for r in cm.records))
 
 
 class TestTask76TicketSession(TempDirCase):
@@ -13434,6 +13437,134 @@ class TestTask120MonitorOrderB6(TempDirCase):
         printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
         self.assertIn("李四", printed)
         self.assertIn("警告", printed)
+
+
+class TestTask123GuiUpdateStateLockedB6(TempDirCase):
+    """Task 123 (B6-6)：gui update_state_locked 非法 JSON 静默覆写（P2）。
+
+    engine_mod.load_state_file 吞掉一切读异常 → {}；非法 JSON 穿过 Task 75e/
+    Task 109 守卫（{} 本身是 dict），mutator 照跑，write_state 静默覆写清空
+    文件里的 dedup/retry（丢防重记录 → 重复下单风险）。与 monitor 侧 Task 120
+    (1.2) 同口径：不可读时 warn + quarantine（Task 40）+ 拒绝写入（False），
+    绝不静默覆写；瞬时占用时跳过本次（不挪档不落盘）。
+    """
+
+    def _patch_gui(self, config_obj, state_raw):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump(config_obj, f)
+        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+            p = mock.patch.object(gui, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            f.write(state_raw)
+        return cfg, st
+
+    @staticmethod
+    def _bad_files(tmp):
+        return [f for f in os.listdir(tmp)
+                if f.startswith("state.json.bad-")]
+
+    def test_illegal_json_refuses_write_and_quarantines(self):
+        # RED：旧代码 load_state_file 吞损坏 → {} → mutator 照跑 → write_state
+        # 静默落盘清空 dedup/retry；无 .bad 留证。
+        _, st = self._patch_gui({"state_file": "state.json"},
+                                '{"tasks": {"t": {}}, "dedup": {"k": "v"}')
+        calls = []
+        with self.assertLogs(gui.LOG, level="WARNING") as cm:
+            ret = gui.update_state_locked(lambda s: calls.append(1))
+        self.assertFalse(ret)
+        self.assertEqual(calls, [])  # mutator 未运行
+        self.assertEqual(len(self._bad_files(self.tmp)), 1)  # 旧代码：无留证
+        self.assertFalse(os.path.exists(st))  # 已挪走，未被覆写
+        self.assertTrue(any("已损坏" in r.getMessage() for r in cm.records))
+
+    def test_mark_task_created_illegal_json_refuses(self):
+        # 经 _mark（任务创建/状态变更路径）：拒绝写入且 quarantine。
+        _, st = self._patch_gui({"state_file": "state.json"},
+                                '{"tasks": {"t1": {}}, "dedup": {"k": "v"}')
+        with self.assertLogs(gui.LOG, level="WARNING"):
+            gui.mark_task_created(None, {"name": "t1"}, False)
+        self.assertEqual(len(self._bad_files(self.tmp)), 1)
+        self.assertFalse(os.path.exists(st))
+
+    def test_delete_task_everywhere_illegal_json_refuses_state_write(self):
+        # 经 _clear（任务删除路径）：config 删除成功（update_config_locked 先行），
+        # state 拒绝写入且 quarantine。
+        cfg, st = self._patch_gui(
+            {"tasks": [{"name": "t1", "uid": "u1"}],
+             "state_file": "state.json"},
+            '{"tasks": {"t1": {}}, "dedup": {"k": "v"}')
+        with self.assertLogs(gui.LOG, level="WARNING"):
+            gui.delete_task_everywhere(None, {"name": "t1", "uid": "u1"})
+        with open(cfg, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["tasks"], [])  # config 侧删除成功
+        self.assertEqual(len(self._bad_files(self.tmp)), 1)
+        self.assertFalse(os.path.exists(st))
+
+    def test_nondict_top_level_refuses_and_quarantines(self):
+        # 顶层合法但非 dict（如 []）：与 Task 120 同口径，拒绝写入 + quarantine
+        # （取代 Task 75e 的 warn + {} 继续写）。
+        _, st = self._patch_gui({"state_file": "state.json"}, '["x"]')
+        calls = []
+        with self.assertLogs(gui.LOG, level="WARNING"):
+            ret = gui.update_state_locked(lambda s: calls.append(1))
+        self.assertFalse(ret)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self._bad_files(self.tmp)), 1)
+        self.assertFalse(os.path.exists(st))
+
+    def test_transient_oserror_skips_without_quarantine(self):
+        # 瞬时占用（Task 40 口径）：跳过本次，不挪档、不落盘。
+        _, st = self._patch_gui({"state_file": "state.json"},
+                                '{"tasks": {}}')
+        calls = []
+        with mock.patch.object(
+                gui.appcommon, "read_state_or_none",
+                return_value=(None, PermissionError("busy"), ("fp",))), \
+             self.assertLogs(gui.LOG, level="WARNING"):
+            ret = gui.update_state_locked(lambda s: calls.append(1))
+        self.assertFalse(ret)
+        self.assertEqual(calls, [])
+        self.assertEqual(self._bad_files(self.tmp), [])
+        self.assertTrue(os.path.exists(st))  # 文件原地未动
+
+    def test_missing_state_file_writes_normally(self):
+        # 正向对照：文件不存在 → 旧行为（{} + 落盘）不变。
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"state_file": "state.json"}, f)
+        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+            p = mock.patch.object(gui, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        st = os.path.join(self.tmp, "state.json")
+
+        def _mark(state):
+            entry = state.setdefault("tasks", {}).setdefault("t", {})
+            entry["status"] = "paused"
+            return "ok"
+
+        ret = gui.update_state_locked(_mark)
+        self.assertEqual(ret, "ok")  # mutator 返回值透传不变
+        with open(st, encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["tasks"]["t"]["status"], "paused")
+
+    def test_tasks_section_non_dict_still_heals(self):
+        # 正向对照：Task 109 口径不变——tasks 节非 dict 仍 warn + {} 继续写。
+        _, st = self._patch_gui({"state_file": "state.json"},
+                                '{"tasks": "junk"}')
+        with self.assertLogs(gui.LOG, level="WARNING") as cm:
+            gui.update_state_locked(
+                lambda s: s.setdefault("tasks", {})
+                          .setdefault("t", {}).__setitem__("status", "paused"))
+        with open(st, encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["tasks"]["t"]["status"], "paused")
+        self.assertTrue(any("tasks" in r.getMessage() for r in cm.records))
 
 
 if __name__ == "__main__":

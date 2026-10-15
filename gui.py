@@ -323,25 +323,41 @@ def update_state_locked(mutator):
 
     mutator(state) 就地修改读到的 dict；返回其返回值。
     路径解析沿用 save_state 的口径（config 的 state_file，默认 state.json）。
+    Task 123（B6-6）：load_state_file 吞掉一切读异常返回 {}，非法 JSON 穿过
+    Task 75e/109 守卫（{} 本身是 dict），mutator 照跑，write_state 静默覆写，
+    清空文件里的 dedup/retry（丢防重记录 → 重复下单风险）。与 monitor 侧
+    Task 120（1.2）同口径：state 不可读时 warn + quarantine（Task 40 口径）+
+    拒绝写入（返回 False），绝不静默覆写；瞬时占用时跳过本次（不挪档不落盘）。
     """
     config = load_config()
     path = os.path.join(HERE, config.get("state_file", "state.json"))
     try:
         with filelock.file_lock(path + ".lock"):
-            state = engine_mod.load_state_file(path)
-            if not isinstance(state, dict):
-                # Task 75e：合法非 dict JSON（如 []）直接透传会导致 mutator 的
-                # state.setdefault 抛 AttributeError；记 warning 后按 {} 处理
-                # （与 Task 62c 的 appcommon 读路径口径一致）。
-                LOG.warning("state.json 内容非 dict（%s），已按空状态处理：%s",
-                            type(state).__name__, path)
-                state = {}
+            state, err, read_fp = appcommon.read_state_or_none(path)
+            if err is not None:
+                if isinstance(err, OSError):
+                    # Task 40 瞬时占用口径：另一进程正在写 state.json，
+                    # 本次跳过，不挪档、不落盘（Task 120 monitor 同口径）。
+                    LOG.warning("state.json 被占用，本次跳过（稍后重试）：%s",
+                                path)
+                    return False
+                # 内容损坏（非法 JSON / 顶层非 dict）：挪档留证后拒绝写入，
+                # 绝不静默覆写清空 dedup（Task 40 quarantine 口径；
+                # Task 120 monitor 同口径——取代 Task 75e 的 warn + {} 继续写）。
+                LOG.warning("state.json 已损坏（%s），已隔离留证，本次拒绝写入：%s",
+                            err, path)
+                bad = appcommon.quarantine_corrupt(path, read_fp)
+                if bad is not None:
+                    LOG.warning("坏档已挪为 %s", bad)
+                else:
+                    LOG.warning("坏档挪移失败，本次不落盘以保留证据：%s", path)
+                return False
             tasks_sec = state.get("tasks")
             if "tasks" in state and not isinstance(tasks_sec, dict):
                 # Task 109：tasks 节非 dict（如手改的列表/字符串）时，mutator 的
                 # state.setdefault("tasks", {}).setdefault(name, {}) 抛
-                # AttributeError（Task 75e 只守卫了顶层；Task 93 管的是读侧）。
-                # 记 warning 后按 {} 处理，与 _state_tasks_dict 同口径。
+                # AttributeError。记 warning 后按 {} 处理，与 _state_tasks_dict
+                # 同口径（read_state_or_none 只保证顶层是 dict）。
                 LOG.warning("state.json 的 tasks 节不是对象（%s），已按空处理：%s",
                             type(tasks_sec).__name__, path)
                 state["tasks"] = {}
