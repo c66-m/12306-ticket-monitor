@@ -123,6 +123,20 @@ def log(msg):
     LOG.info(msg)
 
 
+def _type_len_summary(v):
+    """Task 131：类型+长度摘要（Task 118/124 口径）。
+
+    %r 整值经 log() → LOG.info → DayFileHandler 进持久 logs/launcher_*.log，
+    裸字符串脏向量（如任务条目 "张三"）会把真实姓名打进日志；只记类型名
+    +长度，不打印值内容。
+    """
+    try:
+        ln = len(v)
+    except TypeError:
+        ln = "?"
+    return "%s/%s" % (type(v).__name__, ln)
+
+
 # ----------------------------- 配置读写 -----------------------------
 
 _DEFAULT_LC = {
@@ -255,7 +269,9 @@ def load_launcher_config():
     # 后续 _save_preset/_delete_preset 写回的是已清理列表，文件自然被治愈。
     presets = lc.get("presets")
     if not isinstance(presets, list):
-        log("[警告] launcher_config.json presets 非 list，已按空处理：%r" % (presets,))
+        # Task 131 2.2.5：%r 整值进持久日志（Task 118/124 口径：类型+长度）。
+        log("[警告] launcher_config.json presets 非 list，已按空处理"
+            "（类型/长度：%s）" % _type_len_summary(presets))
         lc["presets"] = []
     else:
         clean = [p for p in presets if isinstance(p, dict)]
@@ -294,7 +310,9 @@ def load_grab_tasks():
                     if isinstance(t, dict):
                         clean.append(t)
                     else:
-                        log("[警告] grab_tasks.json 存在非 dict 条目，已剔除：%r" % (t,))
+                        # Task 131 2.2.5：%r 整条目进持久日志（类型+长度）。
+                        log("[警告] grab_tasks.json 存在非 dict 条目，已剔除"
+                            "（类型/长度：%s）" % _type_len_summary(t))
                 return clean
         except Exception as e:
             log("[错误] grab_tasks.json 读取失败：%s" % e)
@@ -1079,12 +1097,16 @@ def merge_trains_from_monitor(lc, saver=None):
         return False
     tasks = cfg.get("tasks") or []
     if not isinstance(tasks, list):
-        log("[提醒] 监控系统 config.json tasks 非列表，本轮不合并车次：%r" % (tasks,))
+        # Task 131 2.2.5：%r 整值进持久日志（类型+长度）。
+        log("[提醒] 监控系统 config.json tasks 非列表，本轮不合并车次"
+            "（类型/长度：%s）" % _type_len_summary(tasks))
         return False
     mon = []
     for t in tasks:
         if not isinstance(t, dict):
-            log("[提醒] 监控任务条目非对象，已跳过：%r" % (t,))
+            # Task 131 2.2.5：%r 整条目进持久日志（类型+长度）。
+            log("[提醒] 监控任务条目非对象，已跳过"
+                "（类型/长度：%s）" % _type_len_summary(t))
             continue
         # Task 84a：字符串 trains 按单车次归一化，绝不逐字符拆
         for tr in _normalize_trains(t.get("trains"), log):
@@ -3809,11 +3831,15 @@ def ensure_passengers():
             return
         tasks = cfg.get("tasks") or []
         if not isinstance(tasks, list):
-            log("[提醒] config.json tasks 非列表，跳过乘车人导入：%r" % (tasks,))
+            # Task 131 2.2.5：%r 整值进持久日志（类型+长度）。
+            log("[提醒] config.json tasks 非列表，跳过乘车人导入"
+                "（类型/长度：%s）" % _type_len_summary(tasks))
             return
         for t in tasks:
             if not isinstance(t, dict):
-                log("[提醒] 监控任务条目非对象，已跳过：%r" % (t,))
+                # Task 131 2.2.5：%r 整条目进持久日志（类型+长度）。
+                log("[提醒] 监控任务条目非对象，已跳过"
+                    "（类型/长度：%s）" % _type_len_summary(t))
                 continue
             for n in _normalize_passenger_names(t.get("passenger_names"), log):
                 n = n.strip()

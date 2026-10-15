@@ -13839,11 +13839,12 @@ class TestTask122TickLabelB6(TempDirCase):
 
 
 def _iter_warn_repr_calls(here):
-    """扫描仓库顶层 *.py：找出 warn/error 日志调用中含 %r 字面量的调用。
+    """扫描仓库顶层 *.py：找出 warn/error/info 日志调用中含 %r 字面量的调用。
 
     用 AST 精确匹配（含多行调用、f-string !r），返回 (文件名, 归一化调用源码)
     列表。调用源码归一化后作 allowlist key——行号会漂移，内容不变则 key 稳定。
-    （Task 124 2.2.4 附带：锁住全仓库 warn-%r sweep。）
+    （Task 124 2.2.4 附带：锁住全仓库 warn-%r sweep。Task 131 2.2.5 扩展：
+    LOG.info / 裸 log() 也进持久日志，口径一并覆盖。）
     """
     import ast
 
@@ -13851,10 +13852,10 @@ def _iter_warn_repr_calls(here):
         f = node.func
         if isinstance(f, ast.Attribute):
             if isinstance(f.value, ast.Name) and f.value.id == "LOG" \
-                    and f.attr in ("warning", "error"):
+                    and f.attr in ("warning", "error", "info"):
                 return True
             return f.attr in ("_put_log", "_log")
-        return isinstance(f, ast.Name) and f.id in ("warn", "_log")
+        return isinstance(f, ast.Name) and f.id in ("warn", "_log", "log")
 
     def _has_repr(call):
         for sub in ast.walk(call):
@@ -14062,6 +14063,15 @@ class TestTask124PiiConvergeB7(TempDirCase):
         ('launcher.py', 'self._put_log("[提醒] 任务名非字符串，已跳过序号统计：%r" % (raw_name,))'),
         ('notify.py', 'LOG.warning("[配置] smtp_port 非法，已回退 465：%r", raw)'),
         ('ticket.py', 'LOG.warning("[余票] 未知席别码 %r（码串 %r），已跳过", s[i:i + 4], s)'),
+        # Task 131（2.2.5）：sweep 口径扩展到 LOG.info / 裸 log( 后新增的
+        # 5 处未登记调用——均为配置/状态文件顶层形状或配置路径值，不含乘车人
+        # 结构：顶层非 dict / tasks 节非 dict 的是"整个文件形状错误"的调试值；
+        # state_file 是配置路径值（Task 127 已裁决非 PII）。确认无 PII 后登记。
+        ('launcher.py', 'log("[提醒] 监控系统 config.json 顶层不是对象，本轮不合并车次：%r" % (cfg,))'),
+        ('launcher.py', 'log("[提醒] config.json 顶层不是对象，跳过乘车人导入：%r" % (cfg,))'),
+        ('launcher.py', 'log("[提醒] state.json 顶层不是对象，已按空重建：%r" % (state,))'),
+        ('launcher.py', 'log("[提醒] state.json tasks 节形状非法，已按空重建：%r" % (tasks_sec,))'),
+        ('launcher.py', 'log("[提醒] state_file 非字符串，已用默认值 state.json：%r" % (state_file,))'),
     ])
 
     def test_warn_repr_sweep_locked(self):
@@ -14849,6 +14859,102 @@ class TestTask130ReworkClassifySites(TempDirCase):
         captured = self._run_task_capture_classify(
             ["张三"], (False, "m", {"reason": "dup"}))
         self.assertEqual(captured["passenger_names"], ["张三"])
+
+
+class TestTask131LauncherPiiB8(TempDirCase):
+    """Task 131（B8-3）：launcher PII bundle（P3×1）。
+
+    2.2.5：launcher.py 6 处 log("…%r…" % …) 经模块级 log() → LOG.info →
+    DayFileHandler 进持久 logs/launcher_*.log；裸字符串脏向量可致真实
+    姓名落盘。Task 118/124 口径：类型+摘要（不打印值内容）。
+    附带：Task 124 的 sweep 锁定测试口径扩展到 LOG.info / 裸 log(。
+    """
+
+    def _write(self, name, obj):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        return path
+
+    def _here_config(self, obj):
+        """把 launcher.HERE 指向临时目录并写入 config.json。"""
+        self._write("config.json", obj)
+        real = launcher.HERE
+        launcher.HERE = self.tmp
+        self.addCleanup(setattr, launcher, "HERE", real)
+
+    def _logged(self, mlog):
+        return "\n".join(str(c.args[0]) for c in mlog.call_args_list
+                         if c.args)
+
+    # ---------- 6 处泄漏点 ----------
+
+    def test_presets_non_list_no_repr(self):
+        # RED：改前 log("…：%r" % (presets,)) 把 "张三" 原样打进持久日志。
+        path = self._write("launcher_config.json", {"presets": "张三"})
+        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", path), \
+             mock.patch.object(launcher, "log") as mlog:
+            launcher.load_launcher_config()
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_grab_tasks_nondict_entry_no_repr(self):
+        # RED：改前 "%r" % (t,) 把脏条目 "张三" 原样打进持久日志。
+        path = self._write("grab_tasks.json", {"tasks": ["张三"]})
+        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
+             mock.patch.object(launcher, "log") as mlog:
+            launcher.load_grab_tasks()
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_merge_trains_tasks_non_list_no_repr(self):
+        # RED：改前 "%r" % (tasks,) 把 tasks 节裸字符串打进持久日志。
+        self._here_config({"tasks": "张三"})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.merge_trains_from_monitor(
+                {"trains": [], "synced_trains": []}, saver=lambda c: None)
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_merge_trains_nondict_entry_no_repr(self):
+        # RED：改前 "%r" % (t,) 把脏条目 "张三" 原样打进持久日志。
+        self._here_config({"tasks": [{"name": "ok", "trains": ["K1"]},
+                                      "张三"]})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.merge_trains_from_monitor(
+                {"trains": [], "synced_trains": []}, saver=lambda c: None)
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_ensure_passengers_tasks_non_list_no_repr(self):
+        # RED：改前 "%r" % (tasks,) 把 tasks 节裸字符串打进持久日志。
+        self._here_config({"tasks": "张三"})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.ensure_passengers()
+        self.assertNotIn("张三", self._logged(mlog))
+
+    def test_ensure_passengers_nondict_entry_no_repr(self):
+        # RED：改前 "%r" % (t,) 把脏条目 "张三" 原样打进持久日志。
+        self._here_config({"tasks": [{"name": "ok", "passenger_names": []},
+                                      "张三"]})
+        with mock.patch.object(launcher, "log") as mlog:
+            launcher.ensure_passengers()
+        self.assertNotIn("张三", self._logged(mlog))
+
+    # ---------- sweep 口径扩展的锁定 ----------
+
+    def test_sweep_covers_log_info_calls(self):
+        # 锁定口径扩展：扫描器必须看见 LOG.info / 裸 log( 的 %r 调用。
+        # 5 处非 PII 调用保留（已在 _WARN_REPR_ALLOW 登记），此处正向断言
+        # 扫描器确实覆盖该口径；回退任一已修复点为 %r 整值 →
+        # test_warn_repr_sweep_locked 失败（未登记的新命中）。
+        hits = _iter_warn_repr_calls(HERE)
+        launcher_hits = sorted(
+            s for n, s in hits
+            if n == "launcher.py"
+            and (s.startswith("log(") or "LOG.info" in s))
+        self.assertEqual(len(launcher_hits), 5,
+                         "扩展口径应恰好看到 5 处已登记的非 PII 调用：\n%s"
+                         % "\n".join(launcher_hits))
+        for s in launcher_hits:
+            self.assertIn(("launcher.py", s),
+                          TestTask124PiiConvergeB7._WARN_REPR_ALLOW)
 
 
 if __name__ == "__main__":
