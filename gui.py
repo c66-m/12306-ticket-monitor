@@ -135,7 +135,11 @@ def _skip_unhashable_task_name(t, where):
         sig = (where, repr(t))
         if sig not in _UNHASHABLE_NAME_WARNED:
             _UNHASHABLE_NAME_WARNED.add(sig)
-            LOG.warning("[配置] %s：任务名不可哈希已跳过：%r", where, t)
+            # Task 124 2.2.4：%r 整条 task dict 进持久日志会把真实乘车人名
+            # 落盘（logs/monitor_*.log）。Task 118 口径：只记坏任务名 repr +
+            # 条目类型，不打印整条 dict；坏值本身仍可识别，调试价值保留。
+            LOG.warning("[配置] %s：任务名不可哈希已跳过（任务名：%r，条目类型：%s）",
+                        where, name, type(t).__name__)
         return True
     return False
 
@@ -1126,8 +1130,13 @@ class TaskWizard(tk.Toplevel):
                     sig = ("历史快捷", repr(t))
                     if sig not in _UNHASHABLE_NAME_WARNED:
                         _UNHASHABLE_NAME_WARNED.add(sig)
-                        LOG.warning("[配置] 历史快捷：from/to 非字符串已跳过：%r",
-                                    t)
+                        # Task 124 2.2.4 附带（同家族漏网）：%r 整条 task dict
+                        # 进持久日志（Task 118 口径：记任务名 + 坏值类型，
+                        # 不打印整条 dict）。
+                        LOG.warning("[配置] 历史快捷：任务「%s」的 from/to "
+                                    "非字符串已跳过（from 类型：%s，to 类型：%s）",
+                                    t.get("name"), type(fr).__name__,
+                                    type(to).__name__)
                     continue
                 key = (fr, to)
                 if key[0] and key[1] and key not in seen:
@@ -2548,12 +2557,22 @@ class StartMonitorDialog(tk.Toplevel):
             # 直接 TypeError。非法条目记 warning 后跳过（逐条检查而非
             # 整体过滤，保持 idx 与 self.vars 对齐）。
             if not isinstance(t, dict):
-                LOG.warning("[配置] 启动对话框：tasks 含非法条目已跳过：%r", t)
+                # Task 124 2.2.4：%r 脏条目进持久日志（Task 118 口径：
+                # 只记类型+长度；大字符串也不产生超大单行）。
+                detail = type(t).__name__
+                if hasattr(t, "__len__"):
+                    detail += "，长度：%d" % len(t)
+                LOG.warning("[配置] 启动对话框：tasks 含非法条目已跳过（%s）",
+                            detail)
                 continue
             try:
                 hash(t.get("name"))
             except TypeError:
-                LOG.warning("[配置] 启动对话框：任务名不可哈希已跳过：%r", t)
+                # Task 124 2.2.4：%r 整条 task dict 进持久日志（Task 118
+                # 口径：只记坏任务名 repr + 条目类型，不打印整条 dict）。
+                LOG.warning("[配置] 启动对话框：任务名不可哈希已跳过"
+                            "（任务名：%r，条目类型：%s）",
+                            t.get("name"), type(t).__name__)
                 continue
             st = eng.task_status(t)
             if var.get():

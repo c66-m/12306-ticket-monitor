@@ -814,8 +814,11 @@ class MonitorEngine(object):
             # 覆盖未来调用方）。不可哈希任务名 → 记 warning，按未知任务
             # 默认 "paused" 处理（与 .get(name, {}).get("status", "paused")
             # 的缺省一致）；正常路径逐字不变。
-            LOG.warning("[状态] task_status：任务名不可哈希，已按 paused 处理：%r",
-                        task)
+            # Task 124 2.2.4 附带（同家族漏网）：%r 整条 task dict 进持久
+            # 日志（Task 118 口径：只记坏任务名 repr + 条目类型）。
+            LOG.warning("[状态] task_status：任务名不可哈希，已按 paused "
+                        "处理（任务名：%r，条目类型：%s）",
+                        name, type(task).__name__)
             return "paused"
         return self.state["tasks"].get(name, {}).get("status", "paused")
 
@@ -827,8 +830,12 @@ class MonitorEngine(object):
             # Task 116：同上。注意 guard 必须在墓碑检查之前：
             # _deleted_names 是 set，unhashable 的 name 做 `in` 检查
             # 本身就会 TypeError。忽略写入（调用方本就忽略返回值）。
-            LOG.warning("[状态] set_task_status：任务名不可哈希，忽略状态写入 %s：%r",
-                        STATUS_LABELS.get(status, status), task)
+            # Task 124 2.2.4 附带（同家族漏网）：%r 整条 task dict 进持久
+            # 日志（Task 118 口径：只记坏任务名 repr + 条目类型）。
+            LOG.warning("[状态] set_task_status：任务名不可哈希，忽略状态写入 "
+                        "%s（任务名：%r，条目类型：%s）",
+                        STATUS_LABELS.get(status, status), name,
+                        type(task).__name__)
             return
         # 墓碑守卫（Task 53 返工）：已删除任务的在途轮询写回不得复活 state
         # 条目——setdefault 会无声复活；GUI 显式动作（恢复/重置/新建）经

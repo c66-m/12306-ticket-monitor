@@ -147,6 +147,18 @@ def _mask_text_names(text, names):
     return text
 
 
+def _fail_body_slice(body_text, hit, names):
+    """提交失败路径的页面原文切片（Task 124 2.2.8；2.2.6 家族第 4 点）。
+
+    以失败关键词为锚点向前 30 字符取 200 字符窗口；原文里的已知姓名用
+    _mask_text_names 脱敏（2.2.6 同口径）——返回的 msg 进控制台 +
+    logs/order_timing.jsonl，raw 切片此前会把真实姓名落盘。
+    关键词锚点与原文结构保留，可调试性不丢。
+    """
+    i = max(0, body_text.find(hit) - 30)
+    return _mask_text_names(body_text[i:i + 200].replace("\n", " "), names)
+
+
 # 同一时刻只允许一个浏览器实例占用 profile。Playwright 的持久化 profile 是独占的：
 # 引擎会话体检 / 弹窗刷新 / 侧边栏刷新 / 重新登录 并发时会互相把对方挤掉，
 # 症状是浏览器 exitCode=21 启动即退、报 "browser has been closed"。
@@ -1345,8 +1357,9 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         _body = ""
                     hit = next((t for t in _fail_keys if t in _body), None)
                     if hit:
-                        i = max(0, _body.find(hit) - 30)
-                        body = _body[i:i + 200].replace("\n", " ")
+                        # Task 124 2.2.8：切片在构造点一次脱敏——其后两处
+                        # return（dup / 普通失败）进的 msg 全覆盖。
+                        body = _fail_body_slice(_body, hit, picked)
                         mark("result")
                         if any(k in _body for k in _dup_keys):
                             # 不是「没抢到」，是「账号已有（未支付）订单」——

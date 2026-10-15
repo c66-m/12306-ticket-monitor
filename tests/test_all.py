@@ -13838,6 +13838,244 @@ class TestTask122TickLabelB6(TempDirCase):
         self.assertIn("引擎：运行中（2 个任务）", self._label_texts(app))
 
 
+def _iter_warn_repr_calls(here):
+    """扫描仓库顶层 *.py：找出 warn/error 日志调用中含 %r 字面量的调用。
+
+    用 AST 精确匹配（含多行调用、f-string !r），返回 (文件名, 归一化调用源码)
+    列表。调用源码归一化后作 allowlist key——行号会漂移，内容不变则 key 稳定。
+    （Task 124 2.2.4 附带：锁住全仓库 warn-%r sweep。）
+    """
+    import ast
+
+    def _is_warn_call(node):
+        f = node.func
+        if isinstance(f, ast.Attribute):
+            if isinstance(f.value, ast.Name) and f.value.id == "LOG" \
+                    and f.attr in ("warning", "error"):
+                return True
+            return f.attr in ("_put_log", "_log")
+        return isinstance(f, ast.Name) and f.id in ("warn", "_log")
+
+    def _has_repr(call):
+        for sub in ast.walk(call):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                    and "%r" in sub.value:
+                return True
+            if isinstance(sub, ast.FormattedValue) and sub.conversion == 114:
+                return True
+        return False
+
+    hits = []
+    for name in sorted(os.listdir(here)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(here, name), encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _is_warn_call(node) \
+                    and _has_repr(node):
+                seg = ast.get_source_segment(src, node)
+                hits.append((name, " ".join(seg.split())))
+    return hits
+
+
+class TestTask124PiiConvergeB7(TempDirCase):
+    """Task 124 (B7-1)：日志 PII 收敛 bundle（P3×2）。
+
+    2.2.4：gui 三处（:138 _skip_unhashable_task_name、:2551/:2556
+    TaskWizard.apply_start）%r 整 task dict → 真实乘车人名进持久日志
+    （logs/monitor_*.log）。Task 118 口径：类型+摘要。
+    附带：engine.py:817/:830（Task 116 guard 的 %r 整 dict）与
+    gui.py:1129（_render_history from/to 检查的 %r 整 dict）是同一家族
+    的漏网（scanner-8 未覆盖）——实现者自查发现，同口径一并收敛。
+    2.2.8：browser_order 提交失败路径 raw 页面切片（200 字符窗口）进 msg →
+    控制台 + order_timing.jsonl；_mask_text_names 脱敏（2.2.6 同口径）。
+    """
+
+    # ---------- 2.2.4：_skip_unhashable_task_name ----------
+
+    def test_skip_unhashable_warn_no_full_dict(self):
+        # RED：改前 LOG.warning("...：%r", where, t) 原样打印整条 task
+        # dict → passenger_names 里的真实姓名进持久日志。
+        gui._UNHASHABLE_NAME_WARNED.clear()
+        bad = {"name": ["x"], "passenger_names": ["张三"]}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            self.assertTrue(gui._skip_unhashable_task_name(bad, "UT"))
+        self.assertTrue(any("不可哈希" in m for m in logs.output),
+                        "警告须指出任务名不可哈希")
+        self.assertNotIn("张三", "\n".join(logs.output))
+
+    def test_skip_unhashable_warns_once(self):
+        # 节奏 pin：同一坏条目每进程只记一次（refresh 每 2 秒调用，防刷屏）。
+        gui._UNHASHABLE_NAME_WARNED.clear()
+        bad = {"name": ["x"]}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            for _ in range(3):
+                gui._skip_unhashable_task_name(bad, "UT")
+        self.assertEqual(len(logs.output), 1)
+
+    # ---------- 2.2.4：TaskWizard.apply_start 两处内联检查 ----------
+
+    def _apply_dlg(self, varmap, eng):
+        dlg = mock.Mock()
+        dlg.vars = {i: mock.Mock(get=mock.Mock(return_value=v))
+                    for i, v in varmap.items()}
+        dlg.app.get_ops_engine.return_value = eng
+        return dlg
+
+    def test_apply_start_nondict_entry_no_repr(self):
+        # RED：改前 "%r" 原样打印裸条目。
+        tasks = ["张三", {"name": "good", "from": "BJ", "to": "SH"}]
+        eng = mock.Mock()
+        dlg = self._apply_dlg({0: True, 1: True}, eng)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                gui.StartMonitorDialog.apply_start(dlg)
+        self.assertTrue(any("非法条目" in m for m in logs.output))
+        self.assertNotIn("张三", "\n".join(logs.output))
+        names = [c.args[0]["name"]
+                 for c in eng.set_task_status.call_args_list]
+        self.assertEqual(names, ["good"])  # 好任务照常处理
+
+    def test_apply_start_unhashable_name_no_full_dict(self):
+        # RED：改前 "%r" 打印整条 dict → passenger_names 泄漏。
+        tasks = [{"name": ["x"], "passenger_names": ["张三"]},
+                 {"name": "good", "from": "BJ", "to": "SH"}]
+        eng = mock.Mock()
+        dlg = self._apply_dlg({0: True, 1: True}, eng)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                gui.StartMonitorDialog.apply_start(dlg)
+        self.assertTrue(any("不可哈希" in m for m in logs.output))
+        self.assertNotIn("张三", "\n".join(logs.output))
+        names = [c.args[0]["name"]
+                 for c in eng.set_task_status.call_args_list]
+        self.assertEqual(names, ["good"])
+
+    # ---------- 2.2.4 附带：engine guard 两处 %r 整 dict ----------
+
+    def _bare_engine(self):
+        e = engine_mod.MonitorEngine.__new__(engine_mod.MonitorEngine)
+        e.state = {"tasks": {}}
+        return e
+
+    def test_engine_task_status_guard_no_full_dict(self):
+        # RED（同家族漏网）：改前 guard 的 warning 用 %r 打印整条 task
+        # dict → passenger_names 进持久日志。
+        e = self._bare_engine()
+        bad = {"name": ["x"], "passenger_names": ["张三"]}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            self.assertEqual(e.task_status(bad), "paused")
+        self.assertNotIn("张三", "\n".join(logs.output))
+
+    def test_engine_set_task_status_guard_no_full_dict(self):
+        # RED：同上，set_task_status 的 guard 分支。
+        e = self._bare_engine()
+        bad = {"name": ["x"], "passenger_names": ["张三"]}
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            e.set_task_status(bad, "monitoring")
+        self.assertNotIn("张三", "\n".join(logs.output))
+        self.assertEqual(e.state, {"tasks": {}})  # 无写入
+
+    # ---------- 2.2.4 附带：_render_history from/to 检查 ----------
+
+    def test_render_history_bad_fromto_no_full_dict(self):
+        # RED（同家族漏网）：改前 "%r" 打印整条 dict → passenger_names 泄漏。
+        gui._UNHASHABLE_NAME_WARNED.clear()
+        tasks = [{"name": "t1", "from": ["x"], "to": "上海",
+                  "passenger_names": ["张三"]}]
+        panel = gui.TaskWizard.__new__(gui.TaskWizard)
+        panel.hist_frame = mock.Mock()
+        panel.hist_frame.winfo_children.return_value = []
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "tk"):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel._render_history()
+        self.assertNotIn("张三", "\n".join(logs.output))
+
+    # ---------- 2.2.8：提交失败切片脱敏 ----------
+
+    def test_fail_body_slice_masks_names(self):
+        # RED：改前内联 body = _body[i:i+200] raw 进 msg（AttributeError：
+        # 脱敏路径不存在）。2.2.6 同口径：_mask_text_names。
+        body = "某某车次余票不足，乘客张三的订单提交失败，请稍后重试"
+        out = browser_order._fail_body_slice(body, "提交失败", ["张三"])
+        self.assertNotIn("张三", out)
+        self.assertIn("张*", out)  # 与 _mask_name 同口径
+        self.assertIn("提交失败", out)  # 关键词锚点保留，可调试
+
+    def test_fail_body_slice_window(self):
+        # 窗口语义 pin：锚点前 30 字符起取 200 字符（与旧内联一致）。
+        body = "A" * 100 + "提交失败" + "B" * 300
+        out = browser_order._fail_body_slice(body, "提交失败", [])
+        self.assertEqual(out, ("A" * 30 + "提交失败" + "B" * 300)[:200])
+
+    # ---------- 2.2.4 附带：全仓库 warn-%r sweep 锁定 ----------
+
+    _WARN_REPR_ALLOW = frozenset([
+        # (文件名, 归一化调用源码)。Task 124 时逐条复核：均为标量/字段值，
+        # 或 Tk 展示 sink（launcher._put_log 只写内存文本框，不落盘），
+        # 无整 task dict / 乘车人结构进持久日志。
+        ('engine.py', 'LOG.warning("[配置] %s=%r 非法，已按默认值 %r 处理", key, raw, default)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 trains 为字符串，已按单个车次处理：%r", task.get("name"), raw)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 seat_types 为字符串，已按单个席别处理：%r", task.get("name"), raw)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 dates 字段非列表，已忽略：%r", task.get("name"), dates)'),
+        ('engine.py', 'LOG.warning("[配置] %s=%r 非法，已按默认值 %r 处理", what, raw, default)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 trains 形状非法，已忽略：%r", task.get("name"), raw)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 seat_types 形状非法，已忽略：%r", task.get("name"), raw)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 dates 含非法条目已跳过：%r", task.get("name"), d)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 date_range 形状非法，已跳过：%r", task.get("name"), dr)'),
+        ('engine.py', 'LOG.warning("[状态] 任务「%s」的 from/to 形状非法，未清除防重记录：%r -> %r", task.get("name"), from_name, to_name)'),
+        ('engine.py', 'LOG.warning("[配置] adaptive 字段非字典，已禁用自适应频率：%r", ad)'),
+        ('engine.py', 'LOG.warning("[任务] 任务「%s」的 from/to 形状非法，已跳过：%r -> %r", task.get("name"), from_name, to_name)'),
+        ('engine.py', 'LOG.warning("[任务] 任务「%s」的 seats_by_date 形状非法，已忽略：%r", task.get("name"), task.get("seats_by_date"))'),
+        ('engine.py', 'LOG.warning("任务 %s 的 priority=%r 非法，已按默认值 5 处理", task.get("name"), raw)'),
+        ('engine.py', 'LOG.warning("[配置] %s=%r 非法，已按默认值 %r 处理", what, raw, default)'),
+        ('engine.py', 'LOG.warning("[配置] adaptive.peak_hours 形状非法 %r，已禁用自适应频率", peak)'),
+        ('engine.py', 'LOG.error("[配置] tasks 含不可哈希任务名已跳过（任务名：%r，条目类型：%s）", name, type(t).__name__)'),
+        # Task 124 收敛后的坏任务名 repr（Task 118 同口径：只记坏名 + 类型，
+        # 不打印整条 dict；坏名本身的 repr 仍可识别是哪个值坏了）。
+        ('engine.py', 'LOG.warning("[状态] task_status：任务名不可哈希，已按 paused " "处理（任务名：%r，条目类型：%s）", name, type(task).__name__)'),
+        ('engine.py', 'LOG.warning("[状态] set_task_status：任务名不可哈希，忽略状态写入 " "%s（任务名：%r，条目类型：%s）", STATUS_LABELS.get(status, status), name, type(task).__name__)'),
+        ('gui.py', 'LOG.warning("[配置] %s：任务名不可哈希已跳过（任务名：%r，条目类型：%s）", where, name, type(t).__name__)'),
+        ('gui.py', 'LOG.warning("[配置] 启动对话框：任务名不可哈希已跳过" "（任务名：%r，条目类型：%s）", t.get("name"), type(t).__name__)'),
+        ('engine.py', 'LOG.warning("[配置] 任务「%s」的 date_range 非法，已跳过：%r", task.get("name"), dr)'),
+        ('gui.py', 'LOG.warning("history_file 非字符串，已用默认值 order_history.json：%r", hist_file)'),
+        ('launcher.py', 'warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))'),
+        ('launcher.py', 'warn("[提醒] passenger_names 形状非法，已忽略：%r" % (raw,))'),
+        ('launcher.py', 'warn("[提醒] station_history 形状非法，已忽略：%r" % (raw,))'),
+        ('launcher.py', 'warn("[提醒] pax_purpose 形状非法，已忽略：%r" % (raw,))'),
+        ('launcher.py', 'LOG.warning("查询历史记录条目非 dict，已跳过：%r" % (it,))'),
+        ('launcher.py', 'warn("[提醒] trains 形状非法，已忽略：%r" % (raw,))'),
+        ('launcher.py', 'self._put_log("[提醒] query_history 形状非法，已忽略：%r" % (raw_hist,))'),
+        ('launcher.py', 'LOG.warning("抢票任务条目非 dict，已跳过展示：%r" % (task,))'),
+        ('launcher.py', 'self._put_log("[警告] 配置 remind_minutes 非法（%r），已用默认值 10" % (lc.get("remind_minutes"),))'),
+        ('launcher.py', 'self._put_log("[警告] 配置 warm_minutes 非法（%r），已用默认值 10" % (lc.get("warm_minutes"),))'),
+        ('launcher.py', 'self._put_log("[警告] 配置 presets 条目非 dict，已跳过：%r" % (p,))'),
+        ('launcher.py', 'self._put_log("[提醒] 查询历史条目非对象，已跳过：%r" % (h,))'),
+        ('launcher.py', 'self._put_log("[提醒] 任务名非字符串，已跳过序号统计：%r" % (raw_name,))'),
+        ('notify.py', 'LOG.warning("[配置] smtp_port 非法，已回退 465：%r", raw)'),
+        ('ticket.py', 'LOG.warning("[余票] 未知席别码 %r（码串 %r），已跳过", s[i:i + 4], s)'),
+    ])
+
+    def test_warn_repr_sweep_locked(self):
+        # 锁住全仓库 warn/error 日志里的 %r 使用。任何新增的 warn-%r 调用
+        # （如把整 task dict 重新打进日志）都会让本测试失败——新增前请先
+        # 确认不泄漏 PII（整 task dict / 姓名进持久日志），确认后把该调用
+        # 加入 _WARN_REPR_ALLOW。
+        hits = _iter_warn_repr_calls(HERE)
+        new = [(n, s) for n, s in hits
+               if (n, s) not in self._WARN_REPR_ALLOW]
+        self.assertEqual(new, [],
+                         "发现未登记的 warn-%%r 调用：\n%s\n"
+                         "请先确认不泄漏 PII，确认后加入 _WARN_REPR_ALLOW。"
+                         % "\n".join("%s: %s" % (n, s) for n, s in new))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
