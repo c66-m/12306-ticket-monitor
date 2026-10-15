@@ -38,12 +38,12 @@
 ## 五、干活规矩
 - 改完所有文件必须 `py_compile` 过一遍；测试用临时目录/临时 state，跑完删干净，别污染 `state.json`、`logs/order_timing.jsonl`、`order_history.json`。
 - 动 `launcher_config.json` 的测试先备份（`shutil.copy2` → `.pbak`），结束还原。
-- 改完提醒重启才生效：`Get-CimInstance Win32_Process | ? { $_.CommandLine -match "gui\.py|launcher\.py" } | % { Stop-Process -Id $_.ProcessId -Force }`
+- 改完提醒重启才生效（当前入口是 Electron 壳 + `api.py` 后端）：`Get-CimInstance Win32_Process | ? { $_.CommandLine -match "api\.py|gui\.py|launcher\.py|electron" } | % { Stop-Process -Id $_.ProcessId -Force }`（关 Electron 窗口时后端应随壳退出；残留 api.py 进程会占住 stdin/stdout）。
 - 下单优先级按界面点选顺序；开抢前按 `warm_minutes` 预热；耗时看 `logs/order_timing.jsonl`（`python browser_order.py timing`）。
 - 疑案已结（2026-10-07）：K225 长葛→确山「未支付订单」实为 EC74084650，乘车 2026-10-08（非 10-09）已退票（下单 2026-09-28 19:06:16），classify 归 cancelled 允许重购，无需人工处理。
 
 ## 七、结构重构门禁（2026-10-07 起，重构批次 649db10..0dd5c57 落地后的约定）
-- 单点口径清单，改这些语义必须同时核对三个调用方：`appcommon.parse_date_range`（日期区间，gui/monitor/launcher 五个入口）、`appcommon.atomic_write_json / replace_with_retry / write_state`（原子写，全库 11 处）、`appcommon.read_state_or_none / quarantine_corrupt`（state.json 三写方 engine/gui/launcher 共享 plumbing）、`config_keys.py`（配置键 ⊆ example 模板，tests 有防漂移回归）。
+- 单点口径清单，改这些语义必须同时核对三个调用方：`appcommon.parse_date_range`（日期区间，gui/monitor/launcher 五个入口）、`appcommon.atomic_write_json / replace_with_retry / write_state`（原子写，全库 11 处）、`appcommon.read_state_or_none / quarantine_corrupt`（state.json 三写方 engine/gui/launcher 共享 plumbing）、`config_keys.py`（配置键 ⊆ example 模板，tests 有防漂移回归）、`stations_db.json` 的 name↔code 集合（与 `station_name.json`/`station_index.json` 同源，改车站文件读写/迁移消费者/删文件前先跑 `python station_db.py check`，漂移非零退出）。
 - 各写方的防护语义是**参数**不是噪音，别「统一」掉：engine 的 deepcopy 快照 + 直写兜底（`fallback_direct=True`）、launcher 的 `_CFG_WRITE_LOCK` + mtime 二次检测、gui 的 guisave 临时名。Windows 读侧 `read_state_or_none` 有 PermissionError 退避重试（与写方 os.replace 撞车窗口）。
 - **拆 launcher.py（约 3000 行）门禁**：必须等一次真实抢票验证通过 + 工作树无在途功能；拆前单独出拆分清单（4+ 文件 + launcher.py 门面保 `import launcher` / `python launcher.py` 兼容）给用户确认。
 - **拆 browser_order._order_impl（约 579 行）门禁**：必须等「重新登录 + 真实下单取证核对窗原文」的验证窗口；拆时 `mark()` 计时点原样保留、日志格式一行不动。

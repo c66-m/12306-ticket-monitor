@@ -35,51 +35,62 @@ state.json / orders.json / 购票历史 / 邮件通知
 
 ## 模块地图
 
-### 入口层（三选一）
+### 入口层（2026-10-14 Electron 架构：ui + api.py + electron）
 
 | 模块 | 规模 | 职责 |
 |---|---|---|
-| `launcher.py` | 3130 行 | **抢票启动器**（Tkinter）：面向「开抢时刻」，倒计时到秒自动出手；多任务独立窗口并行；行程预设、IP 定位、按事件分级着色的日志区 |
-| `gui.py` | 2834 行 | **监控桌面版**（Tkinter）：常驻轮询监控；四步向导建任务（查询车次→选车次席别→选乘车人→确认）；命中自动下单并邮件通知 |
-| `monitor.py` | 543 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
+| `ui/index.html` + `ui/app.js` + `ui/style.css` | 主窗 87 / 1671 / 960 行 | **唯一界面（纯 HTML/CSS/JS，无框架）**：顶栏（会话胶囊 / 监控开关 / 窗口键：置顶 · 小窗 · 最小化 · 最大化 · 关闭）+ 侧边栏 = 监控任务 / 抢票任务 / 乘车人 / 历史 / 设置 + 主区 + 底部全局日志。渲染、轮询、外观设置全在 app.js |
+| `ui/mini.html` + `ui/mini.js` + `ui/mini.css` | 小窗 3 文件 | **抢票小窗（B7 第二步）**：460×420 无边框，只显示账号 / 进行中任务 / 抢票日志；打开时主窗隐藏，关闭自动还原。外观经 `--appear` 启动参数继承主窗 |
+| `electron/main.js` + `electron/preload.js` | 221 / 27 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
+| `api.py` | 1259 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1174-1211）；引擎启停、日志泵、抢票定时调度、config/state 原子写 |
+| `launcher.py` | 1165 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
+| `gui.py` | 4317 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
+| `monitor.py` | 1127 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
 
 ### 核心链路
 
 | 模块 | 规模 | 职责 |
 |---|---|---|
-| `ticket.py` | 448 行 | **余票查询与解析**（免登录）：车站码表、queryG 竖线字段解析、p20~p33 逐席别判余票；席别命名（卧铺共享字段、p35 码串）、「车次=席别」规则解析与候选求交 |
-| `browser_order.py` | 1117 行 | **浏览器下单**（Playwright）：`#submitOrder_id` → checkOrderInfo → getQueueCount → 核对窗 → `#qr_submit_id` 倒计时 → confirmSingleForQueue → 停在支付页；席别/票种走官方事件链强写内部状态并回读校验；滑块一出现即中止 |
-| `order.py` | 626 行 | **订单事实来源**：官方订单接口回读（未支付 / 未出行 / 历史三列表）、状态分类（paid/unpaid/cancelled/none/blocked/unknown/error）、时间戳归因（`classify_with_time`、`find_recent_order`）、纯 HTTP 下单后备链路 |
-| `engine.py` | 861 行 | **监控引擎**：多任务调度与优先级、自适应轮询频率、防重复下单三层、断点续连、下单决策（含 dup/ambiguous 的官方回读归因分支） |
+| `ticket.py` | 823 行 | **余票查询与解析**（免登录）：车站码表、queryG 竖线字段解析、p20~p33 逐席别判余票；席别命名（卧铺共享字段、p35 码串）、「车次=席别」规则解析与候选求交 |
+| `browser_order.py` | 1708 行 | **浏览器下单**（Playwright）：`#submitOrder_id` → checkOrderInfo → getQueueCount → 核对窗 → `#qr_submit_id` 倒计时 → confirmSingleForQueue → 停在支付页；席别/票种走官方事件链强写内部状态并回读校验；滑块一出现即中止 |
+| `order.py` | 1042 行 | **订单事实来源**：官方订单接口回读（未支付 / 未出行 / 历史三列表）、状态分类（paid/unpaid/cancelled/none/blocked/unknown/error）、时间戳归因（`classify_with_time`、`find_recent_order`）、纯 HTTP 下单后备链路 |
+| `engine.py` | 1621 行 | **监控引擎**：多任务调度与优先级、自适应轮询频率、防重复下单三层、断点续连、下单决策（含 dup/ambiguous 的官方回读归因分支） |
 
 ### 基础层
 
 | 模块 | 规模 | 职责 |
 |---|---|---|
-| `appcommon.py` | 136 行 | 跨界面共享机械层：日期区间解析、原子文件写（临时名 + replace 重试）、state.json 读容错 |
-| `filelock.py` | 73 行 | 跨进程文件锁（msvcrt 字节锁）：launcher 与 gui/engine 是独立进程却共改 config/state.json，原子替换挡不住并发读改写 |
-| `logutil.py` | 47 行 | 按天滚动日志 handler，保持 `logs/<prefix>_YYYYMMDD.log` 命名习惯（标准库 handler 会改变命名，故自实现） |
-| `config_keys.py` | 21 行 | 配置键唯一定义处：代码读取的键 ⊆ example 模板键（测试防漂移回归） |
-| `notify.py` | 76 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
-| `passengers.py` | 186 行 | 乘车人管理：DPAPI（Windows）/ Fernet / 明文三级加密，按环境自动选最安全可用者 |
-| `station_db.py` | 52 行 | 全量车站本地库（3404 站）：在库=运营中；车型标签来自实际查询学习 |
-| `capture_session.py` | 106 行 | 会话抓取：Playwright 打开 Edge 人工登录一次，Cookie 持久化到 `session_cookies.json` |
-| `probe_login.py` | 296 行 | 登录链路诊断：域名连通性、二维码申请/轮询、会话有效性验证（只诊断，不绕过） |
+| `appcommon.py` | 533 行 | 跨界面共享机械层：日期区间解析、原子文件写（临时名 + replace 重试）、state.json 读容错、PII 脱敏口径（`mask_order_no` / `mask_one_name` / `mask_names` / `mask_id_partial`）、北京时间（`beijing_tz`）、展示归一化（normalize/display 车次与席别）单一实现 |
+| `filelock.py` | 144 行 | 跨进程文件锁（msvcrt 字节锁）：launcher 与 gui/engine 是独立进程却共改 config/state.json，原子替换挡不住并发读改写 |
+| `logutil.py` | 132 行 | 按天滚动日志 handler，保持 `logs/<prefix>_YYYYMMDD.log` 命名习惯（标准库 handler 会改变命名，故自实现） |
+| `config_keys.py` | 22 行 | 配置键唯一定义处：代码读取的键 ⊆ example 模板键（测试防漂移回归） |
+| `tools/gen_icon.py`、`tools/gen_icon_emoji.py` | — | 图标生成脚本（产出 ui/appicon.png、electron/icon.ico） |
+| `notify.py` | 147 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
+| `passengers.py` | 496 行 | 乘车人管理：DPAPI（Windows）/ Fernet / 明文三级加密，按环境自动选最安全可用者 |
+| `station_db.py` | 152 行 | 全量车站本地库（3404 站）：在库=运营中；车型标签来自实际查询学习。`rebuild` 从车站索引+车型表合成，`check` 校验三份同源车站文件的 name↔code 漂移（非零退出） |
+| `capture_session.py` | 305 行 | 会话抓取：Playwright 打开 Edge 人工登录一次，Cookie 持久化到 `session_cookies.json` |
+| `probe_login.py` | 520 行 | 登录链路诊断：域名连通性、二维码申请/轮询、会话有效性验证（只诊断，不绕过） |
 
 ## 功能入口
 
 | 入口 | 命令 | 定位 |
 |---|---|---|
-| 监控桌面版 | `python gui.py` | 常驻轮询监控，命中自动下单，邮件通知 |
-| 抢票任务管理器 | `python launcher.py` | 定时开抢/预热/多任务独立窗口，可并行 |
+| 桌面版（唯一界面，Electron） | 双击「启动桌面版.bat」（用绝对路径启动 `electron\node_modules\electron\dist\electron.exe`） | 「监控任务」页常驻轮询；「抢票任务」页定时开抢/预热/多任务并行；顶栏搜索框免登录速查 |
+| 调试（带日志） | 同 bat，先 `set DSH_DEBUG=1` | 打开主进程 `[rpc]`、渲染进程 `[renderer]` 转发 |
 | 命令行后备 | `python monitor.py` | 无 GUI 环境的后备入口（功能以桌面版为准） |
 | 登录 | `python capture_session.py` / `python browser_order.py login` | 浏览器登录一次，会话持久化 |
+
+> 2026-10-13 起 `launcher.py` 不再是独立入口（只保留业务能力）。
+> 2026-10-14 起界面为 `ui/` + `api.py`（Electron）；`gui.py`（Tkinter 版）已停用但保留在仓库内（测试引用）。
+> 「启动桌面版.bat」里的 `set ELECTRON_RUN_AS_NODE=` 与 `set ELECTRON_MIRROR=` 两行不要删（原因见 bat 内注释）。
+> bat 文件必须保持**纯 ASCII**：cmd 按 OEM 代码页（本机 936/GBK）解码批处理，UTF-8 中文注释会错位成命令片段。
+> 依赖装在 `electron/node_modules`，首次安装由 bat 自己在 electron 目录里执行（根目录没有 package.json）。
 
 ## 部署三步
 
 1. 安装依赖：`pip install -r requirements.txt`，然后 `playwright install msedge`（或使用本机已装 Edge/Chrome）。
 2. 登录：运行 `python browser_order.py login`，在弹出的浏览器里完成 12306 登录（扫码或账密+滑块），会话存入 `.browser_profile/`。
-3. 建任务：桌面版「新建任务」或启动器里配置车次/席别/乘车人，勾选自动下单。
+3. 建任务：桌面版「监控任务」页新建任务，或在「抢票任务」页配置车次/席别/乘车人，勾选自动下单。
 
 ## 「首选席别」语法
 
