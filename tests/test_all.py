@@ -653,6 +653,53 @@ class TestNotifyPortValidation(TempDirCase):
         self.assertFalse(broke)
 
 
+class TestTask148NotifyPasswordLeak(TempDirCase):
+    """Task 148（B13-1，P1）：notify.py:89 的 password 形状守卫把 SMTP 授权码
+    `{0!r}` 打进返回 msg → 三条 sink（engine LOG.error / launcher log /
+    console print）泄漏进持久日志。修复：只记类型名，不打印值（Task 124/135
+    PII 口径）；Task 71 的 (ok, msg) 契约（非 str password → ok=False）保持。
+
+    注：测试用 123456 是显然假的凭证值，绝不触碰真实凭证。
+    """
+
+    FAKE_PWD = 123456
+
+    def _email_cfg(self, password):
+        return {"enabled": True, "smtp_host": "smtp.example.com",
+                "smtp_port": 465, "username": "u", "password": password,
+                "from": "u@example.com", "to": ["u@example.com"]}
+
+    def test_non_str_password_msg_has_no_credential_value(self):
+        # RED（旧代码）：msg 含 "邮件配置 password 非法（应为字符串）: 123456"
+        # → "123456" 进三条 sink。修后：msg 不含该值。
+        ok, msg = notify_mod.send_email(self._email_cfg(self.FAKE_PWD), "s", "b")
+        self.assertFalse(ok)  # Task 71 契约：ok=False 保持
+        self.assertEqual(msg, "邮件配置 password 非法（应为字符串，实际类型：int）")
+
+    def test_non_str_password_msg_type_only(self):
+        # 类型-only 摘要：记类型名，不打印值（P1 凭证零泄漏）
+        ok, msg = notify_mod.send_email(self._email_cfg(self.FAKE_PWD), "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("int", msg)
+        self.assertNotIn(str(self.FAKE_PWD), msg)
+
+    def test_non_str_password_none_type_only(self):
+        # 另一脏形状：None → 记 NoneType，契约 ok=False 保持
+        ok, msg = notify_mod.send_email(self._email_cfg(None), "s", "b")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "邮件配置 password 非法（应为字符串，实际类型：NoneType）")
+
+    def test_sink_chain_no_credential(self):
+        # 三条 sink 只消费 msg 本身：engine LOG.error / launcher log /
+        # console print 均以 msg 为唯一变量，无 raw_pwd 重打
+        ok, msg = notify_mod.send_email(self._email_cfg(self.FAKE_PWD), "s", "b")
+        self.assertFalse(ok)
+        for rendered in ("[通知失败] %s" % msg,      # engine.py:1085
+                         "[提醒] 通知：%s" % msg,     # launcher.py:1109
+                         "  %s" % msg):               # monitor.py:1141
+            self.assertNotIn(str(self.FAKE_PWD), rendered)
+
+
 class TestLogutil(TempDirCase):
     def test_day_rotation(self):
         h = logutil.DayFileHandler(self.tmp, "test")

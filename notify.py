@@ -86,7 +86,11 @@ def send_email(cfg, subject, body):
     if not isinstance(raw_pwd, str):
         # Task 71：手改配置把 password 写成非字符串（如数字）时，
         # secret_of 会 AttributeError 逃出 (ok,msg) 契约——如实报错。
-        return False, "邮件配置 password 非法（应为字符串）: {0!r}".format(raw_pwd)
+        # Task 148（B13-1，P1）：旧代码的 "{0!r}" 把授权码原值打进返回
+        # msg，经 engine 的 LOG.error / launcher 的 log() / 控制台 print
+        # 三条 sink 泄漏进持久日志——只记类型名，不打印值。
+        return False, "邮件配置 password 非法（应为字符串，实际类型：{0}）".format(
+            type(raw_pwd).__name__)
     try:
         pwd = secret_of(raw_pwd)  # 兼容明文与 DPAPI 密文两种存储
     except SecretDecryptError as e:
