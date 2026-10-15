@@ -15020,6 +15020,116 @@ class TestTask132BrowserOrderMainKiB8(TempDirCase):
         self.assertNotIn("[中断]", out)
 
 
+
+
+class TestTask133MonitorDisplayGuards(TempDirCase):
+    """Task 133（B9-1，P3×2）：2.2.1 menu_passengers id_no/mobile 真值
+    list/tuple/dict 形状 → TypeError 崩菜单 [4]（Task 126 只覆盖了数字）；
+    2.2.2 menu_task_list message 真值非 str → msg[:80] TypeError 崩菜单 [2]。"""
+
+    # ---------- 2.2.1：menu_passengers ----------
+
+    def _run_passengers_menu(self, passengers):
+        import monitor as monitor_mod
+        import passengers as passengers_mod
+        printed = []
+        with mock.patch.object(passengers_mod, "load_passengers",
+                               return_value=passengers), \
+             mock.patch.object(passengers_mod, "passengers_stamp",
+                               return_value=None), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["0"]), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            monitor_mod.menu_passengers()  # 展示循环不得抛 TypeError
+        return "\n".join(printed)
+
+    @staticmethod
+    def _pax(**kw):
+        p = {"name": "张三", "is_adult": True, "id_type_code": "1",
+             "id_no": "110101199001011234", "mobile": "13800138000"}
+        p.update(kw)
+        return p
+
+    def test_2_2_1_list_id_no_warn_empty(self):
+        # RED（旧代码）：_mask_id([1]*8) → len>=8 → [1,2,3][:3] + "*" → TypeError。
+        # 修后：warn + 按空显示，其余条目正常。
+        dirty = self._pax(id_no=[1, 2, 3, 4, 5, 6, 7, 8])
+        clean = self._pax(name="李四")
+        out = self._run_passengers_menu([dirty, clean])
+        self.assertIn("警告", out)
+        self.assertIn("李四", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_2_2_1_dict_mobile_warn_empty(self):
+        # RED（旧代码）：({"a": 1} or "")[:3] → TypeError（dict 不可切片）。
+        out = self._run_passengers_menu(
+            [self._pax(mobile={"a": 1})])
+        self.assertIn("警告", out)
+        self.assertIn("张三", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_2_2_1_list_mobile_warn_empty(self):
+        # RED（旧代码）：["138"][:3] + "****" → TypeError。
+        out = self._run_passengers_menu(
+            [self._pax(mobile=["13800138000"])])
+        self.assertIn("警告", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_2_2_1_numeric_still_masked(self):
+        # 对照（Task 126 口径保持）：数字仍转字符串脱敏，无警告。
+        out = self._run_passengers_menu(
+            [self._pax(id_no=110101199001011234, mobile=13800138000)])
+        self.assertIn("110***********1234", out)
+        self.assertIn("138****8000", out)
+        self.assertNotIn("警告", out)
+
+    def test_2_2_1_falsy_still_old_behavior(self):
+        # 对照（Task 126 口径保持）：0/0.0 保持旧行为（"" / "未填"），无警告。
+        out = self._run_passengers_menu([self._pax(id_no=0, mobile=0)])
+        self.assertNotIn("警告", out)
+        self.assertIn("未填", out)
+
+    # ---------- 2.2.2：menu_task_list ----------
+
+    @staticmethod
+    def _mock_engine(tasks_state):
+        eng = mock.MagicMock()
+        eng.state = {"tasks": tasks_state}
+        eng.base_interval = 300
+        return eng
+
+    def _run_task_list(self, tasks, tasks_state):
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine(tasks_state)), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_list()  # 不得抛 TypeError
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    @staticmethod
+    def _task(name="t1"):
+        return {"name": name, "from": "北京", "to": "上海", "dates": []}
+
+    def test_2_2_2_message_int_warn_empty(self):
+        # RED（旧代码）：msg=5 → msg[:80] → TypeError，菜单 [2] 崩溃。
+        # 修后：warn + 记录仍展示（message 按空）。
+        printed = self._run_task_list([self._task()], {"t1": {"message": 5}})
+        self.assertIn("警告", printed)
+        self.assertIn("t1", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_2_2_2_message_str_unchanged(self):
+        # 对照：干净 message 照常显示前 80 字符，无警告。
+        printed = self._run_task_list(
+            [self._task()], {"t1": {"message": "一切正常"}})
+        self.assertIn("一切正常", printed)
+        self.assertNotIn("警告", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

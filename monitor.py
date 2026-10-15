@@ -655,6 +655,12 @@ def menu_task_list():
             engine_mod.STATUS_LABELS.get(status, status)))
         msg = (eng.state["tasks"].get(name_raw, {}).get("message", "")
                if isinstance(name_raw, str) else "")
+        # Task 133（2.2.2）：message 真值非 str（如手改成数字）→ msg[:80]
+        # TypeError 崩菜单 [2]；记警告后按空处理（该展示循环最后一个无守卫字段）。
+        if msg and not isinstance(msg, str):
+            print("  [警告] 第 {0} 个任务的状态消息字段非字符串"
+                  "（配置损坏），已忽略。".format(i))
+            msg = ""
         if msg:
             print("      └ {0}".format(msg[:80]))
     print("-" * 110)
@@ -781,10 +787,21 @@ def menu_passengers():
             if isinstance(id_no, (int, float)) and id_no:
                 # 真值数字才转字符串；0/0.0 保持旧行为（_mask_id → ""）。
                 id_no = str(id_no)
+            elif id_no and not isinstance(id_no, str):
+                # Task 133（2.2.1）：真值非字符串（list/tuple/dict 等手改
+                # 形状）无法脱敏显示，记警告后按空显示（Task 126 只处理了数字）。
+                print("  [警告] 乘车人 {0} 的证件号形状非法，已按空显示。".format(
+                    p.get("name")))
+                id_no = ""
             mobile = p.get("mobile")
             if isinstance(mobile, (int, float)) and mobile:
                 # 真值数字才转字符串；0/0.0 保持旧行为（"未填"）。
                 mobile = str(mobile)
+            elif mobile and not isinstance(mobile, str):
+                # Task 133（2.2.1）：同上，手机号形状非法按空显示。
+                print("  [警告] 乘车人 {0} 的手机号形状非法，已按空显示。".format(
+                    p.get("name")))
+                mobile = ""
             mark = "【默认】" if p.get("is_default") else ""
             print("  {0:>2}. {1} {2}{3}  证件:{4} {5}  手机:{6}".format(
                 i, p.get("name"), mark,
