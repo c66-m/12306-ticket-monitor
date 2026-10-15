@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>车票监控中心 · 控制台</title>
+<style>
+/* ============ 令牌 ============ */
+:root{
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  --mono: "SF Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+
+  --r-xl: 32px; --r-lg: 22px; --r-md: 14px; --r-sm: 10px; --r-pill: 999px;
+  --gap: 20px; --pad: 22px;
+
+  --t-fast: 160ms; --t: 200ms; --t-slow: 240ms;
+  --ease: cubic-bezier(.22,.61,.36,1);
+}
+html[data-theme="light"]{
+  --bg:#E7EFFA; --glow-a:rgba(140,190,255,.62); --glow-b:rgba(196,172,255,.44);
+  --glass:rgba(255,255,255,.50); --glass-strong:rgba(255,255,255,.78);
+  --glass-edge:rgba(255,255,255,.92); --glass-tint:rgba(255,255,255,.34);
+  --ink:#141B2E; --ink-2:#3F4B69; --ink-3:#525D7C;
+  --accent:#3A55C4; --accent-2:#5A3DC2; --cyan:#1E86A0; --pink:#AE4776; --amber:#8A5A12;
+  --success:#137049; --danger:#BC342A; --neutral:#525D7C;
+  --on-accent:#fff;
+  --sh-1: 0 2px 6px -2px rgb(24 32 53/.06);
+  --sh-2: 0 14px 34px -14px rgb(24 32 53/.18), 0 2px 8px -3px rgb(24 32 53/.08);
+  --sh-3: 0 28px 64px -24px rgb(24 32 53/.30), 0 6px 18px -8px rgb(24 32 53/.12);
+  --sh-4: 0 40px 84px -28px rgb(24 32 53/.36), 0 10px 26px -10px rgb(24 32 53/.16);
+  --scroll:rgb(24 32 53/.20); --scroll-hover:rgb(24 32 53/.34);
+  color-scheme: light;
+}
+html[data-theme="dark"]{
+  --bg:#0B1020; --glow-a:rgba(91,124,250,.24); --glow-b:rgba(139,111,245,.18);
+  --glass:rgba(26,33,54,.60); --glass-strong:rgba(32,40,64,.80);
+  --glass-edge:rgba(255,255,255,.16); --glass-tint:rgba(255,255,255,.055);
+  --ink:#E8EDF8; --ink-2:#A5B0CC; --ink-3:#79839F;
+  --accent:#7C97FF; --accent-2:#A78BFA; --cyan:#5ACFE6; --pink:#F58CBB; --amber:#F0B45C;
+  --success:#3DBD8A; --danger:#F0655C; --neutral:#79839F;
+  --on-accent:#0B1020;
+  --sh-1: 0 2px 6px -2px rgb(0 0 0/.34);
+  --sh-2: 0 16px 38px -16px rgb(0 0 0/.56), 0 2px 10px -4px rgb(0 0 0/.34);
+  --sh-3: 0 30px 68px -26px rgb(0 0 0/.66), 0 8px 20px -10px rgb(0 0 0/.40);
+  --sh-4: 0 44px 88px -30px rgb(0 0 0/.70), 0 12px 28px -12px rgb(0 0 0/.46);
+  --scroll:rgb(255 255 255/.14); --scroll-hover:rgb(255 255 255/.26);
+  color-scheme: dark;
+}
+
+/* ============ 基底 ============ */
+*,*::before,*::after{box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  margin:0; font-family:var(--font); color:var(--ink);
+  font-size:14px; line-height:1.6; letter-spacing:.005em;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  background:var(--bg);
+  transition:background var(--t-slow) var(--ease), color var(--t-slow) var(--ease);
+}
+body::before{
+  content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:
+    radial-gradient(1120px 720px at 6% -8%, var(--glow-a), transparent 62%),
+    radial-gradient(940px 640px at 98% 106%, var(--glow-b), transparent 60%);
+  transition:background var(--t-slow) var(--ease);
+}
+h1,h2,h3,p,ul,ol,figure{margin:0;}
+ul,ol{list-style:none; padding:0;}
+button{font:inherit; color:inherit; background:none; border:0; cursor:pointer;}
+a{color:inherit; text-decoration:none;}
+svg{display:block;}
+.num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-spacing:-.01em;}
+
+::selection{background:color-mix(in srgb, var(--accent) 30%, transparent); color:var(--ink);}
+:root{caret-color:var(--accent);}
+:focus-visible{outline:none; box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 38%, transparent); border-radius:var(--r-sm);}
+
+*{scrollbar-width:thin; scrollbar-color:var(--scroll) transparent;}
+::-webkit-scrollbar{width:10px; height:10px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--scroll); border-radius:var(--r-pill); border:3px solid transparent; background-clip:padding-box;}
+::-webkit-scrollbar-thumb:hover{background:var(--scroll-hover); background-clip:padding-box;}
+
+/* ============ 玻璃基类 ============ */
+.glass{
+  background:var(--glass);
+  backdrop-filter:blur(22px) saturate(150%);
+  -webkit-backdrop-filter:blur(22px) saturate(150%);
+  border-radius:var(--r-xl);
+  box-shadow:var(--sh-2), inset 0 1px 0 var(--glass-edge);
+  transition:background var(--t-slow) var(--ease), box-shadow var(--t) var(--ease);
+}
+
+/* ============ 骨架 ============ */
+.shell{
+  display:grid; grid-template-columns:248px minmax(0,1fr);
+  gap:var(--gap); padding:18px; min-height:100vh; align-items:start;
+}
+.main{display:grid; gap:var(--gap); align-content:start; min-width:0; grid-column:2; grid-row:1;}
+
+/* ============ 侧边栏 ============ */
+.sidebar{
+  grid-column:1; grid-row:1;
+  position:sticky; top:18px; max-height:calc(100vh - 36px);
+  display:flex; flex-direction:column; padding:20px 16px;
+  box-shadow:var(--sh-3), inset 0 1px 0 var(--glass-edge);
+  z-index:2;
+}
+.brand{display:flex; align-items:center; gap:12px; padding:4px 6px 22px;}
+.brand-mark{
+  width:42px; height:42px; flex:none; border-radius:var(--r-md);
+  display:grid; place-items:center; color:var(--on-accent);
+  background:linear-gradient(140deg, var(--accent), var(--accent-2));
+  box-shadow:0 10px 22px -10px color-mix(in srgb, var(--accent) 78%, transparent);
+}
+.brand-text b{display:block; font-size:15px; font-weight:650; letter-spacing:.01em;}
+.brand-text span{display:block; font-size:12px; color:var(--ink-3); margin-top:1px;}
+
+.nav{display:flex; flex-direction:column; gap:4px; flex:1; min-height:0; overflow-y:auto; padding-right:2px;}
+.nav-label{font-size:11px; font-weight:600; color:var(--ink-3); letter-spacing:.09em; padding:14px 10px 6px;}
+.nav-item{
+  position:relative; display:flex; align-items:center; gap:12px;
+  padding:11px 12px; border-radius:var(--r-md); color:var(--ink-2);
+  font-size:13.5px; font-weight:500;
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+.nav-item svg{flex:none; width:19px; height:19px;}
+.nav-item .rail{
+  position:absolute; right:2px; top:50%; transform:translateY(-50%) scaleY(.3);
+  width:3px; height:24px; border-radius:var(--r-pill); background:var(--accent); box-shadow:0 0 8px -1px currentColor;
+  opacity:0; transition:opacity var(--t) var(--ease), transform var(--t) var(--ease);
+}
+.nav-item:hover{background:var(--glass-strong); color:var(--ink);}
+.nav-item:active{transform:scale(.985);}
+.nav-item[aria-current="page"]{background:var(--glass-strong); color:var(--ink); font-weight:600; box-shadow:var(--sh-1);}
+.nav-item[aria-current="page"] .rail{opacity:1; transform:translateY(-50%) scaleY(1);}
+.nav-item[aria-current="page"] svg{color:var(--accent);}
+.nav-item:nth-of-type(4n+2) .rail{background:var(--cyan);}
+.nav-item:nth-of-type(4n+3) .rail{background:var(--pink);}
+.nav-item:nth-of-type(4n+4) .rail{background:var(--amber);}
+.nav-badge{margin-left:auto; font-size:11px; font-weight:650; padding:2px 8px; border-radius:var(--r-pill);
+  background:color-mix(in srgb, var(--accent) 14%, transparent); color:var(--accent);}
+
+.side-foot{display:flex; align-items:center; gap:10px; padding-top:14px; margin-top:12px;
+  box-shadow:0 -1px 0 var(--glass-tint);}
+.side-foot .nav-item{flex:1; padding-left:8px;}
+.icon-btn{
+  width:40px; height:40px; flex:none; border-radius:var(--r-md);
+  display:grid; place-items:center; color:var(--ink-2); background:var(--glass-tint);
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+.icon-btn:not(.primary):hover{background:var(--glass-strong); color:var(--ink); box-shadow:var(--sh-1);}
+.icon-btn:active{transform:scale(.94);}
+.icon-btn.primary{background:linear-gradient(140deg,var(--accent),var(--accent-2)); color:var(--on-accent);
+  box-shadow:0 10px 22px -10px color-mix(in srgb, var(--accent) 78%, transparent);}
+.icon-btn.primary:hover{background:linear-gradient(140deg,var(--accent),var(--accent-2)); color:var(--on-accent);
+  box-shadow:0 14px 28px -10px color-mix(in srgb, var(--accent) 88%, transparent);}
+
+/* ============ 主题专属：横幅色域 ============ */
+html[data-theme="light"]{--bn-1:#5640BE;--bn-2:#3B4CBE;--bn-3:#1E5C9C;--bn-ink:#fff;--bn-sub:rgba(255,255,255,.88);--bn-ghost:rgba(255,255,255,.18);}
+html[data-theme="dark"]{--bn-1:#5B49B8;--bn-2:#3C4B8C;--bn-3:#2F5F92;--bn-ink:#F6F9FF;--bn-sub:rgba(246,249,255,.84);--bn-ghost:rgba(255,255,255,.12);}
+
+/* ============ 焦点横幅 ============ */
+.banner{
+  position:relative; overflow:hidden; padding:30px 32px; min-height:198px;
+  display:flex; align-items:center; gap:28px;
+  background:linear-gradient(112deg, var(--bn-1) 0%, var(--bn-2) 52%, var(--bn-3) 100%);
+  box-shadow:var(--sh-3), inset 0 1px 0 rgba(255,255,255,.34);
+  color:var(--bn-ink);
+}
+.banner::after{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background:radial-gradient(620px 380px at 88% 8%, rgba(255,255,255,.09), transparent 66%);
+}
+.banner-copy{position:relative; z-index:1; max-width:52ch;}
+.banner h1{font-size:30px; font-weight:650; letter-spacing:-.015em; line-height:1.2; text-wrap:balance;}
+.banner p{margin-top:9px; font-size:14px; color:var(--bn-sub); max-width:46ch;}
+.banner-actions{margin-top:20px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+.btn{
+  display:inline-flex; align-items:center; gap:8px; padding:9px 18px; border-radius:var(--r-pill);
+  font-size:13.5px; font-weight:600; white-space:nowrap;
+  transition:background var(--t-fast) var(--ease), box-shadow var(--t) var(--ease), transform var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.btn:active{transform:scale(.97);}
+.btn-solid{background:#fff; color:#2C3550; box-shadow:0 10px 24px -12px rgba(10,20,50,.55);}
+.btn-solid:hover{box-shadow:0 16px 30px -12px rgba(10,20,50,.62);}
+.btn-ghost{background:var(--bn-ghost); color:var(--bn-ink); box-shadow:inset 0 1px 0 rgba(255,255,255,.22);}
+.btn-ghost:hover{background:#4635AE;}
+.banner-art{position:relative; z-index:1; margin-left:auto; flex:none; color:rgba(255,255,255,.92);}
+.banner-art{padding-top:30px;} .banner-art svg{width:206px; height:auto;}
+
+/* ============ 两列栅格 ============ */
+.cols{display:grid; grid-template-columns:minmax(0,1.62fr) minmax(0,1fr); gap:var(--gap); align-items:start;}
+
+/* ============ 模块卡 ============ */
+.mod{padding:var(--pad); min-width:0;}
+.mod-head{display:flex; align-items:center; gap:12px; margin-bottom:16px;}
+.mod-head h2{font-size:15px; font-weight:650; letter-spacing:.005em;}
+.mod-head .sub{font-size:12px; color:var(--ink-3); margin-left:2px;}
+.mod-head .spacer{margin-left:auto;}
+.pill{
+  display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:var(--r-pill);
+  font-size:12px; font-weight:600; color:var(--ink-2); background:var(--glass-strong); box-shadow:var(--sh-1);
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+.pill:hover{color:var(--ink); transform:translateY(-1px);}
+.pill svg{width:14px; height:14px;}
+
+/* ============ 信息流 ============ */
+.feed{display:flex; flex-direction:column; gap:6px;}
+.feed-row{
+  display:flex; align-items:center; gap:14px; padding:13px 14px; border-radius:var(--r-md);
+  transition:background var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+.feed-row:hover{background:var(--glass-strong); box-shadow:var(--sh-1);}
+.feed-row:active{transform:scale(.995);}
+.rp{width:38px; height:38px; flex:none; border-radius:var(--r-sm); display:grid; place-items:center;
+  background:var(--glass-tint); color:var(--ink-2); box-shadow:var(--sh-1);}
+.rp svg{width:19px; height:19px;}
+.feed-main{min-width:0; flex:1;}
+.feed-main b{display:block; font-size:13.5px; font-weight:600; letter-spacing:.01em;}
+.feed-main span{display:block; font-size:12.5px; color:var(--ink-3); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.chip{
+  display:inline-flex; align-items:center; gap:5px; padding:4px 11px; border-radius:var(--r-sm);
+  font-size:11.5px; font-weight:650; white-space:nowrap;
+  background:color-mix(in srgb, var(--neutral) 13%, transparent); color:var(--neutral);
+}
+.chip::before{content:""; width:5px; height:5px; border-radius:50%; background:currentColor;}
+.chip--run{background:color-mix(in srgb, var(--accent) 14%, transparent); color:var(--accent);}
+.chip--today{background:color-mix(in srgb, var(--amber) 15%, transparent); color:color-mix(in srgb, var(--amber) 74%, var(--ink));}
+.chip--ok{background:color-mix(in srgb, var(--success) 15%, transparent); color:color-mix(in srgb, var(--success) 80%, var(--ink));}
+.chip--fail{background:color-mix(in srgb, var(--danger) 15%, transparent); color:color-mix(in srgb, var(--danger) 82%, var(--ink));}
+.feed-time{font-size:12px; color:var(--ink-3); flex:none;}
+
+/* ============ 瀑布流 ============ */
+.falls{columns:2; column-gap:12px;}
+.fall{
+  break-inside:avoid; margin-bottom:12px; padding:16px 16px 15px; border-radius:var(--r-lg);
+  background:var(--glass-strong); box-shadow:var(--sh-1);
+  transition:box-shadow var(--t) var(--ease), transform var(--t) var(--ease);
+}
+.fall:hover{box-shadow:var(--sh-2); transform:translateY(-2px);}
+.fall .tag{display:inline-flex; align-items:center; gap:6px; font-size:11.5px; font-weight:650; color:var(--ink-3);}
+.fall .train{font-size:17px; font-weight:650; margin-top:8px; letter-spacing:-.005em;}
+.fall .route{font-size:12.5px; color:var(--ink-3); margin-top:3px;}
+.fall .seats{display:flex; flex-wrap:wrap; gap:6px; margin-top:12px;}
+.seat{font-size:11.5px; font-weight:600; padding:4px 9px; border-radius:var(--r-sm);
+  background:var(--glass-tint); color:var(--ink-2);}
+.seat.has{background:color-mix(in srgb, var(--success) 14%, transparent); color:color-mix(in srgb, var(--success) 80%, var(--ink));}
+.seat.none{background:var(--glass-tint); color:var(--ink-3);}
+.bar{height:6px; border-radius:var(--r-pill); background:var(--glass-tint); overflow:hidden; margin-top:13px;}
+.bar i{display:block; height:100%; border-radius:var(--r-pill); background:linear-gradient(90deg,var(--accent),var(--cyan));}
+
+/* ============ 环形统计 ============ */
+.ring-wrap{display:flex; align-items:center; gap:22px; flex-wrap:wrap;}
+.ring{position:relative; width:148px; height:148px; flex:none;}
+.ring svg{width:100%; height:100%; transform:rotate(-90deg);}
+.ring circle{fill:none; stroke-linecap:round;}
+.ring .track{stroke:var(--glass-tint); stroke-width:13;}
+.ring .val{stroke:url(#ringGrad); stroke-width:13; transition:stroke-dasharray 1s var(--ease);}
+.ring-mid{position:absolute; inset:0; display:grid; place-content:center; text-align:center;}
+.ring-mid b{display:block; font-size:27px; font-weight:680; font-family:var(--mono); font-variant-numeric:tabular-nums; letter-spacing:-.02em;}
+.ring-mid span{display:block; font-size:11.5px; color:var(--ink-3); margin-top:2px;}
+.legend{display:flex; flex-direction:column; gap:11px; min-width:150px; flex:1;}
+.legend li{display:flex; align-items:center; gap:10px; font-size:12.5px; color:var(--ink-2);}
+.legend .sw{width:9px; height:9px; border-radius:3px; flex:none;}
+.legend b{margin-left:auto; font-family:var(--mono); font-variant-numeric:tabular-nums; font-weight:650; color:var(--ink);}
+
+/* ============ 快捷条目 ============ */
+.quick{display:flex; flex-direction:column; gap:5px;}
+.quick-item{
+  display:flex; align-items:center; gap:12px; padding:12px 13px; border-radius:var(--r-md);
+  font-size:13.5px; font-weight:550; color:var(--ink-2);
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+.quick-item svg{width:18px; height:18px; flex:none; color:var(--ink-3); transition:color var(--t-fast) var(--ease);}
+.quick-item:not(.is-primary):hover{background:var(--glass-strong); color:var(--ink);}
+.quick-item:not(.is-primary):hover svg{color:var(--accent);}
+.quick-item:active{transform:scale(.99);}
+.quick-item .k{margin-left:auto; font-size:11px; color:var(--ink-3); font-family:var(--mono);}
+.quick-item.is-primary .k{color:var(--on-accent);}
+.quick-item.is-primary{background:linear-gradient(140deg,var(--accent),var(--accent-2)); color:var(--on-accent); font-weight:600;
+  box-shadow:0 12px 26px -14px color-mix(in srgb, var(--accent) 90%, transparent);}
+.quick-item.is-primary svg{color:currentColor;}
+.quick-item.is-primary:hover{background:linear-gradient(140deg,var(--accent),var(--accent-2)); color:var(--on-accent); filter:brightness(1.08);}
+.quick-item.is-primary:hover svg{color:currentColor;}
+
+/* ============ 底部记录栏 ============ */
+.recordbar{
+  grid-column:1 / -1; grid-row:2;
+  display:flex; align-items:center; gap:7px; padding:13px 20px; min-width:0; flex-wrap:wrap;
+  box-shadow:var(--sh-2), inset 0 1px 0 var(--glass-edge);
+}
+.recordbar .lead{display:flex; align-items:center; gap:10px; flex:none; padding-right:14px; margin-right:6px;
+  box-shadow:1px 0 0 var(--glass-tint);}
+.recordbar .lead .icon-btn{width:34px; height:34px;}
+.recordbar .lead b{font-size:13px; font-weight:650; white-space:nowrap;}
+.rec{
+  display:flex; align-items:center; gap:8px; padding:7px 13px; border-radius:var(--r-pill);
+  font-size:12.5px; color:var(--ink-2); white-space:nowrap;
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.rec:hover{background:var(--glass-strong); color:var(--ink);}
+.rec .t{font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:11.5px; color:var(--ink-3);}
+.rec .d{width:4px; height:4px; border-radius:50%; background:var(--ink-3); flex:none;}
+.recordbar .icon-btn{margin-left:auto;}
+
+/* ============ 工具条 ============ */
+.topbar{display:flex; align-items:center; gap:10px; padding:0 2px;}
+.topbar .spacer{margin-left:auto;}
+.theme-switch{display:inline-flex; padding:4px; gap:3px; border-radius:var(--r-pill); background:var(--glass); box-shadow:var(--sh-1);}
+.theme-switch button{padding:6px 13px; border-radius:var(--r-pill); font-size:12.5px; font-weight:600; color:var(--ink-3);
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);}
+.theme-switch button[aria-pressed="true"]{background:var(--glass-strong); color:var(--ink); box-shadow:var(--sh-1);}
+
+/* ============ 横幅工具 ============ */
+.banner-tools{position:absolute; top:18px; right:20px; z-index:3; display:flex; align-items:center; gap:8px;}
+.banner-tools .icon-btn{background:rgba(255,255,255,.20); color:#fff;}
+.banner-tools .icon-btn:hover{background:rgba(255,255,255,.94); color:#333C66;}
+.banner-tools .icon-btn:focus-visible{box-shadow:0 0 0 3px rgba(255,255,255,.55);}
+.banner-tools .theme-switch{background:rgba(255,255,255,.18); box-shadow:inset 0 1px 0 rgba(255,255,255,.24);}
+.banner-tools .theme-switch button{color:rgba(255,255,255,.96); font-weight:650;}
+.banner-tools .theme-switch button[aria-pressed="true"]{background:rgba(255,255,255,.94); color:#333C66; box-shadow:none;}
+
+/* ============ 近 7 日柱 ============ */
+.week{margin-top:20px; display:flex; align-items:flex-end; gap:6px; height:56px;}
+.week span{font-size:12px; color:var(--ink-3); margin-right:auto; align-self:flex-end; padding-bottom:4px; white-space:nowrap;}
+.week i{flex:1; min-height:6px; border-radius:6px; background:color-mix(in srgb, var(--accent) 34%, transparent);}
+.week i.w3{background:linear-gradient(180deg, var(--accent), var(--cyan));}
+.week i.w7{background:linear-gradient(180deg, var(--accent), var(--accent-2));}
+.week i.w1{height:30%;} .week i.w2{height:46%;} .week i.w3{height:74%;} .week i.w4{height:38%;}
+.week i.w5{height:58%;} .week i.w6{height:24%;} .week i.w7{height:90%;}
+
+/* ============ 响应式 ============ */
+@media (max-width:1080px){
+  .shell{grid-template-columns:84px minmax(0,1fr);}
+  .sidebar{padding:18px 12px;}
+  .brand{gap:0; padding:4px 0 18px; justify-content:center;}
+  .brand-text,.nav-label,.nav-item span:not(.rail),.nav-badge{display:none;}
+  .nav-item{justify-content:center; padding:12px 0;}
+  .nav-item .rail{right:-6px;}
+  .side-foot .nav-item{display:none;}
+  .side-foot{justify-content:center;}
+  .cols{grid-template-columns:minmax(0,1fr);}
+  .banner-art{display:none;}
+}
+@media (max-width:760px){
+  .shell{grid-template-columns:minmax(0,1fr); padding:12px; gap:14px;}
+  .sidebar{position:static; height:auto; flex-direction:row; align-items:center; padding:12px 14px; border-radius:var(--r-lg);}
+  .nav{flex-direction:row; overflow-x:auto; gap:6px;}
+  .nav-item{padding:10px 13px;}
+  .side-foot{padding-top:0; margin-top:0; padding-left:12px; box-shadow:-1px 0 0 var(--glass-tint);}
+  .banner{padding:22px 20px; min-height:0;}
+  .banner h1{font-size:24px;}
+  .falls{columns:1;}
+  .recordbar{flex-wrap:wrap;}
+  .recordbar .lead{box-shadow:none;}
+  .recordbar .icon-btn{margin-left:0;}
+}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition-duration:.01ms !important; animation-duration:.01ms !important;}
+}
+@media print{ body::before{display:none;} .glass{box-shadow:none;} }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="var(--accent)"/><stop offset="100%" stop-color="var(--cyan)"/>
+    </linearGradient>
+  </defs>
+    <symbol id="i-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.6 20 6v6.1c0 4.6-3.3 8.1-8 9.3-4.7-1.2-8-4.7-8-9.3V6z"/><path d="M8.6 12.2l2.3 2.3 4.5-4.6"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.2" y="3.2" width="7.2" height="7.2" rx="2.4"/><rect x="13.6" y="3.2" width="7.2" height="7.2" rx="2.4"/><rect x="3.2" y="13.6" width="7.2" height="7.2" rx="2.4"/><rect x="13.6" y="13.6" width="7.2" height="7.2" rx="2.4"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.4 2.6 5.2 13.4h5.6l-1.2 8 8.2-10.8h-5.6z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 6.8V12l3.4 2.1"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6.6 10.2a5.4 5.4 0 1 1 10.8 0c0 3 .8 4.6 1.6 5.6H5c.8-1 1.6-2.6 1.6-5.6z"/><path d="M10.2 19a2 2 0 0 0 3.6 0"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/><path d="M12 2.8v2.4M12 18.8v2.4M4.5 7.4l2 1.2M17.5 15.4l2 1.2M4.5 16.6l2-1.2M17.5 8.6l2-1.2"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5.4v13.2M5.4 12h13.2"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.8" cy="10.8" r="6.4"/><path d="M15.6 15.6 20.4 20.4"/></symbol>
+    <symbol id="i-train" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5.4" y="3.6" width="13.2" height="13.6" rx="4"/><path d="M5.4 11h13.2M9.6 17.2 7.4 20.6M14.4 17.2l2.2 3.4"/><circle cx="9.4" cy="14" r=".9" fill="currentColor" stroke="none"/><circle cx="14.6" cy="14" r=".9" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7.6 5.2 18 12 7.6 18.8z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="6.4" y="6.4" width="11.2" height="11.2" rx="2.6"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M16.4 4.2 19.8 7.6 9.2 18.2 4.8 19.6 6.2 15.2z"/></symbol>
+    <symbol id="i-route" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.6" cy="6.6" r="2.6"/><circle cx="17.4" cy="17.4" r="2.6"/><path d="M6.6 9.2v4.4a3.8 3.8 0 0 0 3.8 3.8h3"/></symbol>
+    <symbol id="i-trend" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16.4 9 11l3.6 3.4L20 6.6"/><path d="M15.4 6.6H20v4.6"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 12S6.4 5.8 12 5.8 21.2 12 21.2 12 17.6 18.2 12 18.2 2.8 12 2.8 12z"/><circle cx="12" cy="12" r="2.9"/></symbol>
+</svg>
+
+<div class="shell">
+
+  <aside class="sidebar glass">
+    <div class="brand">
+      <span class="brand-mark"><svg width="22" height="22" style="color:inherit"><use href="#i-mark"/></svg></span>
+      <span class="brand-text"><b>车票监控</b><span>Ticket Console</span></span>
+    </div>
+
+    <nav class="nav" aria-label="主导航">
+      <p class="nav-label">工作台</p>
+      <a class="nav-item" href="#" aria-current="page"><svg><use href="#i-grid"/></svg><span>任务状态</span><span class="nav-badge num">5</span><i class="rail"></i></a>
+      <a class="nav-item" href="#"><svg><use href="#i-bolt"/></svg><span>抢票任务</span><span class="nav-badge num">3</span><i class="rail"></i></a>
+      <a class="nav-item" href="#"><svg><use href="#i-clock"/></svg><span>购票历史</span><i class="rail"></i></a>
+      <a class="nav-item" href="#"><svg><use href="#i-bell"/></svg><span>通知设置</span><i class="rail"></i></a>
+      <p class="nav-label">数据</p>
+      <a class="nav-item" href="#"><svg><use href="#i-trend"/></svg><span>运行报表</span><i class="rail"></i></a>
+      <a class="nav-item" href="#"><svg><use href="#i-route"/></svg><span>常用行程</span><i class="rail"></i></a>
+    </nav>
+
+    <div class="side-foot">
+      <a class="nav-item" href="#"><svg><use href="#i-gear"/></svg><span>设置</span></a>
+      <button class="icon-btn primary" type="button" aria-label="新建监控任务"><svg width="20" height="20"><use href="#i-plus"/></svg></button>
+    </div>
+  </aside>
+
+  <main class="main">
+
+    <section class="banner glass" aria-labelledby="bannerTitle">
+      <div class="banner-copy">
+        <h1 id="bannerTitle">车票监控中心</h1>
+        <p>5 个任务正在监控，最近一次余票命中在 <span class="num">4 分钟</span>前。任务概览与实时状态集中在这里。</p>
+        <div class="banner-actions">
+          <button class="btn btn-solid" type="button">查看详情</button>
+          <button class="btn btn-ghost" type="button"><svg width="16" height="16"><use href="#i-plus"/></svg>新建监控</button>
+        </div>
+      </div>
+      <div class="banner-art" aria-hidden="true">
+        <svg viewBox="0 0 268 152" fill="none">
+          <path d="M4 122Q134 94 264 122" stroke="rgba(255,255,255,.30)" stroke-width="3" stroke-linecap="round"/>
+          <path d="M22 138Q134 112 246 138" stroke="rgba(255,255,255,.15)" stroke-width="2" stroke-linecap="round"/>
+          <rect x="74" y="40" width="140" height="62" rx="24" fill="rgba(255,255,255,.95)"/>
+          <path d="M208 54q22 4 30 24t4 24h-34z" fill="rgba(255,255,255,.95)"/>
+          <rect x="92" y="56" width="34" height="22" rx="8" fill="#5B7CFA"/>
+          <rect x="134" y="56" width="26" height="22" rx="8" fill="#8B6FF5" opacity=".75"/>
+          <rect x="168" y="56" width="20" height="22" rx="8" fill="#57A9F0" opacity=".6"/>
+          <circle cx="100" cy="112" r="9" fill="rgba(255,255,255,.9)"/>
+          <circle cx="186" cy="112" r="9" fill="rgba(255,255,255,.9)"/>
+          <circle cx="34" cy="40" r="7" fill="rgba(255,255,255,.42)"/>
+          <circle cx="242" cy="34" r="4" fill="rgba(255,255,255,.5)"/>
+          <path d="M26 62q10-8 20 0" stroke="rgba(255,255,255,.4)" stroke-width="2.4" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="banner-tools">
+        <div class="theme-switch" role="group" aria-label="主题">
+          <button type="button" data-theme-set="light" aria-pressed="true">浅色</button>
+          <button type="button" data-theme-set="dark" aria-pressed="false">深色</button>
+        </div>
+        <button class="icon-btn" type="button" aria-label="搜索"><svg width="19" height="19"><use href="#i-search"/></svg></button>
+      </div>
+    </section>
+
+    <div class="cols">
+
+      <section class="mod glass" aria-labelledby="feedTitle">
+        <header class="mod-head">
+          <h2 id="feedTitle">监控动态</h2>
+          <span class="sub">最近 24 小时</span>
+          <span class="spacer"></span>
+          <button class="pill" type="button">全部</button>
+        </header>
+        <ul class="feed">
+          <li class="feed-row"><span class="rp"><svg><use href="#i-train"/></svg></span><span class="feed-main"><b>G102 次</b><span>北京南 → 上海虹桥 · 二等座余 12 张</span></span><span class="chip chip--run">监控中</span><span class="num feed-time">08:12</span></li>
+          <li class="feed-row"><span class="rp"><svg><use href="#i-train"/></svg></span><span class="feed-main"><b>G104 次</b><span>北京南 → 南京南 · 一等座余 3 张</span></span><span class="chip chip--run">监控中</span><span class="num feed-time">08:15</span></li>
+          <li class="feed-row"><span class="rp"><svg><use href="#i-bolt"/></svg></span><span class="feed-main"><b>K925 次</b><span>长春 → 山海关 · 硬座下单成功</span></span><span class="chip chip--ok">已抢到</span><span class="num feed-time">昨天</span></li>
+          <li class="feed-row"><span class="rp"><svg><use href="#i-train"/></svg></span><span class="feed-main"><b>D92 次</b><span>北京西 → 济南西 · 今日 14:20 开抢</span></span><span class="chip chip--today">今日任务</span><span class="num feed-time">07:40</span></li>
+          <li class="feed-row"><span class="rp"><svg><use href="#i-stop"/></svg></span><span class="feed-main"><b>G298 次</b><span>上海虹桥 → 杭州东 · 手动暂停</span></span><span class="chip">已暂停</span><span class="num feed-time">06:55</span></li>
+          <li class="feed-row"><span class="rp"><svg><use href="#i-eye"/></svg></span><span class="feed-main"><b>Z17 次</b><span>北京 → 长沙 · 暂无余票，继续轮询</span></span><span class="chip chip--run">监控中</span><span class="num feed-time">06:31</span></li>
+        </ul>
+      </section>
+
+      <section class="mod glass" aria-labelledby="quickTitle">
+        <header class="mod-head">
+          <h2 id="quickTitle">快捷操作</h2>
+          <span class="sub">常用入口</span>
+        </header>
+        <div class="quick">
+          <button class="quick-item is-primary" type="button"><svg><use href="#i-plus"/></svg>新建监控任务<span class="k">N</span></button>
+          <button class="quick-item" type="button"><svg><use href="#i-play"/></svg>启动监控<span class="k">↵</span></button>
+          <button class="quick-item" type="button"><svg><use href="#i-stop"/></svg>停止监控<span class="k">S</span></button>
+          <button class="quick-item" type="button"><svg><use href="#i-edit"/></svg>编辑任务<span class="k">E</span></button>
+          <button class="quick-item" type="button"><svg><use href="#i-search"/></svg>余票查询<span class="k">F</span></button>
+          <button class="quick-item" type="button"><svg><use href="#i-route"/></svg>测试会话<span class="k">T</span></button>
+        </div>
+      </section>
+    </div>
+
+    <div class="cols">
+
+      <section class="mod glass" aria-labelledby="fallsTitle">
+        <header class="mod-head">
+          <h2 id="fallsTitle">车次余票快照</h2>
+          <span class="sub">点卡片切换监控车次</span>
+          <span class="spacer"></span>
+          <button class="pill" type="button">刷新</button>
+        </header>
+        <div class="falls">
+          <article class="fall">
+            <span class="tag"><svg width="14" height="14"><use href="#i-train"/></svg>高铁</span>
+            <p class="train num">G102</p>
+            <p class="route">北京南 → 上海虹桥 · 10-06 周二</p>
+            <div class="seats"><span class="seat has">二等座 12</span><span class="seat none">一等座 无</span><span class="seat none">商务座 无</span></div>
+            <div class="bar"><i style="width:64%"></i></div>
+          </article>
+          <article class="fall">
+            <span class="tag"><svg width="14" height="14"><use href="#i-train"/></svg>高铁</span>
+            <p class="train num">G104</p>
+            <p class="route">北京南 → 南京南 · 10-06 周二</p>
+            <div class="seats"><span class="seat has">一等座 3</span><span class="seat has">二等座 41</span></div>
+            <div class="bar"><i style="width:82%"></i></div>
+          </article>
+          <article class="fall">
+            <span class="tag"><svg width="14" height="14"><use href="#i-bolt"/></svg>动车</span>
+            <p class="train num">D92</p>
+            <p class="route">北京西 → 济南西 · 10-06 周二</p>
+            <div class="seats"><span class="seat has">二等座 8</span><span class="seat none">卧铺 无</span></div>
+            <div class="bar"><i style="width:38%"></i></div>
+          </article>
+          <article class="fall">
+            <span class="tag"><svg width="14" height="14"><use href="#i-bolt"/></svg>动车</span>
+            <p class="train num">K925</p>
+            <p class="route">长春 → 山海关 · 10-06 周二</p>
+            <div class="seats"><span class="seat has">硬座 有</span><span class="seat has">硬卧 有</span><span class="seat none">软卧 无</span></div>
+            <div class="bar"><i style="width:71%"></i></div>
+          </article>
+          <article class="fall">
+            <span class="tag"><svg width="14" height="14"><use href="#i-train"/></svg>高铁</span>
+            <p class="train num">G298</p>
+            <p class="route">上海虹桥 → 杭州东 · 10-07 周三</p>
+            <div class="seats"><span class="seat has">二等座 全</span></div>
+            <div class="bar"><i style="width:100%"></i></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="mod glass" aria-labelledby="statTitle">
+        <header class="mod-head">
+          <h2 id="statTitle">今日概览</h2>
+          <span class="sub">任务命中率</span>
+        </header>
+        <div class="ring-wrap">
+          <div class="ring">
+            <svg viewBox="0 0 148 148">
+              <circle class="track" cx="74" cy="74" r="62"/>
+              <circle class="val" cx="74" cy="74" r="62" stroke-dasharray="265 389"/>
+            </svg>
+            <div class="ring-mid"><b class="num">68<small style="font-size:15px">%</small></b><span>命中率</span></div>
+          </div>
+          <ul class="legend">
+            <li><i class="sw" style="background:var(--success)"></i>已抢到<b class="num">3</b></li>
+            <li><i class="sw" style="background:var(--accent)"></i>监控中<b class="num">5</b></li>
+            <li><i class="sw" style="background:var(--neutral)"></i>已暂停<b class="num">2</b></li>
+            <li><i class="sw" style="background:var(--amber)"></i>待开抢<b class="num">1</b></li>
+          </ul>
+        </div>
+        <div class="week"><span>近 7 日命中</span><i class="w1"></i><i class="w2"></i><i class="w3"></i><i class="w4"></i><i class="w5"></i><i class="w6"></i><i class="w7"></i></div>
+      </section>
+    </div>
+
+  </main>
+
+  <div class="recordbar glass" role="group" aria-label="最近操作记录">
+    <span class="lead">
+      <span class="icon-btn" aria-hidden="true"><svg width="17" height="17"><use href="#i-clock"/></svg></span>
+      <b>最近操作</b>
+    </span>
+    <span class="rec"><span class="t">09:41</span><span class="d"></span>新建监控 G102</span>
+    <span class="rec"><span class="t">09:22</span><span class="d"></span>启动监控</span>
+    <span class="rec"><span class="t">08:58</span><span class="d"></span>编辑乘车人</span>
+    <span class="rec"><span class="t">08:12</span><span class="d"></span>余票命中 G102</span>
+    <span class="rec"><span class="t">07:40</span><span class="d"></span>设置开抢时间</span>
+    <button class="icon-btn" type="button" aria-label="查看全部记录"><svg width="17" height="17"><use href="#i-plus"/></svg></button>
+  </div>
+</div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = "ticket-console-theme";
+  var has = function () { try { return localStorage.getItem(KEY); } catch (e) { return null; } };
+  function set(t) {
+    root.setAttribute("data-theme", t);
+    document.querySelectorAll("[data-theme-set]").forEach(function (b) {
+      b.setAttribute("aria-pressed", String(b.dataset.themeSet === t));
+    });
+  }
+  var forced = new URLSearchParams(location.search).get("theme");
+  set(forced === "dark" || forced === "light" ? forced
+    : (has() || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")));
+  document.querySelectorAll("[data-theme-set]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      set(b.dataset.themeSet);
+      try { localStorage.setItem(KEY, b.dataset.themeSet); } catch (e) {}
+    });
+  });
+  var mq = window.matchMedia("(prefers-color-scheme: dark)");
+  var follow = function (e) { if (!has()) set(e.matches ? "dark" : "light"); };
+  mq.addEventListener ? mq.addEventListener("change", follow) : mq.addListener(follow);
+  document.querySelectorAll(".nav-item").forEach(function (item) {
+    item.addEventListener("click", function (e) {
+      e.preventDefault();
+      document.querySelectorAll(".nav-item[aria-current]").forEach(function (n) { n.removeAttribute("aria-current"); });
+      item.setAttribute("aria-current", "page");
+    });
+  });
+})();
+</script>
+</body>
+</html>
+
+
