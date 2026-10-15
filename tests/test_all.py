@@ -14351,6 +14351,12 @@ class TestTask127GuiPathsB7(TempDirCase):
     （tick 内不刷屏，故内联而非复用 warn 版）。
     """
 
+    def setUp(self):
+        super().setUp()
+        # Task 129：_state_file_from_config 改为 warn-once（_SANITIZE_WARNED
+        # 共享集合），三个 warn 断言测试需隔离（同 Task 109 的 _reset_warned）。
+        gui._SANITIZE_WARNED.clear()
+
     def _write_config(self, text):
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
@@ -14460,6 +14466,144 @@ class TestTask127GuiPathsB7(TempDirCase):
                                    "b": {"status": "paused"}}}):
             app.tick()
         self.assertIn("引擎：运行中（1 个任务）", self._label_texts(app))
+
+class TestTask129GuiPathsB8(TempDirCase):
+    """Task 129（B8-1）：gui 路径 bundle（P3×2，含 1 回归）。
+
+    2.1.1 gui.py _state_file_from_config（Task 127 新增）— 每次调用都
+    warn，而 load_state() 在 2 秒轮询热路径上（tick、TaskPage.refresh），
+    坏 state_file 配置下持久日志约 1 条/2 秒刷屏。REGRESSION。
+    修复：warn-once（与 Task 109 的 _SANITIZE_WARNED 同口径）。
+    2.2.3 gui.py tick / TaskPage.refresh / MiniWindow._collect — 三处内联
+    load_state().get("tasks", …) 绕过 _state_tasks_dict()，
+    {"tasks": [...]} → AttributeError 被吞 → 标签/任务列表/小窗静默冻结
+    （或置空）。修复：三处统一走 _state_tasks_dict(warn=False)——热路径
+    不刷屏（warn=True 字面复用会在坏形状持续存在时每 2 秒记一次，
+    与 2.1.1 同类问题）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        gui._SANITIZE_WARNED.clear()
+
+    def _patch_files(self, config_obj, state_obj):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump(config_obj, f)
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump(state_obj, f)
+        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+            p = mock.patch.object(gui, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    # ---------- 2.1.1：warn-once ----------
+
+    def test_state_file_warns_once(self):
+        # RED（旧代码）：两次 load_state → 2 条 warning（热路径刷屏）。
+        # 应：同类问题每进程只记一次。
+        self._patch_files({"state_file": 5}, {"tasks": {}})
+        with self.assertLogs(gui.LOG, level="WARNING") as cm:
+            gui.load_state()
+            gui.load_state()
+        pins = [r for r in cm.records if "state_file" in r.getMessage()]
+        self.assertEqual(len(pins), 1)
+
+    def test_state_file_rewarns_on_new_value(self):
+        # 口径 pin：坏值变化视为新问题，重新 warn（key 含 repr(坏值)）。
+        self._patch_files({"state_file": 5}, {"tasks": {}})
+        with self.assertLogs(gui.LOG, level="WARNING"):
+            gui._state_file_from_config({"state_file": 5})
+        with self.assertLogs(gui.LOG, level="WARNING") as cm:
+            gui._state_file_from_config({"state_file": ["x"]})
+        self.assertTrue(any("state_file" in r.getMessage()
+                            for r in cm.records))
+
+    def test_state_file_valid_string_no_warn(self):
+        # 正向对照：合法字符串不 warn（改前即绿）。
+        self._patch_files({"state_file": "custom.json"},
+                          {"tasks": {}})
+        with self.assertNoLogs(gui.LOG, level="WARNING"):
+            gui.load_state()
+
+    # ---------- 2.2.3：三处统一走 _state_tasks_dict ----------
+
+    def _app(self):
+        # Task 122 同技巧：tick 只碰这几个属性；__new__ 免 Tk 初始化。
+        app = gui.MonitorApp.__new__(gui.MonitorApp)
+        app.engine_thread = mock.Mock()
+        app.engine_thread.is_alive.return_value = True
+        app.engine_label = mock.Mock()
+        app.root = mock.Mock()
+        app._acct_time = time.time()
+        app.refresh_account = mock.Mock()
+        app.refresh_tasks = mock.Mock()
+        return app
+
+    def _label_texts(self, app):
+        return [c.kwargs.get("text") for c in
+                app.engine_label.config.call_args_list]
+
+    def test_tick_tasks_section_list_label_updates(self):
+        # RED（旧代码）：state.json 为 {"tasks": [...]} → list.get →
+        # AttributeError → 被 except Exception: pass 吞掉 → 标签冻结
+        # （engine_label.config 从不执行）。应按空状态处理并更新标签。
+        tasks = [{"name": "good", "from": "BJ", "to": "SH"}]
+        self._patch_files({"tasks": tasks}, {"tasks": ["junk"]})
+        app = self._app()
+        app.tick()
+        self.assertIn("引擎：运行中（0 个任务）", self._label_texts(app))
+
+    def test_collect_tasks_section_list_no_crash(self):
+        # RED（旧代码）：_collect 的 try 只包两行 load，{"tasks": [...]} →
+        # state.get(name) 直接 AttributeError 逃出 _collect（Tk 吞掉后
+        # 小窗任务区永久不再更新）。应静默按空处理返回 []。
+        tasks = [{"name": "good", "from": "BJ", "to": "SH"}]
+        self._patch_files({"tasks": tasks}, {"tasks": ["junk"]})
+        mw = gui.MiniWindow.__new__(gui.MiniWindow)
+        self.assertEqual(mw._collect(), [])
+
+    def test_refresh_tasks_section_list_renders(self):
+        # RED（旧代码）：{"tasks": [...]} → state.get 直接 AttributeError →
+        # except Exception: return → 任务列表静默停在旧数据。应渲染行。
+        tasks = [{"name": "good", "from": "BJ", "to": "SH"}]
+        self._patch_files({"tasks": tasks}, {"tasks": ["junk"]})
+        page = gui.TaskPage.__new__(gui.TaskPage)
+        page.app = mock.Mock()
+        page.app.engine_thread = mock.Mock()
+        page.app.engine_thread.is_alive.return_value = False
+        page.tree = mock.Mock()
+        page.tree.selection.return_value = []
+        page.tree.get_children.return_value = []
+        page.tree.yview.return_value = []
+        page.edit_btn = mock.Mock()
+        page._dates_text_cache = {}
+        page._task_by_iid = {}
+        page.refresh()
+        self.assertTrue(page.tree.insert.called)
+
+    def test_state_tasks_dict_warn_param(self):
+        # 口径 pin：warn=False 供热路径使用，坏形状不刷屏；默认 warn=True
+        # 保持 Task 101f 旧行为（改前无该参数，调用即 TypeError）。
+        self._patch_files({}, {"tasks": ["junk"]})
+        with self.assertNoLogs(gui.LOG, level="WARNING"):
+            self.assertEqual(gui._state_tasks_dict(warn=False), {})
+        with self.assertLogs(gui.LOG, level="WARNING"):
+            self.assertEqual(gui._state_tasks_dict(), {})
+
+    def test_clean_state_unchanged(self):
+        # 正向对照：干净输入行为不变（改前即绿）。
+        tasks = [{"name": "good", "from": "BJ", "to": "SH"}]
+        self._patch_files(
+            {"tasks": tasks},
+            {"tasks": {"good": {"status": "monitoring"}}})
+        app = self._app()
+        app.tick()
+        self.assertIn("引擎：运行中（1 个任务）", self._label_texts(app))
+        mw = gui.MiniWindow.__new__(gui.MiniWindow)
+        self.assertEqual([n for n, _s, _m in mw._collect()], ["good"])
+
 
 class TestTask128CtrlCB7(TempDirCase):
     """Task 128 (B7-5)：Ctrl+C bundle（P3×2）。

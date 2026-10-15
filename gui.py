@@ -237,11 +237,19 @@ def save_config(config):
 def _state_file_from_config(config):
     """Task 127（2.2.5，P3）：state_file 非字符串 → os.path.join TypeError；
     与 Task 119（1.4 history_file / launcher 2.2.9）同口径：warn + 默认。
-    三处调用方：load_state / save_state / update_state_locked。"""
+    三处调用方：load_state / save_state / update_state_locked。
+
+    Task 129（2.1.1，P3 回归）：本 helper 在 2 秒轮询热路径上
+    （load_state ← tick/TaskPage.refresh），每次调用都 warn 会刷屏
+    （坏配置下 ~30 条/分钟进持久日志）。与 Task 109 同口径：
+    同类问题每进程只记一次（_SANITIZE_WARNED）。"""
     state_file = config.get("state_file", "state.json")
     if not isinstance(state_file, str):
-        LOG.warning("state_file 非字符串，已用默认值 state.json：%r",
-                    state_file)
+        key = ("state_file", repr(state_file))
+        if key not in _SANITIZE_WARNED:
+            _SANITIZE_WARNED.add(key)
+            LOG.warning("state_file 非字符串，已用默认值 state.json：%r",
+                        state_file)
         state_file = "state.json"
     return os.path.join(HERE, state_file)
 
@@ -251,23 +259,33 @@ def load_state():
     return engine_mod.load_state_file(_state_file_from_config(config))
 
 
-def _state_tasks_dict():
+def _state_tasks_dict(*, warn=True):
     """读 state.json 的 tasks 节：顶层非 dict 或 tasks 节非 dict 时记警告并返回 {}。
 
     Task 101f：state.json 为 [] 等非对象形状时，旧代码 load_state().get("tasks")
-    直接抛 AttributeError，导致"启动监控"/"编辑任务"对话框打不开。"""
+    直接抛 AttributeError，导致"启动监控"/"编辑任务"对话框打不开。
+
+    Task 129（2.2.3，P3）：tick / TaskPage.refresh / MiniWindow._collect
+    三处内联写法绕过了本函数，{"tasks": [...]} → AttributeError 被吞 →
+    标签/任务列表/小窗静默冻结。三处现统一走本函数。
+    warn=False 供 2 秒轮询热路径使用（tick/refresh/_collect）：坏形状
+    持续存在时每 2 秒记一次 warning 会刷屏（与 2.1.1 同类问题），
+    热路径只静默按空处理。"""
     try:
         state = load_state()
     except Exception as e:
-        LOG.warning("state.json 读取失败（%s），已按空状态处理", e)
+        if warn:
+            LOG.warning("state.json 读取失败（%s），已按空状态处理", e)
         return {}
     if not isinstance(state, dict):
-        LOG.warning("state.json 顶层不是对象（%s），已按空状态处理",
-                    type(state).__name__)
+        if warn:
+            LOG.warning("state.json 顶层不是对象（%s），已按空状态处理",
+                        type(state).__name__)
         return {}
     tasks = state.get("tasks", {})
     if not isinstance(tasks, dict):
-        LOG.warning("state.json 的 tasks 节不是对象，已按空处理")
+        if warn:
+            LOG.warning("state.json 的 tasks 节不是对象，已按空处理")
         return {}
     return tasks
 
@@ -2837,7 +2855,12 @@ class TaskPage(ttk.Frame):
     def refresh(self):
         try:
             tasks = load_config().get("tasks") or []
-            state = load_state().get("tasks", {})
+            # Task 129（2.2.3，P3）：{"tasks": [...]} 时旧代码
+            # load_state().get("tasks", {}) 取到 list → state.get 直接
+            # AttributeError → except Exception: return → 任务列表静默
+            # 停在旧数据。统一走 _state_tasks_dict（Task 101f），
+            # warn=False：2 秒轮询热路径，不刷屏。
+            state = _state_tasks_dict(warn=False)
         except Exception:
             return
         engine_running = bool(self.app.engine_thread
@@ -3262,7 +3285,12 @@ class MiniWindow(tk.Toplevel):
         """活跃任务在后，已成功的任务置顶——抢到票是最终结果，不能从小窗里错过。"""
         try:
             tasks = load_config().get("tasks") or []
-            state = load_state().get("tasks") or {}
+            # Task 129（2.2.3，P3）：{"tasks": [...]} 时旧代码
+            # load_state().get("tasks") 取到 list → 下游 state.get(name)
+            # 直接 AttributeError（try 只包两行 load，逃出 _collect）→
+            # Tk 吞掉后小窗任务区永久不再更新。统一走 _state_tasks_dict
+            # （Task 101f），warn=False：定时回调热路径，不刷屏。
+            state = _state_tasks_dict(warn=False)
         except Exception:
             return []
         live, done = [], []
@@ -3626,12 +3654,13 @@ class MonitorApp:
                 tasks = load_config().get("tasks") or []
                 # Task 127（2.2.6，P3）：state.json 为 [] 等非 dict 形状时，
                 # 旧代码 load_state().get("tasks") 直接抛 AttributeError，被外层
-                # except Exception: pass 吞掉后标签冻结在旧数字。与
-                # _state_tasks_dict（Task 101f）同口径：非 dict 按空状态处理
-                # （tick 每 2 秒跑一次，不记 warning 防刷屏，故内联）。
-                raw_state = load_state()
-                state = raw_state.get("tasks", {}) \
-                    if isinstance(raw_state, dict) else {}
+                # except Exception: pass 吞掉后标签冻结在旧数字。
+                # Task 129（2.2.3，P3）：内联只处理了顶层非 dict，
+                # {"tasks": [...]} 仍漏网 → 同一冻结。现统一走
+                # _state_tasks_dict（Task 101f），warn=False：tick 每 2 秒跑一次，
+                # 坏形状持续存在时记 warning 会刷屏（与 2.1.1 同类），只静默
+                # 按空状态处理。
+                state = _state_tasks_dict(warn=False)
                 n = 0
                 for t in tasks:
                     # Task 122：不可哈希任务名 → warn+跳过（114/116/117 口径）。
