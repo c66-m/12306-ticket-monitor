@@ -15496,6 +15496,73 @@ class TestTask134OrderContainerShapes(TempDirCase):
         self.assertIn("k1", warned)               # 坏记录记 warn
 
 
+class TestTask136BrowserOrderCheckKiB9(TempDirCase):
+    """Task 136（B9-4）：Ctrl+C bundle（P3×1）。
+
+    2.2.3 browser_order.py main() 的 check 分支：直接
+    `python browser_order.py check` CLI 在最长 90s 锁等待 + 浏览器启动 +
+    20s 导航窗口按 Ctrl+C → KeyboardInterrupt 逃出 check_session →
+    traceback + 退出码 130，违背 Task 65c 干净退出码口径。
+    修复：check 分支加 except KeyboardInterrupt（打印 [中断] → 退出码 1，
+    与 Task 132 同口径）。timing 分支为纯文件读取快路径，不动。
+    """
+
+    def _run_main(self, argv):
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+             contextlib.redirect_stdout(buf):
+            try:
+                browser_order.main()
+            except SystemExit as e:
+                return e.code, buf.getvalue()
+            return "NO_EXIT", buf.getvalue()
+
+    def _no_kb_interrupt(self, fn):
+        # 旧代码下 Ctrl+C 会逃出 main()；直接让它逃出会杀掉整个 runner
+        # （exit=130），故在测试内捕获并转为普通 FAIL（Task 113 同口径）。
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C 抛出了 KeyboardInterrupt（应优雅退出，不抛 traceback）")
+
+    def test_check_ctrl_c_prints_interrupt_and_exits_1(self):
+        # RED on old code: check_session 的 Ctrl+C 穿透 main()，抛 traceback（exit 130）。
+        with mock.patch.object(browser_order, "check_session",
+                               side_effect=KeyboardInterrupt):
+            code, out = self._no_kb_interrupt(
+                lambda: self._run_main(["browser_order.py", "check"]))
+        self.assertEqual(code, 1)
+        self.assertIn("[中断]", out)
+
+    def test_check_success_exits_0(self):
+        # 正向对照：正常有效仍退出码 0，无 [中断]（新旧代码都通过）。
+        with mock.patch.object(browser_order, "check_session",
+                               return_value=(True, "user1")):
+            code, out = self._run_main(["browser_order.py", "check"])
+        self.assertEqual(code, 0)
+        self.assertIn("[有效]", out)
+        self.assertNotIn("[中断]", out)
+
+    def test_check_failure_exits_1(self):
+        # 正向对照：正常无效仍退出码 1，无 [中断]（新旧代码都通过）。
+        with mock.patch.object(browser_order, "check_session",
+                               return_value=(False, "user1")):
+            code, out = self._run_main(["browser_order.py", "check"])
+        self.assertEqual(code, 1)
+        self.assertIn("[无效]", out)
+        self.assertNotIn("[中断]", out)
+
+    def test_timing_branch_untouched(self):
+        # 范围对照：KI 守卫仅在 check 分支；timing 分支行为不变。
+        with mock.patch.object(browser_order, "show_timing_report",
+                               return_value=0) as m:
+            code, out = self._run_main(["browser_order.py", "timing"])
+        m.assert_called_once_with()
+        self.assertEqual(code, 0)
+        self.assertNotIn("[中断]", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -1786,7 +1786,11 @@ def main():
             sys.exit(1)
         sys.exit(0 if ok else 1)
     if cmd == "check":
-        ok, who = check_session(headless=True)  # 走 exclusive，不跟别的进程抢 profile
+        try:
+            ok, who = check_session(headless=True)  # 走 exclusive，不跟别的进程抢 profile
+        except KeyboardInterrupt:
+            print("[中断] 用户取消了会话检查。")
+            sys.exit(1)
         print(("[有效] %s" % who) if ok else ("[无效] %s" % who))
         sys.exit(0 if ok else 1)
     if cmd == "timing":
