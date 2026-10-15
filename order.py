@@ -929,8 +929,13 @@ def order_ticket(config, task, ticket, seat_name):
     date = ticket.get("query_date") or _dash_date(ticket["start_date"])
     purpose = task.get("purpose_code") or "ADULT"
     # 按人票种：勾选乘车人全是学生票时才用学生余票口径，否则按成人票请求
-    purpose_map = task.get("pax_purpose") or {}
-    wanted_names = list(task.get("passenger_names") or [])
+    pp_raw = task.get("pax_purpose")
+    purpose_map = pp_raw if isinstance(pp_raw, dict) else {}
+    pn_raw = task.get("passenger_names") or []
+    # Task 120（2.2.7）：裸字符串（如漏写方括号的 "张三"）→ 单元素列表，
+    # 绝不逐字符拆（旧代码拆成单字 → 点名零命中 → 回退为全体成人乘车人下单，
+    # wrong-scope）。
+    wanted_names = [pn_raw] if isinstance(pn_raw, str) else list(pn_raw)
     if purpose_map and wanted_names:
         codes = [purpose_map.get(n) or purpose for n in wanted_names]
         purpose = "0X00" if all(c == "0X00" for c in codes) else "ADULT"
@@ -959,7 +964,7 @@ def order_ticket(config, task, ticket, seat_name):
 
     try:
         passengers = get_passengers(sess)
-        wanted = list(task.get("passenger_names") or [])
+        wanted = [pn_raw] if isinstance(pn_raw, str) else list(pn_raw)
         if not wanted:
             # 未在任务里点名时，优先使用本地加密库中的"默认乘车人"
             try:

@@ -188,13 +188,36 @@ def update_state_locked(mutator):
 
     mutator(state) 就地修改读到的 dict；返回其返回值。
     路径解析沿用 gui.save_state 的口径（config 的 state_file，默认 state.json）。
+    Task 120（1.2）：state.json 损坏（非法 JSON/顶层非 dict）时拒绝写入——
+    旧代码经 load_state_file 吞掉损坏返回 {}，随后静默落盘清空全部
+    dedup/retry/状态（丢防重记录 → 重复下单风险）；顶层非 dict（如 []）时
+    mutator 的 state.get 直接 AttributeError 杀死 CLI（且 config 已删，
+    配置与状态不一致）。损坏时 warn + quarantine 留证（Task 40 口径），
+    返回 False；调用方不得再打印"成功"类提示。
+    瞬时占用（读被占用）时跳过本次、不挪档、不落盘（Task 40 瞬时占用口径）。
     """
     config = load_config()
     path = os.path.join(
         HERE, _config_file_name(config, "state_file", "state.json"))
     try:
         with filelock.file_lock(path + ".lock"):
-            state = engine_mod.load_state_file(path)
+            state, err, read_fp = appcommon.read_state_or_none(path)
+            if err is not None:
+                if isinstance(err, OSError):
+                    # Task 40 瞬时占用口径：另一进程正在写 state.json，
+                    # 读句柄撞车——本次跳过，不挪档、不重建、不落盘。
+                    print("  [警告] state.json 被占用，本次跳过（稍后重试）。")
+                    return False
+                # 内容损坏（非法 JSON / 顶层非 dict）：挪档留证后拒绝写入，
+                # 绝不静默覆写清空 dedup（Task 40 quarantine 口径）。
+                print("  [警告] state.json 已损坏（%s），已隔离留证，本次拒绝写入"
+                      "（请修复或删除它后再操作）。" % err)
+                bad = appcommon.quarantine_corrupt(path, read_fp)
+                if bad is not None:
+                    print("  坏档已挪为 %s。" % bad)
+                else:
+                    print("  [警告] 坏档挪移失败，本次不落盘以保留证据。")
+                return False
             result = mutator(state)
             appcommon.write_state(path, state, tmp_kind="monsave")
             return result
@@ -424,15 +447,24 @@ def menu_create_task():
             for part in sel.replace("，", ",").split(","):
                 part = part.strip()
                 if part.isdigit() and 1 <= int(part) <= len(local_passengers):
-                    passenger_names.append(local_passengers[int(part) - 1]["name"])
+                    # Task 120（2.2.8）：条目缺 name 键 → .get 取 None，
+                    # 由下方过滤器统一丢弃并警告，不抛 KeyError。
+                    passenger_names.append(
+                        local_passengers[int(part) - 1].get("name"))
         else:
             passenger_names = passengers_mod.default_names()
         # 防御历史脏数据：旧版本 Ctrl+C 可能把 name=None 的记录存盘，
         # join 会抛 TypeError；过滤掉并警告，让用户去主菜单 [4] 清理 (Task 28 round 5)
-        dropped = sum(1 for n in passenger_names if not n)
+        # Task 120（2.2.8）：真值非字符串（如手改的 ["张三"]）同样会让
+        # "、".join 抛 TypeError——一并过滤（default_names 契约不动，
+        # 在消费侧守卫）。
+        dropped = sum(1 for n in passenger_names
+                      if not isinstance(n, str) or not n)
         if dropped:
-            print("  [警告] 乘车人库中有 {0} 条姓名为空的记录，已跳过（建议到主菜单 [4] 清理）。".format(dropped))
-            passenger_names = [n for n in passenger_names if n]
+            print("  [警告] 乘车人库中有 {0} 条姓名为空或形状非法的记录，已跳过"
+                  "（建议到主菜单 [4] 清理）。".format(dropped))
+            passenger_names = [n for n in passenger_names
+                               if isinstance(n, str) and n]
         if not sel:
             print("  已选择默认乘车人：{0}".format("、".join(passenger_names) or "（无）"))
     else:
@@ -911,7 +943,9 @@ def menu_history():
         print("-" * 100)
         print("  {0}  {1}".format(r.get("time"), r.get("task", "")))
         raw_names = r.get("passengers") or []
-        names = [n for n in raw_names if n]
+        # Task 120（2.2.8）：真值非字符串姓名（如 ["张三"]）→ "、".join
+        # 抛 TypeError；与创建菜单同口径过滤。
+        names = [n for n in raw_names if isinstance(n, str) and n]
         dropped_names += len(raw_names) - len(names)
         print("  {0} {1}  {2}->{3}  席别:{4}  乘车人:{5}".format(
             r.get("date", ""), r.get("train", ""), r.get("from", ""), r.get("to", ""),
@@ -923,7 +957,7 @@ def menu_history():
         if r.get("notify"):
             print("  通知:{0}".format(r["notify"]))
     if dropped_names:
-        print("  [警告] 历史记录中有 {0} 条姓名为空的乘车人，已跳过显示。".format(dropped_names))
+        print("  [警告] 历史记录中有 {0} 条姓名为空或形状非法的乘车人，已跳过显示。".format(dropped_names))
     if dropped_records:
         print("  [警告] 历史记录中有 {0} 条格式损坏的记录，已跳过显示。".format(dropped_records))
     print("-" * 100)

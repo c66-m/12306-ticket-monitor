@@ -13130,6 +13130,312 @@ class TestTask119LauncherGuiShapesB6(TempDirCase):
                         "必须明确记 warning 指出 station_history 为裸字符串")
 
 
+class TestTask120MonitorOrderB6(TempDirCase):
+    """Task 120 (B6-3)：monitor/order 数据安全 bundle（P2×2 + P3×3）。
+
+    1.2 update_state_locked：state.json 不可读/顶层非 dict 时拒绝写入
+        （warn + quarantine 留证，Task 40 口径），不静默覆写清空 dedup。
+    1.1 seats_by_date 按日列表元素级 isinstance 过滤
+        （与 normalize_seat_types 同口径）。
+    2.2.4 dedup_key 乘车人名元素级过滤（非字符串条目）。
+    2.2.7 order 双入口：passenger_names 裸字符串→单元素 list；
+        pax_purpose 非 dict→{}。
+    2.2.8 monitor 乘车人消费点守卫（不改 default_names 契约）。
+    """
+
+    class _StopTest(BaseException):
+        pass
+
+    # ---------- 1.2：update_state_locked（P2）----------
+
+    @staticmethod
+    def _write_state_file(tmp, content):
+        sp = os.path.join(tmp, "state.json")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write(content)
+        return sp
+
+    def _patch_state_env(self, m):
+        p1 = mock.patch.object(m, "load_config",
+                               return_value={"state_file": "state.json"})
+        p2 = mock.patch.object(m, "HERE", self.tmp)
+        for p in (p1, p2):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _bad_files(tmp):
+        return [f for f in os.listdir(tmp)
+                if f.startswith("state.json.bad-")]
+
+    def test_1_2_unreadable_state_refuses_write_and_quarantines(self):
+        # RED：旧代码 load_state_file 吞掉损坏返回 {}，随后 write_state
+        # 静默落盘清空全部 dedup/retry/状态 → 无 .bad 留证文件。
+        import monitor as m
+        sp = self._write_state_file(
+            self.tmp, '{"tasks": {"t": {}}, "dedup": {"k": "v"}')  # 非法 JSON
+        self._patch_state_env(m)
+        with mock.patch("builtins.print"):
+            ret = m.update_state_locked(lambda s: s.update({"tasks": {}}))
+        self.assertFalse(ret)
+        self.assertEqual(len(self._bad_files(self.tmp)), 1)  # 旧代码：无留证
+        self.assertFalse(os.path.exists(sp))  # 已挪走，未被覆写
+
+    def test_1_2_nondict_state_refuses_write_no_crash(self):
+        # RED：旧代码 mutator 的 state.get("tasks") 在 [] 上抛
+        # AttributeError，CLI traceback（且 config 已删，不一致）。
+        import monitor as m
+        sp = self._write_state_file(self.tmp, '["x"]')
+        self._patch_state_env(m)
+
+        def _clear(state):
+            tasks = state.get("tasks")  # 删任务路径的真实 mutator 形状
+            if isinstance(tasks, dict):
+                tasks.pop("t", None)
+
+        with mock.patch("builtins.print"):
+            ret = m.update_state_locked(_clear)  # 旧代码抛 AttributeError
+        self.assertFalse(ret)
+        self.assertEqual(len(self._bad_files(self.tmp)), 1)
+        self.assertFalse(os.path.exists(sp))
+
+    def test_1_2_healthy_state_still_updates(self):
+        # 正向对照（改前即绿）：健康 state.json 走旧流程，mutator 返回值透传。
+        import monitor as m
+        sp = self._write_state_file(
+            self.tmp, '{"tasks": {"t": {"status": "x"}}, "dedup": {}}')
+        self._patch_state_env(m)
+
+        def _clear(state):
+            state.get("tasks", {}).pop("t", None)
+            return "done"
+
+        with mock.patch("builtins.print"):
+            ret = m.update_state_locked(_clear)
+        self.assertEqual(ret, "done")
+        with open(sp, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertNotIn("t", data["tasks"])
+        self.assertEqual(self._bad_files(self.tmp), [])
+
+    def test_1_2_occupied_state_skips_without_quarantine(self):
+        # Task 40 瞬时占用口径：读被占用 → 跳过本次，不挪档、不落盘。
+        import monitor as m
+        sp = self._write_state_file(self.tmp, '{"tasks": {}}')
+        self._patch_state_env(m)
+        with mock.patch.object(appcommon, "read_state_or_none",
+                               return_value=(None, PermissionError("占用"),
+                                             ("fp",))), \
+             mock.patch("builtins.print"):
+            ret = m.update_state_locked(lambda s: True)
+        self.assertFalse(ret)
+        self.assertTrue(os.path.exists(sp))  # 未被挪走
+        self.assertEqual(self._bad_files(self.tmp), [])
+        with open(sp, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"tasks": {}})
+
+    # ---------- 1.1：seats_by_date 元素级过滤（P2）----------
+
+    def test_1_1_seats_by_date_elements_filtered(self):
+        # RED：旧代码无 _normalize_seats_by_date（AttributeError）。
+        task = {"name": "t",
+                "seats_by_date": {"2026-10-20": [["硬座"], "软卧", 123, None],
+                                  "2026-10-21": "硬座"}}
+        self.assertEqual(engine_mod._normalize_seats_by_date(task),
+                         {"2026-10-20": ["软卧"], "2026-10-21": "硬座"})
+
+    def test_1_1_unhashable_element_crash_site(self):
+        # bug 本体记录：未过滤的不可哈希元素在 ticket.seat_candidates_for
+        # 的 order.get(x, 99) 抛 TypeError（单任务无限 loud backoff）。
+        with self.assertRaises(TypeError):
+            ticket.seat_candidates_for("G1", [["硬座"]], {}, {"硬座": "有"})
+
+    def test_1_1_normal_passthrough(self):
+        # 正向对照：正常按日列表逐字不变；缺字段原样透传（调用方 or {}）。
+        task = {"name": "t",
+                "seats_by_date": {"2026-10-20": ["硬座", "软卧"]}}
+        self.assertEqual(engine_mod._normalize_seats_by_date(task),
+                         {"2026-10-20": ["硬座", "软卧"]})
+        self.assertIsNone(engine_mod._normalize_seats_by_date({"name": "t"}))
+
+    # ---------- 2.2.4：dedup_key（P2）----------
+
+    def test_2_2_4_dedup_key_filters_non_string_names(self):
+        # RED：旧代码 "|".join(sorted([["张三"], "李四"])) → TypeError，
+        # 有票命中时单任务无限 loud backoff。
+        task = {"from": "北京", "to": "上海"}
+        key = engine_mod.dedup_key(task, "2026-10-20", "G1", "二等座",
+                                   [["张三"], "李四", None, 123])
+        self.assertEqual(key, "北京|上海|2026-10-20|G1|二等座|李四")
+
+    def test_2_2_4_dedup_key_normal_unchanged(self):
+        # 正向对照（改前即绿）：正常名排序拼接；空 → "*"。
+        task = {"from": "北京", "to": "上海"}
+        self.assertEqual(
+            engine_mod.dedup_key(task, "2026-10-20", "G1", "二等座",
+                                 ["张三", "李四"]),
+            "北京|上海|2026-10-20|G1|二等座|张三|李四")
+        self.assertEqual(
+            engine_mod.dedup_key(task, "2026-10-20", "G1", "二等座", []),
+            "北京|上海|2026-10-20|G1|二等座|*")
+
+    # ---------- 2.2.7：order 双入口（P3）----------
+
+    def test_2_2_7_browser_entry_bare_string_single_element(self):
+        # RED：旧代码 list("张三") → ['张', '三']（逐字拆）。
+        captured = {}
+
+        def fake_via_browser(ticket_, seat_name_, seat_code_, names_, date_,
+                             **kw):
+            captured["names"] = list(names_)
+            return False, "mock", None
+
+        with mock.patch.object(browser_order, "order_via_browser",
+                               side_effect=fake_via_browser):
+            browser_order.order_ticket_via_browser(
+                {}, {"passenger_names": "张三"},
+                {"train_code": "G1", "query_date": "2026-10-20"}, "二等座")
+        self.assertEqual(captured["names"], ["张三"])  # 旧代码：['张', '三']
+
+    def test_2_2_7_browser_entry_pax_purpose_nondict(self):
+        # RED：旧代码 dict("xx") → ValueError。
+        captured = {}
+
+        def fake_via_browser(ticket_, seat_name_, seat_code_, names_, date_,
+                             **kw):
+            captured["purpose_map"] = kw.get("purpose_map")
+            return False, "mock", None
+
+        with mock.patch.object(browser_order, "order_via_browser",
+                               side_effect=fake_via_browser):
+            browser_order.order_ticket_via_browser(
+                {}, {"passenger_names": ["张三"], "pax_purpose": "xx"},
+                {"train_code": "G1", "query_date": "2026-10-20"},
+                "二等座")  # 旧代码 ValueError
+        self.assertEqual(captured["purpose_map"], {})
+
+    def _http_mocks(self, fake_pax):
+        def spy(all_p, wanted):
+            raise self._StopTest(list(wanted))
+
+        return (mock.patch.object(order_mod, "load_session"),
+                mock.patch.object(order_mod, "check_login",
+                                  return_value=(True, "ok")),
+                mock.patch.object(order_mod, "submit_with_busy_retry",
+                                  return_value=(True, "")),
+                mock.patch.object(order_mod, "get_init_dc",
+                                  return_value=("t", "l", "k", None)),
+                mock.patch.object(order_mod, "get_passengers",
+                                  return_value=fake_pax),
+                mock.patch.object(order_mod, "select_passengers",
+                                  side_effect=spy))
+
+    def test_2_2_7_http_entry_bare_string_not_split(self):
+        # RED：旧代码 wanted=['张','三'] → 点名零命中 → 回退全体成人乘车人
+        # 下单（wrong-scope）。
+        fake_pax = [{"name": "张三", "is_adult": True, "id_no": "1"},
+                    {"name": "李四", "is_adult": True, "id_no": "2"}]
+        mocks = self._http_mocks(fake_pax)
+        for p in mocks:
+            p.start()
+            self.addCleanup(p.stop)
+        with self.assertRaises(self._StopTest) as cm:
+            order_mod.order_ticket(
+                {}, {"passenger_names": "张三"},
+                {"train_code": "G1", "query_date": "2026-10-20"}, "二等座")
+        self.assertEqual(cm.exception.args[0], ["张三"])  # 旧代码：['张', '三']
+
+    def test_2_2_7_http_entry_pax_purpose_nondict(self):
+        # RED：旧代码 purpose_map="xx" → .get 抛 AttributeError。
+        fake_pax = [{"name": "张三", "is_adult": True, "id_no": "1"}]
+        mocks = self._http_mocks(fake_pax)
+        for p in mocks:
+            p.start()
+            self.addCleanup(p.stop)
+        with self.assertRaises(self._StopTest):  # 旧代码 AttributeError
+            order_mod.order_ticket(
+                {}, {"passenger_names": ["张三"], "pax_purpose": "xx"},
+                {"train_code": "G1", "query_date": "2026-10-20"}, "二等座")
+
+    # ---------- 2.2.8：monitor 乘车人消费点（P3）----------
+
+    def _drive_create_task(self, m, read_vals, load_pax, default_names=None):
+        """驱动 menu_create_task 走到任务落盘；返回创建的 task dict。"""
+        captured = {}
+
+        def fake_ucl(mut):
+            cfg = {"tasks": []}
+            mut(cfg)
+            captured["cfg"] = cfg
+            return True
+
+        patches = [
+            mock.patch.object(ticket, "load_station_map",
+                              return_value=({"北京": "BJP", "上海": "SHH"},
+                                            {"BJP": "北京", "SHH": "上海"})),
+            mock.patch.object(m, "pick_station",
+                              side_effect=["北京", "上海"]),
+            mock.patch.object(m, "input_dates",
+                              return_value=(["2026-10-20"], [])),
+            mock.patch.object(ticket, "query_tickets",
+                              side_effect=Exception("offline")),
+            mock.patch.object(m, "pick_multi", return_value=["硬座"]),
+            mock.patch.object(m.passengers_mod, "load_passengers",
+                              return_value=load_pax),
+            mock.patch.object(m, "read", side_effect=read_vals),
+            mock.patch.object(m, "ask_priority", return_value=5),
+            mock.patch.object(m, "ask_yes_no", return_value=False),
+            mock.patch.object(m, "update_config_locked",
+                              side_effect=fake_ucl),
+            mock.patch("builtins.print"),
+        ]
+        if default_names is not None:
+            patches.append(mock.patch.object(
+                m.passengers_mod, "default_names",
+                return_value=default_names))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        m.menu_create_task()  # 旧代码在脏乘车人名处抛异常（红）
+        return captured["cfg"]["tasks"][0]
+
+    def test_2_2_8_default_names_nonstr_filtered(self):
+        # RED：default_names 返回真值非字符串（如 ["张三"]）→
+        # "、".join 抛 TypeError，菜单 traceback。
+        import monitor as m
+        task = self._drive_create_task(
+            m, read_vals=["", "", ""],  # 车次回车 / 乘车人回车=默认 / 任务名回车
+            load_pax=[{"name": "x"}],
+            default_names=[["张三"], "李四"])
+        self.assertEqual(task["passenger_names"], ["李四"])
+
+    def test_2_2_8_missing_name_key_no_crash(self):
+        # RED：选中缺 name 键的条目 → ["name"] 抛 KeyError。
+        import monitor as m
+        task = self._drive_create_task(
+            m, read_vals=["", "1", ""],  # 车次回车 / 选第 1 位 / 任务名回车
+            load_pax=[{"id_type_code": "1"}, {"name": "李四"}])
+        self.assertEqual(task["passenger_names"], [])
+
+    def test_2_2_8_history_dirty_names_no_crash(self):
+        # RED：历史记录 passengers 含真值非字符串 → "、".join 抛 TypeError。
+        import monitor as m
+        hist = [{"time": "t", "task": "t", "date": "2026-10-20",
+                 "train": "G1", "from": "北京", "to": "上海",
+                 "seat": "二等座", "passengers": [["张三"], "李四", None],
+                 "result": "success", "message": "ok"}]
+        hp = os.path.join(self.tmp, "order_history.json")
+        with open(hp, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False)
+        with mock.patch.object(m, "load_config", return_value={}), \
+             mock.patch.object(m, "HERE", self.tmp), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_history()  # 旧代码 TypeError
+        printed = " ".join(str(c.args[0]) for c in mprint.call_args_list)
+        self.assertIn("李四", printed)
+        self.assertIn("警告", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

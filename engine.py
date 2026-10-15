@@ -255,6 +255,22 @@ def normalize_seat_types(task):
     return [s for s in raw if isinstance(s, str)]
 
 
+def _normalize_seats_by_date(task):
+    """seats_by_date 按日列表的元素级归一化（Task 120 1.1）。
+
+    与 normalize_seat_types 同口径：非字符串元素直接跳过（不记警告）。
+    手改配置如 {"2026-10-20": [["硬座"]]} 会让 ticket.seat_candidates_for
+    的 order.get(x, 99) 抛 TypeError（unhashable），单任务无限 loud backoff。
+    非 dict 输入原样返回（形状守卫由调用方负责）。
+    """
+    sbd = task.get("seats_by_date")
+    if not isinstance(sbd, dict):
+        return sbd
+    return {d: ([s for s in v if isinstance(s, str)] if isinstance(v, list)
+                else v)
+            for d, v in sbd.items()}
+
+
 def expand_dates(task):
     """把 dates + date_range 展开成日期列表（去重保序）。"""
     result = []
@@ -338,8 +354,13 @@ def future_dates(task, today=None):
 
 
 def dedup_key(task, date, train_code, seat_name, passenger_names):
-    """防重复唯一键：区间|日期|车次|席别|乘车人组合（排序后拼接）。"""
-    names = "|".join(sorted(passenger_names)) if passenger_names else "*"
+    """防重复唯一键：区间|日期|车次|席别|乘车人组合（排序后拼接）。
+
+    Task 120（2.2.4）：乘车人名非字符串条目（如手改配置）→ sorted/join
+    TypeError，有票命中时单任务无限 loud backoff；元素级过滤掉。
+    """
+    strs = [n for n in (passenger_names or []) if isinstance(n, str)]
+    names = "|".join(sorted(strs)) if strs else "*"
     return "{0}|{1}|{2}|{3}|{4}|{5}".format(
         task["from"], task["to"], date, train_code, seat_name, names)
 
@@ -984,7 +1005,7 @@ class MonitorEngine(object):
 
         trains = normalize_trains(task)
         seats_want_all = normalize_seat_types(task)
-        seats_by_date = task.get("seats_by_date") or {}
+        seats_by_date = _normalize_seats_by_date(task) or {}
         if not isinstance(seats_by_date, dict):
             # Task 108：真值非 dict（裸字符串）→ 下方 seats_by_date[date]
             # 直接 TypeError（字符串索引）或 .get 直接 AttributeError；旧代码

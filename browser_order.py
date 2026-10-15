@@ -1663,9 +1663,14 @@ def order_ticket_via_browser(config, task, ticket, seat_name):
         # start_date(p13) 是无横线的始发日期，跨夜车与乘车日可能差一天——
         # 宁可拒绝下单也不能静默订错日期
         return False, "查询结果缺少乘车日期（query_date），拒绝下单以防订错日期", None
-    names = list(task.get("passenger_names") or [])
+    pn_raw = task.get("passenger_names") or []
+    # Task 120（2.2.7）：裸字符串（如漏写方括号的 "张三"）→ 单元素列表，
+    # 绝不逐字符拆（旧代码拆成单字 → 点名零命中 → 回退为全体成人乘车人下单，
+    # wrong-scope）。
+    names = [pn_raw] if isinstance(pn_raw, str) else list(pn_raw)
     # 按人票种：任务里存了 {姓名: 票种代码} 就逐人下发，覆盖到的走本人票种
-    purpose_map = dict(task.get("pax_purpose") or {})
+    pp_raw = task.get("pax_purpose")
+    purpose_map = dict(pp_raw) if isinstance(pp_raw, dict) else {}
     purpose = task.get("purpose_code") or "ADULT"
     if purpose_map and names:
         _codes = [purpose_map.get(n) or purpose for n in names]
