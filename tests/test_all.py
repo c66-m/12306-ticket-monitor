@@ -14045,6 +14045,8 @@ class TestTask124PiiConvergeB7(TempDirCase):
         ('gui.py', 'LOG.warning("[配置] 启动对话框：任务名不可哈希已跳过" "（任务名：%r，条目类型：%s）", t.get("name"), type(t).__name__)'),
         ('engine.py', 'LOG.warning("[配置] 任务「%s」的 date_range 非法，已跳过：%r", task.get("name"), dr)'),
         ('gui.py', 'LOG.warning("history_file 非字符串，已用默认值 order_history.json：%r", hist_file)'),
+        # Task 127（2.2.5）：state_file 同口径守卫——值是配置路径，非 PII。
+        ('gui.py', 'LOG.warning("state_file 非字符串，已用默认值 state.json：%r", state_file)'),
         ('launcher.py', 'warn("[提醒] seat_types 形状非法，已忽略：%r" % (raw,))'),
         ('launcher.py', 'warn("[提醒] passenger_names 形状非法，已忽略：%r" % (raw,))'),
         ('launcher.py', 'warn("[提醒] station_history 形状非法，已忽略：%r" % (raw,))'),
@@ -14334,6 +14336,130 @@ class TestTask126MonitorDisplayGuards(TempDirCase):
         self.assertIn("张三、李四", out)
         self.assertNotIn("警告", out)
 
+
+
+
+class TestTask127GuiPathsB7(TempDirCase):
+    """Task 127（B7-4）：gui/launcher 路径 bundle（P3×2）。
+
+    2.2.5 gui.py:240/:267/:337 — state_file 非字符串 → os.path.join
+    TypeError（Task 119 只修了 launcher 侧）。三处加 isinstance 守卫，
+    与 Task 119 同口径：warn + 默认 state.json。
+    2.2.6 gui.py tick — state.json 为 [] 时 load_state().get("tasks")
+    AttributeError → 被 except Exception: pass 吞掉 → 引擎标签冻结。
+    与 Task 101f 的 _state_tasks_dict 对齐：非 dict 按空状态处理
+    （tick 内不刷屏，故内联而非复用 warn 版）。
+    """
+
+    def _write_config(self, text):
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(text)
+        return cfg
+
+    # ---------- 2.2.5：state_file isinstance 守卫 ----------
+
+    def test_load_state_nonstring_state_file_uses_default(self):
+        # RED（旧代码）：os.path.join(HERE, 5) → TypeError。
+        # 应 warn + 用默认 state.json。
+        cfg = self._write_config(json.dumps({"state_file": 5}))
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": {"t1": {}}}, f)
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp), \
+             self.assertLogs(gui.LOG, level="WARNING") as cm:
+            state = gui.load_state()
+        self.assertEqual(state, {"tasks": {"t1": {}}})
+        self.assertTrue(any("state_file" in r.getMessage()
+                            for r in cm.records))
+
+    def test_save_state_nonstring_state_file_uses_default(self):
+        # RED（旧代码）：os.path.join(HERE, 5) → TypeError。
+        cfg = self._write_config(json.dumps({"state_file": 5}))
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp), \
+             self.assertLogs(gui.LOG, level="WARNING") as cm:
+            gui.save_state({"tasks": {}})
+        st = os.path.join(self.tmp, "state.json")
+        self.assertTrue(os.path.exists(st))
+        with open(st, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"tasks": {}})
+        self.assertTrue(any("state_file" in r.getMessage()
+                            for r in cm.records))
+
+    def test_update_state_locked_nonstring_state_file_no_zombie(self):
+        # RED（旧代码）：os.path.join(HERE, 5) → TypeError 逃出 Tk 回调；
+        # delete 路径 update_config_locked 先删 config、update_state_locked
+        # 再崩 → state 僵尸条目。应 warn + 用默认路径继续，mutator 生效。
+        cfg = self._write_config(json.dumps({"state_file": 5}))
+        st = os.path.join(self.tmp, "state.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": {"t1": {"status": "monitoring"}}}, f)
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp), \
+             self.assertLogs(gui.LOG, level="WARNING") as cm:
+            ret = gui.update_state_locked(
+                lambda s: s["tasks"].pop("t1", None))
+        self.assertTrue(ret)
+        with open(st, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"tasks": {}})
+        self.assertTrue(any("state_file" in r.getMessage()
+                            for r in cm.records))
+
+    def test_state_file_valid_string_passthrough(self):
+        # 正向对照：合法字符串原样使用（改前即绿）。
+        cfg = self._write_config(json.dumps({"state_file": "custom.json"}))
+        st = os.path.join(self.tmp, "custom.json")
+        with open(st, "w", encoding="utf-8") as f:
+            json.dump({"tasks": {"t9": {}}}, f)
+        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
+             mock.patch.object(gui, "HERE", self.tmp):
+            state = gui.load_state()
+        self.assertEqual(state, {"tasks": {"t9": {}}})
+
+    # ---------- 2.2.6：tick 的 [] state ----------
+
+    def _app(self):
+        # Task 122 同技巧：tick 只碰这几个属性；__new__ 免 Tk 初始化。
+        app = gui.MonitorApp.__new__(gui.MonitorApp)
+        app.engine_thread = mock.Mock()
+        app.engine_thread.is_alive.return_value = True
+        app.engine_label = mock.Mock()
+        app.root = mock.Mock()
+        app._acct_time = time.time()
+        app.refresh_account = mock.Mock()
+        app.refresh_tasks = mock.Mock()
+        return app
+
+    def _label_texts(self, app):
+        return [c.kwargs.get("text") for c in
+                app.engine_label.config.call_args_list]
+
+    def test_tick_list_state_label_updates(self):
+        # RED（旧代码）：load_state() 返回 [] → [].get("tasks") →
+        # AttributeError → 被 except Exception: pass 吞掉 → 标签冻结
+        # 在旧数字。应按空状态处理，标签更新为 0 个任务。
+        tasks = [{"name": "a", "from": "BJ", "to": "SH"}]
+        app = self._app()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state", return_value=[]):
+            app.tick()
+        self.assertIn("引擎：运行中（0 个任务）", self._label_texts(app))
+
+    def test_tick_dict_state_unchanged(self):
+        # 正向对照：dict state 时原行为不变（改前即绿）。
+        tasks = [{"name": "a"}, {"name": "b"}]
+        app = self._app()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks": {
+                                   "a": {"status": "monitoring"},
+                                   "b": {"status": "paused"}}}):
+            app.tick()
+        self.assertIn("引擎：运行中（1 个任务）", self._label_texts(app))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

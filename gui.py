@@ -234,10 +234,21 @@ def save_config(config):
         _lock_timeout_abort()
 
 
+def _state_file_from_config(config):
+    """Task 127（2.2.5，P3）：state_file 非字符串 → os.path.join TypeError；
+    与 Task 119（1.4 history_file / launcher 2.2.9）同口径：warn + 默认。
+    三处调用方：load_state / save_state / update_state_locked。"""
+    state_file = config.get("state_file", "state.json")
+    if not isinstance(state_file, str):
+        LOG.warning("state_file 非字符串，已用默认值 state.json：%r",
+                    state_file)
+        state_file = "state.json"
+    return os.path.join(HERE, state_file)
+
+
 def load_state():
     config = load_config()
-    return engine_mod.load_state_file(
-        os.path.join(HERE, config.get("state_file", "state.json")))
+    return engine_mod.load_state_file(_state_file_from_config(config))
 
 
 def _state_tasks_dict():
@@ -264,7 +275,7 @@ def _state_tasks_dict():
 def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
     config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    path = _state_file_from_config(config)
     # 跨进程锁：与 launcher.append_monitor_task 的 state 段互斥（state.json.lock）
     try:
         with filelock.file_lock(path + ".lock"):
@@ -334,7 +345,7 @@ def update_state_locked(mutator):
     拒绝写入（返回 False），绝不静默覆写；瞬时占用时跳过本次（不挪档不落盘）。
     """
     config = load_config()
-    path = os.path.join(HERE, config.get("state_file", "state.json"))
+    path = _state_file_from_config(config)
     try:
         with filelock.file_lock(path + ".lock"):
             state, err, read_fp = appcommon.read_state_or_none(path)
@@ -3613,7 +3624,14 @@ class MonitorApp:
         elif self.engine_thread and self.engine_thread.is_alive():
             try:
                 tasks = load_config().get("tasks") or []
-                state = load_state().get("tasks", {})
+                # Task 127（2.2.6，P3）：state.json 为 [] 等非 dict 形状时，
+                # 旧代码 load_state().get("tasks") 直接抛 AttributeError，被外层
+                # except Exception: pass 吞掉后标签冻结在旧数字。与
+                # _state_tasks_dict（Task 101f）同口径：非 dict 按空状态处理
+                # （tick 每 2 秒跑一次，不记 warning 防刷屏，故内联）。
+                raw_state = load_state()
+                state = raw_state.get("tasks", {}) \
+                    if isinstance(raw_state, dict) else {}
                 n = 0
                 for t in tasks:
                     # Task 122：不可哈希任务名 → warn+跳过（114/116/117 口径）。
