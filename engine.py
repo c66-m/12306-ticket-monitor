@@ -1587,58 +1587,69 @@ class MonitorEngine(object):
         """主循环。stop_event: threading.Event，置位后本轮结束即优雅退出（GUI 内嵌用）。"""
         LOG.info("=" * 64)
         LOG.info("监控引擎启动")
-        # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核
+        # Task 139（2.2.4）：启动期（订单恢复逐条复核 + 会话体检）在主循环的
+        # except KeyboardInterrupt 保护之外——Ctrl+C 会穿透两层 except Exception
+        # （KeyboardInterrupt 是 BaseException）直逃 run() → traceback + exit 130。
+        # Task 132 同口径：启动期整体包 except KeyboardInterrupt，打印 [中断]
+        # 后优雅退出。数据路径不动：已复核的干净记录照常 upsert_order，脏记录
+        # 照常跳过（Task 134 契约）；主循环的既有 KI 处理（:1682）原样保留。
         try:
-            op = os.path.join(HERE, "orders.json")
-            odb = appcommon.load_orders(op)
-            for okey, rec in (odb.get("orders") or {}).items():
-                if rec.get("classify") != "unpaid":
-                    continue
-                # Task 134（2.2.4）：逐条保护——单条脏记录（如手改 orders.json
-                # 把 passengers 写成非可迭代）抛错时记 warning 后跳过该条，
-                # 整批继续（与 _cancelled_dedup_keys 的口径一致：绝不因一条
-                # 坏记录中止整体恢复）。外层 except 仅作最后兜底。
-                try:
-                    LOG.info("[订单恢复] 待支付订单 %s %s %s(订单号 %s)——重新核验官方状态",
-                             rec.get("train"), rec.get("date"), rec.get("seat"),
-                             _mask_order_no(rec.get("order_no") or ""))
-                    cls, ono, raw = order_mod.classify_order_status(
-                        rec.get("date"), rec.get("train"), rec.get("passengers"))
-                    rec.update({"classify": cls, "official_status": raw,
-                                "order_no": ono or rec.get("order_no"),
-                                "decision": "启动复核:%s" % cls})
-                    appcommon.upsert_order(op, okey, rec)
-                    LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
-                    if cls == "cancelled":
-                        # Task 72：精确键匹配清本地防重（旧子串匹配会误清 "G101"）；
-                        # rec 缺 date/train 时记 warning 跳过该条，不中止整体恢复。
-                        if not rec.get("date") or not rec.get("train"):
-                            LOG.warning("[订单恢复] %s 缺少 date/train，跳过本地防重清理",
-                                        okey)
-                        else:
-                            for dk in self._cancelled_dedup_keys(
-                                    rec, self.state.get("dedup", {})):
-                                self.state["dedup"].pop(dk, None)
-                            self._save_state()
-                            LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
-                except Exception as e:
-                    LOG.warning("[订单恢复] %s 复核失败，已跳过（不影响其余订单）: %s",
-                                okey, e)
-        except Exception as e:
-            LOG.warning("[订单恢复] 未完成订单上下文恢复失败(不影响监控): %s", e)
-        active_tasks = [t for t in self.tasks
-                        if self.task_status(t) in ACTIVE_STATUSES]
-        for t in self.tasks:
-            LOG.info("[运行] 任务「%s」%s %s", t["name"],
-                     STATUS_LABELS.get(self.task_status(t), self.task_status(t)),
-                     "启用（优先级 %s，间隔约 %.0fs）" % (t.get("priority", 5), self.task_interval(t))
-                     if t in active_tasks else "")
-        if not active_tasks:
-            LOG.warning("没有处于「监控中/等待重试」状态的任务，引擎将空转（请在界面选择要启动的任务）")
-        LOG.info("基准间隔 %ss / 最小间隔 %ss / 日志目录 %s",
-                 self.base_interval, self.min_interval, self.config.get("log_dir", "logs"))
-        LOG.info("按 Ctrl+C 停止监控")
-        self.check_session_if_needed()
+            # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核
+            try:
+                op = os.path.join(HERE, "orders.json")
+                odb = appcommon.load_orders(op)
+                for okey, rec in (odb.get("orders") or {}).items():
+                    if rec.get("classify") != "unpaid":
+                        continue
+                    # Task 134（2.2.4）：逐条保护——单条脏记录（如手改 orders.json
+                    # 把 passengers 写成非可迭代）抛错时记 warning 后跳过该条，
+                    # 整批继续（与 _cancelled_dedup_keys 的口径一致：绝不因一条
+                    # 坏记录中止整体恢复）。外层 except 仅作最后兜底。
+                    try:
+                        LOG.info("[订单恢复] 待支付订单 %s %s %s(订单号 %s)——重新核验官方状态",
+                                 rec.get("train"), rec.get("date"), rec.get("seat"),
+                                 _mask_order_no(rec.get("order_no") or ""))
+                        cls, ono, raw = order_mod.classify_order_status(
+                            rec.get("date"), rec.get("train"), rec.get("passengers"))
+                        rec.update({"classify": cls, "official_status": raw,
+                                    "order_no": ono or rec.get("order_no"),
+                                    "decision": "启动复核:%s" % cls})
+                        appcommon.upsert_order(op, okey, rec)
+                        LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
+                        if cls == "cancelled":
+                            # Task 72：精确键匹配清本地防重（旧子串匹配会误清 "G101"）；
+                            # rec 缺 date/train 时记 warning 跳过该条，不中止整体恢复。
+                            if not rec.get("date") or not rec.get("train"):
+                                LOG.warning("[订单恢复] %s 缺少 date/train，跳过本地防重清理",
+                                            okey)
+                            else:
+                                for dk in self._cancelled_dedup_keys(
+                                        rec, self.state.get("dedup", {})):
+                                    self.state["dedup"].pop(dk, None)
+                                self._save_state()
+                                LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
+                    except Exception as e:
+                        LOG.warning("[订单恢复] %s 复核失败，已跳过（不影响其余订单）: %s",
+                                    okey, e)
+            except Exception as e:
+                LOG.warning("[订单恢复] 未完成订单上下文恢复失败(不影响监控): %s", e)
+            active_tasks = [t for t in self.tasks
+                            if self.task_status(t) in ACTIVE_STATUSES]
+            for t in self.tasks:
+                LOG.info("[运行] 任务「%s」%s %s", t["name"],
+                         STATUS_LABELS.get(self.task_status(t), self.task_status(t)),
+                         "启用（优先级 %s，间隔约 %.0fs）" % (t.get("priority", 5), self.task_interval(t))
+                         if t in active_tasks else "")
+            if not active_tasks:
+                LOG.warning("没有处于「监控中/等待重试」状态的任务，引擎将空转（请在界面选择要启动的任务）")
+            LOG.info("基准间隔 %ss / 最小间隔 %ss / 日志目录 %s",
+                     self.base_interval, self.min_interval, self.config.get("log_dir", "logs"))
+            LOG.info("按 Ctrl+C 停止监控")
+            self.check_session_if_needed()
+        except KeyboardInterrupt:
+            print("[中断] 用户取消了监控启动。")
+            LOG.info("监控已停止。状态已保存到 %s", self.state_path)
+            return
 
         next_due = {}
         for i, t in enumerate(self.tasks):

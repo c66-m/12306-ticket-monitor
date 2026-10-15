@@ -15922,6 +15922,113 @@ class TestTask138StatusShapesB10(TempDirCase):
         lbl.configure.assert_called()
 
 
+class TestTask139EngineStartupKiB10(TempDirCase):
+    """Task 139（B10-3）：engine.py run() 启动期（订单恢复逐条复核 +
+    check_session_if_needed 会话体检）在 except KeyboardInterrupt 保护之外 →
+    启动期 Ctrl+C 穿透两层 except Exception 逃出 run() → traceback + exit 130，
+    违背 Task 65c/132/136 的干净退出口径。修复：启动期包
+    except KeyboardInterrupt（打印 [中断] 后优雅退出，Task 132 同口径；
+    数据路径不动——干净记录照常 upsert，脏记录照常跳过）。"""
+
+    def _no_kb_interrupt(self, fn):
+        # Task 113/136 同口径：旧代码下 KI 会逃出 run() 并杀掉整个 runner，
+        # 故在测试内捕获并转为普通 FAIL。
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C 抛出了 KeyboardInterrupt（应打印[中断]后优雅退出）")
+
+    def _run_engine(self, e, stop):
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._no_kb_interrupt(lambda: e.run(stop_event=stop))
+        return buf.getvalue()
+
+    def _unpaid_odb(self, k1_pax):
+        return {"orders": {
+            "k1": {"order_no": "E1", "train": "G1", "date": "2026-10-10",
+                   "seat": "硬座", "passengers": k1_pax, "classify": "unpaid"},
+        }}
+
+    def test_startup_recovery_ctrl_c_interrupts_cleanly(self):
+        # RED（旧代码）：KI 从 classify_order_status 逃出 run()。
+        stop = threading.Event()
+        stop.set()
+        e = make_engine(self.tmp)
+        e.check_session_if_needed = lambda: None
+        with mock.patch.object(engine_mod, "LOG") as m_log, \
+                mock.patch.object(engine_mod.appcommon, "load_orders",
+                                  return_value=self._unpaid_odb(["张三"])), \
+                mock.patch.object(engine_mod.order_mod,
+                                  "classify_order_status",
+                                  side_effect=KeyboardInterrupt), \
+                mock.patch.object(engine_mod.appcommon,
+                                  "upsert_order") as m_upsert:
+            out = self._run_engine(e, stop)
+        self.assertIn("[中断]", out)
+        self.assertEqual(m_upsert.call_count, 0)  # KI 中断：无写回
+        m_log.info.assert_any_call("监控已停止。状态已保存到 %s", e.state_path)
+
+    def test_session_check_ctrl_c_interrupts_cleanly(self):
+        # RED（旧代码）：KI 从 check_session_if_needed 逃出 run()。
+        stop = threading.Event()
+        stop.set()
+        e = make_engine(self.tmp)
+        e.check_session_if_needed = mock.Mock(side_effect=KeyboardInterrupt)
+        with mock.patch.object(engine_mod, "LOG") as m_log, \
+                mock.patch.object(engine_mod.appcommon, "load_orders",
+                                  return_value={"orders": {}}):
+            out = self._run_engine(e, stop)
+        self.assertIn("[中断]", out)
+        m_log.info.assert_any_call("监控已停止。状态已保存到 %s", e.state_path)
+
+    def test_clean_startup_unchanged(self):
+        # 正向对照：无订单正常启动 → 走完启动期进主循环后 stop，无 [中断]
+        #（新旧代码都通过）。
+        stop = threading.Event()
+        stop.set()
+        e = make_engine(self.tmp)
+        e.check_session_if_needed = lambda: None
+        with mock.patch.object(engine_mod, "LOG") as m_log, \
+                mock.patch.object(engine_mod.appcommon, "load_orders",
+                                  return_value={"orders": {}}):
+            out = self._run_engine(e, stop)
+        self.assertNotIn("[中断]", out)
+        m_log.info.assert_any_call("监控已停止。状态已保存到 %s", e.state_path)
+
+    def test_startup_recovery_data_contract_unchanged(self):
+        # 数据契约对照：干净记录照常 upsert、脏记录照常跳过（Task 134 契约，
+        # 新旧代码都通过——回归 pin）。
+        stop = threading.Event()
+        stop.set()
+        e = make_engine(self.tmp)
+        e.check_session_if_needed = lambda: None
+        odb = {"orders": {
+            "k1": {"order_no": "E1", "train": "G1", "date": "2026-10-10",
+                   "seat": "硬座", "passengers": ["张三"], "classify": "unpaid"},
+            "k2": {"order_no": "E2", "train": "G1", "date": "2026-10-10",
+                   "seat": "硬座", "passengers": 5, "classify": "unpaid"},
+        }}
+
+        def fake_classify(date, train, pax):
+            if pax == 5:
+                raise TypeError("'int' object is not iterable")
+            return ("unpaid", "E1", "未完成/未支付")
+
+        with mock.patch.object(engine_mod, "LOG"), \
+                mock.patch.object(engine_mod.appcommon, "load_orders",
+                                  return_value=odb), \
+                mock.patch.object(engine_mod.order_mod,
+                                  "classify_order_status",
+                                  side_effect=fake_classify), \
+                mock.patch.object(engine_mod.appcommon,
+                                  "upsert_order") as m_upsert:
+            out = self._run_engine(e, stop)
+        self.assertEqual(m_upsert.call_count, 1)  # 仅干净记录写回
+        self.assertNotIn("[中断]", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
