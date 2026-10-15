@@ -2150,7 +2150,8 @@ HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
 def read_history_records(limit=200):
     """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
     顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
-    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
+    非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。返回的每条记录恒为
+    dict，且 passengers 恒为 None/str/全非空 str 列表（Task 144 record 级漏斗）。"""
     # Task 119（1.4，P2）：history_file 非字符串 → os.path.join TypeError；
     # 该行在 try 块之外，守卫必须在 join 之前，否则 GUI 启动崩溃。
     hist_file = load_config().get("history_file", "order_history.json")
@@ -2166,9 +2167,46 @@ def read_history_records(limit=200):
             LOG.warning("order_history.json 顶层不是列表（%s），按空历史展示：%s",
                         type(history).__name__, path)
             return []
-        return list(reversed(history[-limit:]))
+        records = list(reversed(history[-limit:]))
     except Exception:
         return []
+    # Task 144（R11-S3-1，P2）：record 级漏斗——monitor 侧同形状已由
+    # Task 67（非 dict 记录跳过）/126（passengers 容器守卫）/120（元素过滤）
+    # 修过，gui 侧漏网 → HistoryPanel.__init__ 末尾 self.load() 无 try，
+    # 脏记录直接杀死整个 GUI 进程（启动即死）。本函数是两处 load() 的唯一
+    # 漏斗（全仓库确认），在此一次收敛。口径与 monitor 侧一致：
+    # 非 dict 记录 → warn+跳过；passengers 真值不可迭代 → warn+按空；
+    # 元素非 str → 过滤（warn+展示剩余）。裸字符串保持 cosmetic 既定不立项
+    # （round-7 §4），原样放行。警告只记条数，不打印原值（Task 124/135 PII 口径）。
+    clean = []
+    dropped_records = 0
+    fixed_passengers = 0
+    for r in records:
+        if not isinstance(r, dict):
+            dropped_records += 1
+            continue
+        pax = r.get("passengers")
+        if not pax or isinstance(pax, str):
+            pass  # 缺键/空值 → load() 的 or [] 按空；裸字符串 cosmetic，不碰
+        else:
+            try:
+                items = list(pax)
+            except TypeError:
+                fixed_passengers += 1
+                items = []
+            else:
+                kept = [n for n in items if isinstance(n, str) and n]
+                if len(kept) != len(items):
+                    fixed_passengers += 1
+                items = kept
+            r = dict(r)
+            r["passengers"] = items
+        clean.append(r)
+    if dropped_records or fixed_passengers:
+        LOG.warning("[历史] order_history.json：%d 条记录形状非法已跳过，"
+                    "%d 条 passengers 字段已按空/过滤展示",
+                    dropped_records, fixed_passengers)
+    return clean
 
 
 class HistoryDialog(tk.Toplevel):

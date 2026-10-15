@@ -16572,6 +16572,162 @@ class TestTask143GuiHistoryResultB11(TempDirCase):
         self.assertIn("", results)
 
 
+class TestTask144GuiHistoryRecordShapes(TempDirCase):
+    """Task 144（B12-1）：gui 历史记录级形状 bundle（P2×1）。
+
+    R11-S3-1 — gui.py:2208（HistoryDialog.load）/ :2813（HistoryPanel.load）：
+    order_history.json 记录级形状无守卫 → "、".join(r.get("passengers") or [])
+    TypeError / r.get AttributeError；面板站点导致整个 GUI 启动即死（P2）。
+    修复：在 read_history_records() 加 record 级漏斗（monitor Task 67/120/126
+    同口径：非 dict 记录 → warn+跳过；passengers 真值不可迭代 → warn+按空；
+    元素非 str → 过滤）。裸字符串形状是 cosmetic 既定不立项（round-7 §4），
+    只 pin 不修。
+    """
+
+    # ---------- 测试脚手架 ----------
+
+    def _write_history(self, records):
+        hist_path = os.path.join(self.tmp, "order_history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        return hist_path
+
+    @staticmethod
+    def _record(**kw):
+        r = {"time": "2026-10-08 10:00:00", "task": "t1",
+             "date": "2026-10-09", "train": "G101",
+             "from": "北京", "to": "上海", "seat": "二等座",
+             "passengers": ["张三"], "order_no": "E123",
+             "result": "success", "message": "ok"}
+        r.update(kw)
+        return r
+
+    def _patch_history_file(self, hist_path):
+        return mock.patch.object(gui, "load_config",
+                                return_value={"history_file": hist_path})
+
+    def _make_panel(self):
+        panel = gui.HistoryPanel.__new__(gui.HistoryPanel)
+        panel.tree = mock.Mock()
+        panel.tree.get_children.return_value = ()
+        return panel
+
+    def _patch_tk_for_history_panel(self):
+        # P2 崩溃链是真实 __init__ → 末尾 self.load()（无 try）→ 异常逃出构造。
+        # ttk.Frame.__init__ 走 MRO（必须 patch 方法），而 __init__ 内部的
+        # ttk.Frame(self)/Label/Button/… 走模块属性（必须 patch 类）。
+        # 两个 patch 目标不同（真实类对象 vs 模块属性），按此顺序 start。
+        from tkinter import ttk
+        tree = mock.Mock()
+        tree.get_children.return_value = ()
+        frame_init = mock.patch.object(ttk.Frame, "__init__",
+                                       return_value=None)
+        rest = (
+            mock.patch.object(ttk, "Frame", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Label", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Button", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Treeview", return_value=tree),
+            mock.patch.object(ttk, "Scrollbar", return_value=mock.Mock()),
+        )
+        return (frame_init,) + rest, tree
+
+    # ---------- 三种脏形状（bug 本体） ----------
+
+    def test_non_dict_record_skipped_no_crash(self):
+        # RED（旧代码）：非 dict 记录（如手改成字符串数组）→ r.get →
+        # AttributeError，面板 load 崩。修后：warn+跳过，好记录仍展示。
+        hist = self._write_history(["oops", self._record()])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel.load()  # 改前 AttributeError
+        self.assertTrue(any("形状非法" in m or "跳过" in m for m in logs.output),
+                        "应记一条记录形状警告：%s" % logs.output)
+        inserted = panel.tree.insert.call_args_list
+        self.assertEqual(len(inserted), 1, "好记录仍应展示")
+        self.assertIn("t1", inserted[0][1]["values"])
+
+    def test_passengers_non_iterable_shows_empty(self):
+        # RED（旧代码）："passengers": 5 → "、".join(5) → TypeError。
+        # 修后：warn+按空展示，不崩。
+        hist = self._write_history([self._record(passengers=5)])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel.load()  # 改前 TypeError
+        self.assertTrue(any("passengers" in m for m in logs.output),
+                        "应记一条 passengers 形状警告：%s" % logs.output)
+        values = panel.tree.insert.call_args_list[0][1]["values"]
+        self.assertEqual(values[6], "", "乘车人列应按空展示")
+
+    def test_passengers_elements_non_str_filtered(self):
+        # RED（旧代码）：["张三", 5] → "、".join 抛 TypeError。
+        # 修后：过滤非 str 元素，warn，好名字仍展示。
+        hist = self._write_history([self._record(passengers=["张三", 5])])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel.load()  # 改前 TypeError
+        values = panel.tree.insert.call_args_list[0][1]["values"]
+        self.assertEqual(values[6], "张三")
+
+    # ---------- P2 集成：真实 __init__ → load() 崩溃链 ----------
+
+    def test_p2_panel_construction_survives_dirty_history(self):
+        # P2 集成测试：三种脏形状同文件 → 真实 HistoryPanel.__init__
+        #（末尾 self.load()，无 try）→ 旧代码 TypeError/AttributeError
+        # 逃出 __init__ → GUI 启动即死。新代码下构造成功。
+        hist = self._write_history([
+            "oops",
+            self._record(task="t2", passengers=5),
+            self._record(task="t3", passengers=["张三", 5]),
+            self._record(task="t4"),
+        ])
+        patches, tree = self._patch_tk_for_history_panel()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with self._patch_history_file(hist):
+            panel = gui.HistoryPanel(mock.Mock(), mock.Mock())  # 改前抛异常
+        # 非 dict 记录被剔除；t2 按空展示；t3 过滤后展示"张三"；t4 正常
+        self.assertEqual(len(tree.insert.call_args_list), 3)
+        by_task = {}
+        for c in tree.insert.call_args_list:
+            v = c[1]["values"]
+            by_task[v[1]] = v[6]
+        self.assertEqual(by_task, {"t2": "", "t3": "张三", "t4": "张三"})
+
+    # ---------- 对照：cosmetic 与干净路径零漂移 ----------
+
+    def test_bare_string_passengers_cosmetic_unchanged(self):
+        # 裸字符串是 cosmetic 既定不立项（round-7 §4）：只 pin 不修。
+        # 旧行为："、".join("张三") → "张、三"逐字符展示，不 warn。
+        hist = self._write_history([self._record(passengers="张三")])
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertNoLogs("monitor", level="WARNING"):
+                panel.load()
+        values = panel.tree.insert.call_args_list[0][1]["values"]
+        self.assertEqual(values[6], "张、三")
+
+    def test_clean_records_unchanged_no_warning(self):
+        # 干净记录：渲染与旧代码一致，不记 warning。
+        r3 = self._record(task="t3")
+        del r3["passengers"]
+        records = [self._record(), self._record(task="t2",
+                                                passengers=["张三", "李四"]),
+                   r3]
+        hist = self._write_history(records)
+        panel = self._make_panel()
+        with self._patch_history_file(hist):
+            with self.assertNoLogs("monitor", level="WARNING"):
+                panel.load()
+        pax = [c[1]["values"][6]
+               for c in panel.tree.insert.call_args_list]
+        # read_history_records 最新在前：r3(空)、t2(两名)、r1(一名)
+        self.assertEqual(pax, ["", "张三、李四", "张三"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
