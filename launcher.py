@@ -137,6 +137,27 @@ def _type_len_summary(v):
     return "%s/%s" % (type(v).__name__, ln)
 
 
+_STATUS_SHAPE_WARNED = set()
+
+
+def _coerce_status_str(st, where):
+    """Task 138：status 真值非 str（如手改成 list）→ STATUS_LABELS.get
+    先 hash 键抛 TypeError。
+
+    记 warning 后按 "idle" 处理（launcher 侧默认）。同一脏值每进程只记一次
+    （_tick 每 800ms 调用，防刷屏；与 gui._skip_unhashable_task_name 同口径）。
+    警告只记类型+长度摘要，不打印原值（Task 131/135 PII 口径）。
+    """
+    if st and not isinstance(st, str):
+        sig = (where, repr(st))
+        if sig not in _STATUS_SHAPE_WARNED:
+            _STATUS_SHAPE_WARNED.add(sig)
+            LOG.warning("[状态] %s：任务状态字段非字符串（%s），已按 idle 处理",
+                        where, _type_len_summary(st))
+        return "idle"
+    return st
+
+
 # ----------------------------- 配置读写 -----------------------------
 
 _DEFAULT_LC = {
@@ -4041,7 +4062,10 @@ class TaskManagerPanel(tk.Frame):
                 bits.append("/".join(_dtr))
         ttk.Label(row, text=" · ".join(bits), foreground="#57606a").pack(
             side="left", padx=(6, 0), fill="x", expand=True)
-        label, color = self.STATUS_LABELS.get(task.get("status") or "idle", ("就绪", "#6e7781"))
+        # Task 138：status 真值非 str（如手改成 list）→ STATUS_LABELS.get
+        # 先 hash 键抛 TypeError，管理器窗口构造期崩溃；记警告后按 idle 处理。
+        st = _coerce_status_str(task.get("status") or "idle", "任务管理器")
+        label, color = self.STATUS_LABELS.get(st, ("就绪", "#6e7781"))
         status_lbl = ttk.Label(row, text=label, foreground=color, width=8, anchor="center")
         status_lbl.pack(side="left", padx=6)
         ttk.Button(row, text="打开", width=6,
@@ -4166,8 +4190,11 @@ class TaskManagerPanel(tk.Frame):
                     label, color = "抢票中", "#d97706"
                 else:
                     t = self._find(tid)
-                    label, color = self.STATUS_LABELS.get((t or {}).get("status") or "idle",
-                                                          ("就绪", "#6e7781"))
+                    # Task 138：同上；_tick 每 800ms 调用，同一脏值每进程只记
+                    # 一次（helper 内 warn-once），防刷屏。
+                    st = _coerce_status_str((t or {}).get("status") or "idle",
+                                            "任务管理器")
+                    label, color = self.STATUS_LABELS.get(st, ("就绪", "#6e7781"))
                 status_lbl.configure(text=label, foreground=color)
         finally:
             try:

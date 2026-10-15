@@ -119,6 +119,28 @@ _SANITIZE_WARNED = set()
 
 _UNHASHABLE_NAME_WARNED = set()
 
+_UNHASHABLE_STATUS_WARNED = set()
+
+
+def _coerce_status_str(st, where):
+    """Task 138：status 真值非 str（如手改成 list）→ STATUS_LABELS.get /
+    STATUS_COLOR.get 先 hash 键抛 TypeError（ACTIVE_STATUSES 是 tuple，
+    in 成员检查不 hash，不崩——第一崩点是 dict.get）。
+
+    记 warning 后按 "paused" 处理（gui 侧默认）。同一脏值每进程只记一次
+    （TaskPage.refresh / MiniWindow 每 2 秒调用，防刷屏；与
+    _skip_unhashable_task_name 同口径）。警告只记类型名，不打印原值
+    （Task 124/135 PII 口径）。
+    """
+    if st and not isinstance(st, str):
+        sig = (where, repr(st))
+        if sig not in _UNHASHABLE_STATUS_WARNED:
+            _UNHASHABLE_STATUS_WARNED.add(sig)
+            LOG.warning("[状态] %s：任务状态字段非字符串（类型：%s），"
+                        "已按 paused 处理", where, type(st).__name__)
+        return "paused"
+    return st
+
 
 def _skip_unhashable_task_name(t, where):
     """Task 116：不可哈希任务名 → 记 warning 返回 True（调用方跳过该条目）。
@@ -2530,6 +2552,10 @@ class StartMonitorDialog(tk.Toplevel):
                 continue
             name = t.get("name") or ""
             st = state.get(name, {}).get("status", "paused")
+            # Task 138：status 真值非 str（如手改成 list）→ 下面的
+            # STATUS_COLOR.get(st, TEXT) 先 hash 键抛 TypeError，对话框打不开；
+            # 记警告后按 paused 处理（ACTIVE_STATUSES 是 tuple，in 检查不 hash）。
+            st = _coerce_status_str(st, "启动对话框")
             active = st in engine_mod.ACTIVE_STATUSES
             started = self.running and active
             var = tk.BooleanVar(value=active)
@@ -2877,6 +2903,11 @@ class TaskPage(ttk.Frame):
             if _skip_unhashable_task_name(t, "任务列表"):
                 continue
             st = state.get(t.get("name"), {}).get("status", "paused")
+            # Task 138：status 真值非 str（如手改成 list）→ 下面的
+            # STATUS_LABELS.get(st, st) 先 hash 键抛 TypeError，任务列表冻结；
+            # 记警告后按 paused 处理。refresh 每 2 秒调用，同一脏值每进程只记
+            # 一次（helper 内 warn-once），防刷屏。
+            st = _coerce_status_str(st, "任务列表")
             msg = state.get(t.get("name"), {}).get("message", "")
             # 启动状态：引擎运行中且任务处于 监控中/等待重试 = 已启动
             started = engine_running and st in engine_mod.ACTIVE_STATUSES

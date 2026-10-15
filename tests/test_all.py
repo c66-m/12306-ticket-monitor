@@ -15699,6 +15699,229 @@ class TestTask137EngineValueShapes(TempDirCase):
                          e.state["tasks"]["t2"])
 
 
+class TestTask138StatusShapesB10(TempDirCase):
+    """Task 138（B10-2）：gui/launcher status 形状 bundle（P3×1，2.2.1 R9-GL-1）。
+
+    gui.py 3 处 + launcher.py 2 处 STATUS_LABELS.get 对真值不可哈希 status
+    抛 TypeError（or "idle" 只兜 falsy，真值非 str 穿过）。第一崩点是 dict.get
+    先 hash 键（ACTIVE_STATUSES 是 tuple，in 检查不 hash，不崩）。
+    修复：取值后、任何使用前加守卫——真值非 str → warn + "paused"（gui）/
+    "idle"（launcher）；2 秒/800ms 轮询热路径 warn-once。
+    """
+
+    # ---------- 测试脚手架 ----------
+
+    def _reset_gui_warned(self):
+        if hasattr(gui, "_UNHASHABLE_STATUS_WARNED"):
+            gui._UNHASHABLE_STATUS_WARNED.clear()
+
+    def _reset_launcher_warned(self):
+        if hasattr(launcher, "_STATUS_SHAPE_WARNED"):
+            launcher._STATUS_SHAPE_WARNED.clear()
+
+    def _patch_tk_for_dialog(self):
+        import tkinter as tk
+        from tkinter import ttk
+        return (
+            mock.patch.object(tk.Toplevel, "__init__", return_value=None),
+            mock.patch.object(gui.StartMonitorDialog, "title"),
+            mock.patch.object(gui.StartMonitorDialog, "geometry"),
+            mock.patch.object(gui.StartMonitorDialog, "configure"),
+            mock.patch.object(tk, "Frame", return_value=mock.Mock()),
+            mock.patch.object(tk, "Label", return_value=mock.Mock()),
+            mock.patch.object(tk, "BooleanVar"),
+            mock.patch.object(tk, "Checkbutton", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Button", return_value=mock.Mock()),
+        )
+
+    def _make_task_page(self):
+        page = gui.TaskPage.__new__(gui.TaskPage)
+        page.app = mock.Mock()
+        page.app.engine_thread = None
+        page.tree = mock.Mock()
+        page.tree.selection.return_value = ()
+        page.tree.get_children.return_value = ()
+        page.tree.yview.return_value = (0.0, 1.0)
+        page.edit_btn = mock.Mock()
+        page._task_by_iid = {}
+        page._dates_text_cache = {}
+        return page
+
+    # ---------- gui helper 单元测试 ----------
+
+    def test_gui_coerce_unhashable_to_paused(self):
+        # 真值不可哈希 → warn + 按 paused 处理。
+        self._reset_gui_warned()
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            self.assertEqual(gui._coerce_status_str(["x"], "任务列表"), "paused")
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+
+    def test_gui_coerce_clean_and_falsy_unchanged(self):
+        # 对照：干净字符串/falsy 原样通过，不记 warning（新旧代码都应通过）。
+        self._reset_gui_warned()
+        with self.assertNoLogs("monitor", level="WARNING"):
+            self.assertEqual(gui._coerce_status_str("monitoring", "X"),
+                             "monitoring")
+            self.assertEqual(gui._coerce_status_str("", "X"), "")
+            self.assertIsNone(gui._coerce_status_str(None, "X"))
+            self.assertEqual(gui._coerce_status_str(0, "X"), 0)
+        # 真值非 str（即使可哈希）→ 按 paused 处理（Task 133 同口径）。
+        self.assertEqual(gui._coerce_status_str(5, "X"), "paused")
+
+    def test_gui_coerce_warn_once(self):
+        # 热路径：同一脏值连续两次 → 只记一次 warning。
+        self._reset_gui_warned()
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            gui._coerce_status_str(["x"], "任务列表")
+            gui._coerce_status_str(["x"], "任务列表")
+        warned = [m for m in logs.output if "非字符串" in m]
+        self.assertEqual(len(warned), 1,
+                         "热路径刷屏回归：%s" % logs.output)
+
+    # ---------- launcher helper 单元测试 ----------
+
+    def test_launcher_coerce_unhashable_to_idle(self):
+        # 真值不可哈希 → warn + 按 idle 处理。
+        self._reset_launcher_warned()
+        with self.assertLogs("launcher", level="WARNING") as logs:
+            self.assertEqual(launcher._coerce_status_str(["x"], "任务管理器"),
+                             "idle")
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+
+    def test_launcher_coerce_warn_once(self):
+        # 800ms 热路径：同一脏值连续两次 → 只记一次 warning。
+        self._reset_launcher_warned()
+        with self.assertLogs("launcher", level="WARNING") as logs:
+            launcher._coerce_status_str(["x"], "任务管理器")
+            launcher._coerce_status_str(["x"], "任务管理器")
+        warned = [m for m in logs.output if "非字符串" in m]
+        self.assertEqual(len(warned), 1,
+                         "热路径刷屏回归：%s" % logs.output)
+
+    # ---------- 站点 1：gui 启动监控对话框 ----------
+
+    def test_dialog_init_unhashable_status_no_crash(self):
+        # P3：改前 STATUS_COLOR.get(["x"], TEXT) 直接 TypeError，对话框打不开。
+        self._reset_gui_warned()
+        tasks = [{"name": "a", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-12"]}]
+        dlg = gui.StartMonitorDialog.__new__(gui.StartMonitorDialog)
+        patches = self._patch_tk_for_dialog()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "_state_tasks_dict",
+                               return_value={"a": {"status": ["x"]}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                gui.StartMonitorDialog.__init__(dlg, mock.Mock())  # 改前 TypeError
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+        # 坏状态按 paused 处理：该行正常建行、不锁定为已启动。
+        self.assertIn(0, dlg.vars)
+
+    # ---------- 站点 2：gui TaskPage.refresh（2 秒轮询） ----------
+
+    def test_refresh_unhashable_status_no_crash_and_warn_once(self):
+        # P3：改前 STATUS_LABELS.get(["x"], ["x"]) 直接 TypeError，任务列表冻结。
+        self._reset_gui_warned()
+        tasks = [{"name": "good", "from": "BJ", "to": "SH"}]
+        page = self._make_task_page()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks":
+                                             {"good": {"status": ["x"]}}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                page.refresh()  # 改前 TypeError
+                page._last_rows_sig = None  # 模拟下一次 2 秒轮询
+                page.refresh()
+        warned = [m for m in logs.output if "非字符串" in m]
+        self.assertEqual(len(warned), 1,
+                         "热路径刷屏回归：%s" % logs.output)
+
+    # ---------- 站点 3：gui MiniWindow._collect —— 裁决为 benign ----------
+
+    def test_miniwindow_collect_unhashable_status_benign(self):
+        # 站点 3 经核验为 benign（非 bug），故无守卫、无 RED：
+        # _collect 内的 st == "success" / st in ACTIVE_STATUSES（tuple 成员
+        # 检查不 hash）对非 str 恒为 False → 脏 status 在 _collect 内即被丢弃；
+        # refresh_tasks 渲染循环的 MINI_STAT_COLOR.get / STATUS_LABELS.get
+        # 只可能收到干净字符串，不可能崩。第九轮重扫"先崩于 in 检查"的断言
+        # 不成立（tuple 的 in 不 hash）。
+        # Pin 住：脏 status → 不崩、不 warn、任务静默不展示（行为不变）。
+        import tkinter as tk
+        win = gui.MiniWindow.__new__(gui.MiniWindow)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": [{"name": "t"}]}), \
+             mock.patch.object(gui, "_state_tasks_dict",
+                               return_value={"t": {"status": ["x"]}}):
+            with self.assertNoLogs("monitor", level="WARNING"):
+                rows = win._collect()
+        self.assertEqual(rows, [])
+        # 端到端：refresh_tasks 同样不崩、不 warn。
+        win.task_box = mock.Mock()
+        win.task_box.winfo_children.return_value = []
+        win._last_sig = object()
+        win._wrap = 200
+        win.winfo_width = mock.Mock(return_value=300)
+        patches = (mock.patch.object(tk, "Label", return_value=mock.Mock()),
+                   mock.patch.object(tk, "Frame", return_value=mock.Mock()))
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": [{"name": "t"}]}), \
+             mock.patch.object(gui, "_state_tasks_dict",
+                               return_value={"t": {"status": ["x"]}}):
+            with self.assertNoLogs("monitor", level="WARNING"):
+                win.refresh_tasks()
+
+    # ---------- 站点 4：launcher 任务管理器 _add_row ----------
+
+    def test_add_row_unhashable_status_no_crash(self):
+        # P3：改前 STATUS_LABELS.get(["x"], ...) 直接 TypeError，
+        # 管理器窗口构造期崩溃。
+        self._reset_launcher_warned()
+        from tkinter import ttk
+        panel = launcher.TaskManagerPanel.__new__(launcher.TaskManagerPanel)
+        panel._row_widgets = {}
+        panel.list_box = mock.Mock()
+        task = {"id": "t1", "name": "T", "status": ["x"]}
+        with mock.patch.object(ttk, "Frame", return_value=mock.Mock()), \
+             mock.patch.object(ttk, "Label", return_value=mock.Mock()), \
+             mock.patch.object(ttk, "Button", return_value=mock.Mock()), \
+             self.assertLogs("launcher", level="WARNING") as logs:
+            panel._add_row(task)  # 改前 TypeError
+        self.assertIn("t1", panel._row_widgets)
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+
+    # ---------- 站点 5：launcher 任务管理器 _tick（800ms） ----------
+
+    def test_tick_unhashable_status_no_crash_and_warn_once(self):
+        # P3：改前 STATUS_LABELS.get(["x"], ...) 直接 TypeError，
+        # 每 800ms 一次 Tk 回调异常。
+        self._reset_launcher_warned()
+        panel = launcher.TaskManagerPanel.__new__(launcher.TaskManagerPanel)
+        row, lbl = mock.Mock(), mock.Mock()
+        panel._row_widgets = {"t1": (row, lbl)}
+        panel._windows = {}
+        panel.tasks = [{"id": "t1", "name": "T", "status": ["x"]}]
+        panel.after = mock.Mock()
+        with self.assertLogs("launcher", level="WARNING") as logs:
+            panel._tick()  # 改前 TypeError
+            panel._tick()
+        warned = [m for m in logs.output if "非字符串" in m]
+        self.assertEqual(len(warned), 1,
+                         "热路径刷屏回归：%s" % logs.output)
+        # 状态标签被正常刷新（idle → 默认展示），无异常。
+        lbl.configure.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
