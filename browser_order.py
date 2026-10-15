@@ -29,6 +29,8 @@ import threading
 import time
 import weakref
 
+import appcommon  # Task 118 2.2.5：save_state 用 atomic_write_json(mode=0o600)
+
 try:
     import msvcrt  # Windows 文件字节锁：跨进程互斥靠它
 except ImportError:  # 非 Windows 平台没有 msvcrt，改用 fcntl
@@ -103,6 +105,39 @@ def _tt_mismatch_report(tt_args, tt_bad, tt_now):
            % (json.dumps(_mask_tt_diag(tt_args), ensure_ascii=False),
               json.dumps(_mask_ticket_names(tt_bad), ensure_ascii=False)))
     return msg, {"limit_ticket_types": _mask_ticket_names(tt_now)}
+
+
+def _passenger_missed_msg(missed, people):
+    """点名未匹配的错误返回 msg：姓名脱敏（Task 118 2.2.6）。
+
+    msg 用户可见，且经 _record_timing 以 (msg or "")[:140] 持久化进
+    logs/order_timing.jsonl；missed 与可用名单的姓名用 _mask_name 脱敏，
+    文案/结构保留以维持可调试性（与 _tt_mismatch_report 同口径）。
+    """
+    return ("乘车人 %s 在确认页没匹配到（可用：%s）。已中止，未提交订单——"
+            "请核对姓名或账号常用联系人" % (
+                "、".join(_mask_name(n) for n in missed),
+                "、".join(_mask_name(p["text"]) for p in people[:8])))
+
+
+def _passenger_unchecked_msg(bad_names):
+    """勾选未生效的错误返回 msg：姓名脱敏（Task 118 2.2.6）。
+
+    同 _passenger_missed_msg 的数据流（用户可见 + jsonl 持久化）。
+    """
+    return ("乘车人 %s 勾选未生效（可能未核验/证件过期）。已中止，未提交订单"
+            % "、".join(_mask_name(n) for n in bad_names))
+
+
+def _dialog_seat_mismatch_msg(abort_seat, seat_name, dlg_text, picked):
+    """核对窗席别不一致的错误返回 msg：原文里的姓名脱敏（Task 118 2.2.6）。
+
+    与同函数 _log 用的 _mask_text_names(dlg_text, picked) 同一脱敏结果——
+    返回 msg 不再用 raw dlg_text（此前真实姓名进 msg → jsonl）。席别信息
+    与原文结构保留，可调试性不丢。
+    """
+    return ("核对窗显示席别 %s，与所选 %s 不一致。已中止，未提交订单（原文：%s）"
+            % (abort_seat, seat_name, _mask_text_names(dlg_text, picked)[:160]))
 
 
 def _mask_text_names(text, names):
@@ -459,11 +494,10 @@ def save_state(ctx):
             if os.path.exists(STATE_PATH):
                 return False
         # 原子写：写一半被杀会留下半截 JSON，下次 launch() 注不回 cookie，
-        # 开抢时刻变成"未登录"
-        tmp = STATE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"cookies": cookies}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATE_PATH)
+        # 开抢时刻变成"未登录"。0o600：活的 tk/uamtk 会话凭证落盘（Task 118 2.2.5，
+        # 与 capture_session.py / order.py 同口径；在 tmp 上 chmod 再 replace，
+        # 目标文件继承该权限）。
+        appcommon.atomic_write_json(STATE_PATH, {"cookies": cookies}, mode=0o600)
         return True
     except Exception:
         return False
@@ -924,12 +958,7 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     missed.append(name)
             if missed:
                 # 点了名但没匹配到：绝不能悄悄改勾别人（此前会静默勾第一位）
-                return (False,
-                        "乘车人 %s 在确认页没匹配到（可用：%s）。已中止，未提交订单——"
-                        "请核对姓名或账号常用联系人" % (
-                            "、".join(missed),
-                            "、".join(p["text"] for p in people[:8])),
-                        None)
+                return (False, _passenger_missed_msg(missed, people), None)
             if not targets:
                 targets = [people[0]]  # 未点名：沿用账号第一位（既有约定）
 
@@ -955,9 +984,7 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 [t["id"] for t in targets])
             if unchecked_ids:
                 bad_names = [t["text"] for t in targets if t["id"] in unchecked_ids]
-                return (False,
-                        "乘车人 %s 勾选未生效（可能未核验/证件过期）。已中止，未提交订单"
-                        % "、".join(bad_names), None)
+                return (False, _passenger_unchecked_msg(bad_names), None)
             _log("  [浏览器] 乘车人：%s" % "、".join(_mask_name(n) for n in picked))
             mark("passenger")
 
@@ -1205,8 +1232,8 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             # 的纪律"不一致就中止、不提交"——此前照常提交，可能
                             # 买到与所选不符（更贵）的席别
                             return (False,
-                                    "核对窗显示席别 %s，与所选 %s 不一致。已中止，未提交订单（原文：%s）"
-                                    % (abort_seat, seat_name, dlg_text[:160]),
+                                    _dialog_seat_mismatch_msg(
+                                        abort_seat, seat_name, dlg_text, picked),
                                     {"seat_in_dialog": abort_seat})
                     page.evaluate(
                         "() => { const e = document.querySelector('#qr_submit_id'); if (e) e.click(); }")

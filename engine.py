@@ -188,19 +188,34 @@ def _sanitize_tasks(raw):
     if raw is None:
         return []
     if not isinstance(raw, list):
-        LOG.error("[配置] tasks 字段非列表，已忽略全部任务：%r", raw)
+        # Task 118 2.1.1：%r 整个 tasks 字段进日志会把真实姓名落盘（Task 68a 起
+        # pre-existing 的同模式，parent 裁决一并收敛）——只记类型+长度，
+        # 仍可识别是什么形状坏了。
+        detail = type(raw).__name__
+        if hasattr(raw, "__len__"):
+            detail += "，长度：%d" % len(raw)
+        LOG.error("[配置] tasks 字段非列表（%s），已忽略全部任务", detail)
         return []
     out = []
     for t in raw:
         if not isinstance(t, dict):
-            LOG.error("[配置] tasks 含非法条目已跳过：%r", t)
+            # Task 118 self-review 追加：与 2.1.1 同函数同家族——非 dict 条目
+            # 的 %r 同样会把真实姓名落盘（如裸字符串条目）。只记类型+长度。
+            detail = type(t).__name__
+            if hasattr(t, "__len__"):
+                detail += "，长度：%d" % len(t)
+            LOG.error("[配置] tasks 含非法条目已跳过（%s）", detail)
             continue
         name = t.get("name")
         if name is not None:
             try:
                 hash(name)
             except TypeError:
-                LOG.error("[配置] tasks 含不可哈希任务名已跳过：%r", t)
+                # Task 118 2.1.1：%r 整条 task dict 进日志会把真实姓名落盘
+                # （Task 108 引入的回归）——只记坏任务名 repr + 条目类型，
+                # 不打印整条 dict；坏值本身仍可识别，调试价值保留。
+                LOG.error("[配置] tasks 含不可哈希任务名已跳过（任务名：%r，条目类型：%s）",
+                          name, type(t).__name__)
                 continue
         out.append(t)
     return out

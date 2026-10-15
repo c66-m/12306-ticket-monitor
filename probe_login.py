@@ -83,11 +83,13 @@ def banner(title):
 
 
 # Task 113：newapptk 是可换会话 Cookie 的 bearer token（Task 98a 同口径按
-# *** 处理）。step5 的 show(r, mask_pii=True) 曾把它明文打印——mask_pii=True
+# *** 处理）。Task 118 2.2.1：uamauthclient 响应的 "apptk" 同为 bearer token，
+# 同按 *** 处理（引号锚定，newapptk 分支不会误命中 apptk）。step5 的
+# show(r, mask_pii=True) 曾把它明文打印——mask_pii=True
 # 只覆盖字段表里的 PII 字段名，不等于已脱敏（Task 98 reviewer 误判，第四轮重扫 2.4）。
 _PII_VALUE_RE = re.compile(
     r'("(?:passenger_name|passenger_id_no|mobile_no|id_no|user_name|username|name|'
-    r'phone_no|email|address|born_date|newapptk)"'
+    r'phone_no|email|address|born_date|newapptk|apptk)"'
     r"\s*:\s*\""
     r')(?:[^"\\]|\\.)*(")')
 
@@ -100,6 +102,7 @@ def _mask_pii(text):
     email / address / born_date 等字段值抹掉，
     字段名与 JSON 结构保留，仍可判断接口变更（Task 65a，Task 78b 补全字段）。
     newapptk（bearer token，可换会话 Cookie）同按 *** 处理（Task 113）。
+    apptk（uamauthclient 响应的 bearer token）同按 *** 处理（Task 118 2.2.1）。
     """
     if not text:
         return text

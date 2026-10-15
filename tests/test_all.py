@@ -12762,6 +12762,131 @@ class TestTask117MiniWindowB5(TempDirCase):
                                 ("a", "monitoring", "")])
 
 
+class TestTask118CredHygieneB6(TempDirCase):
+    """Task 118 (B6-1)：凭证/日志卫生 bundle（P3×5）——"姓名/token 进日志"
+    PII 家族一次收敛。含 Batch 5 sanitize 工作引入的同模式回归
+    （2.1.1 Task 108、2.1.3 Task 112）。
+
+    2.2.1 probe_login.py:396 — show(r2, mask_pii=True) 把 uamauthclient
+        响应的 "apptk" bearer token 明文打印。_mask_pii 字段表加 apptk。
+    2.2.5 browser_order.py:464-466 — save_state() 写 .browser_state.json
+       （活的 tk/uamtk 会话凭证）未传 0o600。换 atomic_write_json(mode=0o600)。
+    2.2.6 browser_order.py — 三处错误返回 msg 嵌真实乘车人姓名
+        （:928-931 点名未匹配、:959-960 勾选未生效、:1208 核对窗席别不一致），
+        控制台 + logs/order_timing.jsonl。复用 _mask_name/_mask_text_names。
+    2.1.1 engine.py:203（Task 108 回归）+ :191（pre-existing 同模式，
+        parent 裁决一并收敛）——%r 整条 task dict/整列表进日志，
+        真实姓名落盘。改为类型+摘要。
+    2.1.3 passengers.py:379-380 / :371-373（Task 112 回归）——sanitize
+        警告 %r 原样打印脏条目。改为类型+长度。
+    """
+
+    # ---- 2.2.1 apptk 脱敏 ----
+    def test_mask_pii_redacts_apptk(self):
+        # RED on old code: _mask_pii 原样返回 apptk（uamauthclient 响应字段）
+        out = probe_login._mask_pii('{"result_code":0,"apptk":"SECRET-APPTK-XYZ"}')
+        self.assertNotIn("SECRET-APPTK-XYZ", out)
+        self.assertIn('"apptk":"***"', out)  # 字段名/结构保留，仍可判断接口变更
+
+    def test_mask_pii_still_redacts_newapptk(self):
+        # alternation 顺序安全：加 apptk 分支后 newapptk 仍被自己的分支命中，
+        # 不会被 apptk 分支误吞（引号锚定）。改前即绿，对照。
+        out = probe_login._mask_pii('{"result_code":0,"newapptk":"SECRET-NEWAPPTK"}')
+        self.assertNotIn("SECRET-NEWAPPTK", out)
+        self.assertIn('"newapptk":"***"', out)
+
+    # ---- 2.2.5 .browser_state.json 0o600 ----
+    def test_save_state_writes_0600(self):
+        # RED on old code: 手工 open()+replace，落盘 0o644（umask 022）
+        class FakeCtx(object):
+            def cookies(self):
+                return [{"name": "tk", "value": "SECRET-TK"},
+                        {"name": "uamtk", "value": "SECRET-UAMTK"}]
+
+        target = os.path.join(self.tmp, ".browser_state.json")
+        with mock.patch.object(browser_order, "STATE_PATH", target):
+            ok = browser_order.save_state(FakeCtx())
+        self.assertTrue(ok)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["cookies"][0]["name"], "tk")
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+
+    # ---- 2.2.6 三处错误返回 msg 脱敏 ----
+    def test_passenger_missed_msg_masks_names(self):
+        # RED on old code: helper 不存在（:928-931 把 missed/可用名单明文拼进 msg）
+        msg = browser_order._passenger_missed_msg(
+            ["张三"], [{"text": "张三"}, {"text": "李四"}])
+        self.assertNotIn("张三", msg)
+        self.assertNotIn("李四", msg)
+        self.assertIn("没匹配到", msg)  # 文案/结构不变
+
+    def test_passenger_unchecked_msg_masks_names(self):
+        # RED on old code: helper 不存在（:959-960 把 bad_names 明文拼进 msg）
+        msg = browser_order._passenger_unchecked_msg(["张三", "王五"])
+        self.assertNotIn("张三", msg)
+        self.assertNotIn("王五", msg)
+        self.assertIn("勾选未生效", msg)  # 文案/结构不变
+
+    def test_dialog_seat_mismatch_msg_masks_dlg_text(self):
+        # RED on old code: helper 不存在（:1208 用 raw dlg_text[:160] 拼进 msg，
+        # 同函数 :1197 的 _log 已用 _mask_text_names 脱敏）
+        dlg = "核对窗：乘车人 张三，席别 硬座"
+        msg = browser_order._dialog_seat_mismatch_msg("硬座", "无座", dlg, ["张三"])
+        self.assertNotIn("张三", msg)
+        self.assertIn("硬座", msg)  # 席别信息保留，可调试性不丢
+        self.assertIn("不一致", msg)  # 文案/结构不变
+
+    # ---- 2.1.1 engine sanitize 警告 %r 回归 ----
+    def test_sanitize_tasks_unhashable_warns_without_whole_dict(self):
+        # RED on old code: %r 整条 task dict 进日志，passengers 里的真实姓名落盘
+        t = {"name": ["x"], "passengers": ["张三"], "from": "BJ", "to": "SH"}
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            out = engine_mod._sanitize_tasks([t])
+        self.assertEqual(out, [])
+        logged = "\n".join(logs.output)
+        self.assertNotIn("张三", logged)
+        self.assertIn("['x']", logged)  # 坏值本身仍可识别：调试价值保留
+
+    def test_sanitize_tasks_non_list_warns_without_whole_list(self):
+        # :191 pre-existing 同模式：tasks 整字段非 list → %r 整列表进日志
+        raw = {"tasks": [{"name": "t1", "passengers": ["张三"]}]}  # 非 list
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            out = engine_mod._sanitize_tasks(raw)
+        self.assertEqual(out, [])
+        logged = "\n".join(logs.output)
+        self.assertNotIn("张三", logged)
+        self.assertIn("dict", logged)  # 类型保留：仍可识别是什么形状坏了
+
+    def test_sanitize_tasks_non_dict_warns_without_raw_entry(self):
+        # self-review 追加：同函数同家族——非 dict 条目（如裸字符串）的 %r
+        # 同样会把真实姓名落盘。只记类型+长度。
+        with self.assertLogs("monitor", level="ERROR") as logs:
+            out = engine_mod._sanitize_tasks(["张三", {"name": "ok"}])
+        self.assertEqual(out, [{"name": "ok"}])
+        logged = "\n".join(logs.output)
+        self.assertNotIn("张三", logged)
+        self.assertIn("str", logged)
+
+    # ---- 2.1.3 passengers sanitize 警告 %r 回归 ----
+    def test_sanitize_entries_warns_without_raw_entry(self):
+        # RED on old code: %r 原样打印脏条目，裸字符串乘车人姓名进持久日志
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            out = pax_mod._sanitize_passenger_entries(["张三", 12345], "p.json")
+        self.assertEqual(out, [])
+        logged = "\n".join(logs.output)
+        self.assertNotIn("张三", logged)
+        self.assertIn("str", logged)  # 类型保留：仍可识别是什么形状坏了
+
+    def test_sanitize_non_list_section_warns_without_raw_section(self):
+        # :371-373：passengers 节本身非 list → %r 整个节进日志
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            out = pax_mod._sanitize_passenger_entries({"weird": "张三"}, "p.json")
+        self.assertEqual(out, [])
+        logged = "\n".join(logs.output)
+        self.assertNotIn("张三", logged)
+        self.assertIn("dict", logged)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -368,16 +368,26 @@ def _sanitize_passenger_entries(entries, path):
     节本身非 list 时按空处理（损坏形状，非用户内容）。
     """
     if not isinstance(entries, list):
-        LOG.warning("[警告] 乘车人文件 %s 的 passengers 节不是列表（%r），"
-                    "已按空处理", path, entries)
+        # Task 118 2.1.3：%r 整个 passengers 节进日志会把真实姓名落盘
+        # （Task 112 引入的回归）——只记类型+长度；大字符串也不产生超大单行。
+        detail = type(entries).__name__
+        if hasattr(entries, "__len__"):
+            detail += "，长度：%d" % len(entries)
+        LOG.warning("[警告] 乘车人文件 %s 的 passengers 节不是列表（%s），"
+                    "已按空处理", path, detail)
         return []
     clean = []
     for e in entries:
         if isinstance(e, dict):
             clean.append(e)
         else:
-            LOG.warning("[警告] 乘车人文件 %s 含非法条目（%r），已跳过",
-                        path, e)
+            # Task 118 2.1.3：%r 原样打印脏条目会把真实姓名落盘（Task 112 引入
+            # 的回归）——只记类型+长度；大字符串也不产生超大单行。
+            detail = type(e).__name__
+            if hasattr(e, "__len__"):
+                detail += "，长度：%d" % len(e)
+            LOG.warning("[警告] 乘车人文件 %s 含非法条目（%s），已跳过",
+                        path, detail)
     return clean
 
 
