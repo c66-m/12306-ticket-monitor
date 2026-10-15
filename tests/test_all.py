@@ -14682,6 +14682,113 @@ class TestTask128CtrlCB7(TempDirCase):
         self.assertNotIn("中断", self._printed(mprint))
 
 
+class TestTask130EngineShapesB8(TempDirCase):
+    """Task 130（B8-2）：engine 入口形状 bundle（P3×2）。
+
+    2.2.1 engine.py:1068-1069（+ dedup_key:362）：passenger_names 真值
+        非可迭代（如手改 "passenger_names": 5）→ TypeError → 有票命中时
+        单任务无限 loud backoff（Task 125 只修了元素形状，容器形状残留；
+        round-4/5 §4 豁免的只是裸字符串形状，不涉及容器形状）。
+    2.2.2 engine.py:964-972（MonitorEngine._notify）：notify/email 配置节
+        真值非 dict（如手改 "notify": 5）→ .get AttributeError → 被调用点
+        except 吞掉后通知静默丢失（engine 经 json.load 直接读配置，gui 的
+        _sanitize_config_shapes 覆盖不到 engine 路径）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # _WARNED_CONFIG 是模块级 warn-once 集合：测试隔离，避免串扰。
+        self._warned_before = set(engine_mod._WARNED_CONFIG)
+        self.addCleanup(self._restore_warned)
+
+    def _restore_warned(self):
+        engine_mod._WARNED_CONFIG.clear()
+        engine_mod._WARNED_CONFIG.update(self._warned_before)
+
+    # ---------- 2.2.1：passenger_names 容器形状 ----------
+
+    def _run_task_hit(self, passenger_names):
+        e = make_engine(self.tmp)
+        t = task_of(passenger_names=passenger_names)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123",
+                                              "passengers": "张三"})), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            broke, _rec = e._run_task(t)
+        return e, t
+
+    def test_2_2_1_int_shape_hit_path_no_crash(self):
+        # RED（旧代码）：(5 or []) → 5 → for n in 5 抛 TypeError，
+        # 直接逃出 _run_task（命中→通知→下单之前），单任务无限 loud backoff。
+        e, t = self._run_task_hit(5)
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "success")
+
+    def test_2_2_1_dedup_key_int_shape_no_crash(self):
+        # RED（旧代码）：[n for n in (5 or [])] → TypeError。
+        t = task_of()
+        key = engine_mod.dedup_key(t, "2026-10-10", "K225", "硬座", 5)
+        self.assertTrue(key.endswith("|*"), key)  # 按缺失处理 → 乘车人段为 "*"
+
+    def test_2_2_1_clean_list_unchanged(self):
+        # 正向对照：干净输入行为不变（新旧代码都通过）。
+        t = task_of()
+        key = engine_mod.dedup_key(t, "2026-10-10", "K225", "硬座", ["张三"])
+        self.assertTrue(key.endswith("|张三"), key)
+        e, t2 = self._run_task_hit(["张三"])
+        self.assertEqual(e.state["tasks"][t2["name"]]["status"], "success")
+
+    # ---------- 2.2.2：notify/email 配置节形状 ----------
+
+    def _write_config(self, cfg):
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        return path
+
+    def _make_engine_via_init(self, cfg):
+        path = self._write_config(cfg)
+        return engine_mod.MonitorEngine(config_path=path, setup_logging=False)
+
+    def test_2_2_2_notify_int_shape_sanitized_at_load(self):
+        # RED（旧代码）：config["notify"] 保持 5 → _notify 内
+        # (5 or {}).get("email") 抛 AttributeError，被调用点吞掉后通知静默丢失。
+        e = self._make_engine_via_init({"notify": 5, "tasks": []})
+        self.assertEqual(e.config["notify"], {})
+        res = e._notify({"name": "t1"}, "subj", "body")
+        self.assertEqual(res, {})
+
+    def test_2_2_2_email_int_shape_sanitized_at_load(self):
+        # RED（旧代码）：notify.email=5 → email_cfg.get("enabled") 抛 AttributeError。
+        e = self._make_engine_via_init({"notify": {"email": 5}, "tasks": []})
+        self.assertEqual(e.config["notify"]["email"], {})
+        res = e._notify({"name": "t1"}, "subj", "body")
+        self.assertEqual(res, {})
+
+    def test_2_2_2_sync_config_hot_update_sanitized(self):
+        # RED（旧代码）：热更新只重 sanitize tasks，notify 脏形状直达 _notify。
+        e = self._make_engine_via_init(
+            {"notify": {"email": {"enabled": False}}, "tasks": []})
+        path = e.config_path
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"notify": 5, "tasks": []}, f)
+        new_mtime = os.path.getmtime(path) + 2
+        os.utime(path, (new_mtime, new_mtime))
+        self.assertTrue(e._sync_config())
+        self.assertEqual(e.config["notify"], {})
+
+    def test_2_2_2_clean_notify_unchanged(self):
+        # 正向对照：干净配置原样通过（新旧代码都通过）。
+        e = self._make_engine_via_init(
+            {"notify": {"email": {"enabled": True}}, "tasks": []})
+        self.assertEqual(e.config["notify"], {"email": {"enabled": True}})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

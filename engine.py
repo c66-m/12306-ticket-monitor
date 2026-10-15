@@ -179,6 +179,35 @@ def _safe_config_path(config, key, default):
     return default
 
 
+def _sanitize_notify_section(config):
+    """notify/email 配置节形状守卫（Task 130，2.2.2）。
+
+    gui 的 _sanitize_config_shapes（gui.py:147）是 gui 私有，engine 经
+    json.load 直接读配置（python engine.py 独立运行）时脏形状直达
+    MonitorEngine._notify → (5 or {}).get("email") 抛 AttributeError，
+    被调用点 except 吞掉后通知静默丢失。同口径：非 dict → 记一次警告
+    后按 {} 处理（键缺失时静默通过，不警告）。
+    """
+    notify = config.get("notify")
+    if "notify" in config and not isinstance(notify, dict):
+        key = ("notify_section", repr(notify))
+        if key not in _WARNED_CONFIG:
+            _WARNED_CONFIG.add(key)
+            LOG.warning("[配置] config.json 的 notify 节不是对象（%s），"
+                        "已按空配置处理", type(notify).__name__)
+        config["notify"] = {}
+        notify = {}
+    if isinstance(notify, dict):
+        email = notify.get("email")
+        if "email" in notify and not isinstance(email, dict):
+            key = ("email_section", repr(email))
+            if key not in _WARNED_CONFIG:
+                _WARNED_CONFIG.add(key)
+                LOG.warning("[配置] config.json 的 notify.email 节不是对象"
+                            "（%s），已按空配置处理", type(email).__name__)
+            notify["email"] = {}
+
+
 def _sanitize_tasks(raw):
     """tasks 字段形状校验（Task 68a）：非列表→记 error 后视为空；非 dict 条目→
     记 error 后跳过该条。绝不让手改配置的形状手误崩掉引擎进程。
@@ -358,8 +387,13 @@ def dedup_key(task, date, train_code, seat_name, passenger_names):
 
     Task 120（2.2.4）：乘车人名非字符串条目（如手改配置）→ sorted/join
     TypeError，有票命中时单任务无限 loud backoff；元素级过滤掉。
+    Task 130（2.2.1）：passenger_names 真值非可迭代（如手改成数字 5）
+    → for n in 5 抛 TypeError；Task 125 只修了元素形状，容器形状残留。
+    非可迭代真值按缺失处理（Task 125 口径）。
     """
-    strs = [n for n in (passenger_names or []) if isinstance(n, str)]
+    pn_iter = (passenger_names if isinstance(passenger_names, (list, tuple, str))
+               else [])
+    strs = [n for n in pn_iter if isinstance(n, str)]
     names = "|".join(sorted(strs)) if strs else "*"
     return "{0}|{1}|{2}|{3}|{4}|{5}".format(
         task["from"], task["to"], date, train_code, seat_name, names)
@@ -405,6 +439,7 @@ class MonitorEngine(object):
             LOG.error("[配置] %s 顶层不是对象（%s），已按默认配置继续",
                       self.config_path, type(self.config).__name__)
             self.config = {}
+        _sanitize_notify_section(self.config)  # Task 130（2.2.2）
         try:
             self._config_mtime = os.path.getmtime(self.config_path)
         except OSError:
@@ -727,6 +762,8 @@ class MonitorEngine(object):
             return False
         self._config_mtime = m
         self.config = new_config
+        _sanitize_notify_section(self.config)  # Task 130（2.2.2）：热更新
+        # 只重 sanitize tasks，notify/email 脏形状直达 _notify → 通知静默丢失。
         self.base_interval = _safe_config_int(
             self.config.get("poll_interval_seconds", 45), 45,
             "poll_interval_seconds")
@@ -1066,7 +1103,14 @@ class MonitorEngine(object):
                     # → sorted() 比较 str < int 抛 TypeError，崩在下方
                     # dedup_key 的修复之前（Task 120 只给 dedup_key 加了元素级
                     # 过滤）；与 dedup_key 同口径元素级过滤。
-                    p_names = sorted(n for n in (task.get("passenger_names") or [])
+                    # Task 130（2.2.1）：passenger_names 真值非可迭代（如手改
+                    # 成数字 5）→ for n in 5 抛 TypeError，有票命中时单任务
+                    # 无限 loud backoff；Task 125 只修了元素形状，容器形状
+                    # 残留。非可迭代真值按缺失处理（Task 125 口径）。
+                    pn_raw = task.get("passenger_names")
+                    pn_iter = (pn_raw if isinstance(pn_raw, (list, tuple, str))
+                               else [])
+                    p_names = sorted(n for n in pn_iter
                                      if isinstance(n, str)) or ["(账号默认)"]
                     key = dedup_key(task, date, train_code, seat_name,
                                     task.get("passenger_names") or [])
