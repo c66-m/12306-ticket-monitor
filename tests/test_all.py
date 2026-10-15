@@ -2898,6 +2898,93 @@ class TestSessionCheckTransient(TempDirCase):
             e.check_session_if_needed()
         self.assertEqual(e.task_status(t), "failed")
 
+    def test_passport_redirect_is_permanent(self):
+        # 真失效的落点：302 到 /otn/passport?redirect=...（不是 /login），
+        # 落点页是登录门户 HTML —— 旧代码在这里抛 JSONDecodeError，被归成
+        # "校验异常"，引擎于是永不标 failed。
+        class FakePage:
+            url = "https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api"
+
+            def goto(self, *a, **kw):
+                pass
+
+            def evaluate(self, *a):
+                return "<html>您好，请登录免费注册</html>"
+
+            def close(self):
+                pass
+
+        ok, who = browser_order.session_ok(object(), page=FakePage())
+        self.assertFalse(ok)
+        self.assertIn("已跳转登录门户", who)
+        self.assertTrue(browser_order.session_failure_is_permanent(who))
+
+    def test_login_portal_body_is_permanent(self):
+        # 落点没变但正文是登录门户（跳转被前端接管的情形）：同样算确认失效
+        class FakePage:
+            url = "https://kyfw.12306.cn/otn/index/initMy12306Api"
+
+            def goto(self, *a, **kw):
+                pass
+
+            def evaluate(self, *a):
+                return "  请先登录"
+
+            def close(self):
+                pass
+
+        ok, who = browser_order.session_ok(object(), page=FakePage())
+        self.assertFalse(ok)
+        self.assertIn("已跳转登录门户", who)
+
+    def test_goto_timeout_is_not_permanent(self):
+        class FakePage:
+            url = ""
+
+            def goto(self, *a, **kw):
+                raise TimeoutError("Timeout 20000ms exceeded")
+
+            def evaluate(self, *a):
+                return ""
+
+            def close(self):
+                pass
+
+        ok, who = browser_order.session_ok(object(), page=FakePage())
+        self.assertFalse(ok)
+        self.assertIn("校验异常", who)
+        self.assertFalse(browser_order.session_failure_is_permanent(who))
+
+    def test_risk_control_html_is_not_permanent(self):
+        # 无门户标志的非 JSON 页（风控拦截页）仍按瞬时处理，不标 failed
+        class FakePage:
+            url = "https://kyfw.12306.cn/otn/index/initMy12306Api"
+
+            def goto(self, *a, **kw):
+                pass
+
+            def evaluate(self, *a):
+                return "<html>当前访问存在异常，请稍后再试</html>"
+
+            def close(self):
+                pass
+
+        ok, who = browser_order.session_ok(object(), page=FakePage())
+        self.assertFalse(ok)
+        self.assertIn("校验异常", who)
+        self.assertFalse(browser_order.session_failure_is_permanent(who))
+
+    def test_passport_redirect_marks_task_failed(self):
+        # 端到端：门户文案一路走到引擎，自动下单任务必须被标 failed
+        e, t = self._browser_engine()
+        portal = ("已跳转登录门户："
+                  "https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api")
+        with mock.patch.object(browser_order, "busy", return_value=False), \
+             mock.patch.object(browser_order, "check_session",
+                               return_value=(False, portal)):
+            e.check_session_if_needed()
+        self.assertEqual(e.task_status(t), "failed")
+
 
 class TestLoadStateErrorSplit(TempDirCase):
     """Task 40: _load_state 区分"真坏档"与"瞬时占用"。

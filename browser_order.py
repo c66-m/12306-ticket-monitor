@@ -455,11 +455,27 @@ def session_ok(ctx, page=None):
     if own:
         page = ctx.new_page()
     try:
-        # wait_until 必须是 domcontentloaded：12306 的 load 事件要等一票第三方
-        # 资源，默认的 "load" 经常把超时耗光，表现为"校验卡住不动"。
-        page.goto(CHECK_URL, timeout=20000, wait_until="domcontentloaded")
-        raw = page.evaluate("() => document.body.innerText")
-        data = json.loads(raw)
+        try:
+            # wait_until 必须是 domcontentloaded：12306 的 load 事件要等一票第三方
+            # 资源，默认的 "load" 经常把超时耗光，表现为"校验卡住不动"。
+            page.goto(CHECK_URL, timeout=20000, wait_until="domcontentloaded")
+            raw = page.evaluate("() => document.body.innerText") or ""
+            final_url = page.url or ""
+        except Exception as e:
+            return False, "校验异常: %s" % str(e)[:100]
+        try:
+            # 先看落点再看正文：踢会话时 12306 是 302 到 /otn/passport?redirect=...，
+            # 落点页是登录门户 HTML，json.loads 必然抛 JSONDecodeError。旧代码让这条
+            # 真失效落进通用的"校验异常"桶，而引擎把"校验异常"一律当瞬时故障 →
+            # 任务永不标 failed、无限重试、永不下单。
+            # 判据与 order.verify_session（纯 HTTP 版）同口径。
+            if "/login" in final_url or "/passport" in final_url:
+                return False, "已跳转登录门户：%s" % final_url
+            if "请先登录" in raw or "未登录" in raw[:500]:
+                return False, "已跳转登录门户：%s" % final_url
+            data = json.loads(raw)
+        except Exception as e:
+            return False, "校验异常: %s" % str(e)[:100]
         if data.get("status"):
             return True, (data.get("data") or {}).get("user_name")
         return False, "接口返回 status=false（会话已失效）"
@@ -471,6 +487,19 @@ def session_ok(ctx, page=None):
                 page.close()
             except Exception:
                 pass
+
+
+# 会话失效判据：只有这两类算"确认失效"，其余（goto 超时 / 网络抖动 / 风控
+# 非 JSON 页）都是瞬时故障。默认方向取"重试"——误把任务标 failed 要人工恢复，
+# 代价比多试几轮大，所以拿白名单而不是把"校验异常"整类当永久。
+_PERMANENT_FAILURE_MARKS = ("已跳转登录门户", "接口返回 status=false")
+
+
+def session_failure_is_permanent(who):
+    """失败文案是否代表"确认失效"（而非瞬时故障）。引擎据此决定把自动下单
+    任务标 failed 还是只走冷却重试。"""
+    text = str(who or "")
+    return any(mark in text for mark in _PERMANENT_FAILURE_MARKS)
 
 
 @_exclusive(lock_timeout=420)

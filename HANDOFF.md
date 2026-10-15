@@ -138,9 +138,9 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ### tests/TEST_REPORT.md（历史存档 + 已加复核抬头）
 - 5.3KB，抬头写「日期:2026-10-06 · 基线:a8b4b57 · 测试套件(47 项)」，内容为当时的二次自我检查报告（append_monitor_task 并发丢数据、mtime 15.6ms 盲区、误导性日志等**已修项**）。
-- 当前基线是 **711 项**，该报告早于 Electron 迁移与三轮重构，**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
+- 当前基线是 **716 项**（2026-10-16 复核；本报告写于 47 项时代，早于 Electron 迁移与三轮重构），**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
 
-## 0.98 本轮批次（2026-10-16：config/state 收敛 + 文档订正）
+## 0.98 本批（2026-10-16）：config/state 收敛 + 文档订正 + 会话失效判定修复
 
 - **config/state 家族跨文件重复已收敛**（原第 10 节待办，用户 2026-10-16 裁决「消掉」）：
   `load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records` 原在 `api.py`、`gui.py`、`monitor.py` 各有一份，现机械层单源到 `appcommon.py` 新分节「config.json 共享 plumbing」（appcommon.py:534 起）：
@@ -151,6 +151,27 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 - **monitor.update_config_locked 新增损坏/非 dict 的 CLI 提示**（旧版静默 `return False`）——仍在锁内、仍在 mutator 之前拒绝，只是补一句人话；无测试断言旧文案。
 - **回归**：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 711 tests, OK (skipped=15)**。代码改动 5 个文件（api.py / appcommon.py / gui.py / launcher.py / monitor.py），文档订正 5 个（RULES / HANDOFF / README / PRODUCT / tests/TEST_REPORT）。
 - **本轮踩到的坑**：改造 `api.load_config` 时内部闭包 `_broken` 给模块级 `_CONFIG_CORRUPT_WARNED` 赋值忘了再声明 `global` → 名字退化成局部变量 → `UnboundLocalError`，被只覆盖该路径的 `test_api_load_config_gbk_still_returns_empty` 逮到。**模块级哨兵在嵌套函数里赋值，每层都要 `global`。**
+
+### 会话失效被误判成瞬时故障（2026-10-16 修，本轮 CDP 冒烟时发现）
+
+**症状**：浏览器模式下任务无限重试、永不下单，界面却只显示「监控中」。
+**根因链**：踢会话时 12306 是 302 到 `/otn/passport?redirect=...`（**不是** `/login`），落点页是登录门户 HTML →
+`session_ok` 里 `json.loads(raw)` 抛 `JSONDecodeError` → 旧代码把它兜进 `"校验异常: %s"`；
+而 `engine.py` 的 `permanent = not ok and not who.startswith("校验异常")` 把「校验异常」整类当瞬时故障 →
+`set_task_status(..., "failed")` 永不触发。`order.py:341-343` 的注释早就点过这个病（「只认 /login 会把真失效误判成临时故障 -> 无限重试、永不下单」），
+纯 HTTP 版 `order.verify_session` 判对了，浏览器版漏了。
+**修法**（判据与 `order.verify_session` 同口径）：
+- `browser_order.session_ok`：goto/evaluate 单独一层 try（异常仍=「校验异常」，瞬时）；随后先看落点 `page.url` 含 `/login`|`/passport`、
+  再看正文 `raw` 含「请先登录」/前 500 字含「未登录」，命中即 `(False, "已跳转登录门户：<url>")`；顺序在 `json.loads` 之前。
+- 新增 `browser_order._PERMANENT_FAILURE_MARKS = ("已跳转登录门户", "接口返回 status=false")` 与 `session_failure_is_permanent(who)`：
+  **白名单**判定（旧代码是 `startswith("校验异常")` 前缀黑名单），默认方向取「重试」——误标 failed 要人工恢复，代价更大，未知文案一律按瞬时。
+- `engine.py:1342` 改为 `permanent = (not ok) and browser_order.session_failure_is_permanent(who)`。
+  全库只有 engine 拿 `permanent` 做任务状态分支（launcher/api/monitor/gui 只看 `ok`），所以只动这一处。
+**测试**：`tests/test_all.py` 的 `TestSessionCheckTransient` 加 5 例（门户落点 / 门户正文 / goto 超时 / 无门户标志的风控 HTML / 门户文案到引擎必须标 failed），跑真实 `session_ok` 而非 mock 文案。
+**实跑取证**：失效会话下 `session_ok` 真实返回 `(False, "已跳转登录门户：https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api")`，`session_failure_is_permanent` = True。
+**回归**：`compileall` 干净；`tests\test_all.py` → **Ran 716 tests, OK (skipped=15)**。
+
+**教训**：把「异常」整类当瞬时故障的兜底，会把真失效吞掉——兜底判据要用**确认失效的白名单**，不要用「排除了异常前缀就算永久」。
 
 ## 1. 位置与仓库现状（2026-10-16 复核）
 - 当前家：C:\develep\产物\12306（本项目唯一工作副本）。
@@ -236,7 +257,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 7. 测试与验证口径
 - 语法检查：python -X utf8 -m compileall -q .
-- 全量测试：python -X utf8 tests\test_all.py → 现状 **Ran 711, OK (skipped=15)**（2026-10-16 复核，零失败）。
+- 全量测试：python -X utf8 tests\test_all.py → 现状 **Ran 716, OK (skipped=15)**（2026-10-16 复核，零失败）。
   历史：曾一度为 696/5/15、701/4/15，那批 Windows 平台差异失败（test_append_history_shape_invalid_abandon_rereads、
   test_cookie_path_absolute_passthrough、test_menu_notify_routes_password_through_protect_secret、
   test_load_session_relative_path_resolves_against_here、test_save_session_relative_path_resolves_against_here）
@@ -258,6 +279,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 9. 当前运行状态
 - 登录态已失效：order.verify_session(order.session_from_browser_state()) → (False, '已跳转登录门户：https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api', True)。第三位 True = 服务端明确判失效（非网络故障）。
+  浏览器版同口径（2026-10-16 实测）：browser_order.session_ok(ctx) → (False, '已跳转登录门户：https://kyfw.12306.cn/otn/passport?redirect=/otn/index/initMy12306Api')，session_failure_is_permanent → True。
 - cookie 文件(.browser_state.json 4721B / session_cookies.json 1593B)搬迁前后逐字节一致 → 自然过期，不是搬家造成。抢票前需重新登录一次。
 - 车站文件一致性（2026-10-15 实测）：`python station_db.py check` → 漂移 0 处；stations_db.json 已 rebuild（3404 站，待识别 3313），三份同源文件时间戳漂移消除。
 - 免登录链路正常（本次实测）：ticket.load_station_map() 3404 站；ticket.query_tickets('SHH','GZQ','2026-10-16') → 26 车次；parse_row → G1305 上海南→广州新塘，seat_names_all → ['商务座','一等座','二等座','无座']；train_seat_kind('G1305')=G、train_seat_kind('K225')=普速。
@@ -266,7 +288,9 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 ## 10. 未决 / 待办（没有授权就别动）
 - ~~main ahead 8：是否 git push~~ **已完成**：HEAD=190a919 已推送，与 origin/main 同步（见第 1 节）。
 - ~~交接文档校正未提交~~ **已完成**：3f683ff（HANDOFF/README）+ 671324a（PRODUCT.md）已提交，工作树干净。**下次 push 时这两个 commit 会一起上去**。
-- ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（711 OK）。
+- ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（现 716 OK）。
+- ~~浏览器模式会话失效被误判成瞬时故障（引擎永不标 failed、无限重试）~~ **已修（2026-10-16，见 §0.98 末节）**：
+  session_ok 先判落点/正文的门户标志（顺序在 json.loads 之前），引擎改用白名单 session_failure_is_permanent；新增 5 条测试，全量 716 OK。
 - 一等卧/二等卧/高级动卧（官方码 I/J/A）是否进下单码表（长期未决）。
 - 重新登录后做一次真实下单核对（核对窗席别 vs 订单详情，需登录实跑）。
 - ~~**config/state 家族跨文件重复尚未收敛**~~ **已完成（2026-10-16，见 §0.98；策略以参数/回调注入保留，未拉平）**（用户 2026-10-16 裁决「消掉」）：load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records 在 api.py、gui.py、monitor.py 各有一份。实测三份不是机械重复而是**能力分层**（monitor 有 FileNotFoundError 分支 + `_DAMAGED_STAMP` 指纹拒写 + expect_stamp；gui 有 messagebox 弹窗与 `guisave` 临时名；api 最简但有 expect_stamp），收敛必须**参数化保留策略**（RULES.md §七 第 2 条是硬约束），落点是 appcommon.py（已具 state.json 共享 plumbing 分节，含 read_state_or_none / `_read_history_list`）。逐字等价可无痛下沉的只有 `load_state` 与 `normalize_email_settings`（后者须统一选 gui 的**严格** EMAIL_RE，api 现为宽松版）。
@@ -340,6 +364,6 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
 2. git status -sb + `git log --oneline origin/main..main` 看实况（本文档不记 sha；是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
-4. python -X utf8 tests\test_all.py（预期 711 OK / skipped=15）
+4. python -X utf8 tests\test_all.py（预期 716 OK / skipped=15）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
 6. 需要下线实跑就先重新登录，再动代码。

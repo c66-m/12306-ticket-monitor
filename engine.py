@@ -1336,10 +1336,10 @@ class MonitorEngine(object):
                     self._last_session_check = now - 1140
                     return
                 ok, who = browser_order.check_session(timeout=6)
-                # session_ok 对 goto 超时等任何异常都返回 (False, "校验异常: ...")：
-                # 这是 12306 偶发卡顿类的瞬时故障，只走冷却重试；只有明确的会话失效
-                # 才把任务标记为失败。
-                permanent = not ok and not str(who or "").startswith("校验异常")
+                # goto 超时等一律返回 (False, "校验异常: ...")，属 12306 偶发卡顿的
+                # 瞬时故障，只走冷却重试；只有 browser_order 认定的"确认失效"
+                # （跳登录门户 / 接口 status=false）才把任务标失败。
+                permanent = (not ok) and browser_order.session_failure_is_permanent(who)
             except Exception as e:
                 ok, who, permanent = False, "浏览器会话校验异常: %s" % str(e)[:100], False
         else:
