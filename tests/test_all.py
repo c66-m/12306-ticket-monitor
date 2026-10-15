@@ -15191,6 +15191,63 @@ class TestTask133ReworkStatusField(TempDirCase):
         self.assertIn("t1", printed)
 
 
+class TestTask133ReworkStatusOps(TempDirCase):
+    """Task 133 二次返工（P3）：scoped re-review 新发现——menu_task_ops
+    （菜单 [6]）的 STATUS_LABELS.get(status, status) 对不可哈希 status
+    （如手改成 list）TypeError 崩菜单 [6]。与 menu_task_list 的 status
+    守卫同口径：warn + 按空处理。"""
+
+    @staticmethod
+    def _task(name="t1"):
+        return {"name": name, "from": "北京", "to": "上海", "dates": []}
+
+    @staticmethod
+    def _mock_engine(tasks_state):
+        # 与真实 engine.task_status 同行为：返回 state 里 status 字段原值。
+        eng = mock.MagicMock()
+        eng.state = {"tasks": tasks_state}
+        eng.base_interval = 300
+        eng.task_status = lambda t: eng.state["tasks"].get(
+            t.get("name"), {}).get("status", "paused")
+        # 避免 status="monitoring" 时走入轮询估算块的无关 TypeError。
+        eng.task_interval = lambda t: 300
+        return eng
+
+    def _run_task_ops(self, tasks, tasks_state, reads):
+        import monitor as m
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(m, "fresh_engine",
+                               return_value=self._mock_engine(tasks_state)), \
+             mock.patch.object(m, "read", side_effect=reads), \
+             mock.patch("builtins.print") as mprint:
+            m.menu_task_ops()  # 不得抛 TypeError
+        return " ".join(str(c.args[0]) for c in mprint.call_args_list)
+
+    def test_ops_status_unhashable_warn_empty(self):
+        # RED（旧代码）：选中任务后 status=["x"] → STATUS_LABELS.get(["x"])
+        # → TypeError，菜单 [6] 崩溃。修后：warn + 操作菜单正常展示。
+        printed = self._run_task_ops(
+            [self._task()], {"t1": {"status": ["x"]}}, ["1", ""])
+        self.assertIn("警告", printed)
+        self.assertIn("t1", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_ops_status_dict_warn_empty(self):
+        # RED（旧代码）：status={"a": 1} → dict.get 不可哈希键 → TypeError。
+        printed = self._run_task_ops(
+            [self._task()], {"t1": {"status": {"a": 1}}}, ["1", ""])
+        self.assertIn("警告", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_ops_status_str_unchanged(self):
+        # 对照：干净 status 照常显示，无警告。
+        printed = self._run_task_ops(
+            [self._task()], {"t1": {"status": "monitoring"}}, ["1", ""])
+        self.assertNotIn("警告", printed)
+        self.assertIn("t1", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

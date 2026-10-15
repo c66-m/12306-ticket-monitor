@@ -715,6 +715,13 @@ def menu_task_ops():
         return
     eng = fresh_engine()
     status = eng.task_status(task)
+    # Task 133 二次返工：status 真值非 str（如手改成 list/dict）→ 下面的
+    # STATUS_LABELS.get(status, status) 对不可哈希键 TypeError 崩菜单 [6]；
+    # 记警告后按空处理（与 menu_task_list 的 status 守卫同口径）。
+    if status and not isinstance(status, str):
+        print("  [警告] 第 {0} 个任务的状态字段非字符串"
+              "（配置损坏），已忽略。".format(idx + 1))
+        status = ""
     print("\n  任务：{0}（当前状态：{1}）".format(task["name"],
           engine_mod.STATUS_LABELS.get(status, status)))
     print("   1. 暂停监控       2. 恢复监控（继续抢票）")
