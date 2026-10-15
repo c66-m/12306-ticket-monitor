@@ -153,6 +153,17 @@ def save_session(session, cookie_path=None):
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
 
 
+def _iterable_passenger_names(pn_raw):
+    """passenger_names 容器形状守卫（Task 134 2.2.4：与 engine.py Task 130
+    的 `_iterable_passenger_names` 同口径）。
+
+    真值非可迭代（如手改 orders.json 把 passengers 写成数字 5）按缺失
+    处理 → []；裸字符串保持原样（§4 豁免，set("张三") 逐字符旧行为不变）；
+    falsy 值 → []（与 `or []` 一致）。
+    """
+    return pn_raw if isinstance(pn_raw, (list, tuple, str)) else []
+
+
 def _classify_orders(date, train, passenger_names, orders):
     """纯分类逻辑（不查接口）：对已查到的订单列表做状态分类。
 
@@ -160,7 +171,7 @@ def _classify_orders(date, train, passenger_names, orders):
     抽出是为了让 classify_with_time 复用同一次查询结果，避免每次调用
     打两次官方订单接口（HTTP 量翻倍，频繁回读时易触 12306 限流）。
     """
-    want = set(passenger_names or [])
+    want = set(_iterable_passenger_names(passenger_names))
 
     def _pax_hit(x):
         pax = set(x.get("passengers") or [])
@@ -255,7 +266,7 @@ def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, 
     """
     lo = not_before_ts - window_sec
     hi = not_before_ts + 600
-    want = set(passenger_names or [])
+    want = set(_iterable_passenger_names(passenger_names))
     best = None
     for o in orders:
         if ((o.get("train") or "") != (train_code or "")
@@ -712,7 +723,7 @@ def find_duplicate(orders, date, train_code, passenger_names,
       （旧代码保守判重，一条畸形记录永久封锁该 date+train 的一切下单）。
     - 空目标乘车人集不算命中。
     """
-    want = set(passenger_names or [])
+    want = set(_iterable_passenger_names(passenger_names))
     # 席别比对统一到提交时的有效席别：调用方 seat_name 是用户勾选（改判前），
     # 订单 seat 是实际出票席别（改判后）。_effective_seat_name 做同价改判。
     want_seat = _effective_seat_name(seat_name, train_code)

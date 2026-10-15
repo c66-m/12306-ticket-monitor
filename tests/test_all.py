@@ -15248,6 +15248,83 @@ class TestTask133ReworkStatusOps(TempDirCase):
         self.assertIn("t1", printed)
 
 
+class TestTask134OrderContainerShapes(TempDirCase):
+    """Task 134（P3）：order.py 三处 `want = set(passenger_names or [])`
+    （_classify_orders:163 / find_recent_order:258 / find_duplicate:715）
+    对真值非可迭代（如手改 orders.json 把 passengers 写成数字 5）抛
+    TypeError；engine.py:1568 的启动复核把原值直传，一条脏记录中止整批
+    未完成订单的启动复核。修复口径：三处 want 统一加可迭代守卫（真值非
+    可迭代 → 空集，与 Task 130 的 _iterable_passenger_names 同口径；裸
+    字符串豁免；falsy 不变）；engine.py:1568 逐条保护（坏记录跳过+warn，
+    整批继续，_cancelled_dedup_keys 口径）。"""
+
+    def test_classify_orders_noniterable_no_crash(self):
+        # RED（旧代码）：TypeError: 'int' object is not iterable。
+        cls, ono, raw = order_mod._classify_orders("2026-10-10", "G1", 5, [])
+        self.assertEqual(cls, "none")
+
+    def test_find_recent_order_noniterable_no_crash(self):
+        # RED（旧代码）：TypeError。
+        got = order_mod.find_recent_order([], "2026-10-10", "G1", 5,
+                                          1700000000)
+        self.assertIsNone(got)
+
+    def test_find_duplicate_noniterable_no_crash(self):
+        # RED（旧代码）：TypeError。
+        got = order_mod.find_duplicate([], "2026-10-10", "G1", 5)
+        self.assertIsNone(got)
+
+    def test_bare_string_shape_unchanged(self):
+        # 对照：裸字符串豁免（§4）——旧行为逐字符迭代，不得抛错、结果不变。
+        cls, ono, raw = order_mod._classify_orders("2026-10-10", "G1",
+                                                   "张三", [])
+        self.assertEqual(cls, "none")
+
+    def test_none_names_no_match(self):
+        # 对照：falsy 行为不变——空目标集不算命中。
+        cls, ono, raw = order_mod._classify_orders("2026-10-10", "G1",
+                                                   None, [])
+        self.assertEqual(cls, "none")
+
+    def test_startup_recovery_per_record_protection(self):
+        # RED（旧代码）：第一条脏记录抛错 → 逃出 for 循环 → 整批启动复核被
+        # 中止，第二条记录的 classify_order_status 从未被调用。修后：坏记录
+        # 跳过+warn，整批继续（第二条正常复核）。
+        e = make_engine(self.tmp)
+        e.check_session_if_needed = lambda: None
+        stop = threading.Event()
+        stop.set()
+        odb = {"orders": {
+            "k1": {"order_no": "E1", "train": "G1", "date": "2026-10-10",
+                   "seat": "硬座", "passengers": 5, "classify": "unpaid"},
+            "k2": {"order_no": "E2", "train": "G1", "date": "2026-10-10",
+                   "seat": "硬座", "passengers": ["张三"],
+                   "classify": "unpaid"},
+        }}
+        calls = []
+
+        def fake_classify(date, train, pax):
+            calls.append((date, train, pax))
+            if pax == 5:
+                raise TypeError("'int' object is not iterable")
+            return ("unpaid", "E2", "未完成/未支付")
+
+        with mock.patch.object(engine_mod, "LOG") as m_log, \
+                mock.patch.object(engine_mod.appcommon, "load_orders",
+                                  return_value=odb), \
+                mock.patch.object(engine_mod.order_mod,
+                                  "classify_order_status",
+                                  side_effect=fake_classify), \
+                mock.patch.object(engine_mod.appcommon,
+                                  "upsert_order") as m_upsert:
+            e.run(stop_event=stop)
+        self.assertEqual(len(calls), 2)          # 整批继续：第二条被复核
+        self.assertEqual(m_upsert.call_count, 1)  # 仅干净记录写回
+        warned = " ".join(str(c.args)
+                          for c in m_log.warning.call_args_list)
+        self.assertIn("k1", warned)               # 坏记录记 warn
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

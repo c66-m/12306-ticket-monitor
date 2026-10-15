@@ -1562,28 +1562,36 @@ class MonitorEngine(object):
             for okey, rec in (odb.get("orders") or {}).items():
                 if rec.get("classify") != "unpaid":
                     continue
-                LOG.info("[订单恢复] 待支付订单 %s %s %s(订单号 %s)——重新核验官方状态",
-                         rec.get("train"), rec.get("date"), rec.get("seat"),
-                         _mask_order_no(rec.get("order_no") or ""))
-                cls, ono, raw = order_mod.classify_order_status(
-                    rec.get("date"), rec.get("train"), rec.get("passengers"))
-                rec.update({"classify": cls, "official_status": raw,
-                            "order_no": ono or rec.get("order_no"),
-                            "decision": "启动复核:%s" % cls})
-                appcommon.upsert_order(op, okey, rec)
-                LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
-                if cls == "cancelled":
-                    # Task 72：精确键匹配清本地防重（旧子串匹配会误清 "G101"）；
-                    # rec 缺 date/train 时记 warning 跳过该条，不中止整体恢复。
-                    if not rec.get("date") or not rec.get("train"):
-                        LOG.warning("[订单恢复] %s 缺少 date/train，跳过本地防重清理",
-                                    okey)
-                    else:
-                        for dk in self._cancelled_dedup_keys(
-                                rec, self.state.get("dedup", {})):
-                            self.state["dedup"].pop(dk, None)
-                        self._save_state()
-                        LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
+                # Task 134（2.2.4）：逐条保护——单条脏记录（如手改 orders.json
+                # 把 passengers 写成非可迭代）抛错时记 warning 后跳过该条，
+                # 整批继续（与 _cancelled_dedup_keys 的口径一致：绝不因一条
+                # 坏记录中止整体恢复）。外层 except 仅作最后兜底。
+                try:
+                    LOG.info("[订单恢复] 待支付订单 %s %s %s(订单号 %s)——重新核验官方状态",
+                             rec.get("train"), rec.get("date"), rec.get("seat"),
+                             _mask_order_no(rec.get("order_no") or ""))
+                    cls, ono, raw = order_mod.classify_order_status(
+                        rec.get("date"), rec.get("train"), rec.get("passengers"))
+                    rec.update({"classify": cls, "official_status": raw,
+                                "order_no": ono or rec.get("order_no"),
+                                "decision": "启动复核:%s" % cls})
+                    appcommon.upsert_order(op, okey, rec)
+                    LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
+                    if cls == "cancelled":
+                        # Task 72：精确键匹配清本地防重（旧子串匹配会误清 "G101"）；
+                        # rec 缺 date/train 时记 warning 跳过该条，不中止整体恢复。
+                        if not rec.get("date") or not rec.get("train"):
+                            LOG.warning("[订单恢复] %s 缺少 date/train，跳过本地防重清理",
+                                        okey)
+                        else:
+                            for dk in self._cancelled_dedup_keys(
+                                    rec, self.state.get("dedup", {})):
+                                self.state["dedup"].pop(dk, None)
+                            self._save_state()
+                            LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
+                except Exception as e:
+                    LOG.warning("[订单恢复] %s 复核失败，已跳过（不影响其余订单）: %s",
+                                okey, e)
         except Exception as e:
             LOG.warning("[订单恢复] 未完成订单上下文恢复失败(不影响监控): %s", e)
         active_tasks = [t for t in self.tasks
