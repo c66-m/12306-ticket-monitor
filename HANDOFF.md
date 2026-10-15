@@ -259,6 +259,13 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 - 重新登录后做一次真实下单核对（核对窗席别 vs 订单详情，需登录实跑）。
 - **config/state 家族跨文件重复尚未收敛**（用户 2026-10-16 裁决「消掉」）：load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records 在 api.py、gui.py、monitor.py 各有一份。实测三份不是机械重复而是**能力分层**（monitor 有 FileNotFoundError 分支 + `_DAMAGED_STAMP` 指纹拒写 + expect_stamp；gui 有 messagebox 弹窗与 `guisave` 临时名；api 最简但有 expect_stamp），收敛必须**参数化保留策略**（RULES.md §七 第 2 条是硬约束），落点是 appcommon.py（已具 state.json 共享 plumbing 分节，含 read_state_or_none / `_read_history_list`）。逐字等价可无痛下沉的只有 `load_state` 与 `normalize_email_settings`（后者须统一选 gui 的**严格** EMAIL_RE，api 现为宽松版）。
 - 两条驱动循环（launcher Grabber 一次性 vs engine MonitorEngine 常驻）是否重构——语义不同，暂缓到真实抢票跑通之后。
+- **RULES.md §七 两条门禁的数字与措辞已过期**（本轮核实，**未改**——RULES 是业务规则，改动建议先与你对齐）：
+  (a) 「拆 launcher.py（**约 3000 行**）」实测只有 **1168 行**；
+  (b) 同条要求门面保 `python launcher.py` 兼容，但实测 launcher.py **已无 `__main__`**（2026-10-13 起不再是独立入口，见 README:84），该兼容条款已失效；
+  (c) 「拆 browser_order._order_impl（约 579 行）」实测 `def _order_impl` 在 `browser_order.py:726`、下一定义在 `:1324` → 约 **599 行**（量级未变）。
+- **拆 launcher.py 的《拆分清单》文档已随 2026-10-16 裁决被删**（原 LAUNCHER_SPLIT_PLAN.md）——该门禁要求「拆前单独出拆分清单给用户确认」，真到拆的时候需重新起草。
+- `web-dashboard/` 设计稿是否落地到 `ui/`（见 §0.97）：它是玻璃拟态方向的演进提案（全域零实线边框、层级用阴影写），落地需重写 ui/ 的样式与部分结构，属独立批次。
+- `tests/TEST_REPORT.md` 抬头仍是「日期:2026-10-06 · 基线:a8b4b57 · 测试套件(47 项)」，远早于当前 711 项基线。**要么更新、要么删**（保留价值是那几个已修并发 bug 的成因分析）。
 - ~~5 个 md + .zip + .scratch/ 如何处置~~ **已裁决（2026-10-16）：删除**，已提交。
 - ~~PRODUCT.md 视觉口径冲突~~ **已裁决（2026-10-16）：以落地的 Electron 玻璃拟态为准**，PRODUCT.md §Brand Commitments 已改写。
 
