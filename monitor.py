@@ -1009,8 +1009,18 @@ def menu_history():
             r.get("seat", ""), "、".join(names)))
         if r.get("order_no"):
             print("  订单号:{0}".format(r["order_no"]))
-        print("  结果:{0}   {1}".format(
-            label.get(r.get("result"), r.get("result")), r.get("message", "")))
+        res = r.get("result")
+        try:
+            label_txt = label.get(res, res)
+        except TypeError:
+            # Task 142（2.2.1 R10-S2-1）：result 真值不可哈希（如手改成
+            # ["success"]）→ label.get 抛 TypeError 崩菜单 [5]；记警告后按
+            # "（配置损坏）"占位展示（与 Task 133 的 message 守卫同口径：
+            # warn+占位，不崩菜单）。真值可哈希非 str（如 5）/ falsy 保持
+            # 旧行为（benign，无崩溃——崩溃面精确限定为不可哈希）。
+            print("  [警告] 历史记录 result 字段形状非法（配置损坏），已用占位展示。")
+            label_txt = "（配置损坏）"
+        print("  结果:{0}   {1}".format(label_txt, r.get("message", "")))
         if r.get("notify"):
             print("  通知:{0}".format(r["notify"]))
     if dropped_names:

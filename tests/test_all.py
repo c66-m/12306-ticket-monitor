@@ -16351,6 +16351,87 @@ class TestTask139EngineStartupKiB10(TempDirCase):
         self.assertNotIn("[中断]", out)
 
 
+class TestTask142HistoryResultGuard(TempDirCase):
+    """Task 142（B11-3）：menu_history result 形状 bundle（P3×1）。
+
+    2.2.1 R10-S2-1 — monitor.py:1013 menu_history：
+    `label.get(r.get("result"), …)` 对真值不可哈希 result（如手改成
+    ["success"]）抛 TypeError → 菜单 [5] 崩溃 → 整个 CLI 死亡。
+    修复：label.get 前加守卫——.get 抛 TypeError 时记警告后按
+    "（配置损坏）"占位展示（与 Task 133 的 message 守卫同口径：
+    warn+占位，不崩菜单；Task 126 在同一函数内已有 try/except
+    TypeError 形状守卫先例）。真值可哈希非 str（如 5）/ falsy
+    保持旧行为（benign，无崩溃）。
+    """
+
+    def _run_history(self, records):
+        import monitor as monitor_mod
+        hist_path = os.path.join(self.tmp, "order_history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False)
+        printed = []
+        with mock.patch.object(monitor_mod, "load_config",
+                               return_value={"history_file": hist_path}), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            monitor_mod.menu_history()  # 不得抛 TypeError
+        return "\n".join(printed)
+
+    @staticmethod
+    def _record(**kw):
+        r = {"time": "2026-10-08 10:00:00", "task": "t1",
+             "date": "2026-10-09", "train": "G101",
+             "from": "北京", "to": "上海", "seat": "二等座",
+             "passengers": ["张三"], "result": "success", "message": "ok"}
+        r.update(kw)
+        return r
+
+    def test_unhashable_result_no_crash_placeholder(self):
+        # RED（旧代码）：label.get(["success"]) → TypeError，菜单 [5] 崩溃。
+        # 修后：warn + "（配置损坏）"占位，记录其余字段仍展示，菜单不死。
+        out = self._run_history([self._record(result=["success"])])
+        self.assertIn("（配置损坏）", out)
+        self.assertIn("警告", out)
+        self.assertIn("t1", out)  # 记录本身仍展示
+        self.assertIn("G101", out)
+
+    def test_legit_results_unchanged(self):
+        # 对照：合法 result 渲染与旧代码一致，无警告。
+        out = self._run_history([
+            self._record(result="success"),
+            self._record(result="dup"),
+            self._record(result="failed"),
+            self._record(result="hit_no_order"),
+            self._record(result="ambiguous"),  # 不在 label 内，走默认回显
+        ])
+        self.assertIn("下单成功", out)
+        self.assertIn("防重跳过", out)
+        self.assertIn("下单失败", out)
+        self.assertIn("命中未下单", out)
+        self.assertIn("ambiguous", out)
+        self.assertNotIn("警告", out)
+        self.assertNotIn("（配置损坏）", out)
+
+    def test_numeric_result_keeps_old_behavior(self):
+        # 真值可哈希非 str：旧代码 label.get(5, 5) → 回默认显示 "5"，无崩溃；
+        # 修后行为不变（benign，不 warn）。
+        out = self._run_history([self._record(result=5)])
+        self.assertIn("结果:5", out)
+        self.assertNotIn("警告", out)
+        self.assertNotIn("（配置损坏）", out)
+
+    def test_missing_result_keeps_old_behavior(self):
+        # falsy（缺键 → None）：旧代码 label.get(None, None) → 显示 "None"；
+        # 修后行为不变（benign，不 warn）。
+        r = self._record()
+        del r["result"]
+        out = self._run_history([r])
+        self.assertIn("结果:None", out)
+        self.assertNotIn("警告", out)
+        self.assertNotIn("（配置损坏）", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
