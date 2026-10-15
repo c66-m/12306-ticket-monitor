@@ -14461,6 +14461,83 @@ class TestTask127GuiPathsB7(TempDirCase):
             app.tick()
         self.assertIn("引擎：运行中（1 个任务）", self._label_texts(app))
 
+class TestTask128CtrlCB7(TempDirCase):
+    """Task 128 (B7-5)：Ctrl+C bundle（P3×2）。
+
+    2.2.10 _launch_browser 的 p.chromium.launch() 无 Ctrl+C 守卫；
+    2.2.11 _browser_mode_login 委托 browser_order.login() 的多分钟交互登录
+    无 Ctrl+C 守卫（browser_order.login() 内部本次不碰）。
+    """
+
+    def _printed(self, mprint):
+        return "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
+
+    def _no_kb_interrupt(self, fn):
+        # 旧代码下 Ctrl+C 会逃出被测函数；直接让它逃出会杀掉整个 runner
+        # （exit=130），故在测试内捕获并转为普通 FAIL（Task 113 同口径）。
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C 抛出了 KeyboardInterrupt（应优雅退出，不抛 traceback）")
+
+    # ---- 2.2.10 _launch_browser ----
+
+    def test_launch_browser_ctrl_c_exits_gracefully(self):
+        # RED on old code: launch 的 Ctrl+C 穿透 except Exception，抛 traceback
+        import capture_session
+        p = mock.Mock()
+        p.chromium.launch.side_effect = KeyboardInterrupt
+        with mock.patch("builtins.print") as mprint:
+            result = self._no_kb_interrupt(
+                lambda: capture_session._launch_browser(p))
+        self.assertIsNone(result)  # 调用方既有失败出口：browser is None → return 1
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_launch_browser_normal_failure_unchanged(self):
+        # 正向对照：普通异常仍走原失败文案（新旧代码都通过）。
+        import capture_session
+        p = mock.Mock()
+        p.chromium.launch.side_effect = RuntimeError("boom")
+        with mock.patch("builtins.print") as mprint:
+            self.assertIsNone(capture_session._launch_browser(p))
+        self.assertIn("失败", self._printed(mprint))
+        self.assertNotIn("中断", self._printed(mprint))
+
+    # ---- 2.2.11 _browser_mode_login ----
+
+    def test_browser_mode_login_ctrl_c_exits_gracefully(self):
+        # RED on old code: login 内部的 Ctrl+C 穿透 except Exception，抛 traceback
+        import capture_session
+        import browser_order
+        with mock.patch.object(browser_order, "login",
+                               side_effect=KeyboardInterrupt), \
+             mock.patch("builtins.print") as mprint:
+            result = self._no_kb_interrupt(
+                capture_session._browser_mode_login)
+        self.assertFalse(result)  # 调用方既有失败出口：return 0 if ok else 1
+        self.assertIn("中断", self._printed(mprint))
+
+    def test_browser_mode_login_normal_failure_unchanged(self):
+        # 正向对照：普通异常仍走原失败文案（新旧代码都通过）。
+        import capture_session
+        import browser_order
+        with mock.patch.object(browser_order, "login",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch("builtins.print") as mprint:
+            self.assertFalse(capture_session._browser_mode_login())
+        self.assertIn("失败", self._printed(mprint))
+        self.assertNotIn("中断", self._printed(mprint))
+
+    def test_browser_mode_login_false_no_spurious_interrupt_text(self):
+        # 正常返回 False（登录失败但无异常）不得打印 [中断]（新旧代码都通过）。
+        import capture_session
+        import browser_order
+        with mock.patch.object(browser_order, "login", return_value=False), \
+             mock.patch("builtins.print") as mprint:
+            self.assertFalse(capture_session._browser_mode_login())
+        self.assertNotIn("中断", self._printed(mprint))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

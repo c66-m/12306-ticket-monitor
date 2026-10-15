@@ -90,6 +90,9 @@ def _browser_mode_login():
     try:
         import browser_order
         return bool(browser_order.login())
+    except KeyboardInterrupt:
+        print("[中断] 用户取消了浏览器登录。")
+        return False
     except Exception as e:
         print("[失败] 浏览器登录失败：{0}".format(e))
         print("       请检查 Playwright / Edge 是否安装正确后重试。")
@@ -100,6 +103,9 @@ def _launch_browser(p):
     """启动 Edge：失败给友好提示并返回 None（Task 69c，与 65e 同口径）。"""
     try:
         return p.chromium.launch(channel="msedge", headless=False)
+    except KeyboardInterrupt:
+        print("[中断] 用户取消了 Edge 启动。")
+        return None
     except Exception as e:
         print("[失败] Edge 启动失败：{0}".format(e))
         print("       请先执行：playwright install msedge（或确认本机已安装 Edge）后重试。")
