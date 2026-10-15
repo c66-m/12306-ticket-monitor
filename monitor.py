@@ -1272,7 +1272,12 @@ def main():
         fresh_engine().run()
         return
     if args and args[0] in ("check", "query"):
-        menu_quick_check()
+        try:
+            menu_quick_check()
+        except KeyboardInterrupt:
+            # Task 149（R12-S2-2）：直调 menu_quick_check 绕过 main_menu 的
+            # Ctrl+C 守卫；查询中 Ctrl+C 按 Task 132/136 同口径干净退出。
+            print("[中断] 用户取消了余票查询。")
         return
     main_menu()
 

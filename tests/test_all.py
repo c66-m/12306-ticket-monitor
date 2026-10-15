@@ -17044,6 +17044,60 @@ class TestTask147DupPopupSliceMaskB12(TempDirCase):
         self.assertEqual(out, ("A" * 30 + "订单" + "B" * 300)[:200])
 
 
+class TestTask149MonitorCheckQueryKiB13(unittest.TestCase):
+    """Task 149（B13-2）：monitor.py main() check/query 分支 Ctrl+C（P3×1）。
+
+    R12-S2-2 — `main()` 的 check/query 参数分支直接调 `menu_quick_check()`，
+    绕过 `main_menu()` 的 Ctrl+C 守卫 → 查询中 Ctrl+C 抛 traceback、退出码
+    130。修复：分支包 `try/except KeyboardInterrupt`（打印"[中断]"后 return，
+    Task 132/136 同口径）。
+    """
+
+    def _run_main(self, argv1, quick_check):
+        import monitor as monitor_mod
+        printed = []
+        with mock.patch.object(sys, "argv", ["monitor.py", argv1]), \
+             mock.patch.object(monitor_mod, "menu_quick_check", quick_check), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            monitor_mod.main()  # 不得抛 KeyboardInterrupt
+        return "\n".join(printed)
+
+    def test_check_branch_ki_clean_exit(self):
+        # RED（旧代码）：menu_quick_check 抛 KI → 逃出 main()（traceback+130）。
+        out = self._run_main(
+            "check", mock.Mock(side_effect=KeyboardInterrupt()))
+        self.assertIn("[中断]", out)
+
+    def test_query_branch_ki_clean_exit(self):
+        # query 分支同样受保护。
+        out = self._run_main(
+            "query", mock.Mock(side_effect=KeyboardInterrupt()))
+        self.assertIn("[中断]", out)
+
+    def test_check_branch_normal_no_spurious_interrupt(self):
+        # 对照：正常路径无误印 "[中断]"。
+        out = self._run_main("check", mock.Mock())
+        self.assertNotIn("[中断]", out)
+
+    def test_menu9_path_still_works(self):
+        # 对照：菜单 [9] 经 main_menu 走自有守卫（"已中断，返回主菜单。"），未动。
+        import monitor as monitor_mod
+        printed = []
+        with mock.patch.object(monitor_mod, "pick_station",
+                               side_effect=KeyboardInterrupt()), \
+             mock.patch.object(monitor_mod, "read",
+                               side_effect=["9", "0"]), \
+             mock.patch.object(monitor_mod, "pause"), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a: printed.append(
+                            " ".join(map(str, a)))):
+            monitor_mod.main_menu()
+        out = "\n".join(printed)
+        self.assertIn("已中断，返回主菜单。", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
