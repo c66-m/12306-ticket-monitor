@@ -12887,6 +12887,249 @@ class TestTask118CredHygieneB6(TempDirCase):
         self.assertIn("dict", logged)
 
 
+class TestTask119LauncherGuiShapesB6(TempDirCase):
+    """Task 119 (B6-2)：launcher/gui 配置形状 bundle（P2x2 + P3x4）。
+
+    1.3 pax_purpose 非 dict 真值 → _refresh_pax 的 saved.get / purpose_of /
+        purpose_map_of / build_monitor_task 的 dict("...") 四处全崩，启动器
+        启动崩溃。修复：_refresh_pax 入口归一化并写回 self.lc，一处堵四处。
+    1.4 gui read_history_records 的 history_file 非字符串 → os.path.join
+        TypeError（join 在 try 外）→ GUI 启动崩溃。修复：join 前形状守卫。
+    2.2.9 launcher append_monitor_task 的 state_file 非字符串 → TypeError
+        （config 已追加）→ 调用方弹"创建失败"误导，重试产生重复任务。
+        修复：join 前形状守卫。
+    2.2.10 launcher TaskManagerPanel._new_task 的 (name or "").strip()，
+        name 为 list → AttributeError。修复：strip 前 isinstance 检查。
+    2.2.11 gui _render_history 的 from/to 不可哈希 → TypeError 被外层
+        except 吞 → 快捷按钮全灭。修复：类型检查 + warn-once 跳过坏条目。
+    2.2.13 launcher _sync_from_lc 的 station_history 裸字符串读侧逐字符拆。
+        修复：读侧复用 _normalize_station_history（Task 110）。
+    """
+
+    # ---------- 1.3：pax_purpose（P2）----------
+
+    def test_1_3_helper_normalizes(self):
+        # RED：旧代码无此 helper（AttributeError）。
+        warns = []
+        self.assertEqual(launcher._normalize_pax_purpose("abc", warns.append),
+                         {})
+        self.assertEqual(len(warns), 1)
+        d = {"张三": "1"}
+        self.assertIs(launcher._normalize_pax_purpose(d, warns.append), d)
+        self.assertEqual(len(warns), 1)  # dict 原样通过，不 warn
+        self.assertEqual(launcher._normalize_pax_purpose(None, warns.append),
+                         {})
+        self.assertEqual(launcher._normalize_pax_purpose("", warns.append),
+                         {})
+        self.assertEqual(launcher._normalize_pax_purpose([], warns.append),
+                         {})
+        self.assertEqual(len(warns), 1)  # falsy 不 warn
+
+    def _pax_app(self, lc):
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.lc = lc
+        app.pax_vars = {}
+        app.pax_purpose_vars = {}
+        app.pax_box = mock.Mock()
+        app.pax_box.winfo_children.return_value = []
+        app._put_log = mock.Mock()
+        return app
+
+    def test_1_3_refresh_pax_entry_normalizes(self):
+        # RED：旧代码 saved = "abc"，saved.get(name) → AttributeError，
+        # 启动器启动崩溃。
+        app = self._pax_app({"pax_purpose": "abc", "purpose_code": "ADULT",
+                             "passenger_names": []})
+        with mock.patch.object(launcher.passengers_mod, "load_passengers",
+                               return_value=[{"name": "张三"}]), \
+             mock.patch.object(launcher, "tk"), \
+             mock.patch.object(launcher, "ttk"):
+            app._refresh_pax()  # 改前 AttributeError
+        self.assertEqual(app.lc["pax_purpose"], {})
+        warned = " ".join(c.args[0] for c in app._put_log.call_args_list)
+        self.assertIn("pax_purpose", warned)
+
+    def test_1_3_four_crash_points_blocked(self):
+        # 四处崩溃点经入口归一化后全部可达。改前形态先记录在案：
+        bad_lc = {"pax_purpose": "abc", "passenger_names": ["张三"]}
+        with self.assertRaises(AttributeError):  # :2501 saved.get
+            "abc".get("张三")
+        with self.assertRaises(AttributeError):  # :162 purpose_of
+            launcher.purpose_of(bad_lc)
+        with self.assertRaises(AttributeError):  # :176 purpose_map_of
+            launcher.purpose_map_of(bad_lc)
+        with self.assertRaises(ValueError):  # :1135 dict("...")
+            dict("abc" or {})
+        # 入口归一化（与 _refresh_pax 内完全相同的调用）：
+        lc = {"pax_purpose": "abc", "purpose_code": "ADULT",
+              "passenger_names": ["张三"]}
+        lc["pax_purpose"] = launcher._normalize_pax_purpose(
+            lc.get("pax_purpose"), lambda m: None)  # 改前 AttributeError
+        self.assertEqual(launcher.purpose_of(lc), "ADULT")
+        self.assertEqual(launcher.purpose_map_of(lc), {"张三": "ADULT"})
+        task = launcher.build_monitor_task(
+            "北京", "上海", ["2026-10-20"], "", ["G101"], ["二等座"],
+            ["张三"], "ADULT", False, False, 5,
+            pax_purpose=lc.get("pax_purpose"))
+        self.assertEqual(task["pax_purpose"], {})
+
+    # ---------- 1.4：gui history_file（P2）----------
+
+    def test_1_4_history_file_non_string(self):
+        # RED：改前 os.path.join(HERE, ["x"]) → TypeError（join 在 try 块外），
+        # GUI 启动崩溃。
+        with mock.patch.object(gui, "load_config",
+                               return_value={"history_file": ["x"]}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                recs = gui.read_history_records()  # 改前 TypeError
+        self.assertEqual(recs, [])
+        self.assertTrue(any("history_file" in m for m in logs.output),
+                        "必须明确记 warning 指出 history_file 形状非法")
+
+    def test_1_4_history_file_normal_unchanged(self):
+        # 正向对照：合法文件照常读；缺文件 → []（旧行为）。
+        recs_path = os.path.join(self.tmp, "order_history.json")
+        with open(recs_path, "w", encoding="utf-8") as f:
+            json.dump([{"result": "success"}], f)
+        with mock.patch.object(gui, "load_config", return_value={
+                "history_file": "order_history.json"}), \
+             mock.patch.object(gui, "HERE", self.tmp):
+            self.assertEqual(gui.read_history_records(),
+                             [{"result": "success"}])
+        empty = tempfile.mkdtemp(prefix="t12306_empty_")
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        with mock.patch.object(gui, "load_config", return_value={}), \
+             mock.patch.object(gui, "HERE", empty):
+            self.assertEqual(gui.read_history_records(), [])
+
+    # ---------- 2.2.9：append_monitor_task 的 state_file（P3）----------
+
+    def test_2_2_9_state_file_non_string(self):
+        # RED：改前 os.path.join(HERE, ["x"]) → TypeError；且此时 config
+        # 已追加，调用方弹"创建失败"，用户重试产生重复任务。
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [], "state_file": ["x"]}, f)
+        with mock.patch.object(launcher, "HERE", self.tmp):
+            with self.assertLogs("launcher", level="INFO") as logs:
+                name = launcher.append_monitor_task({"name": "T119"},
+                                                    start_now=False)
+        self.assertEqual(name, "T119")
+        cfg_data = json.load(open(cfg, encoding="utf-8"))
+        self.assertEqual(len(cfg_data["tasks"]), 1)  # 一次调用只落一条
+        st = json.load(open(os.path.join(self.tmp, "state.json"),
+                            encoding="utf-8"))
+        self.assertEqual(st["tasks"]["T119"]["status"], "paused")
+        self.assertTrue(any("state_file" in m for m in logs.output),
+                        "必须明确记 warning 指出 state_file 形状非法")
+
+    # ---------- 2.2.10：_new_task 的 name.strip()（P3）----------
+
+    def _task_panel(self, tasks):
+        p = launcher.TaskManagerPanel.__new__(launcher.TaskManagerPanel)
+        p.tasks = tasks
+        p._put_log = mock.Mock()
+        p._refresh_list = mock.Mock()
+        p._open_task = mock.Mock()
+        return p
+
+    def test_2_2_10_new_task_name_list(self):
+        # RED：改前 (["x"] or "").strip() → AttributeError。
+        p = self._task_panel([{"id": 1, "name": ["x"]},
+                              {"id": 2, "name": "任务 1"}])
+        with mock.patch.object(launcher, "new_grab_task",
+                               return_value={"id": 99,
+                                             "name": "任务 2"}) as m_new, \
+             mock.patch.object(launcher, "save_grab_tasks") as m_save:
+            p._new_task()  # 改前 AttributeError
+        m_new.assert_called_once_with(2)  # 坏名跳过，按"任务 1"取序号+1
+        self.assertEqual(len(p.tasks), 3)
+        m_save.assert_called_once_with(p.tasks)
+        p._open_task.assert_called_once_with(99)
+        warned = " ".join(c.args[0] for c in p._put_log.call_args_list)
+        self.assertIn("跳过", warned)
+
+    def test_2_2_10_new_task_name_none_silent(self):
+        # 正向对照：name=None 走旧 "" 口径静默（不 warn），序号照常。
+        p = self._task_panel([{"id": 1, "name": None},
+                              {"id": 2, "name": "任务 5"}])
+        with mock.patch.object(launcher, "new_grab_task",
+                               return_value={"id": 99,
+                                             "name": "任务 6"}) as m_new, \
+             mock.patch.object(launcher, "save_grab_tasks"):
+            p._new_task()
+        m_new.assert_called_once_with(6)
+        logged = " ".join(c.args[0] for c in p._put_log.call_args_list)
+        self.assertNotIn("跳过", logged)
+
+    # ---------- 2.2.11：_render_history 的 from/to（P3）----------
+
+    def _render_panel(self, tasks):
+        panel = gui.TaskWizard.__new__(gui.TaskWizard)
+        panel.hist_frame = mock.Mock()
+        panel.hist_frame.winfo_children.return_value = []
+        return tasks, panel
+
+    def test_2_2_11_render_history_unhashable(self):
+        # RED：改前 key not in seen → TypeError 被外层 except 吞，pairs 全空，
+        # 快捷按钮全灭（Button 0 次）；好条目也被连累。
+        gui._UNHASHABLE_NAME_WARNED.clear()
+        tasks = [{"name": "bad", "from": ["x"], "to": "上海"},
+                 "non-dict-entry",
+                 {"name": "good", "from": "北京", "to": "上海"}]
+        _, panel = self._render_panel(tasks)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "tk") as mtk:
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel._render_history()  # 改前按钮全灭
+        self.assertEqual(mtk.Button.call_count, 1)  # 只有好条目渲染
+        self.assertTrue(any("from/to" in m for m in logs.output),
+                        "必须明确记 warning 指出 from/to 形状非法")
+
+    def test_2_2_11_render_history_warns_once(self):
+        # 定时/重复渲染不刷屏：同一坏条目只记一次。
+        gui._UNHASHABLE_NAME_WARNED.clear()
+        tasks = [{"name": "bad", "from": ["x"], "to": "上海"}]
+        _, panel = self._render_panel(tasks)
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "tk"):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                panel._render_history()
+                panel._render_history()
+                panel._render_history()
+        pins = [m for m in logs.output if "from/to" in m]
+        self.assertEqual(len(pins), 1)
+
+    # ---------- 2.2.13：_sync_from_lc 的 station_history（P3）----------
+
+    def test_2_2_13_sync_station_history_bare_string(self):
+        # RED：改前裸字符串 "北京" 直传 set_history，被逐字符拆成 ['北','京']。
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.lc = {"station_history": "北京"}
+        app.from_ent = mock.Mock()
+        app.to_ent = mock.Mock()
+        app.trains_var = mock.Mock()
+        app.date_var = mock.Mock()
+        app.date_to_var = mock.Mock()
+        app.seat_vars = {}
+        app.seat_pri_var = mock.Mock()
+        app.start_var = mock.Mock()
+        app.remind_var = mock.Mock()
+        app.warm_var = mock.Mock()
+        app.preset_cb = mock.Mock()
+        app._put_log = mock.Mock()
+        app._refresh_pax = mock.Mock()
+        app._save_cfg = mock.Mock()
+        with self.assertLogs("launcher", level="INFO") as logs:
+            app._sync_from_lc()
+        self.assertEqual(app.from_ent.set_history.call_args[0][0], ["北京"])
+        self.assertEqual(app.to_ent.set_history.call_args[0][0], ["北京"])
+        self.assertTrue(any("station_history" in m for m in logs.output),
+                        "必须明确记 warning 指出 station_history 为裸字符串")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

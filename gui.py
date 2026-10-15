@@ -1099,7 +1099,21 @@ class TaskWizard(tk.Toplevel):
         pairs, seen = [], set()
         try:
             for t in (load_config().get("tasks") or []):
-                key = (t.get("from"), t.get("to"))
+                # Task 119（2.2.11，P3）：from/to 不可哈希（如手改的 ["x"]）
+                # → key not in seen 直接 TypeError，被外层 except 吞后快捷
+                # 按钮全灭。坏条目跳过 + warn-once，好条目照常渲染。
+                # （非 dict 条目同属一环，t.get 同样会崩，一并跳过。）
+                if not isinstance(t, dict):
+                    continue
+                fr, to = t.get("from"), t.get("to")
+                if not isinstance(fr, str) or not isinstance(to, str):
+                    sig = ("历史快捷", repr(t))
+                    if sig not in _UNHASHABLE_NAME_WARNED:
+                        _UNHASHABLE_NAME_WARNED.add(sig)
+                        LOG.warning("[配置] 历史快捷：from/to 非字符串已跳过：%r",
+                                    t)
+                    continue
+                key = (fr, to)
                 if key[0] and key[1] and key not in seen:
                     seen.add(key)
                     pairs.append(key)
@@ -2018,7 +2032,14 @@ def read_history_records(limit=200):
     """读购票历史：最近 limit 条、最新在前。文件缺失/损坏返回空列表；
     顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
     非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。"""
-    path = os.path.join(HERE, load_config().get("history_file", "order_history.json"))
+    # Task 119（1.4，P2）：history_file 非字符串 → os.path.join TypeError；
+    # 该行在 try 块之外，守卫必须在 join 之前，否则 GUI 启动崩溃。
+    hist_file = load_config().get("history_file", "order_history.json")
+    if not isinstance(hist_file, str):
+        LOG.warning("history_file 非字符串，已用默认值 order_history.json：%r",
+                    hist_file)
+        hist_file = "order_history.json"
+    path = os.path.join(HERE, hist_file)
     try:
         with open(path, encoding="utf-8") as f:
             history = json.load(f)

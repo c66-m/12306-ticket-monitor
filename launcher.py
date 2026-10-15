@@ -455,6 +455,18 @@ def _normalize_station_history(raw, warn):
     return [s for s in raw if isinstance(s, str)]
 
 
+def _normalize_pax_purpose(raw, warn):
+    """pax_purpose 字段归一化（Task 119；与 _normalize_station_history 同口径）：
+    非 dict 真值（如手改的 "abc"）记警告后按 {} 处理——旧代码下游四处全崩
+    （_refresh_pax 的 saved.get、purpose_of、purpose_map_of、
+    build_monitor_task 的 dict("…")）→ 启动器启动崩溃；falsy 值沿用旧
+    "" 口径静默归 {}。"""
+    if raw and not isinstance(raw, dict):
+        warn("[提醒] pax_purpose 形状非法，已忽略：%r" % (raw,))
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def _save_passengers_or_warn(passengers, parent, expect_stamp=passengers_mod._STAMP_UNSET):
     """保存乘车人；磁盘盒子不可解密被拒写（return False）时弹 error 并返回 False。
 
@@ -1191,7 +1203,15 @@ def append_monitor_task(task, start_now=True):
             log("[错误] 文件被占用，稍后重试：%s" % cfg_path)
             raise TimeoutError("文件被占用，稍后重试") from e
         # state.json 条目（与 gui.mark_task_created 的无 app 分支保持一致）
-        state_path = os.path.join(HERE, cfg.get("state_file", "state.json"))
+        # Task 119（2.2.9，P3）：state_file 非字符串 → os.path.join TypeError；
+        # 旧代码 config 已追加才崩，调用方弹"创建失败"误导用户，重试产生重复
+        # 任务。守卫必须在 join 之前（join 在锁内 try 之外）。
+        state_file = cfg.get("state_file", "state.json")
+        if not isinstance(state_file, str):
+            log("[提醒] state_file 非字符串，已用默认值 state.json：%r"
+                % (state_file,))
+            state_file = "state.json"
+        state_path = os.path.join(HERE, state_file)
         try:
             with filelock.file_lock(state_path + ".lock"):
                 if os.path.exists(state_path):
@@ -2385,7 +2405,10 @@ class LauncherApp(tk.Frame):
 
     def _sync_from_lc(self):
         lc = self.lc
-        hist = lc.get("station_history") or []
+        # Task 119（2.2.13，P3）：读侧复用 _normalize_station_history（Task 110
+        # 的写侧归一化）——旧代码裸字符串 "北京" 直传 set_history 被逐字符拆成
+        # ['北','京']。本函数启动时调一次，无刷屏之虞。
+        hist = _normalize_station_history(lc.get("station_history"), log)
         self.from_ent.set_history(hist)
         self.to_ent.set_history(hist)
         self.from_ent.set(lc.get("from") or "")
@@ -2479,6 +2502,12 @@ class LauncherApp(tk.Frame):
             self._save_cfg(lc)
 
     def _refresh_pax(self):
+        # Task 119（1.3，P2）：pax_purpose 非 dict 真值（如手改的 "abc"）→
+        # 下游四处全崩（本函数 saved.get、purpose_of、purpose_map_of、
+        # build_monitor_task 的 dict("…")），启动器启动崩溃。入口归一化并
+        # 写回 self.lc，一处堵四处（后续读的全是同一对象）。
+        self.lc["pax_purpose"] = _normalize_pax_purpose(
+            self.lc.get("pax_purpose"), self._put_log)
         cur_sel = {n for n, v in self.pax_vars.items() if v.get()}
         cur_pp = {n: v.get() for n, v in self.pax_purpose_vars.items()}
         for w in self.pax_box.winfo_children():
@@ -3975,7 +4004,15 @@ class TaskManagerPanel(tk.Frame):
         # 名字序号取现存最大号 +1：删除任务后新建不再出现重名（两个"任务 2"）
         seqs = []
         for t in self.tasks:
-            m = re.match(r"任务\s*(\d+)$", (t.get("name") or "").strip())
+            # Task 119（2.2.10，P3）：name 为 list 等非字符串真值时旧代码
+            # (name or "").strip() 直接 AttributeError；strip 前类型检查，
+            # 坏名跳过（None 等 falsy 沿用旧 "" 口径静默）。
+            raw_name = t.get("name")
+            if raw_name and not isinstance(raw_name, str):
+                self._put_log("[提醒] 任务名非字符串，已跳过序号统计：%r"
+                              % (raw_name,))
+                continue
+            m = re.match(r"任务\s*(\d+)$", (raw_name or "").strip())
             if m:
                 seqs.append(int(m.group(1)))
         task = new_grab_task((max(seqs) if seqs else 0) + 1)
