@@ -366,6 +366,15 @@ def _sanitize_passenger_entries(entries, path):
     load 入口一次性 sanitize：一处堵住下游 8+ 崩溃点（monitor/launcher/gui
     的 p.get("name") / p["name"] 等）。脏条目记 warning 后剔除；passengers
     节本身非 list 时按空处理（损坏形状，非用户内容）。
+
+    Task 141（2.2.3 R10-S4-1）：dict 条目内的 name 字段形状也归一——
+    缺 name 键 / name 非 str（如手改的 ["张三"]、[]/{}）→ warn + 剔除条目。
+    下游 4 处（launcher._refresh_pax 的 p["name"]/name in sel/pax_vars[name]、
+    launcher 抢票对话框的 name in sel、gui.on_done 的 name in merged）做
+    set/dict-key 操作，非 str 名直接 TypeError/KeyError。falsy 非 str
+    （[]/{}）同样不可哈希，一并剔除；空字符串名是 str，保留（零漂移）。
+    警告只记类型，不打印原值（name 可能是 ["张三"] 含真实姓名，
+    Task 118/124/135 PII 口径）。
     """
     if not isinstance(entries, list):
         # Task 118 2.1.3：%r 整个 passengers 节进日志会把真实姓名落盘
@@ -379,6 +388,17 @@ def _sanitize_passenger_entries(entries, path):
     clean = []
     for e in entries:
         if isinstance(e, dict):
+            if "name" not in e:
+                LOG.warning("[警告] 乘车人文件 %s 的条目缺少姓名字段，已跳过",
+                            path)
+                continue
+            name = e["name"]
+            if not isinstance(name, str):
+                # name 可能是 ["张三"] 含真实姓名——只记类型，不打印原值。
+                LOG.warning("[警告] 乘车人文件 %s 的条目姓名字段非字符串"
+                            "（类型：%s），已跳过",
+                            path, type(name).__name__)
+                continue
             clean.append(e)
         else:
             # Task 118 2.1.3：%r 原样打印脏条目会把真实姓名落盘（Task 112 引入

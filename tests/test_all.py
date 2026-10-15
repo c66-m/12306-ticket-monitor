@@ -15758,14 +15758,14 @@ class TestTask138StatusShapesB10(TempDirCase):
                         "必须明确记 warning：%s" % logs.output)
 
     def test_gui_coerce_clean_and_falsy_unchanged(self):
-        # 对照：干净字符串/falsy 原样通过，不记 warning（新旧代码都应通过）。
+        # Task 141（2.2.2）：口径变更——falsy 非 str（None/0/[]/{}）不再原样
+        # 通过，改为 warn + 按 paused 处理（真值检查已去掉）。
+        # 干净字符串/空字符串（是 str）仍原样通过，不记 warning。
         self._reset_gui_warned()
         with self.assertNoLogs("monitor", level="WARNING"):
             self.assertEqual(gui._coerce_status_str("monitoring", "X"),
                              "monitoring")
             self.assertEqual(gui._coerce_status_str("", "X"), "")
-            self.assertIsNone(gui._coerce_status_str(None, "X"))
-            self.assertEqual(gui._coerce_status_str(0, "X"), 0)
         # 真值非 str（即使可哈希）→ 按 paused 处理（Task 133 同口径）。
         self.assertEqual(gui._coerce_status_str(5, "X"), "paused")
 
@@ -15920,6 +15920,188 @@ class TestTask138StatusShapesB10(TempDirCase):
                          "热路径刷屏回归：%s" % logs.output)
         # 状态标签被正常刷新（idle → 默认展示），无异常。
         lbl.configure.assert_called()
+
+
+class TestTask141ShapesB11(TempDirCase):
+    """Task 141（B11-2）：gui/launcher 形状 bundle（P3×2）。
+
+    2.2.2 R10-S3-1：Task 138 的 _coerce_status_str 只守真值非 str；
+        falsy 不可哈希 status（[]/{}）穿过守卫 → gui.py:2586
+        STATUS_COLOR.get（"启动监控"对话框打不开）+ gui.py:2924
+        STATUS_LABELS.get（2 秒轮询异常刷屏 + 任务列表冻结）。
+        修复：去掉真值检查 → if not isinstance(st, str)。
+    2.2.3 R10-S4-1：乘车人脏 name（真值不可哈希/缺 name 键）穿透 Task 112
+        的条目级 sanitize → launcher.py:2608 p["name"] KeyError /
+        :2610 name in sel（set）TypeError / :2612 pax_vars[name] dict-key
+        TypeError + launcher.py:3529 name in sel TypeError +
+        gui.py:1541 name in merged（dict）TypeError。
+        修复：路线 (a)——_sanitize_passenger_entries 值级归一
+        （缺键/非 str name → warn + 剔除条目）。
+    """
+
+    # ---------- 测试脚手架 ----------
+
+    def _reset_gui_warned(self):
+        if hasattr(gui, "_UNHASHABLE_STATUS_WARNED"):
+            gui._UNHASHABLE_STATUS_WARNED.clear()
+
+    def _reset_launcher_warned(self):
+        if hasattr(launcher, "_STATUS_SHAPE_WARNED"):
+            launcher._STATUS_SHAPE_WARNED.clear()
+
+    def _patch_tk_for_dialog(self):
+        import tkinter as tk
+        from tkinter import ttk
+        return (
+            mock.patch.object(tk.Toplevel, "__init__", return_value=None),
+            mock.patch.object(gui.StartMonitorDialog, "title"),
+            mock.patch.object(gui.StartMonitorDialog, "geometry"),
+            mock.patch.object(gui.StartMonitorDialog, "configure"),
+            mock.patch.object(tk, "Frame", return_value=mock.Mock()),
+            mock.patch.object(tk, "Label", return_value=mock.Mock()),
+            mock.patch.object(tk, "BooleanVar"),
+            mock.patch.object(tk, "Checkbutton", return_value=mock.Mock()),
+            mock.patch.object(ttk, "Button", return_value=mock.Mock()),
+        )
+
+    def _make_task_page(self):
+        page = gui.TaskPage.__new__(gui.TaskPage)
+        page.app = mock.Mock()
+        page.app.engine_thread = None
+        page.tree = mock.Mock()
+        page.tree.selection.return_value = ()
+        page.tree.get_children.return_value = ()
+        page.tree.yview.return_value = (0.0, 1.0)
+        page.edit_btn = mock.Mock()
+        page._task_by_iid = {}
+        page._dates_text_cache = {}
+        return page
+
+    # ---------- 2.2.2：_coerce_status_str 去掉真值检查 ----------
+
+    def test_gui_coerce_falsy_unhashable_to_paused(self):
+        # RED：改前 []/{} 为 falsy 短路跳过守卫，原样返回 →
+        # STATUS_COLOR.get([]) / STATUS_LABELS.get({}) 直接 TypeError。
+        self._reset_gui_warned()
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            self.assertEqual(gui._coerce_status_str([], "任务列表"), "paused")
+            self.assertEqual(gui._coerce_status_str({}, "任务列表"), "paused")
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+
+    def test_gui_coerce_falsy_non_str_warns_but_empty_str_kept(self):
+        # None/0 → warn + paused；"" 是 str，原样通过不记 warning。
+        self._reset_gui_warned()
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            self.assertEqual(gui._coerce_status_str(None, "X"), "paused")
+            self.assertEqual(gui._coerce_status_str(0, "X"), "paused")
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+        with self.assertNoLogs("monitor", level="WARNING"):
+            self.assertEqual(gui._coerce_status_str("", "X"), "")
+            self.assertEqual(gui._coerce_status_str("monitoring", "X"),
+                             "monitoring")
+
+    def test_launcher_coerce_falsy_unhashable_to_idle(self):
+        # launcher helper 口径统一（调用方 or "idle" 已兜 falsy，此处为
+        # helper 级别的一致性 pin）。
+        self._reset_launcher_warned()
+        with self.assertLogs("launcher", level="WARNING") as logs:
+            self.assertEqual(launcher._coerce_status_str([], "任务管理器"),
+                             "idle")
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+
+    def test_dialog_init_falsy_unhashable_status_no_crash(self):
+        # P3：改前 STATUS_COLOR.get([], TEXT) 直接 TypeError，对话框打不开。
+        self._reset_gui_warned()
+        tasks = [{"name": "a", "from": "BJ", "to": "SH",
+                  "dates": ["2026-10-12"]}]
+        dlg = gui.StartMonitorDialog.__new__(gui.StartMonitorDialog)
+        patches = self._patch_tk_for_dialog()
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "_state_tasks_dict",
+                               return_value={"a": {"status": []}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                gui.StartMonitorDialog.__init__(dlg, mock.Mock())  # 改前 TypeError
+        self.assertTrue(any("非字符串" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+        self.assertIn(0, dlg.vars)
+
+    def test_refresh_falsy_unhashable_status_no_crash_and_warn_once(self):
+        # P3：改前 STATUS_LABELS.get({}, {}) 直接 TypeError，任务列表冻结。
+        self._reset_gui_warned()
+        tasks = [{"name": "good", "from": "BJ", "to": "SH"}]
+        page = self._make_task_page()
+        with mock.patch.object(gui, "load_config",
+                               return_value={"tasks": tasks}), \
+             mock.patch.object(gui, "load_state",
+                               return_value={"tasks":
+                                             {"good": {"status": {}}}}):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                page.refresh()  # 改前 TypeError
+                page._last_rows_sig = None  # 模拟下一次 2 秒轮询
+                page.refresh()
+        warned = [m for m in logs.output if "非字符串" in m]
+        self.assertEqual(len(warned), 1,
+                         "热路径刷屏回归：%s" % logs.output)
+
+    # ---------- 2.2.3：_sanitize_passenger_entries 值级归一 ----------
+
+    def test_sanitize_drops_missing_name_key(self):
+        # RED：改前缺 name 键的 dict 条目原样放行 →
+        # launcher.py:2608 p["name"] KeyError。
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            out = pax_mod._sanitize_passenger_entries(
+                [{"id_type_code": "1"}, {"name": "李四"}], "p.json")
+        self.assertEqual(out, [{"name": "李四"}])
+        self.assertTrue(any("姓名" in m for m in logs.output),
+                        "必须明确记 warning：%s" % logs.output)
+
+    def test_sanitize_drops_truthy_non_str_name_without_pii(self):
+        # RED：改前真值非 str name 原样放行 → 下游 set/dict-key TypeError。
+        # PII：["张三"] 含真实姓名，不得进日志（Task 118/124/135 口径）。
+        with self.assertLogs("monitor", level="WARNING") as logs:
+            out = pax_mod._sanitize_passenger_entries(
+                [{"name": ["张三"]}, {"name": "李四"}], "p.json")
+        self.assertEqual(out, [{"name": "李四"}])
+        logged = "\n".join(logs.output)
+        self.assertNotIn("张三", logged)
+        self.assertIn("list", logged)  # 类型保留：仍可识别是什么形状坏了
+
+    def test_sanitize_drops_falsy_unhashable_name(self):
+        # []/{} 为 falsy 但不可哈希 → launcher.py:2610 `name in sel`
+        #（sel 为 set 时）TypeError。一并剔除。
+        with self.assertLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(
+                [{"name": []}, {"name": {}}, {"name": "王五"}], "p.json")
+        self.assertEqual(out, [{"name": "王五"}])
+
+    def test_sanitize_keeps_clean_entries(self):
+        # 对照：干净条目（含空字符串名）零漂移，不记 warning。
+        entries = [{"name": "张三", "id_no": "1"},
+                   {"name": "", "id_no": "2"}]
+        with self.assertNoLogs("monitor", level="WARNING"):
+            out = pax_mod._sanitize_passenger_entries(entries, "p.json")
+        self.assertEqual(out, entries)
+
+    def test_default_names_no_dirty_names_flow_out(self):
+        # 集成：脏条目在 load 期被剔除 → default_names 只流出干净 str 名。
+        path = os.path.join(self.tmp, "p.json")
+        box = {"enc": "none", "data": json.dumps([
+            {"name": ["张三"], "is_default": True},
+            {"id_no": "x", "is_default": True},
+            {"name": "李四", "is_default": True},
+        ])}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(box, f)
+        with self.assertLogs("monitor", level="WARNING"):
+            names = pax_mod.default_names(path)
+        self.assertEqual(names, ["李四"])
 
 
 class TestTask140EngineValueShapesB11(TempDirCase):

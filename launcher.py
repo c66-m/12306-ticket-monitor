@@ -144,11 +144,15 @@ def _coerce_status_str(st, where):
     """Task 138：status 真值非 str（如手改成 list）→ STATUS_LABELS.get
     先 hash 键抛 TypeError。
 
+    Task 141（2.2.2 R10-S3-1）：与 gui._coerce_status_str 同口径——去掉真值
+    检查，任何非 str 一律 warn + 按 "idle" 处理（调用方 `or "idle"` 已兜
+    falsy，此处为 helper 级别的一致性）。
+
     记 warning 后按 "idle" 处理（launcher 侧默认）。同一脏值每进程只记一次
     （_tick 每 800ms 调用，防刷屏；与 gui._skip_unhashable_task_name 同口径）。
     警告只记类型+长度摘要，不打印原值（Task 131/135 PII 口径）。
     """
-    if st and not isinstance(st, str):
+    if not isinstance(st, str):
         sig = (where, repr(st))
         if sig not in _STATUS_SHAPE_WARNED:
             _STATUS_SHAPE_WARNED.add(sig)

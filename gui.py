@@ -127,12 +127,16 @@ def _coerce_status_str(st, where):
     STATUS_COLOR.get 先 hash 键抛 TypeError（ACTIVE_STATUSES 是 tuple，
     in 成员检查不 hash，不崩——第一崩点是 dict.get）。
 
+    Task 141（2.2.2 R10-S3-1）：falsy 不可哈希 status（[]/{}）同样会崩
+    dict.get（`if st and …` 短路跳过是口径缺口）——去掉真值检查，
+    任何非 str 一律 warn + 按 "paused" 处理。"" 是 str，原样通过。
+
     记 warning 后按 "paused" 处理（gui 侧默认）。同一脏值每进程只记一次
     （TaskPage.refresh / MiniWindow 每 2 秒调用，防刷屏；与
     _skip_unhashable_task_name 同口径）。警告只记类型名，不打印原值
     （Task 124/135 PII 口径）。
     """
-    if st and not isinstance(st, str):
+    if not isinstance(st, str):
         sig = (where, repr(st))
         if sig not in _UNHASHABLE_STATUS_WARNED:
             _UNHASHABLE_STATUS_WARNED.add(sig)
