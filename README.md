@@ -21,7 +21,7 @@
 ticket.py（免登录轻客户端轮询余票）
    │  命中「有票 ∩ 席别候选」
    ▼
-engine.py / launcher.py（设防重记录 → 发起下单）
+engine.py / grabber.py（设防重记录 → 发起下单）
    │
    ▼
 orderflow.py（阶段化管线：检测→填单→提交→确认→驻留判定→日志；order_flow_mode 开关默认新链）
@@ -46,8 +46,8 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `ui/mini.html` + `ui/mini.js` + `ui/mini.css` | 小窗 3 文件 | **抢票小窗（B7 第二步）**：460×420 无边框，只显示账号 / 进行中任务 / 抢票日志；打开时主窗隐藏，关闭自动还原。外观经 `--appear` 启动参数继承主窗 |
 | `electron/main.js` + `electron/preload.js` | 221 / 27 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
 | `api.py` | 1273 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停（启动时自动起，`auto_start_engine=false` 可关）、日志泵、抢票定时调度、config/state 原子写 |
-| `launcher.py` | 1164 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
-| `gui.py` | 4296 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
+| `grabber.py` | 1188 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查。**2026-10-18 由 `launcher.py` 改名**（原名暗示「启动器」，与职责不符）；调用方统一 `import grabber as launcher` 别名，数百处调用点零改动 |
+| `legacy/gui.py` | 4300 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）而保留在 `legacy/` 包内。新功能一律改 `ui/` |
 | `monitor.py` | 1140 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
 
 ### 核心链路
@@ -64,12 +64,16 @@ state.json / orders.json / 购票历史 / 邮件通知
 
 | 模块 | 规模 | 职责 |
 |---|---|---|
-| `appcommon.py` | 533 行 | 跨界面共享机械层：日期区间解析、原子文件写（临时名 + replace 重试）、state.json 读容错、PII 脱敏口径（`mask_order_no` / `mask_one_name` / `mask_names` / `mask_id_partial`）、北京时间（`beijing_tz`）、展示归一化（normalize/display 车次与席别）单一实现 |
-| `filelock.py` | 144 行 | 跨进程文件锁（msvcrt 字节锁）：launcher 与 gui/engine 是独立进程却共改 config/state.json，原子替换挡不住并发读改写 |
+| `appcommon.py` | 768 行 | 跨界面共享机械层：数据目录解析（`data_path` / `state_path_of` / `history_path_of`）、日期区间解析、原子文件写（临时名 + replace 重试）、state.json 读容错、PII 脱敏口径（`mask_order_no` / `mask_one_name` / `mask_names` / `mask_id_partial`）、北京时间（`beijing_tz`）、展示归一化（normalize/display 车次与席别）单一实现 |
+| `filelock.py` | 144 行 | 跨进程文件锁（msvcrt 字节锁）：grabber 与界面/engine 是独立进程却共改 config/state.json，原子替换挡不住并发读改写 |
 | `logutil.py` | 132 行 | 按天滚动日志 handler，保持 `logs/<prefix>_YYYYMMDD.log` 命名习惯（标准库 handler 会改变命名，故自实现） |
 | `config_keys.py` | 22 行 | 配置键唯一定义处：代码读取的键 ⊆ example 模板键（测试防漂移回归） |
 | `tools/gen_icon.py`、`tools/gen_icon_emoji.py` | — | 图标生成脚本（产出 ui/appicon.png、electron/icon.ico） |
 | `tools/clean_profile.py` | 135 行 | 清 `.browser_profile/` 可再生产物（缓存/遥测/崩溃转储），保留登录态；无参干跑、`--force` 真删，抢不到 profile 锁即认为浏览器在跑并拒绝清理 |
+| `tools/migrate_data_dir.py` | 183 行 | 根目录 → `data/` 的一次性数据迁移（幂等、先备份、md5 校验后才删源）；支持 `--dry-run` 与 `--rollback` |
+| `tools/check.py` | 270 行 | **一键自检**：语法编译 → 遗留引用扫描（`launcher`→`grabber`、`gui`→`legacy`、数据文件 `HERE` 硬拼）→ 数据完整性（存在/非空/JSON 可解析）→ 车站四库一致性 → 全量测试。`--quick` 跳过测试（约 1 秒）。退出码 0/1，可直接接 CI |
+| `pyproject.toml` | — | 项目元数据与工具口径（**不打包分发**）：`requires-python >=3.9`、运行时依赖（与 requirements.txt 同源）、ruff 检查范围（排除 legacy/产物目录）、pytest 收集路径 |
+| `data/` | 数据目录 | 运行时数据与静态资产（2026-10-18 从根目录分离）：`state.json` / `orders.json` / `order_history.json` / `passengers.json` / `grab_tasks.json` / `session_cookies.json` / `.browser_state.json` + 车站四份库文件。路径统一由 `appcommon.data_path()` 解析（`data/` 优先、旧根目录布局兼容回退）。`config.json` / `launcher_config.json` 是用户可手改的配置，仍留根目录；`.browser_profile/`（Playwright 身份目录）与 `logs/` 也维持原位置 |
 | `notify.py` | 147 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
 | `passengers.py` | 496 行 | 乘车人管理：DPAPI（Windows）/ Fernet / 明文三级加密，按环境自动选最安全可用者 |
 | `station_db.py` | 152 行 | 全量车站本地库（3404 站）：在库=运营中；车型标签来自实际查询学习。`rebuild` 从车站索引+车型表合成，`check` 校验三份同源车站文件的 name↔code 漂移（非零退出） |
@@ -87,8 +91,8 @@ state.json / orders.json / 购票历史 / 邮件通知
 | 命令行后备 | `python monitor.py` | 无 GUI 环境的后备入口（功能以桌面版为准） |
 | 登录 | `python capture_session.py` / `python browser_order.py login` | 浏览器登录一次，会话持久化 |
 
-> 2026-10-13 起 `launcher.py` 不再是独立入口（只保留业务能力）。
-> 2026-10-14 起界面为 `ui/` + `api.py`（Electron）；`gui.py`（Tkinter 版）已停用但保留在仓库内（测试引用）。
+> 2026-10-13 起抢票模块不再是独立入口（只保留业务能力）；2026-10-18 由 `launcher.py` 改名为 `grabber.py`。
+> 2026-10-14 起界面为 `ui/` + `api.py`（Electron）；Tkinter 版已停用，2026-10-18 从根目录移入 `legacy/gui.py`（仅测试引用）。
 > 「启动桌面版.bat」里的 `set ELECTRON_RUN_AS_NODE=` 与 `set ELECTRON_MIRROR=` 两行不要删（原因见 bat 内注释）。
 > bat 文件必须保持**纯 ASCII**：cmd 按 OEM 代码页（本机 936/GBK）解码批处理，UTF-8 中文注释会错位成命令片段。
 > 依赖装在 `electron/node_modules`，首次安装由 bat 自己在 electron 目录里执行（根目录没有 package.json）。
@@ -98,6 +102,17 @@ state.json / orders.json / 购票历史 / 邮件通知
 1. 安装依赖：`pip install -r requirements.txt`，然后 `playwright install msedge`（或使用本机已装 Edge/Chrome）。
 2. 登录：运行 `python browser_order.py login`，在弹出的浏览器里完成 12306 登录（扫码或账密+滑块），会话存入 `.browser_profile/`。
 3. 建任务：桌面版「监控任务」页新建任务，或在「抢票任务」页配置车次/席别/乘车人，勾选自动下单。
+
+## 改完代码怎么验证
+
+```bash
+python tools/check.py          # 全量自检：编译 / 遗留引用 / 数据 / 车站库 / 800 测试
+python tools/check.py --quick  # 跳过测试，约 1 秒
+```
+
+自检全绿再提交。其中「遗留引用」一项专门防结构退化，检查三类约束：
+模块改名（`launcher` → `grabber`）、停用归档（`gui` → `legacy/`）、
+数据文件路径（必须走 `appcommon.data_path`，不得用 `os.path.join(HERE, ...)`）。
 
 ## 「首选席别」语法
 

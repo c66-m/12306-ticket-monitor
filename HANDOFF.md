@@ -3,14 +3,15 @@
 ## 0. 一句话定位
 Python 后端 + Electron 桌面壳：查票/监控余票 + 自动抢票（Playwright 驱动真实浏览器下单）。
 **2026-10-14 起为 Electron 架构：界面在 `ui/`（HTML/CSS/JS），`api.py` 是 JSON-RPC 后端，
-`electron/` 是壳；`gui.py`（Tkinter 版）已降级为 legacy，仍在仓库内但不再是入口。**
+`electron/` 是壳；Tkinter 版 `gui.py` 已降级为 legacy（2026-10-18 移入 `legacy/gui.py`），
+不再是入口。**
 
 **先读第 0.95 节（当前架构），第 0.9 节是已停用的 Tkinter 批次，留作历史。**
 
 ## 0.95 当前架构：Electron 桌面壳 + JSON-RPC 后端（2026-10-14 起，最新批次）
 
-**旧 Tkinter 界面（gui.py）已停用**：文件仍在仓库内（4296 行，2026-10-16 实测）供 test_all.py 引用，但不再是入口、
-不再维护。「启动桌面版.bat」现在启动 Electron。
+**旧 Tkinter 界面已停用**：文件在 `legacy/gui.py`（4300 行，2026-10-18 从根目录移入）
+供 test_all.py 引用，但不再是入口、不再维护。「启动桌面版.bat」现在启动 Electron。
 
 ### 分层
 
@@ -24,12 +25,12 @@ electron/      壳（Node）
   preload.js   27 行：contextBridge 暴露 window.api = { call, onPush, win, top }
 api.py         1222 行：JSON-RPC 后端（stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项）
   ↓ 复用既有业务模块
-launcher.py(Grabber/任务库) engine.py(监控引擎) ticket.py(查票) order.py(browser_order.py)/...
+grabber.py(Grabber/任务库) engine.py(监控引擎) ticket.py(查票) order.py(browser_order.py)/...
 ```
 
 通信：`window.api.call(method, params)` → preload → `ipcMain.handle("rpc")` → 写 python stdin，
 逐行读 stdout 解析 → 回包。后端主动推送走 `push(tag, payload)` → `py-push` 事件 → 前端 `bridge.onPush`。
-后端线程共三个：`log_pump`（把 `launcher.LOGQ` 推给前端）、`_armed_loop`（每 2 s 扫抢票任务，
+后端线程共三个：`log_pump`（把 `grabber.LOGQ` 推给前端，调用方别名 `launcher`）、`_armed_loop`（每 2 s 扫抢票任务，
 到点自动开抢，`_armed_fired` 防重）、启动即自动起的监控引擎线程（`auto_start_engine=false` 可关）。
 
 ### 前端轮询节奏
@@ -262,7 +263,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 | electron/main.js | 221 | Electron 壳：spawn python api.py、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、win/win-top 通道、F11、DSH_DEBUG 日志开关 |
 | electron/preload.js | 27 | contextBridge：window.api = { call, onPush, win, top } |
 | api.py | 1222 | **JSON-RPC 后端**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项；引擎启停（_engine_stop）、日志泵 log_pump、抢票定时调度 _armed_loop、config/state 原子写与文件锁 |
-| launcher.py | 1164 | **抢票业务模块（无界面）**：Grabber、任务库/配置 IO、车站搜索/类型探测、append_monitor_task、merge_trains_from_monitor、check_update、ensure_passengers、resolve_dates |
+| grabber.py | 1188 | **抢票业务模块（无界面）**：Grabber、任务库/配置 IO、车站搜索/类型探测、append_monitor_task、merge_trains_from_monitor、check_update、ensure_passengers、resolve_dates。**2026-10-18 由 launcher.py 改名**，调用方用 `import grabber as launcher` 别名 |
 | launcher_utils.py | 290 | 纯业务工具（席别表/掩码 mask_id·mask_mobile/归一化/时间/车型/IP 定位 ip_locate/build_monitor_task）；无 tkinter 依赖 |
 | engine.py | 1621 | 监控引擎：多任务调度、自适应频率、防重三层、历史/重试冷却；run(stop_event=None) 支持优雅退出 |
 | browser_order.py | 1708 | Playwright 真浏览器下单全流程（_order_impl 分 8 段 mark()） |
@@ -278,7 +279,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 | notify.py | 147 | 邮件通知（SMTP SSL） |
 | station_db.py | 152 | 全量车站本地库（3404 站）；`rebuild` 合成、`check` 校验三份同源车站文件 name↔code 漂移（非零退出） |
 | config_keys.py | 22 | 配置键唯一定义处（测试防漂移） |
-| gui.py | 4296 | **legacy（已停用）**：旧 Tkinter 单窗口界面；不再是任何入口，仅因 tests/test_all.py 深度引用（288 处）而原地保留；新功能一律改 ui/ |
+| legacy/gui.py | 4300 | **legacy（已停用）**：旧 Tkinter 单窗口界面，2026-10-18 移入 `legacy/`；不再是任何入口，仅因 tests/test_all.py 深度引用（288 处）而保留；新功能一律改 ui/ |
 | launcher_widgets.py / theme.py / liquid.py | 已删除 | 2026-10-13 随 Tkinter 界面推翻；`_undo_backup/` 备份目录已于 2026-10-15 清理 |
 | tools/gen_icon.py、tools/gen_icon_emoji.py | — | 图标生成脚本（原根目录 _icon_gen*.py，2026-10-14 归位） |
 
@@ -414,17 +415,120 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
   第一次回报可能是旧值），所以置顶态以主进程回报为准、不要在前端自己取反。
 
 ## 11. 上手禁忌（改代码前必看）
-- 当前界面是 ui/ + api.py（Electron）。**别再去改 gui.py 加功能**（legacy，只为测试而存在）。
+- 当前界面是 ui/ + api.py（Electron）。**别再去改 legacy/gui.py 加功能**（停用代码，只为测试而存在）。
 - ticket.py parse_row 的位置魔数索引不要动——RULES.md 与全部席别推导都依赖它。
 - 两条驱动循环语义不同，别合并；RULES.md 的工作流定义别绕过。
 - 原子写/锁的现有差异是修过的并发 bug（filelock 路径、bad 文件重命名、mtime 二次探测、engine 的 deepcopy 直写回退），抽取公共层时必须参数化保留，不许拉平。
 - 日期区间解析现有口径：max_span_days=5（最多 6 个日期），多处入口已统一，别改口径。
-- 项目文档：RULES.md（业务规则）、README.md、PRODUCT.md、HANDOFF.md（本文件）。拆 launcher.py 的清单要求见 RULES.md §七。
+- 项目文档：RULES.md（业务规则）、README.md、PRODUCT.md、HANDOFF.md（本文件）。拆 grabber.py 的清单要求见 RULES.md §七。
 
 ## 12. 下一次开工第一步建议
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
 2. git status -sb + `git log --oneline origin/main..main` 看实况（本文档不记 sha；是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
-4. python -X utf8 tests\test_all.py（预期 726 OK / skipped=15）
-5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
+4. python -X utf8 tests\test_all.py（预期 800 OK / skipped=15）
+5. 改界面/后端就去 ui/ 与 api.py（**别再去 legacy/gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
 6. 需要下线实跑就先重新登录，再动代码。
+
+## 13. 2026-10-18 数据目录分离（本批变更，已过 800 测试）
+
+**动机**：根目录原先平铺 18 个 .py + 11 个数据 json + 3 个车站大库 + 多个 .lock，
+代码与数据混杂；`%SystemDrive%` 幽灵目录也是这类问题的副产物（里面有搜狗输入法的
+活数据，本次未动）。
+
+**结构**：
+
+```
+（根目录）  代码 + config.json + launcher_config.json + .browser_profile/ + logs/
+data/      运行时数据：orders / state / order_history / passengers / grab_tasks /
+           session_cookies / .browser_state + 车站四库（stations_db / station_index /
+           station_name / station_kind）
+```
+
+**单一解析口径** `appcommon.data_path(name)`：
+1. 绝对路径直通（测试注入）；
+2. `data/<name>` 存在 → 新布局；
+3. 根目录 `<name>` 存在 → 旧布局兼容回退；
+4. 都不存在 → 落 `data/<name>`。
+
+`appcommon.state_path_of / history_path_of` 改走 `_resolve_data_file`：base_dir 是
+项目根时用 data_path，是临时目录时严格落临时目录（测试隔离）。
+
+**必须知道的坑（本批踩过）**：
+- `ticket.py::_abs_cache_path` 原先直接拼 `__file__` 目录，车站缓存刷新会把
+  `station_name.json / station_index.json` **写回根目录**，抵消数据分离。已改走 data_path。
+- `engine.orders_path` 做成实例属性：`_run_task` 的「官方回读未支付」分支会 upsert
+  订单，测试用 `object.__new__` 构造引擎时若不注入 `orders_path`，假单会写进真实库
+  （本批真的发生过，已从迁移备份恢复）。
+- 测试入口新增**全局数据隔离**：`appcommon.DATA_DIR` 重定向到临时副本（只复制车站
+  四库，不复制隐私数据）；保险名单 `_REAL_FILES` 补了 `orders.json`。
+- 故意不迁：`config.json`（用户手改的配置）、`.browser_profile/`（换路径 = 丢登录态
+  与设备指纹）、`logs/`（测试锁定目录形态）。
+
+**迁移与回滚**：`python tools/migrate_data_dir.py --dry-run` / `--rollback`；
+本次备份在 `data_migration_backup/20261018-113333/`（含隐私数据，已在 .gitignore）。
+
+**依赖锁定**：`requirements.txt` 按实际环境回填 `==`（requests 2.33.1 /
+playwright 1.58.0 / cryptography 50.0.2）。升级 playwright 必须跟跑
+`python -m playwright install chromium`，否则浏览器二进制与库版本不匹配。
+
+**调试产物出库**：`runs/fofa-*.jsonl` 已 `git rm --cached`（本地文件保留），
+`.gitignore` 增加 `runs/*.jsonl` 与 data/ 精确忽略规则（车站库仍入库）。
+
+## 14. 2026-10-18 第二批：legacy 归档 + 抢票模块改名
+
+**动机**：根目录 18 个 .py 平铺，已停用的 `gui.py`（4300 行）与活跃模块混放，
+容易被误当活代码维护；`launcher.py` 原名暗示「启动器」，实际是抢票业务模块
+（启动器界面 2026-10-13 已删除），名字与职责不符。
+
+**变更**：
+
+1. `gui.py` → `legacy/gui.py`（新建 `legacy/` 包）。文件内 **`HERE`（legacy/ 自身）
+   与 `APP_ROOT`（项目根）分离**：`CONFIG_PATH` / `log_dir` / `state_path_of` /
+   `history_path_of` / `capture_session.py` 路径全部改用 `APP_ROOT`。
+   测试：`import gui` → `from legacy import gui`；4 处 `patch.object(gui, "HERE")`
+   → `"APP_ROOT"`；2 处字符串式 `mock.patch("gui.subprocess.run")` →
+   `"legacy.gui.subprocess.run"`；`_PRODUCT_FILES` 里 `gui.py` → `legacy/gui.py`。
+2. `launcher.py` → `grabber.py`，`launcher_utils.py` → `grabber_utils.py`。
+   调用方统一用别名（`import grabber as launcher` / `import grabber_utils as
+   launcher_utils`），数百处 `launcher.xxx` 调用点**零改动**。
+   内部 `import launcher` 全部改 `import grabber as launcher`（`station_db` 三处、
+   测试六处）；测试 `patch.dict(sys.modules, {"launcher": ...})` → `{"grabber": ...}`
+   （否则导入真实模块 → 离线空索引提前返回）。
+3. 文档：README 模块地图 / HANDOFF 当前架构与模块地图同步；**历史批次记录不动**
+   （改历史会让「当时发生了什么」失真）。
+
+**验证口径**：`python tests/test_all.py` → 800 tests / OK / skipped=15；
+真实 `data/` 全文件 md5 零变化。
+
+**遗留**：`%SystemDrive%/` 目录仍在（内含搜狗输入法活数据，属外部程序副作用，
+不属本项目产物，未动）；建议在确认无程序依赖后手工删除。
+
+## 15. 2026-10-18 第三批：工程化收尾（pyproject + 一键自检）
+
+**动机**：前两批改造（数据分离、模块改名）靠人工核对完成，容易在后续改动中退化；
+项目也没有 `pyproject.toml`，Python 版本下限与工具口径都是口口相传。
+
+**新增**：
+
+1. `pyproject.toml`：声明 `requires-python >=3.9`（代码未用 match / PEP 604 /
+   3.11+ 标准库，实测 3.12）、运行时依赖（与 requirements.txt 同源）、ruff 检查
+   范围（排除 legacy/electron/产物目录）、pytest 收集路径。**故意不声明
+   `[build-system]`**——本项目不打包分发（Electron 直接 spawn `api.py`）。
+2. `tools/check.py`（270 行）：一键自检 5 项 —— 语法编译 / 遗留引用 /
+   数据完整性 / 车站库一致性 / 全量测试。`--quick` 跳过测试（约 1 秒），
+   退出码 0/1，可直接接 CI。
+
+**自检当场抓到的真 bug**：`station_db.check()` 读车站四库时用
+`os.path.join(HERE, name)`，数据迁到 data/ 后直接报「文件缺失」——这是数据分离
+漏掉的第三处（前两处：`ticket._abs_cache_path` 车站缓存写回根目录、
+`engine.orders_path` 不可注入）。修复：新增 `appcommon.resolve_data_file(base_dir, name)`
+公开函数（项目根走 data_path、临时目录严格本地），`station_db.check` 改用之；
+`state_path_of` / `history_path_of` 同步复用同一实现。
+
+**为什么「遗留引用」这一项值得留着**：它把三批改造的约束变成可执行检查——
+`import launcher` / `from gui import` / `os.path.join(HERE, "*.json")` 一旦在
+新代码里复活，自检直接红。白名单只允许 4 个用户配置文件
+（config / launcher_config 及其 example）。
+
+**验证口径**：`python tools/check.py` → 5/5 OK（800 tests, skipped=15）。

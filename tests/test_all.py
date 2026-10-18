@@ -19,7 +19,9 @@ state.json / config.json / order_history.json 等真实数据。
 """
 
 import datetime
+import atexit
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -40,8 +42,8 @@ import order as order_mod            # noqa: E402
 import notify as notify_mod          # noqa: E402
 import logutil                       # noqa: E402
 import passengers as pax_mod         # noqa: E402
-import launcher                      # noqa: E402
-import gui                           # noqa: E402
+import grabber as launcher          # noqa: E402  （2026-10-18 改名：launcher.py → grabber.py）
+from legacy import gui                  # noqa: E402  （legacy/：已停用，仅测试引用）
 import browser_order                 # noqa: E402
 import appcommon                     # noqa: E402
 import filelock                      # noqa: E402
@@ -50,6 +52,35 @@ import time                          # noqa: E402
 import contextlib                    # noqa: E402
 import io                            # noqa: E402
 import station_db as station_db_mod   # noqa: E402
+
+
+# --- 测试全局数据隔离（2026-10-18）------------------------------------------
+# 业务模块的数据路径统一由 appcommon.data_path 解析；测试若忘记 patch，就会写进
+# 真实 data/（历史事故：测试假单 E9 被写进用户 orders.json，因保险名单漏了它）。
+# 这里把 DATA_DIR 重定向到临时副本：只复制静态资产（车站库），隐私/运行数据
+# 绝不复制——缺失即视为不存在，与真实环境彻底隔离。
+_REAL_DATA_DIR = appcommon.DATA_DIR          # 隔离前的真实目录，供保险名单使用
+_TEST_DATA_DIR = tempfile.mkdtemp(prefix="t12306_data_")
+atexit.register(shutil.rmtree, _TEST_DATA_DIR, ignore_errors=True)
+
+
+def _isolate_data_dir():
+    os.makedirs(_TEST_DATA_DIR, exist_ok=True)
+    for _name in ("stations_db.json", "station_index.json",
+                  "station_name.json", "station_kind.json"):
+        _src = os.path.join(_REAL_DATA_DIR, _name)
+        if os.path.exists(_src):
+            shutil.copy2(_src, os.path.join(_TEST_DATA_DIR, _name))
+    appcommon.DATA_DIR = _TEST_DATA_DIR
+
+
+_isolate_data_dir()
+
+
+def _real_path(name):
+    """真实数据文件路径（不受测试隔离影响）：data/ 优先，回退根目录旧布局。"""
+    p = os.path.join(_REAL_DATA_DIR, name)
+    return p if os.path.exists(p) else os.path.join(HERE, name)
 
 
 def synthetic_row(train="K225", hard_seat="5", from_c="VNP", to_c="ZAF"):
@@ -82,6 +113,9 @@ def make_engine(tmp):
     }
     e.state_path = os.path.join(tmp, "state.json")
     e.history_path = os.path.join(tmp, "order_history.json")
+    # 订单库必须隔离：_run_task 的「官方回读未支付」分支会 upsert 订单，
+    # 不注入就会写进真实 data/orders.json（曾把测试假单 E9 写进用户库）。
+    e.orders_path = os.path.join(tmp, "orders.json")
     e.name2code = {"长葛": "VNP", "确山": "ZAF"}
     e.code2name = {"VNP": "长葛", "ZAF": "确山"}
     e.tasks = []
@@ -103,15 +137,19 @@ def task_of(tmp_name="t1", **over):
     return t
 
 
-# 真实数据保险名单：测试碰这些文件 = 事故（曾经真的把用户的 launcher_config.json 覆盖成空壳）
+# 真实数据保险名单：测试碰这些文件 = 事故（曾经真的把用户的 launcher_config.json 覆盖成空壳，
+# 也曾经把测试假单 E9 写进真实 orders.json —— 所以订单库必须在这里）
 _REAL_FILES = ("launcher_config.json", "grab_tasks.json", "config.json",
-               "state.json", "order_history.json", "passengers.json")
+               "state.json", "order_history.json", "passengers.json",
+               "orders.json")
 
 
 def _real_snapshot():
     snap = {}
     for name in _REAL_FILES:
-        p = os.path.join(HERE, name)
+        # 必须盯真实目录（_real_path），不能用被隔离改写的 appcommon.DATA_DIR，
+        # 否则快照全变 None，保险名单形同虚设。
+        p = _real_path(name)
         try:
             with open(p, "rb") as f:
                 snap[name] = hashlib.md5(f.read()).hexdigest()
@@ -1672,8 +1710,8 @@ class TestConfigKeys(TempDirCase):
     # 产品代码文件全集（Task 80a：旧版只扫 6 个文件，有盲区）。
     # 测试文件本身不扫，避免测试固件里的字符串污染扫描。
     _PRODUCT_FILES = ["appcommon.py", "browser_order.py", "capture_session.py",
-                      "config_keys.py", "engine.py", "filelock.py", "gui.py",
-                      "launcher.py", "logutil.py", "monitor.py", "notify.py",
+                      "config_keys.py", "engine.py", "filelock.py", "legacy/gui.py",
+                      "grabber.py", "logutil.py", "monitor.py", "notify.py",
                       "order.py", "passengers.py", "probe_login.py",
                       "station_db.py", "ticket.py"]
 
@@ -4879,7 +4917,7 @@ class TestLockedRMW(TempDirCase):
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"tasks": [], "state_file": "state.json"}, f)
-        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+        for name, val in (("CONFIG_PATH", cfg), ("APP_ROOT", self.tmp)):
             p = mock.patch.object(gui, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -5534,7 +5572,7 @@ class TestDeleteTaskClearsState(TempDirCase):
             json.dump({"tasks": {"t1": {"status": "monitoring",
                                        "fail_streak": 0}},
                        "dedup": {}, "retry": {}}, f)
-        for name, val in (("CONFIG_PATH", cfg), ("HERE", self.tmp)):
+        for name, val in (("CONFIG_PATH", cfg), ("APP_ROOT", self.tmp)):
             p = mock.patch.object(gui, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -7001,7 +7039,9 @@ class TestTicketP3(TempDirCase):
         fake_launcher.get_station_index.return_value = fake_idx
         fake_launcher.load_station_kinds.return_value = {"VNP": "G"}
         db_path = os.path.join(self.tmp, "stations_db.json")
-        with mock.patch.dict(sys.modules, {"launcher": fake_launcher}), \
+        # 2026-10-18 改名：station_db.rebuild 内部 import grabber（别名 launcher），
+        # 注入假模块必须用 grabber 这个名字，否则导入真实模块 → 离线空索引提前返回。
+        with mock.patch.dict(sys.modules, {"grabber": fake_launcher}), \
                 mock.patch.object(station_db, "DB_PATH", db_path), \
                 mock.patch("builtins.print") as mprint:
             db = station_db.rebuild()
@@ -7553,12 +7593,13 @@ class TestTask69CaptureSession(TempDirCase):
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"session_cookies_file": "my_cookies.json"}, f)
+        # 2026-10-18 数据目录改造：相对名统一交给 appcommon.data_path（data/ 优先）
         self.assertEqual(capture_session._cookie_path(cfg),
-                         os.path.join(capture_session.HERE, "my_cookies.json"))
+                         appcommon.data_path("my_cookies.json"))
 
     def test_cookie_path_fallback(self):
         import capture_session
-        default = os.path.join(capture_session.HERE, "session_cookies.json")
+        default = appcommon.data_path("session_cookies.json")
         # 配置文件不存在 → 回退
         self.assertEqual(capture_session._cookie_path(os.path.join(self.tmp, "nope.json")),
                          default)
@@ -7574,7 +7615,7 @@ class TestTask69CaptureSession(TempDirCase):
 
     def test_cookie_path_non_string_fallback(self):
         import capture_session
-        default = os.path.join(capture_session.HERE, "session_cookies.json")
+        default = appcommon.data_path("session_cookies.json")
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"session_cookies_file": 123}, f)
@@ -8544,7 +8585,7 @@ class TestTask74Launcher(TempDirCase):
         app._save_cfg = lambda *a, **k: None
         try:
             app._pax_mtime = os.path.getmtime(
-                os.path.join(launcher.HERE, "passengers.json"))
+                appcommon.data_path("passengers.json"))
         except OSError:
             app._pax_mtime = float("inf")
         app.pax_vars = {}               # _refresh_pax 需要的空勾选集
@@ -9803,6 +9844,8 @@ class TestTask84LauncherP3(TempDirCase):
                       f, ensure_ascii=False)
         logged = []
         with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher.appcommon, "data_path",
+                               side_effect=lambda n: os.path.join(self.tmp, n)), \
              mock.patch.object(launcher, "log", logged.append), \
              mock.patch.object(launcher.passengers_mod, "save_passengers",
                                return_value=True) as m_save:
@@ -9859,6 +9902,8 @@ class TestTask84LauncherP3(TempDirCase):
                       f, ensure_ascii=False)
         logged = []
         with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher.appcommon, "data_path",
+                               side_effect=lambda n: os.path.join(self.tmp, n)), \
              mock.patch.object(launcher, "log", logged.append), \
              mock.patch.object(launcher.passengers_mod, "save_passengers",
                                return_value=False):
@@ -10246,7 +10291,7 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
     def test_display_trains_string_not_char_split(self):
         # (b) 旧代码无此 helper（AttributeError）；各展示点对 "G101"
         # 会 join 成 "G,1,0,1" 逐字符拆。
-        import launcher as launcher_mod
+        import grabber as launcher_mod
         self.assertEqual(launcher_mod._display_trains("G101"), ["G101"])
         self.assertEqual(",".join(launcher_mod._display_trains("G101")), "G101")
         self.assertEqual(launcher_mod._display_trains(["g1 ", ""]), ["G1"])
@@ -10255,7 +10300,7 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
 
     def test_mask_one_name(self):
         # (c) 旧代码无此 helper（AttributeError）；_ptxt 记全名。
-        import launcher as launcher_mod
+        import grabber as launcher_mod
         self.assertEqual(launcher_mod._mask_one_name("张三丰"), "张**")
         self.assertEqual(launcher_mod._mask_one_name("李"), "*")
         self.assertEqual(launcher_mod._mask_one_name(""), "")
@@ -11313,7 +11358,7 @@ class TestTask94GuiStartupRobustness(TempDirCase):
         cfg = self._history_cfg('{"a": 1}')
         self._reset_corrupt_flag()
         with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "HERE", self.tmp):
+             mock.patch.object(gui, "APP_ROOT", self.tmp):
             with self.assertLogs(gui.LOG, level="WARNING") as cm:
                 self.assertEqual(gui.read_history_records(), [])
         self.assertTrue(any("列表" in r.getMessage() for r in cm.records),
@@ -11323,14 +11368,14 @@ class TestTask94GuiStartupRobustness(TempDirCase):
         cfg = self._history_cfg('42')
         self._reset_corrupt_flag()
         with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "HERE", self.tmp):
+             mock.patch.object(gui, "APP_ROOT", self.tmp):
             self.assertEqual(gui.read_history_records(), [])
 
     def test_read_history_records_valid_list_unchanged(self):
         cfg = self._history_cfg('[{"t": 1}, {"t": 2}, {"t": 3}]')
         self._reset_corrupt_flag()
         with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "HERE", self.tmp):
+             mock.patch.object(gui, "APP_ROOT", self.tmp):
             recs = gui.read_history_records(limit=2)
         self.assertEqual([r["t"] for r in recs], [3, 2])
 
@@ -11338,7 +11383,7 @@ class TestTask94GuiStartupRobustness(TempDirCase):
         cfg = self._write_text("config.json", '{"history_file": "order_history.json"}')
         self._reset_corrupt_flag()
         with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "HERE", self.tmp):
+             mock.patch.object(gui, "APP_ROOT", self.tmp):
             self.assertEqual(gui.read_history_records(), [])
 
 
@@ -12031,7 +12076,7 @@ class TestTask99CaptureSessionP3(unittest.TestCase):
         import capture_session
         proc = mock.Mock()
         proc.returncode = 0
-        with mock.patch("gui.subprocess.run", return_value=proc) as mrun:
+        with mock.patch("legacy.gui.subprocess.run", return_value=proc) as mrun:
             self.assertTrue(gui._relogin_ok_via_script("capture_session.py"))
         timeout = mrun.call_args.kwargs["timeout"]
         self.assertGreaterEqual(timeout, capture_session.MAX_WAIT_SEC + 60)
@@ -12039,7 +12084,7 @@ class TestTask99CaptureSessionP3(unittest.TestCase):
     def test_relogin_script_timeout_still_returns_false(self):
         # 超时仍视为失败返回 False（行为不变，只是阈值对齐）
         import capture_session
-        with mock.patch("gui.subprocess.run",
+        with mock.patch("legacy.gui.subprocess.run",
                         side_effect=subprocess.TimeoutExpired("cmd", 1)):
             self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
 
@@ -12066,7 +12111,7 @@ class TestTask99CaptureSessionP3(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 order_mod.load_session("rel/cookies.json")
         checked = m_exists.call_args[0][0]
-        self.assertEqual(checked, os.path.join(order_mod.HERE, "rel", "cookies.json"))
+        self.assertEqual(checked, appcommon.data_path(os.path.join("rel", "cookies.json")))
 
     def test_load_session_absolute_path_passthrough(self):
         # 绝对路径透传（pin：正常路径行为不变）
@@ -12088,7 +12133,7 @@ class TestTask99CaptureSessionP3(unittest.TestCase):
         with mock.patch.object(order_mod.appcommon, "atomic_write_json") as m_write:
             order_mod.save_session(session, "rel/cookies.json")
         written = m_write.call_args[0][0]
-        self.assertEqual(written, os.path.join(order_mod.HERE, "rel", "cookies.json"))
+        self.assertEqual(written, appcommon.data_path(os.path.join("rel", "cookies.json")))
 
     # ---- (d) 已关闭浏览器 defensive close ----
 
@@ -12210,11 +12255,13 @@ class TestTask100NotifyPassengersP3(TempDirCase):
 
     def test_c_ensure_passengers_passes_expect_stamp_none(self):
         # RED on old code: 裸调 save_passengers 不传指纹，首跑双进程可静默覆写
-        import launcher
+        import grabber as launcher
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"tasks": [{"passenger_names": ["张三"]}]}, f)
         with mock.patch.object(launcher, "HERE", self.tmp), \
+             mock.patch.object(launcher.appcommon, "data_path",
+                               side_effect=lambda n: os.path.join(self.tmp, n)), \
              mock.patch.object(launcher, "log"), \
              mock.patch.object(launcher.passengers_mod, "save_passengers",
                                return_value=True) as m_save:
@@ -12279,7 +12326,7 @@ class TestTask101CrossModuleP3(TempDirCase):
 
     # ---- (a) save_station_kinds 并发写：tmp 文件名必须带线程后缀 ----
     def test_a_tmp_unique_per_thread(self):
-        import launcher
+        import grabber as launcher
         real_path = launcher.STATION_KIND_PATH
         real_kinds = launcher._station_kinds
         launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
@@ -12302,7 +12349,7 @@ class TestTask101CrossModuleP3(TempDirCase):
 
     # ---- (b) get_station_index：加载失败不永久缓存，下次重试；日志文案属实 ----
     def test_b_failed_load_not_cached(self):
-        import launcher
+        import grabber as launcher
         launcher._STATION_INDEX = None
         self.addCleanup(setattr, launcher, "_STATION_INDEX", None)
         with mock.patch.object(ticket, "load_station_index",
@@ -12316,7 +12363,7 @@ class TestTask101CrossModuleP3(TempDirCase):
         self.assertNotIn("只按站名匹配", logged, "失败时索引为空，'只按站名匹配'不属实")
 
     def test_b_success_still_cached(self):
-        import launcher
+        import grabber as launcher
         launcher._STATION_INDEX = None
         self.addCleanup(setattr, launcher, "_STATION_INDEX", None)
         st = [{"name": "北京", "code": "BJP", "py": "beijing", "spy": "bj"}]
@@ -13531,6 +13578,168 @@ class TestHistoryLabelSync(unittest.TestCase):
         self.assertIsNotNone(m, "ui/app.js 里找不到 HISTORY_LABELS 定义")
         pairs = dict(re.findall(r'(\w+):\s*"([^"]*)"', m.group(1)))
         self.assertEqual(pairs, appcommon.HISTORY_RESULT_LABEL)
+
+
+class TestApiRpcContract(TempDirCase):
+    """api.py 的 JSON-RPC 契约（37 个方法）——拆分 api.py 的前置保险。
+
+    覆盖三层：
+      1. 注册完整性：37 个方法名齐全且 callable；
+      2. 逐个 dispatch 冒烟：每个方法用空 params 调一次，必须返回合法
+         JSON-RPC 响应（result 或 error），进程不崩；
+      3. 错误包装：非法 JSON / 非对象载荷 / 未知方法 / handler 抛异常
+         都必须由 dispatch 转成 error 响应，而不是把异常抛给主循环。
+
+    副作用防线（缺一不可，否则测试会真的联网 / 开浏览器 / 发邮件）：
+      - socket.create_connection 与 smtplib.SMTP_SSL 一律抛 OSError；
+      - probe_session / browser_order.login / send_email / start_engine /
+        stop_engine / Grabber 全部打桩；
+      - config、抢票任务、乘车人路径指向临时目录。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.api = importlib.import_module("api")
+        self._out = io.StringIO()
+        # emit() 用的是模块级 WRITE/FLUSH 绑定，redirect_stdout 捕不到
+        self._patch(self.api, "WRITE", self._out.write)
+        self._patch(self.api, "FLUSH", lambda: None)
+
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        self._patch(self.api, "CONFIG_PATH", cfg)
+        self._patch(self.api.launcher, "LAUNCHER_CFG_PATH",
+                    os.path.join(self.tmp, "launcher_config.json"))
+        self._patch(self.api.launcher, "_monitor_cfg_path",
+                    lambda: os.path.join(self.tmp, "monitor_config.json"))
+        self._patch(self.api.launcher, "GRAB_TASKS_PATH",
+                    os.path.join(self.tmp, "grab_tasks.json"))
+        self._patch(self.api.passengers_mod, "DEFAULT_PATH",
+                    os.path.join(self.tmp, "passengers.json"))
+
+        # 副作用打桩：引擎 / 会话探测 / 浏览器登录 / 邮件 / 抢票线程
+        self._patch(self.api, "start_engine", lambda *a, **k: True)
+        self._patch(self.api, "stop_engine", lambda *a, **k: True)
+        self._patch(self.api, "probe_session",
+                    lambda *a, **k: {"ok": False, "message": "契约测试"})
+        self._patch(self.api, "current_session", lambda *a, **k: None)
+        self._patch(self.api.browser_order, "login", lambda *a, **k: False)
+        self._patch(self.api.browser_order, "check_session",
+                    lambda *a, **k: (False, "契约测试"))
+        self._patch(self.api.notify_mod, "send_email", lambda *a, **k: (True, ""))
+        self._patch(self.api.launcher, "Grabber", mock.Mock())
+
+        # 网络禁卫：任何漏网的真实连接都失败（handler 会把它转成 error 响应）
+        def _blocked(*_a, **_k):
+            raise OSError("契约测试禁止真实网络")
+        self._patch_obj("socket.create_connection", _blocked)
+        self._patch_obj("smtplib.SMTP_SSL", _blocked)
+
+        self.api._grabbers.clear()
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _patch_obj(self, dotted, value):
+        p = mock.patch(dotted, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _dispatch(self, payload, expect_id=None):
+        """执行一行请求，返回对应的 JSON-RPC 响应。
+
+        handler 内部可能先 push 若干条通知（如 relogin 的 log/session），
+        与 reply 混在同一输出流里；必须按 id 定位 reply，不能整段 json.loads。
+        """
+        self._out.seek(0)
+        self._out.truncate()
+        self.api.rpc_dispatch(payload)
+        objs = []
+        for line in self._out.getvalue().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                objs.append(json.loads(line))
+            except ValueError:
+                continue
+        for obj in reversed(objs):
+            if expect_id is not None and obj.get("id") == expect_id:
+                return obj
+        for obj in reversed(objs):
+            if "result" in obj or "error" in obj:
+                return obj
+        return objs[-1] if objs else None
+
+    def _call(self, method, params=None):
+        return self._dispatch(json.dumps({"jsonrpc": "2.0", "id": 7,
+                                          "method": method,
+                                          "params": params or {}}),
+                              expect_id=7)
+
+    # ---- 1. 注册完整性 ----
+
+    def test_methods_registry_complete(self):
+        self.assertEqual(len(self.api.METHODS), 37,
+                         "方法数变化必须同步契约测试：%s" % sorted(self.api.METHODS))
+        for name, fn in self.api.METHODS.items():
+            self.assertTrue(callable(fn), "%s 不可调用" % name)
+            self.assertRegex(name, r"^[a-z][A-Za-z0-9]*$", "方法名必须是 lowerCamel")
+
+    # ---- 2. 逐方法 dispatch 冒烟 ----
+
+    def test_every_method_dispatch_smoke(self):
+        for method in sorted(self.api.METHODS):
+            with self.subTest(method=method):
+                resp = self._call(method)
+                self.assertIsInstance(resp, dict, "%s 无响应" % method)
+                self.assertEqual(resp.get("id"), 7, "%s 响应 id 不匹配" % method)
+                self.assertTrue("result" in resp or "error" in resp,
+                                "%s 返回既无 result 也无 error" % method)
+                if "error" in resp:
+                    self.assertIn("message", resp["error"])
+
+    # ---- 3. 分发层错误包装 ----
+
+    def test_unknown_method_returns_error(self):
+        resp = self._call("noSuchMethod")
+        self.assertIn("error", resp)
+        self.assertIn("未知方法", resp["error"]["message"])
+
+    def test_bad_json_returns_error(self):
+        resp = self._dispatch("{not json")
+        self.assertIn("error", resp)
+        self.assertIn("JSON 解析失败", resp["error"]["message"])
+
+    def test_non_object_payload_returns_error(self):
+        for payload in ("[1, 2]", '"text"', "42", "null"):
+            with self.subTest(payload=payload):
+                resp = self._dispatch(payload)
+                self.assertIn("error", resp)
+                self.assertIn("JSON 对象", resp["error"]["message"])
+
+    def test_handler_exception_is_wrapped(self):
+        def boom(_params):
+            raise ValueError("handler 炸了")
+        with mock.patch.dict(self.api.METHODS, {"__boom": boom}):
+            resp = self._call("__boom")
+        self.assertIn("error", resp)
+        self.assertIn("ValueError", resp["error"]["message"])
+        self.assertIn("handler 炸了", resp["error"]["message"])
+
+    def test_empty_params_never_raise(self):
+        """漏参数是最常见的协议层故障：只允许返回 error，不允许把异常抛给主循环。"""
+        must_have_params = ("createTask", "deleteTask", "setTaskStatus",
+                            "resetTask", "saveGrabTask", "renameGrabTask",
+                            "deleteGrabTask", "passengerDetail", "deletePreset")
+        for method in must_have_params:
+            with self.subTest(method=method):
+                resp = self._call(method, params={})
+                self.assertIsInstance(resp, dict)
+                self.assertTrue("result" in resp or "error" in resp)
 
 
 if __name__ == "__main__":
