@@ -7,6 +7,7 @@ CONFIG_KEYS = frozenset({
     "session_cookies_file", "state_file", "history_file", "passengers_file",
     "log_dir", "http_timeout", "notify", "tasks",
     "order_mode", "browser_headless", "task_defaults",
+    "keep_pay_page", "pay_page_keep_seconds",
     "order_flow_mode", "order_flow", "auto_start_engine",
 })
 NOTIFY_EMAIL_KEYS = frozenset({

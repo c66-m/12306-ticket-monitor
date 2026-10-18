@@ -39,6 +39,8 @@
   "tasks": [],
   "order_mode": "browser",
   "browser_headless": false,
+  "keep_pay_page": true,
+  "pay_page_keep_seconds": 300,
   "order_flow_mode": true,
   "order_flow": {
     "read_poll_seconds": 0.5,

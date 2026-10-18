@@ -636,3 +636,29 @@ deleteTask 带 uid、状态被回设、提交日期为新选值；全量 809 tes
 **验证**：真实浏览器（真实 app.js + mock RPC）7/7 —— 改开始后结束跟随、
 手设区间可行、再改开始后区间被清除、保存提交 `dates=[该日]` 且 `date_range=[]`；
 编辑流程原有 7 项回归仍全绿；`tools/check.py --quick` 5/5。
+
+## 20. 2026-10-18 下单成功后保留「席位已锁定」付款页
+
+**需求**：网页下单成功后要停在 12306 的订单确认页（「席位已锁定，请在 xx 分
+xx 秒内完成支付」），让人亲眼确认下单成功并直接支付。
+
+**原因**：`_order_impl` 判定到 `payOrder` 后立即返回，`ExitStack` 的
+`_safe_close_ctx` 随即关窗——用户只看到窗口一闪。
+
+**改动**：
+- `browser_order._hold_pay_page(page, seconds, should_stop)`：留在付款页，直到
+  **用户关窗 / 手动停止 / 超时**；测试替身没有 `is_closed` 时直接返回，不会挂住单测。
+- `_order_impl` 成功分支：`headless=False` 时先按配置保留付款页，再返回成功。
+- `browser_order._pay_page_hold_seconds()`：读 config.json——
+  `keep_pay_page`（false 关闭）、`pay_page_keep_seconds`（默认 300，上限 1200 = 座位锁定 20 分钟）。
+- `config_keys.CONFIG_KEYS` 与 `config.example.json` 同步登记这两个键
+  （`TestConfigKeys` 会做「代码读取键 ⊆ 模板键」的回归）。
+
+**注意**：保留期间浏览器仍持有 profile 独占锁——这正是「浏览器正在用」的诚实
+语义，其它下单/体检会排队；关窗或超时后自动释放。要恢复旧行为把
+`keep_pay_page` 设为 false 即可。
+
+**验证**：
+- 真实 Playwright 页面：2 秒档实测 2.1s 返回；已关闭页面 0.0s 立即返回。
+- 单测 `TestKeepPayPage` 4 项（配置解析 / 测试替身不阻塞 / 关窗即返 / 手动停止即返）。
+- 全量 813 tests OK (skipped=15)。

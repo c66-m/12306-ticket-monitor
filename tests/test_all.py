@@ -13791,6 +13791,61 @@ class TestMonitorTaskEdit(unittest.TestCase):
         self.assertEqual(deleted, ["u2"], "同名任务必须按 uid 精确删除，不能删到第一条")
 
 
+class TestKeepPayPage(unittest.TestCase):
+    """下单成功后把「席位已锁定」付款页留给用户核对/支付（2026-10-18 需求）。
+
+    座位锁定页是判断「真的下单成功」最直观的证据；旧流程成功后立刻 ctx.close()，
+    用户只看到窗口一闪。现在保留窗口，关窗 / 手动停止 / 超时才继续。
+    """
+
+    def test_hold_seconds_respects_config(self):
+        import browser_order as bo
+        cases = ((({}, 300)),
+                 ({"keep_pay_page": False}, 0),
+                 ({"pay_page_keep_seconds": 60}, 60),
+                 ({"pay_page_keep_seconds": "abc"}, 300),
+                 ({"pay_page_keep_seconds": 99999}, 1200))
+        for cfg, want in cases:
+            with mock.patch.object(bo.appcommon, "read_config_or_empty", return_value=cfg):
+                self.assertEqual(bo._pay_page_hold_seconds(), want, cfg)
+
+    def test_hold_returns_immediately_without_is_closed(self):
+        import browser_order as bo
+        with mock.patch.object(bo, "_log"):
+            bo._hold_pay_page(object(), 300)   # 测试替身：不抛、不阻塞
+
+    def test_hold_returns_when_window_closed(self):
+        import browser_order as bo
+
+        class _P:
+            def __init__(self):
+                self.n = 0
+
+            def is_closed(self):
+                return self.n >= 1
+
+            def wait_for_timeout(self, _ms):
+                self.n += 1
+
+        p = _P()
+        with mock.patch.object(bo, "_log"):
+            bo._hold_pay_page(p, 60)
+        self.assertEqual(p.n, 1, "关窗后必须立刻返回，不再空等")
+
+    def test_hold_aborts_on_manual_stop(self):
+        import browser_order as bo
+
+        class _P:
+            def is_closed(self):
+                return False
+
+            def wait_for_timeout(self, _ms):
+                raise AssertionError("手动停止后不应继续等待")
+
+        with mock.patch.object(bo, "_log"):
+            bo._hold_pay_page(_P(), 60, lambda: True)
+
+
 if __name__ == "__main__":
     # 全局兜底：跑完对一次真实数据指纹。TempDirCase 只在继承它的用例里守着，
     # 其余用例写穿隔离时无人告警（2026-10-18 就这样清空了 grab_tasks.json）。
