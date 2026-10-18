@@ -41,19 +41,25 @@ if ROOT not in sys.path:
 SKIP_DIRS = ("__pycache__", "node_modules", "data", "data_migration_backup",
              ".browser_profile", "logs", "runs", "legacy")
 
-# data/ 下必需的数据文件（缺失 = 迁移未完成或误删）
-REQUIRED_DATA = (
-    "state.json",
-    "orders.json",
-    "order_history.json",
-    "grab_tasks.json",
-    "passengers.json",
+# data/ 下的文件按「缺失的语义」分三级——一刀切会把首次运行判成故障。
+#
+# 一级：随代码分发的静态资产。缺失 = 故障（程序无法工作），CI 也必须过。
+REQUIRED_ASSETS = (
     "stations_db.json",
     "station_index.json",
     "station_name.json",
     "station_kind.json",
 )
-# 仅登录后才存在的文件：缺失不算失败
+# 二级：首次运行自动创建的运行时数据。缺失 = 正常（干净 clone / 新机器），
+# 但存在时解析失败 = 故障（损坏的档比没有更危险）。
+RUNTIME_DATA = (
+    "state.json",
+    "orders.json",
+    "order_history.json",
+    "grab_tasks.json",
+    "passengers.json",
+)
+# 三级：登录后才存在的文件。缺失 = 正常。
 OPTIONAL_DATA = ("session_cookies.json", ".browser_state.json")
 
 # 已改名/已归档模块的遗留引用（生产代码里出现即失败）
@@ -121,41 +127,55 @@ def check_legacy_refs() -> list[str]:
     return problems
 
 
+def _validate_json(path: str) -> str | None:
+    """数据文件内容校验：返回错误描述，None 表示 OK。"""
+    if os.path.getsize(path) == 0:
+        return "为空"
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            json.load(f)
+    except (OSError, ValueError) as exc:
+        return "不可解析（%s）" % exc
+    return None
+
+
 def check_data(detail: list[str]) -> list[str]:
-    """data/ 下的数据文件必须存在、非空、JSON 可解析。"""
+    """data/ 数据检查，按「缺失语义」分级（见 REQUIRED_ASSETS 注释）。
+
+    分级的意义：干净 clone / 新机器上运行时数据本来就不存在（首次运行创建），
+    一刀切要求全部存在会让自检与 CI 永远红；但**存在却损坏**必须算故障。
+    """
     import appcommon  # 项目模块，需在 sys.path 注入 ROOT 后导入
 
     problems: list[str] = []
     checked = 0
-    for name in REQUIRED_DATA:
+
+    for name in REQUIRED_ASSETS:
         path = appcommon.data_path(name)
         if not os.path.exists(path):
-            problems.append("缺少必需数据文件：%s（查找位置 %s）" % (name, path))
+            problems.append("缺少静态资产：%s（%s）" % (name, path))
             continue
-        if os.path.getsize(path) == 0:
-            problems.append("数据文件为空：%s" % path)
-            continue
-        try:
-            with open(path, encoding="utf-8-sig") as f:
-                json.load(f)
-        except (OSError, ValueError) as exc:
-            problems.append("数据文件不可解析：%s（%s）" % (name, exc))
+        err = _validate_json(path)
+        if err:
+            problems.append("静态资产 %s %s" % (name, err))
             continue
         checked += 1
 
-    for name in OPTIONAL_DATA:
+    absent = []
+    for name in RUNTIME_DATA + OPTIONAL_DATA:
         path = appcommon.data_path(name)
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            try:
-                with open(path, encoding="utf-8-sig") as f:
-                    json.load(f)
-            except (OSError, ValueError) as exc:
-                problems.append("可选数据文件存在但不可解析：%s（%s）" % (name, exc))
-                continue
-            checked += 1
+        if not os.path.exists(path):
+            absent.append(name)
+            continue
+        err = _validate_json(path)
+        if err:
+            problems.append("数据文件 %s 存在但%s" % (name, err))
+            continue
+        checked += 1
 
     if not problems:
-        detail.append("已校验 %d 个数据文件" % checked)
+        detail.append("已校验 %d 个文件；%d 个待首次运行/登录创建"
+                      % (checked, len(absent)))
     return problems
 
 
