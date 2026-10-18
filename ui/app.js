@@ -588,6 +588,21 @@ async function openMonitorTaskForm(edit) {
   bindStation(modal, "from", (t.from || ""), (t.fromCode || ""));
   bindStation(modal, "to", (t.to || ""), (t.toCode || ""));
 
+  // 结束日期自动识别开始日期：改了开始日期，结束日期直接跟随为同一天。
+  // 这样旧的区间（无论比新开始日期早还是晚）都会被自动清除，不会再落出
+  // 倒置区间（起 > 止）——那是任务被判「监控日期已全部过期」的直接原因。
+  // 需要区间就再手动改结束日期；min 同时挡住日期控件里选更早的日期。
+  const d1El = modal.querySelector("#fD1");
+  const d2El = modal.querySelector("#fD2");
+  const syncEndDate = () => {
+    const v = d1El.value;
+    if (!v) return;
+    d2El.min = v;
+    d2El.value = v;      // 自动跟随 = 自动清除旧区间，回到单日
+  };
+  d1El.addEventListener("change", syncEndDate);
+  if (d1El.value) d2El.min = d1El.value;
+
   // 车次查询：按出发/到达站 + 开始日期拉余票，点车次行即填入车次框
   modal.querySelector("#fQuery").onclick = async () => {
     const qRes = modal.querySelector("#fQResult");
