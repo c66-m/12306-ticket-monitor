@@ -64,6 +64,21 @@ _TEST_DATA_DIR = tempfile.mkdtemp(prefix="t12306_data_")
 atexit.register(shutil.rmtree, _TEST_DATA_DIR, ignore_errors=True)
 
 
+# 模块级路径常量（import 时就算好，改 DATA_DIR 对它们无效）。不重绑 = 写穿隔离：
+# 2026-10-18 实测测试把真实 data/grab_tasks.json 清空成 {"tasks": []}。
+_MODULE_PATH_ATTRS = (
+    ("grabber", "GRAB_TASKS_PATH", "grab_tasks.json"),
+    ("grabber", "STATION_KIND_PATH", "station_kind.json"),
+    ("grabber", "LAUNCHER_CFG_PATH", "launcher_config.json"),
+    ("browser_order", "STATE_PATH", ".browser_state.json"),
+    ("passengers", "DEFAULT_PATH", "passengers.json"),
+    ("capture_session", "COOKIE_PATH", "session_cookies.json"),
+    ("station_db", "DB_PATH", "stations_db.json"),
+    ("api", "CONFIG_PATH", "config.json"),
+    ("monitor", "CONFIG_PATH", "config.json"),
+)
+
+
 def _isolate_data_dir():
     os.makedirs(_TEST_DATA_DIR, exist_ok=True)
     for _name in ("stations_db.json", "station_index.json",
@@ -72,6 +87,10 @@ def _isolate_data_dir():
         if os.path.exists(_src):
             shutil.copy2(_src, os.path.join(_TEST_DATA_DIR, _name))
     appcommon.DATA_DIR = _TEST_DATA_DIR
+    for _mod_name, _attr, _fname in _MODULE_PATH_ATTRS:
+        _mod = sys.modules.get(_mod_name)
+        if _mod is not None and hasattr(_mod, _attr):
+            setattr(_mod, _attr, os.path.join(_TEST_DATA_DIR, _fname))
 
 
 _isolate_data_dir()
@@ -3377,7 +3396,7 @@ class TestLoginPollLoopIdle(unittest.TestCase):
         try:
             with mock.patch.object(bo, "time", clock), \
                     mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: _FakeCtx()), \
-                    mock.patch.object(bo, "session_ok", lambda _ctx, page=None: (False, "")), \
+                    mock.patch.object(bo, "_page_session_ok", lambda _page: (False, "")), \
                     mock.patch.object(bo, "_log"), \
                     mock.patch("playwright.sync_api.sync_playwright",
                                lambda: _FakePlaywright()):
@@ -3418,8 +3437,8 @@ class TestLoginGotoFastLoad(unittest.TestCase):
         bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "goto.lock"))
         try:
             with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
-                    mock.patch.object(bo, "session_ok",
-                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
                     mock.patch.object(bo, "save_state", lambda _ctx: None), \
                     mock.patch.object(bo, "_log"), \
                     mock.patch("playwright.sync_api.sync_playwright",
@@ -3486,8 +3505,8 @@ class TestLoginNoRedundantReload(unittest.TestCase):
         bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "app.lock"))
         try:
             with mock.patch.object(bo, "launch", _fake_launch), \
-                    mock.patch.object(bo, "session_ok",
-                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
                     mock.patch.object(bo, "save_state", lambda _ctx: None), \
                     mock.patch.object(bo, "_log"), \
                     mock.patch("playwright.sync_api.sync_playwright",
@@ -3508,8 +3527,8 @@ class TestLoginNoRedundantReload(unittest.TestCase):
         bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "reload.lock"))
         try:
             with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
-                    mock.patch.object(bo, "session_ok",
-                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
                     mock.patch.object(bo, "save_state", lambda _ctx: None), \
                     mock.patch.object(bo, "_log"), \
                     mock.patch("playwright.sync_api.sync_playwright",
@@ -3529,8 +3548,8 @@ class TestLoginNoRedundantReload(unittest.TestCase):
         bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "reload2.lock"))
         try:
             with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
-                    mock.patch.object(bo, "session_ok",
-                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
                     mock.patch.object(bo, "save_state", lambda _ctx: None), \
                     mock.patch.object(bo, "_log"), \
                     mock.patch("playwright.sync_api.sync_playwright",
@@ -3551,8 +3570,8 @@ class TestLoginNoRedundantReload(unittest.TestCase):
         try:
             with mock.patch.object(bo, "launch",
                                    lambda _p, headless=False, extra_args=None: ctx), \
-                    mock.patch.object(bo, "session_ok",
-                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
                     mock.patch.object(bo, "save_state", lambda _ctx: None), \
                     mock.patch.object(bo, "_log"), \
                     mock.patch("playwright.sync_api.sync_playwright",
@@ -3608,8 +3627,8 @@ class TestLoginQueueNotice(unittest.TestCase):
         try:
             with mock.patch.object(bo, "busy", return_value=busy), \
                     mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: _FakeCtx()), \
-                    mock.patch.object(bo, "session_ok",
-                                      lambda _c, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
                     mock.patch.object(bo, "save_state", lambda _c: None), \
                     mock.patch.object(bo, "_log", lambda line: logs.append(line)), \
                     mock.patch("playwright.sync_api.sync_playwright",
@@ -13743,7 +13762,17 @@ class TestApiRpcContract(TempDirCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    # 全局兜底：跑完对一次真实数据指纹。TempDirCase 只在继承它的用例里守着，
+    # 其余用例写穿隔离时无人告警（2026-10-18 就这样清空了 grab_tasks.json）。
+    _before_all = _real_snapshot()
+    _run = unittest.main(verbosity=2, exit=False)
+    _after_all = _real_snapshot()
+    _drift = [k for k in _after_all if _after_all[k] != _before_all[k]]
+    if _drift:
+        print("\n!!! 真实数据被测试改动：%s —— 隔离失效，必须修 !!!" % ", ".join(_drift),
+              file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0 if _run.result.wasSuccessful() else 1)
 
 
 

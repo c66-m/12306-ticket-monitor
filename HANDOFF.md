@@ -532,3 +532,29 @@ playwright 1.58.0 / cryptography 50.0.2）。升级 playwright 必须跟跑
 （config / launcher_config 及其 example）。
 
 **验证口径**：`python tools/check.py` → 5/5 OK（800 tests, skipped=15）。
+
+## 16. 2026-10-18 登录窗口「一直刷新」根因与修法
+
+**现象**：点「立即登录」后登录页反复刷新，扫码/输密码来不及（此前还出现过
+「弹出两个登录页」）。
+
+**根因**：`login()` 用「探针页」校验登录态——一进循环就 `ctx.new_page()` 再导航
+`CHECK_URL`。在可见浏览器里 `new_page()` 是**真的多开一个窗口**（实测
+`--app` 启动 pages=1，`new_page()` 后 =2）；未登录时该导航被 302 到登录门户，
+于是既出现第二个登录页，又每 15 秒重复一次（用户看到的就是页面不停刷新）。
+
+**修法**：登录期间**不再开任何新页面、不做整页导航**。校验改为在登录页内用
+同源 `fetch('/otn/index/initMy12306Api')`（`_page_session_ok`）：不导航、不开窗、
+不刷新；未登录时落点 URL 带 `/passport` 即判为未登录。兜底节拍保持 15 秒，
+只是不再需要探针页。
+
+**验证**：
+- 真实浏览器（临时 profile，35 秒覆盖 20 秒兜底点）：页面数恒为 1、
+  `framenavigated` 事件 0 次、URL 始终停在 `login.html`。
+- 登录相关 11 个用例 + 全量 807 tests 通过。
+
+**顺带修掉的数据事故**：`GRAB_TASKS_PATH` 等**模块级路径常量在 import 时就定死**，
+测试重定向 `appcommon.DATA_DIR` 对它们无效，导致测试把真实
+`data/grab_tasks.json` 清空成 `{"tasks": []}`（已从迁移备份恢复 3 条任务）。
+修法：测试隔离时一并重绑这些常量；并在 `__main__` 结尾对真实数据做一次
+全量 md5 比对，任何漂移直接退出码 1（不再依赖用例是否继承 `TempDirCase`）。

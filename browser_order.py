@@ -531,6 +531,43 @@ def session_ok(ctx, page=None):
                 pass
 
 
+# 在已打开的页面里做同源 fetch 校验：不开窗口、不导航、不刷新。
+# 未登录时 12306 会把请求 302 到 /otn/passport?...，落点 URL 就是「没登录」的
+# 直接证据；已登录时返回 initMy12306Api 的 JSON（status=true）。
+_FETCH_SESSION_JS = """async () => {
+  try {
+    const r = await fetch('/otn/index/initMy12306Api',
+                          {credentials: 'include', cache: 'no-store'});
+    const text = await r.text();
+    return {status: r.status, url: r.url, body: text.slice(0, 1000)};
+  } catch (e) {
+    return {status: -1, url: '', body: 'ERR:' + String(e)};
+  }
+}"""
+
+
+def _page_session_ok(page):
+    """在已打开的页面上用同源 fetch 校验登录态，返回 (ok, who)。
+
+    判据与 session_ok 一致，但**不做任何导航**：登录过程中用户正对着登录页
+    扫码，一次整页导航就会清掉二维码与"已扫描"状态。旧实现另开探针页导航
+    CHECK_URL，未登录时被 302 到登录门户——用户看到的就是「第二个登录页」
+    和「页面一直刷新」（2026-10-18 两次反馈）。
+    """
+    r = page.evaluate(_FETCH_SESSION_JS) or {}
+    url = r.get("url") or ""
+    body = (r.get("body") or "").strip()
+    if "/login" in url or "/passport" in url:
+        return False, ""
+    if "请先登录" in body[:500] or "未登录" in body[:500]:
+        return False, ""
+    # 非 JSON（风控页 / 空白页）由 json 抛异常，调用方按「没验成」处理
+    data = json.loads(body)
+    if data.get("status"):
+        return True, (data.get("data") or {}).get("user_name") or ""
+    return False, ""
+
+
 # 会话失效判据：只有这两类算"确认失效"，其余（goto 超时 / 网络抖动 / 风控
 # 非 JSON 页）都是瞬时故障。默认方向取"重试"——误把任务标 failed 要人工恢复，
 # 代价比多试几轮大，所以拿白名单而不是把"校验异常"整类当永久。
@@ -592,16 +629,15 @@ def _login_locked(timeout_sec=300, stop_event=None):
         page.route("**/*", _no_reload)
         if need_nav:
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        # 探针页延迟到「检测到登录信号」再创建：未登录时它对 CHECK_URL 的导航
-        # 会被 302 到登录门户，用户会看到两个登录页（2026-10-18 反馈）。
-        # 登录成功后才有必要校验，那时探针页不会落到登录门户。
-        probe = None
+        # 登录期间一律不开新页面、不做整页导航：用户正对着登录页扫码，多一个
+        # 窗口或一次导航都会打断（2026-10-18 反馈「两个登录页」「页面一直刷新」）。
+        # 校验改在登录页内用同源 fetch 完成（_page_session_ok）：零窗口、零导航。
         deadline = time.time() + timeout_sec
         next_fast = 0.0   # 有登录信号时的校验节拍（2 秒）
-        # 兜底校验推迟启动：扫码正常在几秒到十几秒内完成，过早兜底会让探针页
-        # 先对 CHECK_URL 跳一次登录门户，用户会以为「开了两个登录页」。
-        # 生产（timeout 300s）推迟 20 秒；测试用短超时时按一半缩短，保证覆盖到。
+        # 无信号时的兜底节拍：12306 改版导致 tk Cookie 没落地时靠它兜住。
+        # 推迟启动给扫码留安静时间（生产 20 秒；短超时按一半缩短，测试仍覆盖）。
         next_slow = time.time() + min(20.0, timeout_sec / 2.0)
+        miss = 0          # 校验连续抛异常的次数（页面被关 / 被导航走）
         ok, who = False, ""
         while time.time() < deadline:
             if stop_event is not None:
@@ -634,43 +670,34 @@ def _login_locked(timeout_sec=300, stop_event=None):
                             break
                 except Exception:
                     pass
-            # 有信号：每 2 秒做一次真实校验（uam 中转没走完时会暂时失败，
-            # 短间隔重试直到通过）；无信号：15 秒兜底探测。
+            # 有信号：每 2 秒校验一次（uam 中转没走完时会暂时不通过，短间隔重试
+            # 直到通过）；无信号：15 秒兜底探测。两者都不碰页面本身。
             if signal and now >= next_fast:
                 next_fast = now + 2
                 next_slow = now + 15
-                if probe is None:
-                    probe = ctx.new_page()
-                    probe.goto("about:blank")
                 try:
-                    ok, who = session_ok(ctx, page=probe)
+                    ok, who = _page_session_ok(page)
+                    miss = 0
                 except Exception:
                     ok, who = False, ""
-                    # 探针页可能已被用户关掉：重建一次再等下一轮
-                    try:
-                        probe = ctx.new_page()
-                        probe.goto("about:blank")
-                    except Exception:
-                        probe = None
+                    miss += 1
                 if ok:
+                    break
+                if miss >= 10:      # 约 20 秒都读不到页面：窗口已被关闭/接管
+                    _log("[停止] 登录窗口已关闭或页面不可用。")
                     break
             elif not signal and now >= next_slow:
                 next_slow = now + 15
-                # 兜底校验：tk cookie 没出现时（12306 改版 / 扫码后 cookie 未落地）
-                # 用探针页导航一次确认登录态。未登录时它会被 302 到登录门户，
-                # 所以校验完立刻回空白——用户最多看到短暂的空白页，而不是第二个
-                # 「登录页」（2026-10-18 反馈的正是探针页停在登录门户）。
-                if probe is None:
-                    probe = ctx.new_page()
                 try:
-                    ok, who = session_ok(ctx, page=probe)
+                    ok, who = _page_session_ok(page)
+                    miss = 0
                 except Exception:
                     ok, who = False, ""
-                try:
-                    probe.goto("about:blank")
-                except Exception:
-                    probe = None
+                    miss += 1
                 if ok:
+                    break
+                if miss >= 10:
+                    _log("[停止] 登录窗口已关闭或页面不可用。")
                     break
         if ok:
             save_state(ctx)
