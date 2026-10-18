@@ -923,6 +923,39 @@ def _extract_pay_evidence(body):
     return ""
 
 
+# 「下单成功」的唯一口径：页面上真的出现「席位已锁定」的订单界面。
+# 只看 URL 不够——payOrder 加载失败 / 被踢 / 只渲染一半时 URL 是对的，
+# 页面却是空白或错误页，按 URL 判成功会把失败当成功（用户 2026-10-18 要求
+# 以「弹出锁定席位的界面」为准）。
+_PAY_LOCK_TEXT = "席位已锁定"
+_PAY_LOCK_WAIT_SEC = 10.0
+
+
+def _wait_pay_locked(page, wait_sec=_PAY_LOCK_WAIT_SEC, stop=None):
+    """轮询页面正文直到出现「席位已锁定」界面，返回 (ok, body, evidence)。
+
+    页面从 payOrder 跳到渲染完成有 1~3 秒延迟，所以给一个短窗口轮询；
+    stop 置位（用户点停止）立即放弃，交上层按「结果未知」处理。
+    """
+    deadline = time.time() + wait_sec
+    body = ""
+    while True:
+        try:
+            body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            return False, body, ""
+        if _PAY_LOCK_TEXT in body:
+            return True, body, _extract_pay_evidence(body)
+        if stop is not None and stop():
+            return False, body, ""
+        if time.time() >= deadline:
+            return False, body, _extract_pay_evidence(body) if body else ""
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            return False, body, ""
+
+
 def _wait_slide_gone(page, sec, stop=None):
     """等用户在浏览器窗口手动完成滑块（脚本不绕过验证码）。
 
@@ -1617,19 +1650,24 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         return (False,
                                 "订单结果落在 %s（非付款页）——无法确认本次下单结果，"
                                 "交官方订单接口回读" % url, {"reason": "ambiguous"})
-                    # 到付款页后核对页面上真实显示的席别，防止静默买错；
-                    # 同时提取付款页证据（席位已锁定/支付剩余时间）供上层记账
+                    # 成功口径：页面上真的出现「席位已锁定」的订单界面。
+                    # 只看 URL 不够——payOrder 加载失败时 URL 对、页面是空白/错误页。
+                    locked, body_raw, pay_evidence = _wait_pay_locked(
+                        page, _PAY_LOCK_WAIT_SEC, _stopped)
+                    if not locked:
+                        mark("result")
+                        return (False,
+                                "已跳到付款页但没出现「席位已锁定」界面"
+                                "（页面可能仍在加载、被踢或已失效）——"
+                                "无法确认本次下单成功，交官方订单接口回读",
+                                {"reason": "ambiguous", "page_kind": "payOrder"})
+                    # 页面正文已拿到：核对真实显示的席别，防止静默买错
                     seat_on_page = ""
-                    pay_evidence = ""
-                    try:
-                        body = page.evaluate("() => document.body.innerText").replace("\n", " ")
-                        for kw in (seat_name, "无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座"):
-                            if kw and kw in body:
-                                seat_on_page = kw
-                                break
-                        pay_evidence = _extract_pay_evidence(body)
-                    except Exception:
-                        pass
+                    body = body_raw.replace("\n", " ")
+                    for kw in (seat_name, "无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座"):
+                        if kw and kw in body:
+                            seat_on_page = kw
+                            break
                     warn = ""
                     if seat_on_page and seat_on_page != seat_name:
                         warn = "（注意：页面显示席别为 %s，与期望的 %s 不一致，请核对订单）" % (

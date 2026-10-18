@@ -4060,6 +4060,9 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
             self._slide_ups = [["nc-container"], []]  # 确认窗里滑块出现一次
             self._result_slide_seen = False  # 结果等待里滑块也只出现一次
             self._result_t0 = None  # 结果循环第一次读 url 时打点
+            # 成功页正文：「席位已锁定」是判定下单成功的唯一口径（2026-10-18）
+            self.body_text = ("中国铁路12306 订单信息 席位已锁定，请在提示时间内尽快完成支付。"
+                              "支付剩余时间：00时19分34秒")
 
         def set_default_timeout(self, ms):
             pass
@@ -4145,7 +4148,7 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
             if js.startswith("(ids) =>"):
                 return []  # 勾选回读：全部已勾上
             if "document.body" in js:
-                return ""
+                return self.body_text
             if "#submitOrder_id" in js:
                 self.submit_order_clicked = True
                 return None
@@ -4247,6 +4250,27 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         ok, msg, extra, page = self._run_order()
         self.assertTrue(ok, "结果等待应被滑块耗时顺延，实际返回：%r" % (msg,))
         self.assertIn("已提交订单", msg)
+
+    def test_pay_url_without_locked_page_is_ambiguous(self):
+        """URL 已到 payOrder，但页面没渲染出「席位已锁定」→ 不算成功。
+
+        2026-10-18 用户口径：必须以「弹出锁定席位的界面」为准。只看 URL 会把
+        加载失败 / 被踢 / 空白页当成下单成功，进而误报。
+        """
+        clock = self._Clock()
+        page = self._Page(clock)
+        page.body_text = ""            # payOrder 但正文为空
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock), \
+             mock.patch.object(browser_order, "_wait_slide_gone",
+                               side_effect=lambda p, sec, stop=None: 60.0):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10", warm=self._Warm(page))
+        self.assertFalse(ok, "没有锁定界面不得判成功")
+        self.assertEqual(extra.get("reason"), "ambiguous")
+        self.assertIn("席位已锁定", msg)
 
     def test_extract_pay_evidence_variants(self):
         # 支付证据纯函数：锁定位/支付剩余时间两特征各状态全覆盖
@@ -12976,8 +13000,11 @@ class TestOrderflowClassifySnapshot(TempDirCase):
         pay = "https://kyfw.12306.cn/otn/confirmPassenger/payOrder/init"
         self.assertEqual(orderflow.classify_snapshot(
             "https://kyfw.12306.cn/otn/leftTicket/init", "预订 余票充足"), "wait")
-        self.assertEqual(orderflow.classify_snapshot(pay, "订单提交成功，请尽快支付"), "success")
         self.assertEqual(orderflow.classify_snapshot(pay, "席位已锁定，请在 30 分钟内完成支付"), "success")
+        # 2026-10-18 起成功口径收紧为「出现席位已锁定界面」：只有泛化的
+        # 「订单提交成功」不算（可能是过程中提示或旧单页），继续观察。
+        self.assertEqual(orderflow.classify_snapshot(pay, "订单提交成功，请尽快支付"), "wait")
+        self.assertEqual(orderflow.classify_snapshot(pay, "支付剩余时间：00时19分58秒"), "wait")
         self.assertEqual(orderflow.classify_snapshot(
             "https://kyfw.12306.cn/otn/queryOrder/MyOrderNoComplete/init", "订单提交成功"), "ambiguous")
         self.assertEqual(orderflow.classify_snapshot(

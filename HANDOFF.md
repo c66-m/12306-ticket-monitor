@@ -662,3 +662,29 @@ xx 秒内完成支付」），让人亲眼确认下单成功并直接支付。
 - 真实 Playwright 页面：2 秒档实测 2.1s 返回；已关闭页面 0.0s 立即返回。
 - 单测 `TestKeepPayPage` 4 项（配置解析 / 测试替身不阻塞 / 关窗即返 / 手动停止即返）。
 - 全量 813 tests OK (skipped=15)。
+
+## 21. 2026-10-18 「下单成功」口径收紧为出现「席位已锁定」界面
+
+**需求**：只有网页真的弹出「席位已锁定，请在 xx 分 xx 秒内完成支付」的订单
+界面，才算本次下单成功。
+
+**旧口径的问题**：两条链路都只看 URL——
+- 旧链 `_order_impl`：URL 含 `payOrder` 即判成功（页面空白/被踢也算成功）；
+- 新链 `orderflow.classify_snapshot`：URL 含 payOrder + 正文命中任一泛化词
+  （`待支付` / `待付款` / `支付剩余时间` / `席位已锁定` / `订单提交成功`），
+  「待支付」这类词在旧单列表或错误页同样会出现。
+
+**改动**：
+- `browser_order._wait_pay_locked()`：pages 到 payOrder 后轮询正文（最长 10 秒），
+  **必须出现「席位已锁定」**才判成功；期间可被「停止」打断；超时按 ambiguous
+  交官方回读，绝不误报成功。
+- `orderflow._PAY_KEYS` → 单一 `_PAY_LOCK_KEY = "席位已锁定"`：URL 到 payOrder
+  但界面没锁定的一律继续观察（wait），不再用泛化词提前判成功。
+- `orderflow._finish_success()` 也接入付款页保留（§20）：关窗 / 停止 / 超时才继续。
+
+**说明**：若页面始终没出现锁定界面，但官方订单接口回读到本次新订单
+（`_judge_official`），仍按成功上报——那是比页面更硬的证据。
+
+**验证**：`TestOrderflowClassifySnapshot` 更新为「泛化词 → wait、锁定词 →
+success」；新增 `test_pay_url_without_locked_page_is_ambiguous`（URL 到 payOrder
+但正文为空 → ambiguous）；全量 813+ tests。

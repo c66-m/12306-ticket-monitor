@@ -27,7 +27,9 @@ from browser_order import (
     _exclusive,
     _extract_pay_evidence,
     _goto_and_query,
+    _hold_pay_page,
     _log,
+    _pay_page_hold_seconds,
     _record_timing,
     _run_fill_submit_confirm,
     _safe_close_ctx,
@@ -57,9 +59,11 @@ _READ_JS = ("() => { const b = document.body ? document.body.innerText : '';"
             " const p = document.querySelector('#orderResultInfo_id');"
             " const t = p ? p.innerText.trim() : '';"  # 空容器只有空白，别当提示
             " return t ? ('【提示框】' + t + '\\n' + b) : b; }")
-# 付款页成功词：URL 含 payOrder 且正文命中任一才算成功（坑 8：只有付款页
-# 判本次成功；正文还没渲染出来时判 wait，下一轮再读）
-_PAY_KEYS = ("待支付", "待付款", "支付剩余时间", "席位已锁定", "订单提交成功")
+# 付款页成功词：必须是「席位已锁定」的订单界面（2026-10-18 用户口径：
+# 以弹出锁定席位的界面为准）。只看到「待支付 / 订单提交成功」这类泛化词
+# 不判成功——那可能是旧单列表、过程中提示或错误页；URL 已到 payOrder 但
+# 正文还没渲染出锁定界面时判 wait，下一轮再读。
+_PAY_LOCK_KEY = "席位已锁定"
 _SEAT_SCAN = ("无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座")
 
 _FLOW_DEFAULTS = {"read_poll_seconds": 0.5, "page_wait_seconds": 10.0,
@@ -70,7 +74,8 @@ def classify_snapshot(url, body):
     """HOLD 快照分类（纯函数，供单测）。
 
     返回 success / dup / fail / ambiguous / wait：
-    - success: url 含 payOrder 且正文带付款特征词——只有付款页判本次成功。
+    - success: url 含 payOrder 且正文出现「席位已锁定」——以锁定座位的订单
+      界面为唯一成功口径（2026-10-18 用户要求）。
     - ambiguous: 旧单列表（MyOrderNoComplete）/ 订单初始化页（order/init），
       可能是账号里更早的旧单，不能直接当成功，交官方回读。
     - dup: 账号已有未支付订单等，再重试只会得到同样的拒绝。
@@ -80,7 +85,7 @@ def classify_snapshot(url, body):
       只是提示框指向订单列表的链接文字，不是重复订单证据。
     """
     if "payOrder" in url:
-        return "success" if any(k in body for k in _PAY_KEYS) else "wait"
+        return "success" if _PAY_LOCK_KEY in body else "wait"
     if "MyOrderNoComplete" in url or "order/init" in url:
         return "ambiguous"
     if any(k in body for k in _PENDING_KEYS):
@@ -145,8 +150,9 @@ def _judge_official(date, train, passenger_names, t_submit, logger):
         "reason": "ambiguous", "flow_judge": judge}
 
 
-def _finish_success(entry, url, body, date, train, passenger_names, seat_name, logger):
-    """HOLD 读到付款页：取证（页面席别 + 支付证据 + 官方回读单号），返回成功。
+def _finish_success(entry, url, body, date, train, passenger_names, seat_name, logger,
+                    headless=False, stop=None):
+    """HOLD 读到「席位已锁定」界面：取证（页面席别 + 支付证据 + 官方回读单号），返回成功。
 
     关全部页面不在此处显式做：冷启动由 ExitStack callback（_safe_close_ctx）
     在 return 时关，warm 由 launcher finally warm.close() 收尾，重开的新页
@@ -173,6 +179,12 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
              "page_kind": "payOrder"}
     if ono:
         extra["order_no"] = ono
+    # 成功页就是「席位已锁定」的订单界面：headless 没有窗口可看，直接跳过；
+    # 否则保留窗口供核对与支付（关窗 / 手动停止 / 超时才继续）。
+    if not headless:
+        hold = _pay_page_hold_seconds()
+        if hold > 0:
+            _hold_pay_page(entry.get("page"), hold, stop)
     return True, "已提交订单（未支付）：%s%s" % (url, warn), extra
 
 
@@ -297,9 +309,11 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     url, body = "", ""
                 snap = classify_snapshot(url, body)
                 if snap == "success":
-                    _emit(logger, "[流程] HOLD：读到付款页（%.1fs）" % (time.time() - e["t_submit"]))
+                    _emit(logger, "[流程] HOLD：读到「席位已锁定」界面（%.1fs）"
+                          % (time.time() - e["t_submit"]))
                     return _finish_success(e, url, body, date, train,
-                                           passenger_names, seat_name, logger)
+                                           passenger_names, seat_name, logger,
+                                           headless=headless, stop=_stopped)
                 if snap == "ambiguous":
                     _emit(logger, "[流程] HOLD：落在旧单列表/订单初始化页，走官方回读")
                     return _judge_official(date, train, passenger_names,
