@@ -38,15 +38,12 @@ import filelock
 import os
 import sys
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+appcommon.ensure_utf8_stdio()
 
 LOG = logging.getLogger("monitor")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PATH = os.path.join(HERE, "passengers.json")
+DEFAULT_PATH = appcommon.data_path("passengers.json")
 
 ID_TYPE_NAMES = {
     "1": "二代身份证",
@@ -480,7 +477,9 @@ def default_names(path=None):
 
 if __name__ == "__main__":
     # 自检：读写一个临时测试数据，验证加解密链路
-    tmp = os.path.join(HERE, "passengers_test_tmp.json")
+    import tempfile
+    _tmpdir = tempfile.mkdtemp(prefix="pax_selfcheck_")
+    tmp = os.path.join(_tmpdir, "passengers_test_tmp.json")
     test = [{"name": "测试", "id_type_code": "1", "id_no": "110101199001011234",
              "mobile": "13800000000", "is_default": True, "is_adult": True}]
     save_passengers(test, tmp)

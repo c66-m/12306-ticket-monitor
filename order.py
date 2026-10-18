@@ -41,10 +41,7 @@ LOG = logging.getLogger(__name__)
 # 调用点与既有测试 pin 不变。
 _mask_order_no = appcommon.mask_order_no
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+appcommon.ensure_utf8_stdio()
 
 try:
     from ticket import SEAT_NAME_TO_CODE, order_seat_code
@@ -81,21 +78,13 @@ BASE_HEADERS = {
 
 
 def _resolve_cookie_path(cookie_path):
-    """会话文件路径解析：相对路径按脚本目录（HERE）解析。
+    """会话文件路径解析：委托 appcommon.cookie_path（单源）。
 
-    与 capture_session._cookie_path 同口径（Task 99c）：写侧（capture_session）
-    一直是 os.path.join(HERE, name)，读/写侧显式传相对路径时若按 CWD 解析，
-    CWD≠脚本目录就会"未找到会话文件"误导或写错位置。绝对路径透传；
-    None/非法值回退默认文件名。
+    绝对路径透传、相对名落 data/（新布局优先、旧根目录回退）、None/非法值
+    回退默认文件名。CWD≠脚本目录时若按 CWD 解析会「未找到会话文件」误导或
+    写错位置，所以解析必须锚在项目数据目录而不是进程工作目录。
     """
-    name = cookie_path if isinstance(cookie_path, str) else None
-    name = name or "session_cookies.json"
-    if os.path.isabs(name):
-        return name
-    # normpath：把配置里的 'rel/cookies.json' 归一成 HERE\rel\cookies.json，
-    # 与 capture_session._cookie_path 同口径（同一路径的字面表示必须唯一，
-    # 否则同一个文件会出现两种键、比对/日志/清理各说各话）。
-    return os.path.normpath(os.path.join(HERE, name))
+    return appcommon.cookie_path(cookie_path)
 
 
 # 公开别名：monitor/gui 等调用方不要各自 os.path.join(HERE, ...) 再抄一遍口径，
@@ -308,7 +297,7 @@ def session_from_browser_state(state_path=None):
     浏览器下单模式下登录态在 .browser_profile 里，session_cookies.json 是
     capture_session 时代的旧载体；读只读接口（乘车人列表等）时用浏览器
     Cookie 组会话即可，不必再开浏览器。"""
-    path = state_path or os.path.join(HERE, ".browser_state.json")
+    path = state_path or appcommon.data_path(".browser_state.json")
     if not os.path.exists(path):
         raise RuntimeError("未找到 %s（请先用浏览器方式登录一次）"
                            % os.path.basename(path))
@@ -979,7 +968,8 @@ def order_ticket(config, task, ticket, seat_name):
             # 未在任务里点名时，优先使用本地加密库中的"默认乘车人"
             try:
                 import passengers as passengers_mod
-                wanted = passengers_mod.default_names(config.get("passengers_file"))
+                wanted = passengers_mod.default_names(
+                    appcommon.data_path(config.get("passengers_file") or "passengers.json"))
             except Exception:
                 wanted = []
         picked = select_passengers(passengers, wanted)

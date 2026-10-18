@@ -1,11 +1,18 @@
+# 版本锁定环境：Windows 11 / Python 3.12（2026-10-18 以实际运行环境 pip list 为准回填）。
+# 升级流程：改版本号 → python -m pip install -r requirements.txt
+#           → playwright 必须跟跑 `python -m playwright install chromium`（浏览器二进制
+#             与库版本绑定，只升库不升二进制会出现 "Executable doesn't exist"）。
+# 如需放宽为区间约束，用 `pip freeze` 生成锁文件（requirements.lock）另存，
+# 不要直接松掉这里的 ==，否则换机器不可复现。
+
 # 必需：HTTP 查询与下单接口
-requests
+requests==2.33.1
 
 # 浏览器下单（browser_order / capture_session）：Playwright + 本机 Edge/Chrome
-playwright
+playwright==1.58.0
 
 # 可选：非 Windows 平台的加密兜底（Windows 用系统 DPAPI，无需此包）
-cryptography
+cryptography==50.0.2
 
 # 2026-10-13 界面重构：旧 UI 的 pillow（圆角/弥散阴影位图）已随 theme.py 删除，
 # 界面全部改为原生 ttk 控件，不再需要 Pillow。

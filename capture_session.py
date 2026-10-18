@@ -24,15 +24,12 @@ import os
 import sys
 import time
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+appcommon.ensure_utf8_stdio()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 默认落盘路径（历史值）。main() 内以 _cookie_path() 为准：优先读
 # config.json 的 session_cookies_file（Task 69a）。
-COOKIE_PATH = os.path.join(HERE, "session_cookies.json")
+COOKIE_PATH = appcommon.data_path("session_cookies.json")
 
 # 同名 Cookie 多 path 条目的落盘复合键分隔符（Task 69e）。
 # \x1f 是 Cookie 名里不可能出现的控制字符；旧文件（纯 name 键）无此分隔符，
@@ -64,24 +61,17 @@ def _order_mode():
 
 
 def _cookie_path(config_path=None):
-    """Cookie 落盘路径：优先 config.json 的 session_cookies_file。
+    """Cookie 落盘路径：优先 config.json 的 session_cookies_file（Task 69a）。
 
-    与 order.py / engine.py / gui.py / monitor.py 同口径
-    （os.path.join(HERE, name)，绝对路径天然透传）；读不到配置时
-    回退旧硬编码值 session_cookies.json（Task 69a）。
+    路径解析单源到 appcommon.cookie_path（与 order.resolve_cookie_path 同一实现）：
+    绝对路径透传、相对名落 data/、缺省/非法值回退 session_cookies.json。
     """
     try:
         with open(config_path or os.path.join(HERE, "config.json"), encoding="utf-8-sig") as f:
-            name = json.load(f).get("session_cookies_file") or "session_cookies.json"
+            name = json.load(f).get("session_cookies_file")
     except Exception:
-        name = "session_cookies.json"
-    if not isinstance(name, str):
-        name = "session_cookies.json"
-    if os.path.isabs(name):
-        # Windows 上 os.path.join(HERE, '/tmp/x.json') 会拼成 'C:/tmp/x.json'：
-        # 盘符被强加、用户配的绝对路径悄悄变味。绝对路径原样透传。
-        return name
-    return os.path.normpath(os.path.join(HERE, name))
+        name = None
+    return appcommon.cookie_path(name)
 
 
 def _browser_mode_login():

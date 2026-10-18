@@ -21,12 +21,27 @@ grab_tasks.json
 # 日志
 logs/
 
+# ===== 数据目录 data/（2026-10-18 起代码与数据分离，详见 tools/migrate_data_dir.py）=====
+# 运行时数据（含隐私 / 可再生）：一律忽略。
+# 注意：data/stations_*.json、data/station_*.json 是随代码分发的静态资产，故意不忽略。
+data/orders.json
+data/state.json
+data/order_history.json
+data/passengers.json
+data/grab_tasks.json
+data/session_cookies.json
+data/.browser_state.json
+# data/ 下的一次性迁移备份（含全部隐私数据）
+data_migration_backup/
+
 # ===== 开发调试产物（含个人测试数据，不上传）=====
 _*
 *.png
 # 例外：web-dashboard 的设计稿预览图是交付物本身（DESIGN.md 引用它们说明视觉方向），入库
 !web-dashboard/preview-*.png
 .browser_profile.lock
+# runs/ 下的 fofa 调试产物（含查询结果），只留脚本本身
+runs/*.jsonl
 # 别在这里写 "%SystemDrive%/"：带引号 git 不展开环境变量，反而会被工具当路径建出真目录
 
 # ===== Python 缓存 =====

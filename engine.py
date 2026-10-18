@@ -34,12 +34,10 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
 import appcommon
+
+appcommon.ensure_utf8_stdio()
+
 import browser_order
 import filelock
 import notify as notify_mod
@@ -182,17 +180,15 @@ def normalize_trains(task):
     """trains 字段归一化（Task 68b）：裸字符串（如漏写方括号的 "G101"）按单个
     车次处理并记警告，绝不逐字符拆（旧代码会拆成 ['G','1','0','1'] 静默漏单）。
     非字符串条目跳过（旧代码直接 AttributeError）。"""
-    raw = task.get("trains") or []
-    if isinstance(raw, str):
-        LOG.warning("[配置] 任务「%s」的 trains 为字符串，已按单个车次处理：%r",
-                    task.get("name"), raw)
-        raw = [raw]
-    elif not isinstance(raw, (list, tuple)):
-        LOG.warning("[配置] 任务「%s」的 trains 形状非法，已忽略：%r",
-                    task.get("name"), raw)
-        raw = []
-    return [t.strip().upper() for t in raw
-            if isinstance(t, str) and t.strip()]
+    # 骨架（裸字符串不拆字符 / 非法形状忽略 / 非字符串条目跳过）已单源到
+    # appcommon.normalize_trains；这里只保留「带任务名的警告文案」这层策略，
+    # 与 grabber._normalize_trains 同一分层方式。
+    return appcommon.normalize_trains(
+        task.get("trains") or [],
+        warn=lambda msg: LOG.warning("[配置] 任务「%s」的 trains %s",
+                                     task.get("name"), msg),
+        str_warn="为字符串，已按单个车次处理：%r",
+        shape_warn="形状非法，已忽略：%r")
 
 
 def normalize_seat_types(task):
@@ -200,16 +196,13 @@ def normalize_seat_types(task):
     按单个席别处理并记警告，绝不逐字符拆（旧代码会拆成 ['硬','座']，
     ticket.seat_candidates_for 照单返回后与余票求交恒为空 → 任务永久
     静默漏单）。与 Task 68b 的 trains 口径一致。非字符串条目跳过。"""
-    raw = task.get("seat_types") or []
-    if isinstance(raw, str):
-        LOG.warning("[配置] 任务「%s」的 seat_types 为字符串，已按单个席别处理：%r",
-                    task.get("name"), raw)
-        raw = [raw]
-    elif not isinstance(raw, (list, tuple)):
-        LOG.warning("[配置] 任务「%s」的 seat_types 形状非法，已忽略：%r",
-                    task.get("name"), raw)
-        raw = []
-    return [s for s in raw if isinstance(s, str)]
+    # 同 normalize_trains：骨架单源 appcommon，仅保留带任务名的文案。
+    return appcommon.normalize_seat_types(
+        task.get("seat_types") or [],
+        warn=lambda msg: LOG.warning("[配置] 任务「%s」的 seat_types %s",
+                                     task.get("name"), msg),
+        str_warn="为字符串，已按单个席别处理：%r",
+        shape_warn="形状非法，已忽略：%r")
 
 
 def expand_dates(task):
@@ -346,8 +339,11 @@ class MonitorEngine(object):
         except OSError:
             self._config_mtime = None
 
-        self.state_path = os.path.join(HERE, self.config.get("state_file", "state.json"))
-        self.history_path = os.path.join(HERE, self.config.get("history_file", "order_history.json"))
+        self.state_path = appcommon.state_path_of(self.config, HERE)
+        self.history_path = appcommon.history_path_of(self.config, HERE)
+        # 订单库路径做成实例属性：测试用 object.__new__ 构造引擎时会注入临时
+        # 目录，避免「官方回读未支付」分支把假订单写进真实 data/orders.json。
+        self.orders_path = appcommon.data_path("orders.json")
         # 例行字段写盘节流：_mark_state_dirty 置脏（last_poll/message 等低频高
         # 频写入点），主循环 _flush_state_if_dirty 在 _STATE_FLUSH_INTERVAL 内
         # 合并写。任何 _save_state() 都可能在过程中被 _run_task 的业务分支直接
@@ -1074,7 +1070,7 @@ class MonitorEngine(object):
                                     "unknown": "官方状态不明确:保留本地记录,下轮再核",
                                     "error": "官方查询失败:保留本地记录,下轮再核"}[cls]
                         appcommon.upsert_order(
-                            os.path.join(HERE, "orders.json"), okey,
+                            self.orders_path, okey,
                             {"order_no": ono, "train": train_code, "date": date,
                              "from": info["from_name"], "to": info["to_name"],
                              "seat": seat_name, "passengers": p_names,
@@ -1462,7 +1458,8 @@ class MonitorEngine(object):
             return None
         try:
             return order_mod.load_session(
-                self.config.get("session_cookies_file", "session_cookies.json"))
+                appcommon.data_path(
+                    self.config.get("session_cookies_file", "session_cookies.json")))
         except Exception:
             return None
 
@@ -1499,7 +1496,8 @@ class MonitorEngine(object):
             except Exception as e:
                 ok, who, permanent = False, "浏览器会话校验异常: %s" % str(e)[:100], False
         else:
-            cookie_path = self.config.get("session_cookies_file", "session_cookies.json")
+            cookie_path = appcommon.data_path(
+                self.config.get("session_cookies_file", "session_cookies.json"))
             try:
                 s = order_mod.load_session(cookie_path)
                 ok, who, permanent = order_mod.verify_session(s)
@@ -1563,7 +1561,7 @@ class MonitorEngine(object):
         self._stop_event = stop_event
         # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核
         try:
-            op = os.path.join(HERE, "orders.json")
+            op = self.orders_path
             odb = appcommon.load_orders(op)
             for okey, rec in (odb.get("orders") or {}).items():
                 if rec.get("classify") != "unpaid":

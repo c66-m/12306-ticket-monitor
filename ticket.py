@@ -35,12 +35,11 @@ import logging
 
 import requests
 
+import appcommon
+
 LOG = logging.getLogger("monitor")
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+appcommon.ensure_utf8_stdio()
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -397,10 +396,16 @@ _STATION_DL_LOCK = threading.Lock()  # 下载串行化：多线程冷启动只�
 
 
 def _abs_cache_path(cache_path):
+    """车站缓存路径解析：相对名统一落 data/（appcommon.data_path 单一口径）。
+
+    这里曾经直接拼 __file__ 目录，导致每次缓存刷新都把 station_name.json /
+    station_index.json 写回项目根目录，抵消了数据/代码分离。
+    """
     import os
+    import appcommon
     if os.path.isabs(cache_path):
         return cache_path
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_path)
+    return appcommon.data_path(cache_path)
 
 
 def _sibling_cache_path(path, name):

@@ -14,10 +14,33 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 
 LOG = logging.getLogger("monitor")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# 运行时数据 / 静态数据统一收纳目录。代码文件留在根目录，数据与代码分离；
+# config.json 与 launcher_config.json 属于「用户可手改的配置」，仍留在根目录。
+DATA_DIR = os.path.join(HERE, "data")
+
+
+def ensure_utf8_stdio() -> None:
+    """把 stdout / stderr 切到 UTF-8 —— 中文 Windows 默认 GBK，中文输出会乱码。
+
+    各 CLI 入口原先各写一份 5 行 try/except（9 处复制粘贴），统一到这里。
+    幂等；流不支持 reconfigure（测试的 StringIO、被替换的管道）时静默跳过——
+    这是能力探测而非业务错误，故吞掉三类预期异常。
+
+    注意：api.py 不用本函数。它的 stdio 是 Electron 的 JSON-RPC 管道，reconfigure
+    失败必须回报主进程（走自己的 _warn），语义不同、不能拉平。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError, ValueError):
+            pass
 
 MAX_DATE_SPAN_DAYS = 5   # 乘车日期区间最多相差天数（= 6 个日期）
 
@@ -566,14 +589,68 @@ EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 _STAMP_UNSET = object()
 
 
+def data_path(name: str) -> str:
+    """数据文件名 → 绝对路径（单一解析口径）。
+
+    解析顺序：
+      1. 绝对路径直通（测试 / 外部注入用）；
+      2. data/<name> 存在 → 用新布局；
+      3. 根目录 <name> 存在 → 兼容旧布局（迁移前 / 未跑迁移脚本的旧副本）；
+      4. 都不存在 → 返回 data/<name>，首次运行自动落到 data/ 下。
+
+    第 3 步是兼容回退，等所有环境都完成迁移后可删除（见 tools/migrate_data_dir.py）。
+    """
+    if os.path.isabs(name):
+        return name
+    candidate = os.path.join(DATA_DIR, name)
+    if os.path.exists(candidate):
+        return candidate
+    legacy = os.path.join(HERE, name)
+    if os.path.exists(legacy):
+        return legacy
+    return candidate
+
+
+def resolve_data_file(base_dir: str, name: str) -> str:
+    """数据文件名 + 基准目录 → 绝对路径（「项目根走 data/、临时目录严格本地」）。
+
+    生产代码传 HERE（项目根）→ 交给 data_path（data/ 优先、旧布局回退）；
+    测试把 base_dir 换成临时目录时严格落在临时目录，不能回退项目根目录——
+    否则测试会读写真实数据（tests/test_all.py 有保险名单守着）。
+    绝对路径原样透传。
+    """
+    if os.path.isabs(name):
+        return name
+    if os.path.abspath(base_dir) == HERE:
+        return data_path(name)
+    return os.path.join(base_dir, name)
+
+
+def cookie_path(name=None) -> str:
+    """会话 Cookie 文件名/路径 → 绝对路径（order 与 capture_session 的单源实现）。
+
+    这两个模块曾各写一份几乎相同的解析（约 20 行 × 2），且 order.py 顶层
+    `from capture_session import ...` 导致二者不能互相导入，只能下沉到这里。
+
+    规则：绝对路径原样透传（Windows 上 join 会给 '/tmp/x' 强加盘符，用户配的
+    绝对路径会悄悄变味）；相对名落 data/（data_path：新布局优先、旧根目录回退）；
+    None / 非字符串回退默认文件名。
+    """
+    name = name if isinstance(name, str) else None
+    name = name or "session_cookies.json"
+    if os.path.isabs(name):
+        return name
+    return os.path.normpath(data_path(name))
+
+
 def state_path_of(config, base_dir):
     """config 的 state_file 键 → 绝对路径（缺省 state.json）。"""
-    return os.path.join(base_dir, config.get("state_file", "state.json"))
+    return resolve_data_file(base_dir, config.get("state_file", "state.json"))
 
 
 def history_path_of(config, base_dir):
     """config 的 history_file 键 → 绝对路径（缺省 order_history.json）。"""
-    return os.path.join(base_dir, config.get("history_file", "order_history.json"))
+    return resolve_data_file(base_dir, config.get("history_file", "order_history.json"))
 
 
 def read_config_or_empty(path, *, missing=None, broken=None, non_dict=None):

@@ -44,7 +44,9 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, ".browser_profile")
-STATE_PATH = os.path.join(HERE, ".browser_state.json")
+# 注意：PROFILE_DIR 故意不迁进 data/——Playwright 持久化 profile 换路径等于
+# 换浏览器身份，登录态与设备指纹全丢；挪它的收益（目录整洁）远小于代价。
+STATE_PATH = appcommon.data_path(".browser_state.json")
 LEFT_TICKET_URL = "https://kyfw.12306.cn/otn/leftTicket/init"
 LOGIN_URL = "https://kyfw.12306.cn/otn/resources/login.html"
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"

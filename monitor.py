@@ -24,14 +24,12 @@ import os
 import subprocess
 import sys
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 import appcommon
+
+appcommon.ensure_utf8_stdio()
+
 import engine as engine_mod
 import filelock
 import notify as notify_mod
@@ -832,7 +830,7 @@ def menu_passengers():
 
 def menu_history():
     config = load_config()
-    path = os.path.join(HERE, config.get("history_file", "order_history.json"))
+    path = appcommon.history_path_of(config, HERE)
     if not os.path.exists(path):
         print("\n  暂无购票历史记录。")
         return
@@ -999,7 +997,7 @@ def menu_session():
     if browser_mode:
         import browser_order
         state_path = getattr(browser_order, "STATE_PATH",
-                             os.path.join(HERE, ".browser_state.json"))
+                             appcommon.data_path(".browser_state.json"))
         print("  会话模式：浏览器下单（.browser_profile）")
         if os.path.exists(state_path):
             try:
