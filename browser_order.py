@@ -21,6 +21,7 @@
 
 import contextlib
 import functools
+import logging
 import json
 import os
 import re
@@ -53,8 +54,13 @@ _SLIDE_WAIT_SEC = 180
 
 
 def _log(msg):
-    print(msg)
-    sys.stdout.flush()
+    """进度提示走 stderr。
+
+    API 进程的 stdout 是 JSON-RPC 通道：非 JSON 行会被 electron/main.js 的
+    JSON.parse 静默丢弃，登录/预热/下单进度因此在界面上永远看不到（"点了登录
+    没反应"的观感来源）。stderr 由主进程接住转成界面日志，CLI 下也照常可见。
+    另一个好处：与 api.emit() 的 OUT_LOCK 不共享 stdout，不会互相截断。"""
+    print(msg, file=sys.stderr, flush=True)
 
 
 # Task 101h：_log 的 PII 脱敏（与 Task 61/65a/84c 同口径）——用户名/乘车人姓名
@@ -107,15 +113,27 @@ class _ProfileLock:
     def __init__(self, path):
         self._path = path
         self._fd = None
+        # 同线程重入计数：文件字节锁本身不支持重入，同一个线程第二次 acquire
+        # 会自我死锁（拿不到自己已经持有的那把），必须先按线程判断。
+        self._owner = None
+        self._depth = 0
 
     def acquire(self, timeout=0):
         if msvcrt is None and fcntl is None:
             return True  # 无跨进程后端：跨进程这一层让位，仅保留进程内锁
+        tid = threading.get_ident()
+        if self._depth and self._owner == tid:
+            # 同线程重入：直接计数放行。没有这条，busy() 在持锁栈内会把自己
+            # 判成"别的程序正占用浏览器"，调用方据此永久跳过会话体检。
+            self._depth += 1
+            return True
         try:
             fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
         except OSError:
             return False
-        deadline = time.time() + max(0.0, timeout)
+        # monotonic：系统时钟回拨（NTP 校时 / VM 快照恢复）会让 time.time()
+        # 版本的 deadline 永不成立，抢不到锁时变成 0.2s 空转的死循环。
+        deadline = time.monotonic() + max(0.0, timeout)
         while True:
             try:
                 os.lseek(fd, 0, os.SEEK_SET)
@@ -125,16 +143,25 @@ class _ProfileLock:
                     # LOCK_NB 抢不到时抛 BlockingIOError（OSError 子类）
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                if time.time() >= deadline:
+                if time.monotonic() >= deadline:
                     os.close(fd)
                     return False
                 time.sleep(0.2)
             else:
                 self._fd = fd
+                self._owner = tid
+                self._depth = 1
                 return True
 
     def release(self):
+        tid = threading.get_ident()
+        if self._depth and self._owner == tid:
+            self._depth -= 1
+            if self._depth:
+                return
         fd, self._fd = self._fd, None
+        self._owner = None
+        self._depth = 0
         if fd is None:
             return
         try:
@@ -378,19 +405,32 @@ def check_session(headless=True, timeout=90):
         return ok, who
 
 
-def launch(p, headless=False, restore=True):
+def launch(p, headless=False, restore=True, extra_args=None):
     """打开持久化 profile，并把上次保存的会话注入回去。
 
     注意：tk / uamtk / JSESSIONID 都是 session cookie，浏览器一关就清空
     （persistent context 关闭等同关浏览器），只有设备指纹类的持久 cookie 能留下。
     而 launch_persistent_context 不接受 storage_state 参数，所以会话只能
-    读文件后用 add_cookies 手动注回，否则下次启动就是"未登录"。"""
+    读文件后用 add_cookies 手动注回，否则下次启动就是"未登录"。
+
+    extra_args: 本次启动追加的 Chromium 参数；登录窗口用 --app= 让第一个窗口
+    直接落在登录页上（见 login()），避免「先空白再跳转」那一下。"""
     errs = []
     for ch in _BROWSER_CHANNELS:
         kwargs = dict(
             headless=headless,
             viewport={"width": 1440, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                # 12306 静态资源首次 1.1 秒、二次 78ms：给磁盘缓存留足空间，
+                # 反复进同一页面少拉一遍
+                "--disk-cache-size=268435456",
+                # 持久化 profile 的后台同步 / 预取会跟抢票抢带宽，关掉
+                "--disable-background-networking",
+                "--disable-sync",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ] + list(extra_args or []),
         )
         if ch:
             kwargs["channel"] = ch
@@ -502,18 +542,54 @@ def session_failure_is_permanent(who):
     return any(mark in text for mark in _PERMANENT_FAILURE_MARKS)
 
 
-@_exclusive(lock_timeout=420)
-def login(timeout_sec=300, stop_event=None):
+# lock_timeout 90 而不是 420：登录是交互动作，等对方放锁期间界面没有任何反馈，
+# 干等 7 分钟只会得到「点了没反应」。90 秒后明确报「浏览器正忙」，用户重试或等流程结束。
+# 排队提示是硬需求：不加日志就是静默卡死（2026-10-17 实测 46 秒零输出）。
+def login(timeout_sec=300, stop_event=None, lock_timeout=90):
     """打开浏览器让用户完成登录；profile 会自动持久化，之后不必重复。
 
     stop_event: threading.Event，置位后尽快关浏览器返回 False（抢票线程的
-    「停止」按钮不必再干等登录超时）。"""
+    「停止」按钮不必再干等登录超时）。
+    lock_timeout: 抢 profile 锁的上限（launcher 传 120 给自己的抢票节奏）。
+    抢锁排队期间界面零反馈，所以进锁前先把「在排队」说出来。
+    """
+    if busy():
+        _log("[浏览器] 浏览器正被占用（登录/下单/体检中），排队等待，最多 %d 秒…"
+             % lock_timeout)
+    return _login_locked(timeout_sec=timeout_sec, stop_event=stop_event,
+                         lock_timeout=lock_timeout)
+
+
+@_exclusive(lock_timeout=90)
+def _login_locked(timeout_sec=300, stop_event=None):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        ctx = launch(p, headless=False)
+        ctx = launch(p, headless=False, extra_args=["--app=" + LOGIN_URL])
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         _log("请在打开的浏览器里完成登录（扫码或账号密码+滑块），最多等 %d 秒。" % timeout_sec)
-        page.goto(LOGIN_URL)
+        # domcontentloaded：12306 登录页的 load 事件要等滑块脚本和第三方资源，
+        # 默认等到 load 就是窗口白屏好几秒（session_ok 早因同一原因改过）
+        # --app= 已经让第一个窗口直接落在登录页上，这里只在没落上时补一次导航：
+        # 用户要的是「别再刷这一下」，不是把窗口停在 about:blank。
+        need_nav = not (page.url or "").startswith(LOGIN_URL)
+        # 登录页上一律不许再整页刷新/跳转：扫到一半被重载，二维码和"已扫描"状态
+        # 全部作废（用户 2026-10-17 反馈"刷新太快，妨碍扫码"）。只放行登录页自己
+        # 这一次文档加载，之后所有 document 请求（reload / location 跳转 / 自动
+        # 重定向）一律 abort。扫码成功不靠页面跳转判定——login 循环靠 tk cookie
+        # 加探针页校验，掐掉导航没有副作用。
+        allowed = {"left": 1 if need_nav else 0}
+
+        def _no_reload(route, request):
+            if request.resource_type == "document":
+                if allowed["left"] > 0:
+                    allowed["left"] -= 1
+                    return route.continue_()
+                return route.abort()
+            return route.continue_()
+
+        page.route("**/*", _no_reload)
+        if need_nav:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded")
         probe = ctx.new_page()   # 复用同一支探针页校验，不再反复开/关标签页
         probe.goto("about:blank")
         deadline = time.time() + timeout_sec
@@ -521,10 +597,16 @@ def login(timeout_sec=300, stop_event=None):
         next_slow = 0.0   # 无信号时的兜底节拍（15 秒）
         ok, who = False, ""
         while time.time() < deadline:
-            if stop_event is not None and stop_event.wait(1):
-                ctx.close()
-                _log("[停止] 登录已被手动停止。")
-                return False
+            if stop_event is not None:
+                if stop_event.wait(1):
+                    ctx.close()
+                    _log("[停止] 登录已被手动停止。")
+                    return False
+            else:
+                # rpc_relogin 调 login() 不传 stop_event：旧代码这个循环零 sleep，
+                # 空转一个核，还每 2 秒打一次官方校验接口（登录途中被 12306 限流，
+                # 识别反而更慢）。没有 stop_event 也要有 1 秒节拍。
+                time.sleep(1)
             now = time.time()
             # 快信号：Cookie 出现 tk = 登录成功（capture_session.py 同款判据，
             # 读 Cookie 无需导航，识别延迟从最坏 30 秒降到 1~2 秒）。登录后
@@ -655,7 +737,7 @@ _QUERY_HIT_JS = r"""(code) => {
 }"""
 
 
-def _goto_and_query(page, info, date, want_hit=True, timeout=20000, wait_code=None):
+def _goto_and_query(page, info, date, want_hit=True, timeout=20000, wait_code=None, should_stop=None):
     """导航到车票页、填条件、点查询，等目标车次渲染出来。返回是否命中。
 
     want_hit=True 要等「预订」按钮出现（真能下单）；False 只要该车次行在
@@ -676,9 +758,21 @@ def _goto_and_query(page, info, date, want_hit=True, timeout=20000, wait_code=No
     page.evaluate("() => { const e = document.querySelector('#query_ticket'); if (e) e.click(); }")
     js = _QUERY_HIT_JS if want_hit else _QUERY_ROW_JS
     arg = info["train_code"] if wait_code is None else wait_code
+    if should_stop is None:
+        should_stop = lambda: False
     try:
-        page.wait_for_function(js, arg=arg, timeout=timeout)
-        return True
+        # 500ms 分片轮询：stop 置位可中断（坑 2 贯穿 DETECT 阶段）；
+        # 窗口死（TargetClosed 等）快速失败，不拖满 20s
+        deadline = time.time() + timeout / 1000
+        while time.time() < deadline:
+            if should_stop():
+                return False
+            try:
+                page.wait_for_function(js, arg=arg, timeout=500)
+                return True
+            except Exception as e:
+                if _window_dead_exc(e):
+                    return False
     except Exception:
         return False
 
@@ -711,17 +805,48 @@ def _slide_up(page):
         return []
 
 
-def _wait_slide_gone(page, sec):
+_PAY_TIME_RE = re.compile(r"支付剩余时间[:：]\s*(\d{1,2}时\d{1,2}分\d{1,2}秒)")
+
+
+def _window_dead_exc(e):
+    """浏览器窗口/上下文已死的异常类判定（小写类名子串匹配）。
+
+    覆盖 Playwright 关闭类异常（TargetClosedError、BrowserContextClosedError、
+    Error 基类）与 websocket/协议层断开（ProtocolError、ConnectionClosedError）。
+    判定失败（鬼魂异常）一律 False，不吞真实失败。
+    """
+    return any(k in type(e).__name__.lower()
+               for k in ("targetclosed", "closed", "protocolerror", "connectionclosed"))
+
+
+def _extract_pay_evidence(body):
+    """付款页正文→支付证据串。无证据返回空串。纯函数便于单测。"""
+    m = _PAY_TIME_RE.search(body)
+    locked = "席位已锁定" in body
+    if locked and m:
+        return "席位已锁定+支付剩余时间%s" % m.group(1)
+    if locked:
+        return "席位已锁定"
+    if m:
+        return "支付剩余时间%s" % m.group(1)
+    return ""
+
+
+def _wait_slide_gone(page, sec, stop=None):
     """等用户在浏览器窗口手动完成滑块（脚本不绕过验证码）。
 
     浏览器和锁都保持原状。成功返回实际等待的秒数（float），超时返回 False。
     调用方必须用返回值补偿业务倒计时——滑块是用户手动完成的，这段时间
     不应消耗「确认窗 15 秒」或「结果等待」倒计时（Task 42）：确认窗循环在
     滑块消失后重置 t_confirm，结果等待循环 deadline += elapsed。
+    stop: threading.Event 或等效 callable，置位时中止等待，返回字符串
+    "user_stopped"（调用方据此把本次下单标成手动停止）。
     """
     t_slide = time.time()
     while time.time() - t_slide < sec:
         page.wait_for_timeout(500)
+        if stop is not None and stop():
+            return "user_stopped"
         try:
             if not _slide_up(page):
                 return time.time() - t_slide
@@ -752,9 +877,491 @@ def _audit_dialog_seat(dlg_text, seat_name, alias_name):
     return dlg_seat, (bad[0] if bad else None)
 
 
+def _run_fill_submit_confirm(ctx, page, info, date, seat_name, seat_code,
+                             passenger_names, purpose="ADULT", alias_name=None,
+                             purpose_map=None, should_stop=None, mark=None,
+                             stage_cb=None):
+    """填单→提交→确认 共享序列：旧单体链与阶段化新链同源，选择器 2026-10 实测勿改。
+
+    覆盖旧 _order_impl 的步骤 3-7：点预订→勾乘车人→席别(limit_tickets 四步强写)→
+    票种(静默改值)→提交→核对窗取证→点确认。返回 dict：ok/msg/extra/clicked/
+    picked/dlg_seat/t_submit。clicked=True 表示确认已点出（此后异常=ambiguous）；
+    t_submit=点确认时刻（官方回读 180s 归因窗口起点）。mark(name)=耗时回调；
+    stage_cb(name)=阶段节点回调（orderflow 打 SUBMIT/CONFIRM 节点日志）。
+    """
+    if mark is None:
+        def mark(name):
+            return None
+    clicked = False
+    picked = []
+    dlg_seat = ""
+    t_submit = 0.0
+    def _fail(msg, extra=None):
+        # 旧 tuple return 归一为共享 res dict（clicked 等由 try 前预初始化兜底）
+        return {"ok": False, "msg": msg, "extra": extra, "clicked": clicked,
+                "picked": picked, "dlg_seat": dlg_seat, "t_submit": t_submit}
+
+    try:
+        # 3) 点该车次的「预订」——精确匹配车次行。:has-text() 是子串匹配，
+        #    查 G1 曾可能点中排在前面的 G11/G100 的「预订」，把订单下给别的车次
+        book_ok = page.evaluate(
+            r"""(code) => {
+                const tb = document.querySelector('#queryLeftTable');
+                if (!tb) return false;
+                const rows = Array.from(tb.querySelectorAll('tr'));
+                let row = null;
+                for (const tr of rows) {
+                    const s = tr.querySelector('strong');
+                    if (s && s.textContent.trim() === code) { row = tr; break; }
+                }
+                if (!row) {
+                    const re = new RegExp('(^|[^A-Za-z0-9])' +
+                        code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
+                    for (const tr of rows) {
+                        if (re.test(tr.innerText || '')) { row = tr; break; }
+                    }
+                }
+                if (!row) return false;
+                const a = Array.from(row.querySelectorAll('a')).find(
+                    a => (a.innerText || '').indexOf('预订') >= 0);
+                if (!a) return false;
+                a.click();
+                return true;
+            }""", info["train_code"])
+        if not book_ok:
+            return _fail("页面上没有 %s 的『预订』按钮（可能已无票或不可预订）" % info["train_code"], None)
+        _log("  [浏览器] 已点 %s 的『预订』" % info["train_code"])
+        mark("book")
+
+        # 4) 确认订单页。官方进页后会异步填 limit_tickets（乘车人/席别/票种
+        #    的内部状态），等这个数组就绪即可，不必死睡 2.5 秒。
+        # commit：导航一发起就走，不必等页面 load（后面有 limit_tickets 兜底）
+        # 账号有未支付/未处理订单时，12306 会拦住预订、页面留在列表页并弹
+        # 「您还有未处理的订单」——这里识别它，别再白等 40 秒超时。
+        try:
+            page.wait_for_url("**/confirmPassenger/initDc**",
+                              wait_until="commit", timeout=30000)
+        except Exception:
+            body = ""
+            for _ in range(3):   # 弹窗渲染可能晚于超时瞬间:复核 3 次
+                try:
+                    body = page.evaluate("() => document.body ? document.body.innerText : ''")
+                except Exception:
+                    body = ""
+                if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
+                    break
+                page.wait_for_timeout(500)
+            if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
+                i = max(0, body.find("订单") - 30)
+                mark("result")
+                return _fail(body[i:i + 200].replace("\n", " "), {"reason": "dup"})
+            raise
+        page.wait_for_selector("#normal_passenger_id input[type=checkbox]",
+                               state="attached", timeout=40000)
+        page.wait_for_function(
+            "() => Array.isArray(window.limit_tickets) && window.limit_tickets.length > 0",
+            timeout=15000)
+        _log("  [浏览器] 已进入确认订单页")
+        mark("confirm")
+
+        # 5) 勾选乘车人。列表是异步渲染的 <ul>，且外层可能不可见，
+        #    所以用 JS 直接 click（等价用户点 label），不走 Playwright 可见性检查。
+        people = page.eval_on_selector_all(
+            "#normal_passenger_id input[type=checkbox]",
+            """els => els.map(e => ({
+                 id: e.id,
+                 text: (e.nextElementSibling ? e.nextElementSibling.innerText : '').trim()
+               }))""")
+        if not people:
+            return _fail("确认页没有可用乘车人（账号里没保存常用联系人？）", None)
+
+        targets, missed = [], []
+        for name in (passenger_names or []):
+            exact = [p for p in people if p["text"] == name]
+            if exact:
+                targets.append(exact[0])
+                continue
+            # 前缀兜底取最短命中（适配"张三（学生）"这类带标注的展示文本），
+            # 避免「张三」按前缀匹配到排在更前面的「张三丰」
+            pref = sorted((p for p in people if p["text"].startswith(name)),
+                          key=lambda p: len(p["text"]))
+            if pref:
+                targets.append(pref[0])
+            else:
+                missed.append(name)
+        if missed:
+            # 点了名但没匹配到：绝不能悄悄改勾别人（此前会静默勾第一位）
+            return _fail(
+                    "乘车人 %s 在确认页没匹配到（可用：%s）。已中止，未提交订单——"
+                    "请核对姓名或账号常用联系人" % (
+                        "、".join(missed),
+                        "、".join(p["text"] for p in people[:8])),
+                    None)
+        if not targets:
+            targets = [people[0]]  # 未点名：沿用账号第一位（既有约定）
+
+        picked = []
+        for t in targets:
+            page.evaluate(
+                "(id) => { const e = document.getElementById(id); if (e && !e.checked) e.click(); }",
+                t["id"])
+            picked.append(t["text"])
+        # 勾选是即时的，等状态落地即可（正常几十毫秒），不再固定睡 1.5 秒
+        try:
+            page.wait_for_function(
+                "(ids) => ids.every(i => { const e = document.getElementById(i);"
+                " return e && e.checked; })",
+                arg=[t["id"] for t in targets], timeout=5000)
+        except Exception:
+            pass
+        # 读回勾选状态：12306 会把未核验/证件过期的联系人置灰，click 无效；
+        # 勾不上还往下走就是给页面残留的勾选下单
+        unchecked_ids = page.evaluate(
+            """(ids) => ids.filter(i => { const e = document.getElementById(i);
+                                          return !e || !e.checked; })""",
+            [t["id"] for t in targets])
+        if unchecked_ids:
+            bad_names = [t["text"] for t in targets if t["id"] in unchecked_ids]
+            return _fail(
+                    "乘车人 %s 勾选未生效（可能未核验/证件过期）。已中止，未提交订单"
+                    % "、".join(bad_names), None)
+        _log("  [浏览器] 乘车人：%s" % "、".join(_mask_name(n) for n in picked))
+        mark("passenger")
+
+        if alias_name:
+            _log("  [浏览器] 席别：勾选 %s 网页端不下发，按同价改判为 %s（%s）下单"
+                 % (seat_name, alias_name, seat_code))
+        # 6) 选席别：确认页的席别是 <select id="seatType_1">，
+        #    选项由服务端按该车次可售席别下发（网页端不一定有无座）。
+        seat = page.locator("#seatType_1").first
+        if seat.count() == 0:
+            return _fail("确认页找不到席别下拉 #seatType_1（页面结构可能已变）", None)
+        opts = seat.evaluate(
+            "e => Array.from(e.options).map(o => ({v: o.value, t: o.text.trim()}))")
+        codes = [o["v"] for o in opts]
+        if seat_code not in codes:
+            readable = "、".join("%s(%s)" % (o["t"].split("（")[0], o["v"]) for o in opts)
+            if alias_name:
+                return _fail(
+                        "勾选 %s，已按同价改判为 %s，但该车次网页端下单页不下发 %s（%s）；可选：%s"
+                        % (seat_name, alias_name, alias_name, seat_code, readable),
+                        {"reason": "alias_no_stock", "seat_codes": codes,
+                         "seat_options": readable, "alias_seat": alias_name})
+            return _fail(
+                    "该车次网页端不提供席别 %s（%s）；可选：%s" % (seat_name, seat_code, readable),
+                    {"reason": "seat_unavailable", "seat_codes": codes,
+                     "seat_options": readable})
+        # 用 jQuery 走官方事件链。官方下单读的是页面内部状态
+        # limit_tickets[i].seat_type，只改 <select> 的 DOM 值不会同步它，
+        # 结果就是界面看着是硬座、提交上去却是下拉的初始值（硬卧）。
+        diag = page.evaluate(
+            """(code) => {
+                const el = document.getElementById('seatType_1');
+                const d = {before: el ? el.value : null};
+                // 1) 先走官方 DOM + 事件链，尽量让页面自身保持一致
+                if (typeof jQuery !== 'undefined') {
+                    jQuery('#seatType_1').val(code).trigger('change');
+                    d.afterVal = el ? el.value : null;
+                }
+                if (typeof upadateSavePassengerInfo === 'function') {
+                    upadateSavePassengerInfo();
+                    d.calledSave = true;
+                }
+                d.afterSave = (window.limit_tickets || []).map(t => t.seat_type);
+                // 2) 实测官方页面不会随 change 更新 limit_tickets（seat_type 停在
+                //    初始值），而提交时 getpassengerTickets() 恰恰读它拼
+                //    passengerTickets —— 不写这里，界面显示硬座、提交却是硬卧。
+                if (Array.isArray(window.limit_tickets)) {
+                    window.limit_tickets.forEach(t => { t.seat_type = code; });
+                }
+                d.lt = (window.limit_tickets || []).map(t => t.seat_type);
+                return d;
+            }""", seat_code)
+        _log("  [浏览器] 席别诊断：%s" % json.dumps(diag, ensure_ascii=False))
+        # 直接等"内部状态已切到目标席别"——这正是下面那句权威判据要查的东西，
+        # 等它成立就不用闭眼睡 1.5 秒。
+        try:
+            page.wait_for_function(
+                "(code) => (window.limit_tickets || []).every(t => t.seat_type === code)",
+                arg=seat_code, timeout=5000)
+        except Exception:
+            pass
+
+        # 权威判据：直接读官方下单所用的内部状态数组
+        tickets = page.evaluate(
+            """() => (window.limit_tickets || []).map(t => ({
+                 name: t.name, seat: t.seat_type, ticket_type: t.ticket_type
+               }))""")
+        _log("  [浏览器] 内部状态 limit_tickets = %s" % json.dumps(_mask_ticket_names(tickets), ensure_ascii=False))
+        seats_now = [t.get("seat") for t in tickets]
+        if seats_now:
+            if any(s != seat_code for s in seats_now):
+                return _fail(
+                        "席别未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单。" % (
+                            seat_code, seats_now),
+                        {"limit_tickets": tickets})
+            _log("  [浏览器] 席别已确认：%s（%s）× %d" % (seat_name, seat_code, len(seats_now)))
+        else:
+            # 读不到内部状态（可能是私有变量）时退回 DOM 校验
+            now_seat = seat.input_value()
+            if now_seat != seat_code:
+                return _fail(
+                        "席别选择未生效（DOM=%s，期望 %s）。已中止，未提交订单。" % (
+                            now_seat, seat_code),
+                        None)
+            _log("  [浏览器] 席别：%s（%s，DOM 校验）" % (seat_name, seat_code))
+        mark("seat")
+
+        # 6.5) 票种：确认页默认按乘车人档案取票种（学生档案会带出学生票 ticket_type=3），
+        #    不显式写就沿用档案；学生票要资质核验，没核验提交必被拒——这正是
+        #    之前连续「订票失败」的真因。这里按每个乘车人**各自的**票种强制对齐
+        #    （成人票=1，学生票=3），支持同一订单里成人票 / 学生票混选。
+        tt_default = "1" if purpose == "ADULT" else "3"
+        tt_map = {n: ("3" if c == "0X00" else "1")
+                  for n, c in (purpose_map or {}).items()}
+        tt_args = {"code": tt_default, "map": tt_map}
+        tt_diag = page.evaluate(
+            """(args) => {
+                const code = args.code, map = args.map || {};
+                const pick = (name) => (name && map[name]) || code;
+                const d = {before: (window.limit_tickets || []).map(t => t.ticket_type),
+                           map: map};
+                // 每个乘车人一行、每行一个 ticketType 下拉：优先按行内身份证/姓名对齐，
+                // 取不到就按行号兜底。静默改 select 值：不派发 change 事件——
+                // change handler 会创建「学生票询问」弹窗（dialog_xsertcj）并把票种改回去。
+                const lt = window.limit_tickets || [];
+                const sels = Array.from(
+                    document.querySelectorAll('select[id^="ticketType_"]'));
+                sels.forEach((sel, i) => {
+                    let nm = null;
+                    const row = sel.closest('tr') || sel.parentElement;
+                    if (row) {
+                        const inp = row.querySelector(
+                            'input[id^="passenger_name"], input[name^="passenger_name"]');
+                        if (inp) nm = (inp.value || '').trim();
+                    }
+                    if (!nm && lt[i]) nm = lt[i].name;
+                    sel.value = pick(nm);
+                });
+                if (typeof upadateSavePassengerInfo === 'function') {
+                    upadateSavePassengerInfo();
+                }
+                // 内存数组才是官方下单所用的权威状态：DOM 没对齐也按姓名逐人写一遍
+                if (Array.isArray(window.limit_tickets)) {
+                    window.limit_tickets.forEach(t => { t.ticket_type = pick(t.name); });
+                }
+                d.after = (window.limit_tickets || []).map(t => t.ticket_type);
+                return d;
+            }""", tt_args)
+        _log("  [浏览器] 票种诊断：%s" % json.dumps(tt_diag, ensure_ascii=False))
+        try:
+            page.wait_for_function(
+                """(args) => (window.limit_tickets || []).every(
+                     t => String(t.ticket_type) === ((args.map || {})[t.name] || args.code))""",
+                arg=tt_args, timeout=3000)
+        except Exception:
+            pass
+        # 读回校验（与席别段同一纪律）：内部状态可读时不一致即中止——
+        # 学生票没核验时盲提交必被拒，白耗抢票窗口（此前只 best-effort 等待）
+        try:
+            tt_now = page.evaluate(
+                """() => (window.limit_tickets || []).map(
+                    t => ({name: t.name, tt: String(t.ticket_type)}))""")
+        except Exception:
+            tt_now = []
+        if tt_now:
+            tt_bad = [t for t in tt_now
+                      if t["tt"] != str((tt_args["map"] or {}).get(t["name"]) or tt_args["code"])]
+            if tt_bad:
+                return _fail(
+                        "票种未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单"
+                        % (json.dumps(tt_args, ensure_ascii=False),
+                           json.dumps(tt_bad, ensure_ascii=False)),
+                        {"limit_ticket_types": tt_now})
+        mark("ticket_type")
+
+        # 7) 提交订单。#submitOrder_id 是 <a href="javascript:">，
+        #    官方启用逻辑给它加的正是 btn92s（不是禁用），Playwright 的
+        #    可点击性判定会一直卡住，所以直接触发 DOM click。
+        #    新版提交链（已逆向 passengerInfo_js.js）：
+        #    submitOrder_id → checkOrderInfo → getQueueCount →
+        #    弹核对窗(checkticketinfo_id) → #qr_submit_id 倒计时约 3 秒
+        #    （btn92 禁用 → btn92s 启用并绑定 qr_submitClickEvent）→
+        #    M("N") → confirmSingle(ForQueue) → payOrder/init。
+        #    倒计时没结束就点 qr_submit 无效——这正是此前「提交后 90 秒
+        #    无结果」卡死的根因：旧选择器永远匹配不到它。
+        page.evaluate(
+            "() => { const e = document.querySelector('#submitOrder_id'); if (e) e.click(); }")
+        _log("  [浏览器] 已点『提交订单』，等核对窗确认按钮启用...")
+        if stage_cb is not None:
+            stage_cb("SUBMIT")
+
+        def _qr_state():
+            try:
+                return page.evaluate(
+                    """() => {
+                        const e = document.querySelector('#qr_submit_id');
+                        if (!e) return {found: false, cls: ''};
+                        const r = e.getBoundingClientRect();
+                        return {found: true, cls: e.className,
+                                shown: r.width > 0
+                                       && getComputedStyle(e).display !== 'none'};
+                    }""")
+            except Exception:
+                return {"found": False, "cls": ""}
+
+        def _visible_ok_btns():
+            try:
+                return page.eval_on_selector_all(
+                    "div.lay-btn a, div.lay-btn span, #i-ok, #check_ticketInfo_id,"
+                    " #lay-btn_id, #confirmDiv a, #confirmDiv span, #popup a, #popup span",
+                    """els => els.filter(e => e.offsetWidth || e.offsetHeight)
+                          .map(e => ({id: e.id, cls: e.className,
+                                      txt: (e.innerText || '').trim().slice(0, 12)}))""")
+            except Exception:
+                return []
+
+        clicked = False
+        captcha_waited = False
+
+        def _stopped():
+            return should_stop is not None and should_stop()
+
+        dlg_seat = ""     # 12306 核对窗里显示的席别（取证：万一与所选不一致，日志里有原文）
+        t_confirm = time.time()
+        while time.time() - t_confirm < 15.0 and not _stopped():
+            # 学生票询问弹窗（学生档案买成人票时出现）：点「取消」= 按成人票继续
+            try:
+                page.evaluate(
+                    """() => {
+                        const w = document.querySelector('#dialog_xsertcj');
+                        if (w && w.getBoundingClientRect().width > 0
+                              && getComputedStyle(w).display !== 'none') {
+                            const c = document.querySelector('#dialog_xsertcj_cancel');
+                            if (c) c.click();
+                        }
+                    }""")
+            except Exception:
+                pass
+            st = _qr_state()
+            # Task 65g：精确匹配启用态类名 btn92s（独立 token），不用子串——
+            # 倒计时中的按钮类名可能含 btn92s 子串，子串匹配会误点
+            if st["found"] and st["shown"] and _cls_has(st["cls"], "btn92s"):
+                # 点确认前先把 12306 自己渲染的核对窗原文抄下来：它是服务端下发
+                # 的载荷，若与我们所选席别不一致，只有日志里留了原文才能对账。
+                try:
+                    dlg_text = page.evaluate(
+                        r"""() => {
+                            const ids = ['checkticketinfo_id', 'lay-box_id',
+                                         'orderResultInfo_id', 'popup', 'confirmDiv'];
+                            const out = [];
+                            for (const id of ids) {
+                                const e = document.getElementById(id);
+                                if (e && e.getBoundingClientRect().width > 0)
+                                    out.push(id + ': ' + (e.innerText || '')
+                                             .replace(/\s+/g, ' ').trim().slice(0, 300));
+                            }
+                            return out.join(' | ');
+                        }""")
+                except Exception:
+                    dlg_text = ""
+                if dlg_text:
+                    _log("  [浏览器] 核对窗原文：%s" % _mask_text_names(dlg_text, picked))
+                    # Task 70c：记录核对窗显示的席别（取证）。此前 dlg_seat
+                    # 从未被赋值，结果页的席别警告与 extra["seat_in_dialog"]
+                    # 是死代码；现在正确赋值。
+                    dlg_seat, abort_seat = _audit_dialog_seat(
+                        dlg_text, seat_name, alias_name)
+                    if abort_seat:
+                        # 服务端渲染的核对窗与页面内部状态不一致：按 RULES.md
+                        # 的纪律"不一致就中止、不提交"——此前照常提交，可能
+                        # 买到与所选不符（更贵）的席别
+                        return _fail(
+                                "核对窗显示席别 %s，与所选 %s 不一致。已中止，未提交订单（原文：%s）"
+                                % (abort_seat, seat_name, dlg_text[:160]),
+                                {"seat_in_dialog": abort_seat})
+                page.evaluate(
+                    "() => { const e = document.querySelector('#qr_submit_id'); if (e) e.click(); }")
+                _log("  [浏览器] qr_submit 倒计时结束已启用（%.1fs），已点确认" % (
+                    time.time() - t_confirm))
+                clicked = True
+                break
+            if _slide_up(page):
+                # 浏览器和锁都保持原状等用户完成滑块；此前直接返回，
+                # 毫秒级关窗让"请手动完成滑块"根本做不到
+                _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
+                slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC, stop=_stopped)
+                if slide_elapsed == "user_stopped":
+                    return _fail("手动停止：滑块等待期间用户已停止任务",
+                            {"reason": "user_stopped"})
+                if slide_elapsed is False:
+                    return _fail("滑块验证等待超时（%d 秒），本次下单中止" % _SLIDE_WAIT_SEC,
+                            {"need_captcha": True})
+                # 滑块是用户手动完成的：等待期间不消耗确认窗倒计时，
+                # 重置计时起点（Task 42；此前倒计时在滑块前定死，回来后
+                # 按钮永远点不下去，却只记一条普通失败日志）
+                t_confirm = time.time()
+                _log("  [浏览器] 滑块已消失（人工等待 %.1fs，不计入确认倒计时），"
+                     "继续等确认按钮…" % slide_elapsed)
+            page.wait_for_timeout(200)
+        if _stopped():
+            # 用户点了停止：clicked 与否分开处置——已点确认的结果未知，
+            # 交上层官方回读；未点确认的直接按手动停止收尾（问题二）
+            if clicked:
+                return _fail("手动停止：确认已提交但结果未知，"
+                        "请先到 12306 核对未完成订单",
+                        {"reason": "ambiguous"})
+            return _fail("手动停止：提交前用户已停止任务",
+                    {"reason": "user_stopped"})
+        if not clicked:
+            # 旧版页面回退：只点文本确认为「确定/确认/是/好的」的可见控件；
+            # #qr_submit_id 交给主轮询管（此刻可能还在倒计时禁用态），并且
+            # 不再盲点第一个控件——点错按钮置 clicked=True 会白白烧掉一次重试
+            btns = _visible_ok_btns()
+            _log("  [浏览器] 未等到 qr_submit，回退旧确认控件：%s" % json.dumps(
+                btns, ensure_ascii=False))
+            for b in btns:
+                # 空 id 会让 getElementById("") 恒返回 null：点了等于没点，却把
+                # clicked 记成 True，上层据此判 ambiguous「已提交但结果未知」，
+                # 实际是漏单（订单根本没提交）。
+                if not b["id"] or b["id"] == "qr_submit_id":
+                    continue
+                if b["txt"] in ("确定", "确认", "是", "好的"):
+                    ok_click = page.evaluate(
+                        "(id) => { const e = document.getElementById(id);"
+                        " if (!e) return false; e.click(); return true; }", b["id"])
+                    if not ok_click:
+                        continue
+                    _log("  [浏览器] 已点确认框：%s" % b["txt"])
+                    clicked = True
+                    break
+        mark("submit")
+        t_submit = time.time()
+        if stage_cb is not None:
+            stage_cb("CONFIRM")
+        return {"ok": True, "msg": "", "extra": None, "clicked": clicked,
+                "picked": picked, "dlg_seat": dlg_seat, "t_submit": t_submit}
+    except Exception as e:
+        if clicked:
+            return {"ok": False,
+                    "msg": "提交确认后异常（结果未知，请先到 12306 核对未完成订单）：%s: %s"
+                           % (type(e).__name__, str(e)[:150]),
+                    "extra": {"reason": "ambiguous"}, "clicked": clicked,
+                    "picked": [], "dlg_seat": "", "t_submit": 0.0}
+        if _window_dead_exc(e):
+            return {"ok": False, "msg": "浏览器窗口异常关闭: %s: %s"
+                    % (type(e).__name__, str(e)[:180]),
+                    "extra": {"reason": "browser_dead"}, "clicked": False,
+                    "picked": [], "dlg_seat": "", "t_submit": 0.0}
+        return {"ok": False, "msg": "浏览器下单异常: %s: %s"
+                % (type(e).__name__, str(e)[:180]),
+                "extra": None, "clicked": False,
+                "picked": [], "dlg_seat": "", "t_submit": 0.0}
+
+
 def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 headless=False, verify_timeout=90, purpose="ADULT", warm=None, tm=None,
-                alias_name=None, purpose_map=None):
+                alias_name=None, purpose_map=None, should_stop=None):
     """
     一次下单的完整流程。返回 (ok, msg, extra)。
 
@@ -838,422 +1445,35 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
             mark("goto")
             mark("query")
 
-            # 3) 点该车次的「预订」——精确匹配车次行。:has-text() 是子串匹配，
-            #    查 G1 曾可能点中排在前面的 G11/G100 的「预订」，把订单下给别的车次
-            book_ok = page.evaluate(
-                r"""(code) => {
-                    const tb = document.querySelector('#queryLeftTable');
-                    if (!tb) return false;
-                    const rows = Array.from(tb.querySelectorAll('tr'));
-                    let row = null;
-                    for (const tr of rows) {
-                        const s = tr.querySelector('strong');
-                        if (s && s.textContent.trim() === code) { row = tr; break; }
-                    }
-                    if (!row) {
-                        const re = new RegExp('(^|[^A-Za-z0-9])' +
-                            code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
-                        for (const tr of rows) {
-                            if (re.test(tr.innerText || '')) { row = tr; break; }
-                        }
-                    }
-                    if (!row) return false;
-                    const a = Array.from(row.querySelectorAll('a')).find(
-                        a => (a.innerText || '').indexOf('预订') >= 0);
-                    if (!a) return false;
-                    a.click();
-                    return true;
-                }""", info["train_code"])
-            if not book_ok:
-                return False, "页面上没有 %s 的『预订』按钮（可能已无票或不可预订）" % info["train_code"], None
-            _log("  [浏览器] 已点 %s 的『预订』" % info["train_code"])
-            mark("book")
-
-            # 4) 确认订单页。官方进页后会异步填 limit_tickets（乘车人/席别/票种
-            #    的内部状态），等这个数组就绪即可，不必死睡 2.5 秒。
-            # commit：导航一发起就走，不必等页面 load（后面有 limit_tickets 兜底）
-            # 账号有未支付/未处理订单时，12306 会拦住预订、页面留在列表页并弹
-            # 「您还有未处理的订单」——这里识别它，别再白等 40 秒超时。
-            try:
-                page.wait_for_url("**/confirmPassenger/initDc**",
-                                  wait_until="commit", timeout=30000)
-            except Exception:
-                body = ""
-                for _ in range(3):   # 弹窗渲染可能晚于超时瞬间:复核 3 次
-                    try:
-                        body = page.evaluate("() => document.body ? document.body.innerText : ''")
-                    except Exception:
-                        body = ""
-                    if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
-                        break
-                    page.wait_for_timeout(500)
-                if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
-                    i = max(0, body.find("订单") - 30)
-                    mark("result")
-                    return False, body[i:i + 200].replace("\n", " "), {"reason": "dup"}
-                raise
-            page.wait_for_selector("#normal_passenger_id input[type=checkbox]",
-                                   state="attached", timeout=40000)
-            page.wait_for_function(
-                "() => Array.isArray(window.limit_tickets) && window.limit_tickets.length > 0",
-                timeout=15000)
-            _log("  [浏览器] 已进入确认订单页")
-            mark("confirm")
-
-            # 5) 勾选乘车人。列表是异步渲染的 <ul>，且外层可能不可见，
-            #    所以用 JS 直接 click（等价用户点 label），不走 Playwright 可见性检查。
-            people = page.eval_on_selector_all(
-                "#normal_passenger_id input[type=checkbox]",
-                """els => els.map(e => ({
-                     id: e.id,
-                     text: (e.nextElementSibling ? e.nextElementSibling.innerText : '').trim()
-                   }))""")
-            if not people:
-                return False, "确认页没有可用乘车人（账号里没保存常用联系人？）", None
-
-            targets, missed = [], []
-            for name in (passenger_names or []):
-                exact = [p for p in people if p["text"] == name]
-                if exact:
-                    targets.append(exact[0])
-                    continue
-                # 前缀兜底取最短命中（适配"张三（学生）"这类带标注的展示文本），
-                # 避免「张三」按前缀匹配到排在更前面的「张三丰」
-                pref = sorted((p for p in people if p["text"].startswith(name)),
-                              key=lambda p: len(p["text"]))
-                if pref:
-                    targets.append(pref[0])
-                else:
-                    missed.append(name)
-            if missed:
-                # 点了名但没匹配到：绝不能悄悄改勾别人（此前会静默勾第一位）
-                return (False,
-                        "乘车人 %s 在确认页没匹配到（可用：%s）。已中止，未提交订单——"
-                        "请核对姓名或账号常用联系人" % (
-                            "、".join(missed),
-                            "、".join(p["text"] for p in people[:8])),
-                        None)
-            if not targets:
-                targets = [people[0]]  # 未点名：沿用账号第一位（既有约定）
-
-            picked = []
-            for t in targets:
-                page.evaluate(
-                    "(id) => { const e = document.getElementById(id); if (e && !e.checked) e.click(); }",
-                    t["id"])
-                picked.append(t["text"])
-            # 勾选是即时的，等状态落地即可（正常几十毫秒），不再固定睡 1.5 秒
-            try:
-                page.wait_for_function(
-                    "(ids) => ids.every(i => { const e = document.getElementById(i);"
-                    " return e && e.checked; })",
-                    arg=[t["id"] for t in targets], timeout=5000)
-            except Exception:
-                pass
-            # 读回勾选状态：12306 会把未核验/证件过期的联系人置灰，click 无效；
-            # 勾不上还往下走就是给页面残留的勾选下单
-            unchecked_ids = page.evaluate(
-                """(ids) => ids.filter(i => { const e = document.getElementById(i);
-                                              return !e || !e.checked; })""",
-                [t["id"] for t in targets])
-            if unchecked_ids:
-                bad_names = [t["text"] for t in targets if t["id"] in unchecked_ids]
-                return (False,
-                        "乘车人 %s 勾选未生效（可能未核验/证件过期）。已中止，未提交订单"
-                        % "、".join(bad_names), None)
-            _log("  [浏览器] 乘车人：%s" % "、".join(_mask_name(n) for n in picked))
-            mark("passenger")
-
-            if alias_name:
-                _log("  [浏览器] 席别：勾选 %s 网页端不下发，按同价改判为 %s（%s）下单"
-                     % (seat_name, alias_name, seat_code))
-            # 6) 选席别：确认页的席别是 <select id="seatType_1">，
-            #    选项由服务端按该车次可售席别下发（网页端不一定有无座）。
-            seat = page.locator("#seatType_1").first
-            if seat.count() == 0:
-                return False, "确认页找不到席别下拉 #seatType_1（页面结构可能已变）", None
-            opts = seat.evaluate(
-                "e => Array.from(e.options).map(o => ({v: o.value, t: o.text.trim()}))")
-            codes = [o["v"] for o in opts]
-            if seat_code not in codes:
-                readable = "、".join("%s(%s)" % (o["t"].split("（")[0], o["v"]) for o in opts)
-                if alias_name:
-                    return (False,
-                            "勾选 %s，已按同价改判为 %s，但该车次网页端下单页不下发 %s（%s）；可选：%s"
-                            % (seat_name, alias_name, alias_name, seat_code, readable),
-                            {"reason": "alias_no_stock", "seat_codes": codes,
-                             "seat_options": readable, "alias_seat": alias_name})
-                return (False,
-                        "该车次网页端不提供席别 %s（%s）；可选：%s" % (seat_name, seat_code, readable),
-                        {"reason": "seat_unavailable", "seat_codes": codes,
-                         "seat_options": readable})
-            # 用 jQuery 走官方事件链。官方下单读的是页面内部状态
-            # limit_tickets[i].seat_type，只改 <select> 的 DOM 值不会同步它，
-            # 结果就是界面看着是硬座、提交上去却是下拉的初始值（硬卧）。
-            diag = page.evaluate(
-                """(code) => {
-                    const el = document.getElementById('seatType_1');
-                    const d = {before: el ? el.value : null};
-                    // 1) 先走官方 DOM + 事件链，尽量让页面自身保持一致
-                    if (typeof jQuery !== 'undefined') {
-                        jQuery('#seatType_1').val(code).trigger('change');
-                        d.afterVal = el ? el.value : null;
-                    }
-                    if (typeof upadateSavePassengerInfo === 'function') {
-                        upadateSavePassengerInfo();
-                        d.calledSave = true;
-                    }
-                    d.afterSave = (window.limit_tickets || []).map(t => t.seat_type);
-                    // 2) 实测官方页面不会随 change 更新 limit_tickets（seat_type 停在
-                    //    初始值），而提交时 getpassengerTickets() 恰恰读它拼
-                    //    passengerTickets —— 不写这里，界面显示硬座、提交却是硬卧。
-                    if (Array.isArray(window.limit_tickets)) {
-                        window.limit_tickets.forEach(t => { t.seat_type = code; });
-                    }
-                    d.lt = (window.limit_tickets || []).map(t => t.seat_type);
-                    return d;
-                }""", seat_code)
-            _log("  [浏览器] 席别诊断：%s" % json.dumps(diag, ensure_ascii=False))
-            # 直接等"内部状态已切到目标席别"——这正是下面那句权威判据要查的东西，
-            # 等它成立就不用闭眼睡 1.5 秒。
-            try:
-                page.wait_for_function(
-                    "(code) => (window.limit_tickets || []).every(t => t.seat_type === code)",
-                    arg=seat_code, timeout=5000)
-            except Exception:
-                pass
-
-            # 权威判据：直接读官方下单所用的内部状态数组
-            tickets = page.evaluate(
-                """() => (window.limit_tickets || []).map(t => ({
-                     name: t.name, seat: t.seat_type, ticket_type: t.ticket_type
-                   }))""")
-            _log("  [浏览器] 内部状态 limit_tickets = %s" % json.dumps(_mask_ticket_names(tickets), ensure_ascii=False))
-            seats_now = [t.get("seat") for t in tickets]
-            if seats_now:
-                if any(s != seat_code for s in seats_now):
-                    return (False,
-                            "席别未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单。" % (
-                                seat_code, seats_now),
-                            {"limit_tickets": tickets})
-                _log("  [浏览器] 席别已确认：%s（%s）× %d" % (seat_name, seat_code, len(seats_now)))
-            else:
-                # 读不到内部状态（可能是私有变量）时退回 DOM 校验
-                now_seat = seat.input_value()
-                if now_seat != seat_code:
-                    return (False,
-                            "席别选择未生效（DOM=%s，期望 %s）。已中止，未提交订单。" % (
-                                now_seat, seat_code),
-                            None)
-                _log("  [浏览器] 席别：%s（%s，DOM 校验）" % (seat_name, seat_code))
-            mark("seat")
-
-            # 6.5) 票种：确认页默认按乘车人档案取票种（学生档案会带出学生票 ticket_type=3），
-            #    不显式写就沿用档案；学生票要资质核验，没核验提交必被拒——这正是
-            #    之前连续「订票失败」的真因。这里按每个乘车人**各自的**票种强制对齐
-            #    （成人票=1，学生票=3），支持同一订单里成人票 / 学生票混选。
-            tt_default = "1" if purpose == "ADULT" else "3"
-            tt_map = {n: ("3" if c == "0X00" else "1")
-                      for n, c in (purpose_map or {}).items()}
-            tt_args = {"code": tt_default, "map": tt_map}
-            tt_diag = page.evaluate(
-                """(args) => {
-                    const code = args.code, map = args.map || {};
-                    const pick = (name) => (name && map[name]) || code;
-                    const d = {before: (window.limit_tickets || []).map(t => t.ticket_type),
-                               map: map};
-                    // 每个乘车人一行、每行一个 ticketType 下拉：优先按行内身份证/姓名对齐，
-                    // 取不到就按行号兜底。静默改 select 值：不派发 change 事件——
-                    // change handler 会创建「学生票询问」弹窗（dialog_xsertcj）并把票种改回去。
-                    const lt = window.limit_tickets || [];
-                    const sels = Array.from(
-                        document.querySelectorAll('select[id^="ticketType_"]'));
-                    sels.forEach((sel, i) => {
-                        let nm = null;
-                        const row = sel.closest('tr') || sel.parentElement;
-                        if (row) {
-                            const inp = row.querySelector(
-                                'input[id^="passenger_name"], input[name^="passenger_name"]');
-                            if (inp) nm = (inp.value || '').trim();
-                        }
-                        if (!nm && lt[i]) nm = lt[i].name;
-                        sel.value = pick(nm);
-                    });
-                    if (typeof upadateSavePassengerInfo === 'function') {
-                        upadateSavePassengerInfo();
-                    }
-                    // 内存数组才是官方下单所用的权威状态：DOM 没对齐也按姓名逐人写一遍
-                    if (Array.isArray(window.limit_tickets)) {
-                        window.limit_tickets.forEach(t => { t.ticket_type = pick(t.name); });
-                    }
-                    d.after = (window.limit_tickets || []).map(t => t.ticket_type);
-                    return d;
-                }""", tt_args)
-            _log("  [浏览器] 票种诊断：%s" % json.dumps(tt_diag, ensure_ascii=False))
-            try:
-                page.wait_for_function(
-                    """(args) => (window.limit_tickets || []).every(
-                         t => String(t.ticket_type) === ((args.map || {})[t.name] || args.code))""",
-                    arg=tt_args, timeout=3000)
-            except Exception:
-                pass
-            # 读回校验（与席别段同一纪律）：内部状态可读时不一致即中止——
-            # 学生票没核验时盲提交必被拒，白耗抢票窗口（此前只 best-effort 等待）
-            try:
-                tt_now = page.evaluate(
-                    """() => (window.limit_tickets || []).map(
-                        t => ({name: t.name, tt: String(t.ticket_type)}))""")
-            except Exception:
-                tt_now = []
-            if tt_now:
-                tt_bad = [t for t in tt_now
-                          if t["tt"] != str((tt_args["map"] or {}).get(t["name"]) or tt_args["code"])]
-                if tt_bad:
-                    return (False,
-                            "票种未同步到页面内部状态（期望 %s，实际 %s）。已中止，未提交订单"
-                            % (json.dumps(tt_args, ensure_ascii=False),
-                               json.dumps(tt_bad, ensure_ascii=False)),
-                            {"limit_ticket_types": tt_now})
-            mark("ticket_type")
-
-            # 7) 提交订单。#submitOrder_id 是 <a href="javascript:">，
-            #    官方启用逻辑给它加的正是 btn92s（不是禁用），Playwright 的
-            #    可点击性判定会一直卡住，所以直接触发 DOM click。
-            #    新版提交链（已逆向 passengerInfo_js.js）：
-            #    submitOrder_id → checkOrderInfo → getQueueCount →
-            #    弹核对窗(checkticketinfo_id) → #qr_submit_id 倒计时约 3 秒
-            #    （btn92 禁用 → btn92s 启用并绑定 qr_submitClickEvent）→
-            #    M("N") → confirmSingle(ForQueue) → payOrder/init。
-            #    倒计时没结束就点 qr_submit 无效——这正是此前「提交后 90 秒
-            #    无结果」卡死的根因：旧选择器永远匹配不到它。
-            page.evaluate(
-                "() => { const e = document.querySelector('#submitOrder_id'); if (e) e.click(); }")
-            _log("  [浏览器] 已点『提交订单』，等核对窗确认按钮启用...")
-
-            def _qr_state():
-                try:
-                    return page.evaluate(
-                        """() => {
-                            const e = document.querySelector('#qr_submit_id');
-                            if (!e) return {found: false, cls: ''};
-                            const r = e.getBoundingClientRect();
-                            return {found: true, cls: e.className,
-                                    shown: r.width > 0
-                                           && getComputedStyle(e).display !== 'none'};
-                        }""")
-                except Exception:
-                    return {"found": False, "cls": ""}
-
-            def _visible_ok_btns():
-                try:
-                    return page.eval_on_selector_all(
-                        "div.lay-btn a, div.lay-btn span, #i-ok, #check_ticketInfo_id,"
-                        " #lay-btn_id, #confirmDiv a, #confirmDiv span, #popup a, #popup span",
-                        """els => els.filter(e => e.offsetWidth || e.offsetHeight)
-                              .map(e => ({id: e.id, cls: e.className,
-                                          txt: (e.innerText || '').trim().slice(0, 12)}))""")
-                except Exception:
-                    return []
-
-            clicked = False
-            captcha_waited = False
-            dlg_seat = ""     # 12306 核对窗里显示的席别（取证：万一与所选不一致，日志里有原文）
-            t_confirm = time.time()
-            while time.time() - t_confirm < 15.0:
-                # 学生票询问弹窗（学生档案买成人票时出现）：点「取消」= 按成人票继续
-                try:
-                    page.evaluate(
-                        """() => {
-                            const w = document.querySelector('#dialog_xsertcj');
-                            if (w && w.getBoundingClientRect().width > 0
-                                  && getComputedStyle(w).display !== 'none') {
-                                const c = document.querySelector('#dialog_xsertcj_cancel');
-                                if (c) c.click();
-                            }
-                        }""")
-                except Exception:
-                    pass
-                st = _qr_state()
-                # Task 65g：精确匹配启用态类名 btn92s（独立 token），不用子串——
-                # 倒计时中的按钮类名可能含 btn92s 子串，子串匹配会误点
-                if st["found"] and st["shown"] and _cls_has(st["cls"], "btn92s"):
-                    # 点确认前先把 12306 自己渲染的核对窗原文抄下来：它是服务端下发
-                    # 的载荷，若与我们所选席别不一致，只有日志里留了原文才能对账。
-                    try:
-                        dlg_text = page.evaluate(
-                            r"""() => {
-                                const ids = ['checkticketinfo_id', 'lay-box_id',
-                                             'orderResultInfo_id', 'popup', 'confirmDiv'];
-                                const out = [];
-                                for (const id of ids) {
-                                    const e = document.getElementById(id);
-                                    if (e && e.getBoundingClientRect().width > 0)
-                                        out.push(id + ': ' + (e.innerText || '')
-                                                 .replace(/\s+/g, ' ').trim().slice(0, 300));
-                                }
-                                return out.join(' | ');
-                            }""")
-                    except Exception:
-                        dlg_text = ""
-                    if dlg_text:
-                        _log("  [浏览器] 核对窗原文：%s" % _mask_text_names(dlg_text, picked))
-                        # Task 70c：记录核对窗显示的席别（取证）。此前 dlg_seat
-                        # 从未被赋值，结果页的席别警告与 extra["seat_in_dialog"]
-                        # 是死代码；现在正确赋值。
-                        dlg_seat, abort_seat = _audit_dialog_seat(
-                            dlg_text, seat_name, alias_name)
-                        if abort_seat:
-                            # 服务端渲染的核对窗与页面内部状态不一致：按 RULES.md
-                            # 的纪律"不一致就中止、不提交"——此前照常提交，可能
-                            # 买到与所选不符（更贵）的席别
-                            return (False,
-                                    "核对窗显示席别 %s，与所选 %s 不一致。已中止，未提交订单（原文：%s）"
-                                    % (abort_seat, seat_name, dlg_text[:160]),
-                                    {"seat_in_dialog": abort_seat})
-                    page.evaluate(
-                        "() => { const e = document.querySelector('#qr_submit_id'); if (e) e.click(); }")
-                    _log("  [浏览器] qr_submit 倒计时结束已启用（%.1fs），已点确认" % (
-                        time.time() - t_confirm))
-                    clicked = True
-                    break
-                if _slide_up(page):
-                    # 浏览器和锁都保持原状等用户完成滑块；此前直接返回，
-                    # 毫秒级关窗让"请手动完成滑块"根本做不到
-                    _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
-                    slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC)
-                    if slide_elapsed is False:
-                        return (False, "滑块验证等待超时（%d 秒），本次下单中止" % _SLIDE_WAIT_SEC,
-                                {"need_captcha": True})
-                    # 滑块是用户手动完成的：等待期间不消耗确认窗倒计时，
-                    # 重置计时起点（Task 42；此前倒计时在滑块前定死，回来后
-                    # 按钮永远点不下去，却只记一条普通失败日志）
-                    t_confirm = time.time()
-                    _log("  [浏览器] 滑块已消失（人工等待 %.1fs，不计入确认倒计时），"
-                         "继续等确认按钮…" % slide_elapsed)
-                page.wait_for_timeout(200)
-            if not clicked:
-                # 旧版页面回退：只点文本确认为「确定/确认/是/好的」的可见控件；
-                # #qr_submit_id 交给主轮询管（此刻可能还在倒计时禁用态），并且
-                # 不再盲点第一个控件——点错按钮置 clicked=True 会白白烧掉一次重试
-                btns = _visible_ok_btns()
-                _log("  [浏览器] 未等到 qr_submit，回退旧确认控件：%s" % json.dumps(
-                    btns, ensure_ascii=False))
-                for b in btns:
-                    if b["id"] == "qr_submit_id":
-                        continue
-                    if b["txt"] in ("确定", "确认", "是", "好的"):
-                        page.evaluate("(id) => { const e = document.getElementById(id); if (e) e.click(); }", b["id"])
-                        _log("  [浏览器] 已点确认框：%s" % b["txt"])
-                        clicked = True
-                        break
+            # 3-7) 填单→提交→确认：共享序列（阶段化新链同源；选择器勿改）
+            res = _run_fill_submit_confirm(
+                ctx, page, info, date, seat_name, seat_code,
+                passenger_names, purpose=purpose, alias_name=alias_name,
+                purpose_map=purpose_map, should_stop=should_stop, mark=mark)
+            if not res["ok"]:
+                return False, res["msg"], res["extra"]
+            clicked = res["clicked"]
+            picked = res["picked"]
+            dlg_seat = res["dlg_seat"]
+            t_submit = res["t_submit"]
+            _stopped = (lambda: should_stop is not None and should_stop())
             _log("  [浏览器] 等待出票结果...")
-            mark("submit")            # 8) 判定结果
+            # 8) 判定结果
             deadline = time.time() + verify_timeout
             tick = 0
-            t_submit = time.time()
+            captcha_waited = False   # 结果循环内滑块已等过标记（提取前在确认段初始化）
             _dup_keys = ("未支付", "未完成订单", "未处理", "已预订", "行程冲突", "已购买")
             _fail_keys = ("订票失败", "出票失败", "余票不足", "系统繁忙") + _dup_keys
             while time.time() < deadline:
+                if _stopped():
+                    # 用户点了停止：clicked 与否结果都未知——已点确认的
+                    # 交上层官方回读，未点确认的按手动停止（问题二）
+                    if clicked:
+                        return (False, "手动停止：确认已提交但结果未知，"
+                                "请先到 12306 核对未完成订单",
+                                {"reason": "ambiguous"})
+                    return (False, "手动停止：等待出票结果期间用户已停止任务",
+                            {"reason": "user_stopped"})
                 # 250ms 一轮：出票结果通常 1-3 秒内 URL 就会变
                 page.wait_for_timeout(250)
                 tick += 1
@@ -1264,7 +1484,14 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                         if not captcha_waited:
                             captcha_waited = True
                             _log("  [浏览器] 触发滑块验证：请在浏览器窗口手动完成（最多等 %d 秒）…" % _SLIDE_WAIT_SEC)
-                            slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC)
+                            slide_elapsed = _wait_slide_gone(page, _SLIDE_WAIT_SEC, stop=_stopped)
+                            if slide_elapsed == "user_stopped":
+                                if clicked:
+                                    return (False, "手动停止：确认已提交但结果未知，"
+                                            "请先到 12306 核对未完成订单",
+                                            {"reason": "ambiguous", "need_captcha": True})
+                                return (False, "手动停止：滑块等待期间用户已停止任务",
+                                        {"reason": "user_stopped"})
                             if slide_elapsed is False:
                                 extra = {"need_captcha": True}
                                 if clicked:
@@ -1291,14 +1518,25 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 url = page.url
                 if any(k in url for k in ("payOrder", "MyOrderNoComplete", "order/init")):
                     _log("  [浏览器] 结果页用时 %.1fs（%d 轮）" % (time.time() - t_submit, tick))
-                    # 到付款页后核对页面上真实显示的席别，防止静默买错
+                    # 只有付款页才是「本次下单成功」；未完成订单列表/订单初始化页
+                    # 可能是账号里更早的旧单，不能当成功直接停机，标 ambiguous
+                    # 交上层官方接口回读（旧代码三 URL 一锅烩误报成功）
+                    if "payOrder" not in url:
+                        mark("result")
+                        return (False,
+                                "订单结果落在 %s（非付款页）——无法确认本次下单结果，"
+                                "交官方订单接口回读" % url, {"reason": "ambiguous"})
+                    # 到付款页后核对页面上真实显示的席别，防止静默买错；
+                    # 同时提取付款页证据（席位已锁定/支付剩余时间）供上层记账
                     seat_on_page = ""
+                    pay_evidence = ""
                     try:
                         body = page.evaluate("() => document.body.innerText").replace("\n", " ")
                         for kw in (seat_name, "无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座"):
                             if kw and kw in body:
                                 seat_on_page = kw
                                 break
+                        pay_evidence = _extract_pay_evidence(body)
                     except Exception:
                         pass
                     warn = ""
@@ -1310,7 +1548,8 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     mark("result")
                     return True, "已提交订单（未支付）：%s%s" % (url, warn), {
                         "passengers": "、".join(picked), "seat_on_page": seat_on_page,
-                        "seat_in_dialog": dlg_seat}
+                        "seat_in_dialog": dlg_seat,
+                        "pay_evidence": pay_evidence, "page_kind": "payOrder"}
                 # 失败提示：500ms 一轮只做一次 innerText 读。原来 8 次
                 # locator.count() 放大成 8 次同步 IPC，页面跳转期排队会加重卡顿
                 if tick % 2 == 0:
@@ -1345,6 +1584,12 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                 return (False,
                         "提交确认后异常（结果未知，请先到 12306 核对未完成订单）：%s: %s"
                         % (type(e).__name__, str(e)[:150]), {"reason": "ambiguous"})
+            # 浏览器窗口/上下文死亡（TargetClosedError 等）不再是普通失败：
+            # 显式标 browser_dead，上层据此回读官方订单接口定生死，绝不盲重试
+            # （问题一：旧行为伪装普通失败→每轮重开窗口→无限刷）
+            if _window_dead_exc(e):
+                return False, "浏览器窗口异常关闭: %s: %s" % (
+                    type(e).__name__, str(e)[:180]), {"reason": "browser_dead"}
             return False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
         # 无 finally：冷启动路径的收尾（save_state + ctx.close）挂在 ExitStack
         # 回调上，预热路径不关窗、留给 WarmSession 继续用。
@@ -1395,6 +1640,9 @@ def order_via_browser(info, seat_name, seat_code, passenger_names, date,
                     pass
                 warm = None
     except Exception as e:
+        if _window_dead_exc(e):
+            return False, "浏览器窗口异常关闭: %s: %s" % (
+                type(e).__name__, str(e)[:180]), {"reason": "browser_dead"}
         return False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
     return _order_via_browser_locked(
         info, seat_name, seat_code, passenger_names, date,
@@ -1405,7 +1653,7 @@ def order_via_browser(info, seat_name, seat_code, passenger_names, date,
 @_exclusive(lock_timeout=180)
 def _order_via_browser_locked(info, seat_name, seat_code, passenger_names, date,
                               headless=False, verify_timeout=90, purpose="ADULT", warm=None,
-                              alias_name=None, purpose_map=None):
+                              alias_name=None, purpose_map=None, should_stop=None):
     """order_via_browser 的锁内本体（stale warm 已在外层 wrapper 处理，见上）。"""
     tm = {}
     t0 = time.perf_counter()
@@ -1414,11 +1662,16 @@ def _order_via_browser_locked(info, seat_name, seat_code, passenger_names, date,
                                      date, headless=headless,
                                      verify_timeout=verify_timeout,
                                      purpose=purpose, warm=warm, tm=tm,
-                                     alias_name=alias_name, purpose_map=purpose_map)
+                                     alias_name=alias_name, purpose_map=purpose_map,
+                                     should_stop=should_stop)
     except RuntimeError:
         raise  # 抢锁失败等：交给调用方决定重试节奏
     except Exception as e:
-        ok, msg, extra = False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
+        if _window_dead_exc(e):
+            ok, msg, extra = False, "浏览器窗口异常关闭: %s: %s" % (
+                type(e).__name__, str(e)[:180]), {"reason": "browser_dead"}
+        else:
+            ok, msg, extra = False, "浏览器下单异常: %s: %s" % (type(e).__name__, str(e)[:180]), None
     if alias_name:
         extra = dict(extra or {})
         extra.setdefault("alias_seat", alias_name)
@@ -1645,6 +1898,24 @@ def order_ticket_via_browser(config, task, ticket, seat_name):
     if purpose_map and names:
         _codes = [purpose_map.get(n) or purpose for n in names]
         purpose = "0X00" if all(c == "0X00" for c in _codes) else "ADULT"
+    if config.get("order_flow_mode", True):
+        # 新链：阶段化管线 orderflow（默认开启）。旧链 order_via_browser
+        # 保留到实跑验证成功后退役（双链并存，REBUILD_PLAN.md）。
+        try:
+            import orderflow
+        except ImportError:
+            pass
+        else:
+            ok, msg, extra = orderflow.run_orderflow(
+                ticket, seat_name, seat_code, names, date,
+                headless=bool(config.get("browser_headless", False)),
+                alias_name=alias_name, purpose=purpose, purpose_map=purpose_map,
+                flow_cfg=config.get("order_flow") or {},
+                logger=logging.getLogger("monitor"))
+            if ok:
+                extra = dict(extra or {})
+                extra.setdefault("passengers", "、".join(names))
+            return ok, msg, extra
     ok, msg, extra = order_via_browser(
         ticket, seat_name, seat_code, names, date,
         headless=bool(config.get("browser_headless", False)), alias_name=alias_name,

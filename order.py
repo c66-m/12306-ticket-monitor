@@ -178,6 +178,10 @@ def _classify_orders(date, train, passenger_names, orders):
             return "unpaid", x.get("order_no", ""), x.get("status") or "未完成/未支付"
     if inc:
         x = inc[0]
+        st = x.get("status") or ""
+        if x.get("_cache_block"):
+            # 12306 拒单封禁（如「取消次数过多，今日不能继续受理」）：原文直出
+            return "blocked", x.get("order_no", ""), st
         return ("blocked", x.get("order_no", ""),
                 "存在其它行程未支付订单(%s %s)挡路" % (x.get("train"), x.get("date")))
     for x in orders:
@@ -534,6 +538,11 @@ def select_passengers(all_passengers, wanted_names):
 
 def _normalize_order_item(item, status):
     """把 queryMyOrderNoComplete / queryMyOrder 里的订单项解析成统一结构。"""
+    if item.get("_cache_block"):
+        # orderCacheDTO 挡单记录：不是真订单，status 用服务端 message 原文
+        return {"train": "", "date": "", "passengers": [], "order_no": "",
+                "status": item.get("status_text") or status,
+                "_no_complete": True, "_cache_block": True}
     passengers = []
     for p in item.get("passengerDTOList") or []:
         name = p.get("passenger_name")
@@ -640,7 +649,19 @@ def check_existing_orders(session, target_date):
     try:
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
                          data={"_json_att": ""}, timeout=15)
-        for item in ((r.json().get("data") or {}).get("orderDBList") or []):
+        # 12306 对「当日取消次数过多」等封禁会返回 orderCacheDTO 而不是
+        # orderDBList：message 是挡单原因（如「今日将不能继续受理您的订票
+        # 请求」）。漏掉它会让回读误判「官方无此订单」→ 无限重下刷封禁。
+        data = r.json().get("data") or {}
+        cache_msg = (((data.get("orderCacheDTO") or {}).get("message") or {})
+                     .get("message") or "").strip()
+        if cache_msg:
+            orders.append({"passengerDTOList": [], "array_passser_name_page": [],
+                           "start_train_date_page": "", "station_train_code": "",
+                           "tickets": [], "sequence_no": "",
+                           "order_no": "", "status": cache_msg, "status_text": cache_msg,
+                           "_no_complete": True, "_cache_block": True})
+        for item in (data.get("orderDBList") or []):
             it = _normalize_order_item(item, "未完成/未支付")
             it["_no_complete"] = True
             orders.append(it)

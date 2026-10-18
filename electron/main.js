@@ -9,6 +9,8 @@ let quitting = false;                                 // 用户退出：不再�
 const UI_DIR = path.join(PY_DIR, "ui");
 let win = null;
 let py = null;
+let restartTimer = null;   // 待执行的重启定时器（clearTimeout 用）
+let restartDelay = 500;    // 重启退避：进程活着就回 500ms，连续失败翻倍到 30s
 
 // 广播给所有窗口：小窗打开时主窗是隐藏的，日志/状态两个窗口都要收到
 function broadcast(channel, payload) {
@@ -39,6 +41,22 @@ function pyCall(method, params) {
   });
 }
 
+// 自动重启：启动失败或秒退时不能每 500ms 无脑重试（CPU 打满 + 日志刷爆），
+// 走指数退避；进程成功吐出第一行后由 rl.on("line") 把退避重置回 500ms。
+function scheduleRestart() {
+  if (quitting) return;
+  broadcast("py-push", { method: "backendRestart", params: {} });
+  const delay = restartDelay;
+  restartDelay = Math.min(restartDelay * 2, 30000);
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    if (quitting) return;
+    startPython();
+    broadcast("py-push", { method: "backendRestarted", params: {} });
+  }, delay);
+}
+
 function startPython() {
   const exe = process.env.PYTHON || "python";
   // -X utf8：让 Python 进程从启动起就用 UTF-8（中文 Windows 默认 GBK，会把中文参数变乱码）
@@ -49,9 +67,21 @@ function startPython() {
   });
   // EPIPE 兜底：py 已退出瞬间 stdin 写失败会触发 'error'，吞掉由 pyCall 的 try/catch 走 reject
   py.stdin.on("error", () => {});
+  // spawn 失败（exe 不存在 / 不可执行）是异步 emit('error')，没有监听就是未捕获异常，
+  // 直接把主进程带走 → 客户端白屏。接住它：在途 RPC 立即失败，再走同一套重启退避。
+  py.on("error", (err) => {
+    const msg = (err && err.message) || String(err);
+    console.error("[py] spawn failed:", msg);
+    broadcast("py-push", { method: "log", params: { line: "[系统] Python 后端启动失败：" + msg, tag: "err" } });
+    for (const [, p] of pending) p.reject(new Error("Python 后端启动失败：" + msg));
+    pending.clear();
+    py = null;
+    scheduleRestart();
+  });
 
   const rl = readline.createInterface({ input: py.stdout, crlfDelay: Infinity });
   rl.on("line", (line) => {
+    restartDelay = 500;   // 能吐出内容＝后端真起来了，退避归零
     if (!line.trim()) return;
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
@@ -85,10 +115,7 @@ function startPython() {
     pending.clear();
     broadcast("py-push", { method: "backendDead", params: { code } });
     // 自动重启：应用退出（window-all-closed 收尾）时不再拉起
-    if (!quitting) {
-      broadcast("py-push", { method: "backendRestart", params: {} });
-      setTimeout(() => { if (!quitting) { startPython(); broadcast("py-push", { method: "backendRestarted", params: {} }); } }, 500);
-    }
+    scheduleRestart();
   });
 }
 
@@ -199,6 +226,9 @@ function createWindow() {
       console.log("[renderer]", level, message, line, sourceId);
     });
   }
+  // 主窗销毁后必须置 null：openMini / win-top 等 IPC 都按 `if (!win)` 判断，
+  // 留着已销毁对象会抛 "Object has been disposed"（关窗后点托盘图标必现）
+  win.on("closed", () => { win = null; });
   win.webContents.on("did-finish-load", () => {
     if (process.env.DSH_DEBUG) console.log("[main] page loaded, resending ready");
     // 页面可能错过早期 ready 推送——重发一次

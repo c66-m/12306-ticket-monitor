@@ -10,11 +10,15 @@ DayFileHandler：按天滚动的文件日志，文件名保持 logs/<prefix>_YYY
 """
 
 import datetime
+import hashlib
 import logging
 import os
 import re
+import tempfile
+import time
 
 import appcommon
+from filelock import file_lock
 
 # 日志留存天数：超过该天数的 <prefix>_YYYYMMDD.log 在打开新一天文件时自动清理，
 # 长期运行不再把磁盘写满。只删匹配命名规则且超期的文件，不碰当天文件。
@@ -28,6 +32,18 @@ _beijing_tz = appcommon.beijing_tz
 
 
 _BEIJING_TZ = _beijing_tz()
+
+
+def _lock_path_for(log_path):
+    """日志文件的跨进程锁路径。
+
+    ponytail: 锁文件放系统临时目录而不是 logs/ 旁边，是因为「每天一个日志文件」
+    这个目录形态本身是被测试锁定的契约（tests 里断言 logs 目录里正好只有当天
+    的日志文件），多出来的 .lock 会破坏它。代价是多用户/多 TEMP 场景下锁不共
+    享——本项目 engine / gui / monitor 永远跑在同一用户下，先按最小够用处理。
+    """
+    tag = hashlib.sha1(log_path.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), "12306log_%s.lock" % tag)
 
 
 def _beijing_today():
@@ -48,6 +64,8 @@ class DayFileHandler(logging.Handler):
         self._encoding = encoding
         self._day = None
         self._fh = None
+        self._path = None
+        self._retry_after = 0.0
         self._retention_days = retention_days
 
     def _open(self):
@@ -56,6 +74,7 @@ class DayFileHandler(logging.Handler):
         path = os.path.join(self._dir, "{0}_{1}.log".format(
             self._prefix, today.strftime("%Y%m%d")))
         self._fh = open(path, "a", encoding=self._encoding)
+        self._path = path
         self._day = today
         self._prune_old_logs(today)
 
@@ -66,7 +85,9 @@ class DayFileHandler(logging.Handler):
             # Task 79d；旧逻辑里 cutoff 会落在今天或未来，误删当天文件）。
             return
         cutoff = today - datetime.timedelta(days=self._retention_days)
-        pattern = re.compile(r"^{0}_(\d{{8}})\.log$".format(
+        # 兼容两种命名：新格式 <prefix>_YYYYMMDD_<pid>.log 与旧的
+        # <prefix>_YYYYMMDD.log，不清理旧文件会永久堆积。
+        pattern = re.compile(r"^{0}_(\d{{8}})(?:_\d+)?\.log$".format(
             re.escape(self._prefix)))
         try:
             names = os.listdir(self._dir)
@@ -94,6 +115,9 @@ class DayFileHandler(logging.Handler):
                 # FileHandler 口径一致）；logging.shutdown() 之后残留的
                 # logger 引用再打日志也不会建出新文件（Task 79c）。
                 raise ValueError("emit on closed DayFileHandler")
+            now = time.time()
+            if now < self._retry_after:
+                return
             today = _beijing_today()
             if self._fh is None or today != self._day:
                 if self._fh is not None:
@@ -102,16 +126,35 @@ class DayFileHandler(logging.Handler):
                     except Exception:
                         pass
                     self._fh = None
-                self._open()
-            self._fh.write(self.format(record) + "\n")
+                try:
+                    self._open()
+                except Exception:
+                    # 打开失败（目录被删/磁盘满/杀软占用）后进入退避期：不加这道
+                    # 门时每条日志都会重试一次 open 再失败并塞进 handleError，
+                    # stderr 被 Electron 主进程读走 → 抢票全程零日志且代价高昂。
+                    self._retry_after = time.time() + 60.0
+                    raise
+            line = self.format(record) + "\n"
+            # 多进程并发写同一个日志文件：Windows 的追加语义不是原子的（实测
+            # 两个进程各写 4000 行最终只剩 4700 行），而且先打开的进程会从自己
+            # 缓存的偏移往后写，直接覆盖别人刚写的内容。engine / gui / monitor
+            # 都按 prefix="monitor" 开同一个文件，所以必须持跨进程锁，并在锁内
+            # 重新 seek 到 EOF 再写。日志量是轮询级，这点开销可忽略。
             # 关键路径 flush：进程硬崩（kill -9）不丢已打日志的尾部。
             # 注意：flush 只把数据送到 OS page cache，防不住断电丢日志；
             # 防断电需要 fsync（Task 79e）。
-            # 日志量小（轮询级），每次 flush 开销可忽略。
             try:
+                with file_lock(_lock_path_for(self._path), timeout=2):
+                    self._fh.seek(0, os.SEEK_END)
+                    self._fh.write(line)
+                    self._fh.flush()
+            except TimeoutError:
+                # 抢不到锁（另一进程正持着同一把写同一个文件）：降级直写。
+                # 宁可偶发串行甚至覆盖，也不能因为拿不到锁把这条日志整个丢掉
+                # —— 日志丢了才是真的没法排查。
+                self._fh.seek(0, os.SEEK_END)
+                self._fh.write(line)
                 self._fh.flush()
-            except Exception:
-                pass
         except Exception:
             self.handleError(record)
 

@@ -38,6 +38,18 @@ CONFIG_PATH = os.path.join(HERE, "config.json")
 # 中文 Windows 下 stdin/stdout 默认走 ANSI 代码页（GBK），而 Electron 侧写的是 UTF-8 字节，
 # 中文参数会被按 GBK 解码成乱码（症状：searchStation 查「长葛」返回空、拼音正常）。
 # 协议两端统一 UTF-8，本文件是协议端点，编码属于它的契约。
+def _warn(what, exc):
+    """静默 except 的观测出口：不改控制流，只在 stderr 留一行。
+
+    进程 stderr 由 electron/main.js:74 转发到 electron/_eerr.txt。
+    必须定义在下面的 stdio reconfigure 之前——那里就是它的第一个调用点，
+    顺序反过来时 reconfigure 一旦失败就是 NameError，整个模块导入失败、后端起不来。"""
+    try:
+        print("[api] %s: %r" % (what, exc), file=sys.stderr)
+    except Exception:
+        pass
+
+
 for _stream in (sys.stdin, sys.stdout):
     try:
         _stream.reconfigure(encoding="utf-8")
@@ -47,16 +59,6 @@ for _stream in (sys.stdin, sys.stdout):
 OUT_LOCK = threading.Lock()
 WRITE = sys.stdout.write
 FLUSH = sys.stdout.flush
-
-
-def _warn(what, exc):
-    """静默 except 的观测出口：不改控制流，只在 stderr 留一行。
-
-    进程 stderr 由 electron/main.js:74 转发到 electron/_eerr.txt。"""
-    try:
-        print("[api] %s: %r" % (what, exc), file=sys.stderr)
-    except Exception:
-        pass
 
 
 def emit(obj):
@@ -84,9 +86,6 @@ def reply(id_, result=None, error=None):
 
 STATUS_COLOR = {"monitoring": "#0969da", "retrying": "#d97706", "paused": "#6e7781",
                 "cancelled": "#6e7781", "success": "#1a7f37", "failed": "#cf222e"}
-
-HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
-                        "notified": "已通知", "failed": "下单失败", "error": "异常"}
 
 # 邮箱正则单源到 appcommon.EMAIL_RE（严格口径）。旧版这里另有一份宽松正则，
 # 会让 gui 拒收的地址从桌面版设置页落进 config.json。
@@ -208,7 +207,11 @@ def get_engine():
     global _engine
     with _engine_lock:
         if _engine is None:
-            _engine = engine_mod.MonitorEngine(setup_logging=False)
+            # setup_logging=True：引擎按天写 logs/monitor_YYYYMMDD.log。它的
+            # StreamHandler 默认走 stderr（stdout 是 JSON-RPC 通道，碰不得），
+            # 与界面的 py-push 推送并行不冲突。关掉的话事后只有
+            # order_timing.jsonl 能查，13:0x「有票却没下单」就是这么瞎猜的。
+            _engine = engine_mod.MonitorEngine(setup_logging=True)
         return _engine
 
 
@@ -283,6 +286,48 @@ def _mark_running_tasks_paused():
     return changed[0]
 
 
+def _resume_stopped_tasks():
+    """软件启动时把上次被动暂停的任务恢复监控。
+
+    只认 message=="引擎已停止"（_mark_running_tasks_paused 的标记）：那是停引擎/
+    关软件留下的，不是用户的意思。用户手动暂停的任务 message 是别的文案，不动
+    ——「我暂停的不该被重启拉起」。
+    """
+    changed = [0]
+
+    def _set(state):
+        tasks = state.get("tasks")
+        if not isinstance(tasks, dict):
+            return
+        for rec in tasks.values():
+            if isinstance(rec, dict) and rec.get("status") == "paused" \
+                    and rec.get("message") == "引擎已停止":
+                rec["status"] = "monitoring"
+                rec["message"] = "软件启动自动恢复"
+                changed[0] += 1
+
+    try:
+        update_state_locked(_set)
+        if changed[0]:
+            launcher.log("[启动] %d 个任务自动恢复监控" % changed[0])
+    except Exception as e:
+        launcher.log("[启动] 任务自动恢复失败：%s" % e)
+    return changed[0]
+
+
+def _auto_start_engine():
+    """启动软件即启动监控引擎；config.json 里 auto_start_engine=false 可关。
+
+    先恢复被动暂停的任务再起引擎：get_engine() 首次创建时会读一遍 state 文件，
+    顺序反了引擎读到的是旧的 paused。
+    """
+    if not load_config().get("auto_start_engine", True):
+        launcher.log("[启动] auto_start_engine=false，跳过自动启动引擎")
+        return False
+    _resume_stopped_tasks()
+    return start_engine()
+
+
 # ---------------- 日志泵 ----------------
 
 def log_pump():
@@ -345,6 +390,9 @@ def rpc_list_monitor_tasks(_p):
             "status": rec.get("status") or t.get("status") or "paused",
             "message": rec.get("message") or "",
             "status_label": engine_mod.STATUS_LABELS.get(rec.get("status") or t.get("status") or "paused", "?"),
+            # 缺省与引擎同口径（engine._run_task 取 task.get("auto_order", True)）：
+            # 老任务可能存着 false，之前界面完全不显示这一项，用户会以为「有票就该下单」
+            "auto_order": bool(t.get("auto_order", True)),
         })
     # engineRunning=线程活着；engine_alive=引擎在真监控（线程活着且存在
     # monitoring/retrying 任务）。引擎空跑时任何任务都不是 ACTIVE，engine_alive=False，
@@ -726,6 +774,15 @@ def rpc_seat_priority_feedback(p):
 _armed_fired = set()  # 已自动触发的抢票任务 id（防重）
 
 
+def _armed_prepare_lead(t):
+    """自动开抢的提前量（秒）：至少提前 3 分钟拉起 Grabber，留给登录+预热；
+    warm_minutes 配得更大就按它。解析异常兜底 180 秒。"""
+    try:
+        return max(180, int(t.get("warm_minutes") or 10) * 60)
+    except (TypeError, ValueError):
+        return 180
+
+
 def _armed_loop():
     """原 gui.GrabTaskForm._tick 的到点自动开抢职责：每 2s 扫一遍抢票任务。"""
     import datetime as _dt
@@ -740,12 +797,11 @@ def _armed_loop():
                 st = launcher_utils.parse_dt(str(t.get("start_time") or ""))
                 if not st:
                     continue
-                if st > now:
+                lead = _armed_prepare_lead(t)
+                if (st - now).total_seconds() > lead:
+                    # 提前 max(3min, warm_minutes) 启动：Grabber 起来后先登录+预热，
+                    # 由 launcher 预热段等到开抢点再下单
                     continue
-                try:
-                    lead = max(0, int(t.get("warm_minutes") or 10)) * 60
-                except (TypeError, ValueError):
-                    lead = 0
                 if (now - st).total_seconds() > max(90, lead):
                     _armed_fired.add(tid)  # 窗口已过，缴械
                     push("log", {"line": "[提示] 任务 %s 开抢窗口已过，自动开抢已缴械" % (t.get("name") or tid), "tag": "warn"})
@@ -986,6 +1042,39 @@ def probe_session(force=False):
     return res
 
 
+_SESSION_WATCH = {"expired_pushed": False}
+
+
+def _session_watch_step(res):
+    """会话看门狗单步：res 为 probe_session() 的结果。
+    返回 (should_push, delay_seconds)。只有「确认失效」的边沿才推一次弹窗事件，
+    推过之后转 30 分钟长节拍（失效期少开真实浏览器复核），恢复（ok）即复位。"""
+    if res.get("ok"):
+        _SESSION_WATCH["expired_pushed"] = False
+        return False, 60
+    if res.get("unknown") or not res.get("permanent"):
+        return False, 60
+    if not _SESSION_WATCH["expired_pushed"]:
+        _SESSION_WATCH["expired_pushed"] = True
+        return True, 1800
+    return False, 1800
+
+
+def _session_watch_loop():
+    """会话看门狗线程：探测 12306 登录态，确认失效时向前端推 sessionExpired
+    弹窗事件（不重复推，直到会话恢复）。启动即探测一次，之后按 step 的节拍。"""
+    while True:
+        try:
+            res = probe_session()
+        except Exception:
+            time.sleep(60)
+            continue
+        should_push, delay = _session_watch_step(res)
+        if should_push:
+            push("sessionExpired", {"message": res.get("message") or "登录已失效"})
+        time.sleep(delay)
+
+
 def rpc_check_session(p):
     p = p or {}
     try:
@@ -995,24 +1084,69 @@ def rpc_check_session(p):
                 "message": str(e), "name": ""}
 
 
-def rpc_relogin(_p):
-    """browser 模式：拉起真实 Edge 滑块（保持旧行为）。"""
+# 登录单飞：设置页「重新登录」/ 失效弹窗「立即登录」/ 头像 doLogin 三个入口都能发
+# relogin。登录窗口还开着时再点一次，旧代码会白开第二支浏览器（还要抢同一把
+# profile 锁，login 的 lock_timeout=90，把真正那次一起拖慢）。非阻塞占用即互斥。
+_LOGIN_GUARD = threading.Lock()
+
+
+def rpc_relogin(p):
+    """browser 模式：会话还活着就先说清楚，真需要人工验证才拉起真实 Edge 滑块。
+
+    为什么先预检：会话有效时 login() 2 秒就判定成功并关窗，用户只看到窗口一闪，
+    会当成「拉起登录失败」；而 login() 抢不到 profile 锁要干等 lock_timeout 秒，
+    期间界面没有任何反馈。预检走快路（cookie 打接口），不碰浏览器。
+    p.force=True 跳过预检强制重登（界面「重新登录」按钮确认后走这条）。
+
+    同一时刻只允许一次登录：进行中再点返回 running=True，由界面提示等待。
+    """
     import threading as _th
+    p = p or {}
+    if not _LOGIN_GUARD.acquire(blocking=False):
+        return {"ok": True, "running": True,
+                "message": "登录窗口已经打开了，请先在浏览器里完成验证"}
 
-    def _do():
-        try:
-            # login() 返回 False 是「超时/取消」，别把没成功也报成已完成
-            ok = bool(browser_order.login())
-            push("log", {"line": "[会话] 重新登录成功" if ok else "[错误] 重新登录未完成（超时或已取消）",
-                         "tag": "ok" if ok else "err"})
-        except Exception as e:
-            ok = False
-            push("log", {"line": "[错误] 重新登录失败：%s" % e, "tag": "err"})
-        reset_session_cache()          # 下一次探测重新验，不用等缓存过期
-        push("session", {"ok": ok})
+    started = False
+    try:
+        if not p.get("force"):
+            try:
+                res = probe_session(force=True)
+            except Exception as e:
+                _warn("重新登录预检", e)
+                res = {}
+            if res.get("ok"):
+                try:
+                    who = launcher_utils.mask_mobile(res.get("name") or "") or "已登录"
+                except Exception:
+                    who = res.get("name") or "已登录"
+                push("log", {"line": "[会话] 会话仍然有效（%s），无需重新登录" % who, "tag": "ok"})
+                push("session", {"ok": True})
+                return {"ok": True, "already": True, "name": who,
+                        "message": "当前已登录（%s），无需重新登录" % who}
 
-    _th.Thread(target=_do, daemon=True).start()
-    return {"ok": True, "message": "已拉起浏览器，等待人工完成验证"}
+        def _do():
+            try:
+                push("log", {"line": "[会话] 正在拉起登录窗口，请在浏览器里扫码或账密+滑块完成验证…",
+                             "tag": "info"})
+                try:
+                    # login() 返回 False 是「超时/取消」，别把没成功也报成已完成
+                    ok = bool(browser_order.login())
+                    push("log", {"line": "[会话] 重新登录成功" if ok else "[错误] 重新登录未完成（超时或已取消）",
+                                 "tag": "ok" if ok else "err"})
+                except Exception as e:
+                    ok = False
+                    push("log", {"line": "[错误] 重新登录失败：%s" % e, "tag": "err"})
+                reset_session_cache()          # 下一次探测重新验，不用等缓存过期
+                push("session", {"ok": ok})
+            finally:
+                _LOGIN_GUARD.release()         # 必须复位，否则再也登不上
+
+        _th.Thread(target=_do, daemon=True).start()
+        started = True
+        return {"ok": True, "message": "已拉起浏览器，等待人工完成验证"}
+    finally:
+        if not started:
+            _LOGIN_GUARD.release()
 
 
 def rpc_get_account(_p):
@@ -1043,6 +1177,97 @@ def rpc_get_account(_p):
 def rpc_list_history(p):
     limit = int(p.get("limit") or 200)
     return {"records": read_history_records(limit)}
+
+
+def rpc_reconcile_history(p):
+    """把历史里「本地没确认到」的记录与 12306 官方订单对一次账。
+
+    只回答一个问题：这些记录背后平台到底有没有订单。
+    不下单、不支付、不取消、不改 state.json / 防重记录、不动引擎轮询。
+    """
+    limit = min(200, max(1, int(p.get("limit") or 50)))
+    path = appcommon.history_path_of(load_config(), HERE)
+
+    todo = ("failed", "ambiguous", "browser_dead")
+    targets = [r for r in appcommon.read_history_records(path, limit=limit)
+               if isinstance(r, dict)
+               and r.get("result") in todo
+               and not r.get("reconciled_at")
+               and (r.get("date") or "").strip()]
+    if not targets:
+        return {"ok": True, "checked": 0, "changed": 0,
+                "message": "没有需要核对的记录"}
+
+    try:
+        sess = order_mod.session_from_browser_state()
+    except Exception as e:
+        return {"ok": False,
+                "message": "读不到登录会话（%s）。请先在界面点「重新登录」后再核对。" % e}
+
+    # 按乘车日期分组：一个日期只打一次官方接口（12306 限流）
+    by_date = {}
+    for r in targets:
+        by_date.setdefault(r["date"], []).append(r)
+
+    # ponytail: 用 (time, date, train) 当定位键。同一秒同车次重复下单的概率
+    # 可以忽略；真出现了也是同一份结论，不会写错值。
+    outcome = {}
+    errors = []
+    for date, group in by_date.items():
+        try:
+            orders = order_mod.check_existing_orders(sess, date)
+        except Exception as e:
+            errors.append("%s：%s" % (date, e))
+            continue
+        for r in group:
+            outcome[(r.get("time"), date, r.get("train"))] = \
+                order_mod._classify_orders(date, r.get("train") or "",
+                                           r.get("passengers") or [], orders)
+
+    if not outcome:
+        return {"ok": False, "checked": 0, "changed": 0, "errors": errors,
+                "message": "官方订单查询全部失败，未做任何改动"}
+
+    changed = 0
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with filelock.file_lock(path + ".lock", timeout=10):
+            # 锁内重读：引擎随时往这个文件 append，用锁外读到的快照写回会吃掉新记录
+            with open(path, encoding="utf-8-sig") as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                return {"ok": False, "message": "order_history.json 结构异常，已放弃写回"}
+            for rec in history:
+                if not isinstance(rec, dict):
+                    continue
+                rid = (rec.get("time"), rec.get("date"), rec.get("train"))
+                if rid not in outcome or rec.get("reconciled_at"):
+                    continue
+                cls, ono, raw = outcome[rid]
+                rec["reconciled_cls"] = cls
+                if raw:
+                    rec["reconciled_raw"] = raw
+                rec["reconciled_at"] = now
+                if cls in ("unpaid", "paid"):
+                    # 关键改判：平台有单，本地记的「失败」是假的
+                    rec["reconciled_from"] = rec.get("result") or ""
+                    rec["result"] = ("confirmed_unpaid" if cls == "unpaid"
+                                     else "confirmed_paid")
+                    if ono:
+                        rec["order_no"] = ono
+                    changed += 1
+            appcommon.atomic_write_json(path, history)
+    except TimeoutError:
+        return {"ok": False, "message": "历史文件正被其它进程写入，请稍后再试"}
+    except Exception as e:
+        return {"ok": False, "message": "写回历史失败：%s" % e}
+
+    msg = "核对 %d 条，更新 %d 条" % (len(targets), changed)
+    if errors:
+        msg += "；%d 个日期查询失败" % len(errors)
+    push("log", {"line": "[对账] " + msg, "tag": "info"})
+    return {"ok": True, "checked": len(targets), "changed": changed,
+            "errors": errors, "message": msg}
 
 
 # ---------------- 设置（SMTP + 会话 + order_mode） ----------------
@@ -1170,6 +1395,7 @@ METHODS = {
     "relogin": rpc_relogin,
     "getAccount": rpc_get_account,
     "listHistory": rpc_list_history,
+    "reconcileHistory": rpc_reconcile_history,
     "getSettings": rpc_get_settings,
     "saveSettings": rpc_save_settings,
     "testEmail": rpc_test_email,
@@ -1217,6 +1443,18 @@ def main():
     threading.Thread(target=log_pump, daemon=True).start()
     # 抢票任务到点自动开抢调度（原 gui._tick）
     threading.Thread(target=_armed_loop, daemon=True).start()
+    # 会话看门狗：登录失效弹窗提醒（不靠引擎体检才发现）
+    threading.Thread(target=_session_watch_loop, daemon=True).start()
+    # 启动软件即启动监控引擎（config.json: auto_start_engine=false 可关）。
+    # 必须接住异常：get_engine() 里会 load_station_map()（首次要联网）、读 config，
+    # 任何一处抛出去就是「后端起不来 → main.js 立刻重启 → 无限崩溃循环」，
+    # 而且此刻 ready 还没发，界面只会看到一片空白。
+    try:
+        _auto_start_engine()
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        push("log", {"line": "[错误] 监控引擎启动失败：%s: %s" % (type(e).__name__, e),
+                     "tag": "err"})
     push("ready", {"pid": os.getpid()})
     for line in sys.stdin:
         rpc_dispatch(line)

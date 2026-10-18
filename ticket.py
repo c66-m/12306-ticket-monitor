@@ -356,7 +356,10 @@ def get_session():
             if _SESSION is None:
                 s = requests.Session()
                 s.headers.update(BASE_HEADERS)
-                s.get("https://kyfw.12306.cn/otn/leftTicket/init", timeout=15)
+                # 40 秒不是拍脑袋：2026-10-17 实测本机 leftTicket/init 首次 30.2 秒
+                # 才回包（二次直接 122 秒超时），旧的 15 秒意味着每次冷启动建会话
+                # 都注定超时，白等 15 秒还拿不到 JSESSIONID。
+                s.get("https://kyfw.12306.cn/otn/leftTicket/init", timeout=40)
                 _SESSION = s
     return _SESSION
 

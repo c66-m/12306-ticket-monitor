@@ -848,8 +848,7 @@ def menu_history():
         print("  [警告] 购票历史文件格式损坏（期望为列表），已按空历史展示。")
         history = []
     print("\n===== 购票历史与通知记录（共 %d 条） =====" % len(history))
-    label = {"success": "下单成功", "dup": "防重跳过", "failed": "下单失败",
-             "hit_no_order": "命中未下单"}
+    label = appcommon.HISTORY_RESULT_LABEL
     dropped_names = 0
     dropped_records = 0
     for r in reversed(history[-50:]):
@@ -944,8 +943,17 @@ def menu_notify():
     # 无锁死风险；非 Windows 无 DPAPI 时按 Task 63a 口径记 error 明示，
     # 不再静默明文保存。非字符串（手改配置脏数据）原样透传，不在此处崩。
     pw_to_store = new_pw or old_pw
-    email["password"] = notify_mod.protect_secret(pw_to_store) \
-        if isinstance(pw_to_store, str) else pw_to_store
+    if isinstance(pw_to_store, str):
+        stored = notify_mod.protect_secret(pw_to_store)
+        email["password"] = stored
+        # ponytail: DPAPI 不可用时 protect_secret 会回退明文（passengers.py:186-189），
+        # 原来只在日志里记一条 error，用户看到的仍是「已设置（加密保存）」——虚假保证。
+        # 这里把真相说出来。要彻底杜绝得改成拒绝保存或引入主密码，代价是牺牲
+        # 无 DPAPI 环境（非 Windows / 受限令牌 / 域漫游配置）的可用性。
+        if pw_to_store and not stored.startswith(notify_mod._DPAPI_PREFIX):
+            print("  [警告] 本机无法加密授权码，将以明文写入 config.json。")
+    else:
+        email["password"] = pw_to_store
     from_addr = read("  发件人地址（回车=发件邮箱）：", "")
     if from_addr is None:
         # Ctrl+C/EOF：取消本次修改（同上，不消化为"保留旧值"；Task 97e）。

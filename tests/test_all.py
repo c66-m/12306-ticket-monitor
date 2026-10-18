@@ -1248,6 +1248,55 @@ class TestEngineFlow(TempDirCase):
                           expect_status="monitoring")
         self.assertNotIn("ACCOUNT_DUP", set(e.state["dedup"].values()))
 
+    def test_dup_none_streak_stops_after_3(self):
+        # 网页端反复判 dup 但官方查无此单（如「取消次数过多」当日封禁）：
+        # 连击 3 次后停任务交人工，防止无限重下刷封禁/烧账号信用。
+        # make_engine 每轮全新空 state，跨轮连击必须同一实例连跑 3 轮。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(False, "已有订单", {"reason": "dup"})), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("none", "", "未找到", None)), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            for _ in range(3):
+                e._run_task(t)
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "failed")
+        self.assertEqual(e.state.get("dup_streak", {}), {})
+
+    def test_dup_none_streak_reset_by_unpaid(self):
+        # 中途官方能看到单（如 unpaid 旧单）：连击态清零，不会误停。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(False, "已有订单", {"reason": "dup"})), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("none", "", "未找到", None)), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            e._run_task(t)
+        self.assertEqual(len(e.state.get("dup_streak", {})), 1)
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(False, "已有订单", {"reason": "dup"})), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付", None)), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            e._run_task(t)
+        self.assertEqual(e.state.get("dup_streak", {}), {})
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "success")
+
     def test_dup_paid_stops_as_success(self):
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
                                return_value=("paid", "E9", "已支付", None)):
@@ -1345,6 +1394,70 @@ class TestEngineFlow(TempDirCase):
             broke, rec = e._run_task(t)
         self.assertTrue(broke and rec)
         self.assertGreaterEqual(e.state["tasks"][t["name"]]["fail_streak"], 1)
+
+    def test_browser_dead_official_none_stops(self):
+        # 问题一：浏览器窗口异常关闭 + 官方回读确认无本次订单 → 停止自动重试，
+        # 不再按普通失败每轮重开窗口（旧行为=无限 [重试] 循环）
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("none", "", "未找到", None)) as mq:
+            e = self._run((False, "浏览器窗口异常关闭: TargetClosedError: Target closed",
+                           {"reason": "browser_dead"}),
+                          expect_status="failed")
+        self.assertEqual(mq.call_count, 1)
+        hist = json.load(open(e.history_path, encoding="utf-8"))
+        self.assertEqual(hist[-1]["result"], "browser_dead")
+
+    def test_browser_dead_official_unpaid_recent_is_success(self):
+        # 窗口死了但官方显示本次已生成未支付订单：如实捞回来报成功，防重复下单
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付",
+                                             {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
+            e = self._run((False, "浏览器窗口异常关闭: TargetClosedError: Target closed",
+                           {"reason": "browser_dead"}),
+                          expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
+        hist = json.load(open(e.history_path, encoding="utf-8"))
+        self.assertEqual(hist[-1]["result"], "success")
+
+    def test_browser_dead_official_error_stops(self):
+        # 窗口死了且官方回读失败/状态不明 → 保守停任务交人工，绝不盲重试
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("error", "", "官方订单查询失败", None)):
+            e = self._run((False, "浏览器窗口异常关闭: TargetClosedError: Target closed",
+                           {"reason": "browser_dead"}),
+                          expect_status="failed")
+        hist = json.load(open(e.history_path, encoding="utf-8"))
+        self.assertEqual(hist[-1]["result"], "browser_dead")
+
+    def test_browser_dead_classify_raises_stops(self):
+        # 官方回读本身抛异常：同样保守停，不能让异常穿透 _run_task
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               side_effect=RuntimeError("查询炸了")):
+            e = self._run((False, "浏览器窗口异常关闭: TargetClosedError: Target closed",
+                           {"reason": "browser_dead"}),
+                          expect_status="failed")
+        hist = json.load(open(e.history_path, encoding="utf-8"))
+        self.assertEqual(hist[-1]["result"], "browser_dead")
+
+    def test_pause_before_order_prevents_submit(self):
+        # 问题二：查询命中的瞬间任务被暂停（用户在轮询期间点了暂停），
+        # 下单发起前的再检必须拦下这次提交——覆盖 _run_task 里
+        # attempt_ts 前的 task_status 再检（入口 896 查不到这个时序）
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+
+        def query_then_pause(*a, **k):
+            e.state["tasks"][t["name"]]["status"] = "paused"
+            return [synthetic_row()]
+
+        with mock.patch.object(e, "_query_with_retry",
+                               side_effect=query_then_pause) as q,              mock.patch.object(engine_mod.order_mod, "order_ticket") as m_order:
+            broke, rec = e._run_task(t)
+        m_order.assert_not_called()
+        self.assertEqual(q.call_count, 1)
+        self.assertFalse(broke and rec)
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "paused")
 
 
 class TestLauncherIntegration(TempDirCase):
@@ -2863,6 +2976,57 @@ class TestTrainCodeCase(TempDirCase):
         self.assertIn("K225", out)
 
 
+class TestPerTaskAutoOrder(TempDirCase):
+    """任务级「自动下单」开关：api 列表接口要回传该字段，且编辑保存能改回来。
+
+    旧症状：任务存着 auto_order=false 时界面不显示任何迹象，命中余票只记
+    history + 发邮件（engine._run_task 的 not auto_order 分支）→「有票没反应」。
+    """
+
+    def _cfg(self):
+        return {"tasks": [
+            {"name": "长葛-郑州 K262 硬座/无座", "from": "长葛", "to": "郑州",
+             "trains": ["K262"], "seat_types": ["硬座"], "auto_order": False},
+            {"name": "默认任务", "from": "北京", "to": "上海",
+             "trains": ["G101"], "seat_types": ["二等座"]},
+        ]}
+
+    def test_list_monitor_tasks_exposes_auto_order(self):
+        import api
+        with mock.patch.object(api, "load_config", return_value=self._cfg()):
+            out = api.rpc_list_monitor_tasks({})
+        by = {t["name"]: t for t in out["tasks"]}
+        self.assertFalse(by["长葛-郑州 K262 硬座/无座"]["auto_order"])
+        # 缺省按引擎口径视为开启（engine._run_task: task.get("auto_order", True)）
+        self.assertTrue(by["默认任务"]["auto_order"])
+
+    def test_form_payload_switches_auto_order_on(self):
+        import api
+        cfg = self._cfg()
+        cfg["tasks"] = [cfg["tasks"][0]]
+        with mock.patch.object(api, "load_config", return_value=cfg), \
+             mock.patch.object(api, "load_state", return_value={}), \
+             mock.patch.object(api, "start_engine") as m_eng, \
+             mock.patch.object(api.launcher, "append_monitor_task"):
+            r = api.rpc_create_task({
+                "from": "长葛", "to": "郑州", "dates": ["2026-10-16"],
+                "trains": ["K262"], "seat_types": ["硬座"],
+                "passengers": ["王小明"], "auto_order": True, "start_now": False})
+            # 编辑时前端传 start_now=false：保存不等于启动引擎
+            r2 = api.rpc_create_task({"from": "长葛", "to": "郑州",
+                                     "dates": ["2026-10-16"], "seat_types": ["硬座"],
+                                     "passengers": ["王小明"], "auto_order": False,
+                                     "start_now": False})
+        self.assertTrue(r["ok"] and r2["ok"])
+        self.assertFalse(m_eng.called)
+
+    def test_build_monitor_task_keeps_auto_order(self):
+        t = launcher.build_monitor_task("长葛", "郑州", ["2026-10-16"], [],
+                                       ["K262"], ["硬座"], ["王小明"],
+                                       "ADULT", True, False, 5)
+        self.assertTrue(t["auto_order"])
+
+
 class TestSessionCheckTransient(TempDirCase):
     """Task 39: 浏览器分支会话体检区分 transient/permanent。
 
@@ -2984,6 +3148,576 @@ class TestSessionCheckTransient(TempDirCase):
                                return_value=(False, portal)):
             e.check_session_if_needed()
         self.assertEqual(e.task_status(t), "failed")
+
+
+class TestEngineIdleKeepalive(TempDirCase):
+    """保活三件套：浏览器模式待命（无活动任务）也体检会话，失效只告警不标任务。"""
+
+    def _idle_engine(self):
+        e = make_engine(self.tmp)
+        e.config["order_mode"] = "browser"
+        t = task_of("t1")
+        e.tasks = [t]
+        e.state["tasks"]["t1"] = {"status": "paused"}
+        e._last_session_check = 0
+        return e, t
+
+    def test_idle_still_checks_session(self):
+        e, t = self._idle_engine()
+        with mock.patch.object(browser_order, "busy", return_value=False), \
+             mock.patch.object(browser_order, "check_session",
+                               return_value=(True, "王小明")) as cs:
+            e.check_session_if_needed()
+        cs.assert_called_once()
+
+    def test_idle_permanent_only_logs(self):
+        e, t = self._idle_engine()
+        with mock.patch.object(browser_order, "busy", return_value=False), \
+             mock.patch.object(browser_order, "check_session",
+                               return_value=(False, "已跳转登录门户")), \
+             mock.patch.object(browser_order, "session_failure_is_permanent",
+                               return_value=True):
+            e.check_session_if_needed()
+        self.assertEqual(e.task_status(t), "paused")
+
+
+class TestTask101ReloginPrecheck(unittest.TestCase):
+    """Task 101：relogin 预检 —— 会话有效不拉窗口，force 才强制重登。
+
+    背景：会话有效时 login() 约 2 秒判定成功并关窗，用户只看到窗口一闪，
+    当成「拉起登录失败」；抢不到 profile 锁还要干等 lock_timeout 秒且无反馈。
+    """
+
+    def _run(self, params, probe_res, wait_login=True):
+        import api
+        calls = {"login": 0}
+
+        def _fake_login(*_a, **_k):
+            calls["login"] += 1
+            return True
+
+        with mock.patch.object(api, "probe_session", return_value=probe_res) as pr, \
+             mock.patch.object(api.browser_order, "login", side_effect=_fake_login), \
+             mock.patch.object(api, "push"):
+            res = api.rpc_relogin(params)
+            if wait_login:
+                # 等登录线程真正收尾（guard 释放）：否则下一个 case 可能撞上
+                # 「登录进行中」的 running 分支
+                deadline = time.time() + 2.0
+                while api._LOGIN_GUARD.locked() and time.time() < deadline:
+                    time.sleep(0.02)
+        return res, calls, pr
+
+    def test_alive_session_skips_browser(self):
+        # RED on old code: 老实现无条件拉起浏览器，用户看到窗口一闪就报失败
+        res, calls, _ = self._run({}, {"ok": True, "name": "王小明"}, wait_login=False)
+        self.assertTrue(res.get("already"))
+        self.assertEqual(calls["login"], 0)
+        self.assertIn("无需重新登录", res.get("message", ""))
+
+    def test_force_skips_precheck_and_launches(self):
+        res, calls, pr = self._run({"force": True}, {"ok": True, "name": "王小明"})
+        pr.assert_not_called()
+        self.assertEqual(calls["login"], 1)
+        self.assertFalse(res.get("already"))
+
+    def test_dead_session_launches_browser(self):
+        res, calls, _ = self._run({}, {"ok": False, "unknown": False, "message": "已跳转登录门户"})
+        self.assertEqual(calls["login"], 1)
+        self.assertFalse(res.get("already"))
+
+class TestReloginSingleFlight(unittest.TestCase):
+    """relogin 单飞：登录窗口已开着时再点任意入口，只回提示，不开第二支浏览器。
+
+    背景（2026-10-17 实测日志）：19:52:27 与 19:52:33 连着两行「重新登录成功」，
+    中间隔 5 秒。设置页按钮 / 失效弹窗 / 头像三个入口都能发 relogin，且无互斥；
+    多出的那次还要抢 profile 锁（login 的 lock_timeout=90），把真正那次拖慢。
+    """
+
+    def test_second_relogin_while_inflight_returns_running(self):
+        import api
+        gate = threading.Event()
+        calls = {"login": 0}
+
+        def _blocking_login(*_a, **_k):
+            calls["login"] += 1
+            gate.wait(5)
+            return True
+
+        with mock.patch.object(api.browser_order, "login", side_effect=_blocking_login), \
+                mock.patch.object(api, "probe_session", return_value={"ok": False}), \
+                mock.patch.object(api, "push"):
+            try:
+                first = api.rpc_relogin({"force": True})
+                self.assertFalse(first.get("running"), "第一次应当真的拉起登录")
+                deadline = time.time() + 3
+                while not calls["login"] and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertEqual(calls["login"], 1, "登录线程没起来")
+                second = api.rpc_relogin({"force": True})
+                self.assertTrue(second.get("running"), "登录进行中再点必须回 running")
+                self.assertIn("已经打开", second.get("message", ""))
+                self.assertEqual(calls["login"], 1, "不得开第二支浏览器")
+            finally:
+                gate.set()
+                deadline = time.time() + 3
+                third = None
+                while time.time() < deadline:
+                    third = api.rpc_relogin({"force": True})
+                    if not third.get("running"):
+                        break
+                    time.sleep(0.05)
+                self.assertFalse((third or {}).get("running"),
+                                 "登录收尾后 guard 必须复位，否则再也登不上")
+
+
+class _FakePage:
+    def __init__(self):
+        self.url = "about:blank"
+
+    def goto(self, *_a, **_k):
+        pass
+
+    def route(self, *_a, **_k):
+        pass
+
+
+class _FakeCtx:
+    def __init__(self):
+        self.pages = [_FakePage()]
+
+    def cookies(self):
+        return []
+
+    def new_page(self):
+        return _FakePage()
+
+    def close(self):
+        pass
+
+
+class _FakePlaywright:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+class _FakeClock:
+    """login 轮询用的假时钟 + 假 sleep：毫秒级跑完整个超时循环。"""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def time(self):
+        self.now += 0.6
+        return self.now
+
+    def monotonic(self):   # _ProfileLock.acquire 的 deadline 走 monotonic
+        self.now += 0.6
+        return self.now
+
+    def sleep(self, sec):
+        self.slept.append(sec)
+
+
+class TestLoginPollLoopIdle(unittest.TestCase):
+    """login() 不传 stop_event 时也要有节拍，不能忙等空转。
+
+    旧代码只有 `if stop_event is not None and stop_event.wait(1)`：rpc_relogin
+    调 login() 不传 stop_event → 循环里一次 sleep 都没有。后果是占满一个核，并在
+    登录途中每 2 秒打一次官方校验接口（12306 限流，识别反而变慢）。
+    """
+
+    def test_poll_loop_yields_without_stop_event(self):
+        import browser_order as bo
+        clock = _FakeClock()
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "poll.lock"))
+        try:
+            with mock.patch.object(bo, "time", clock), \
+                    mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: _FakeCtx()), \
+                    mock.patch.object(bo, "session_ok", lambda _ctx, page=None: (False, "")), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertFalse(bo.login(timeout_sec=3))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertTrue(clock.slept, "无 stop_event 的轮询必须 sleep，否则忙等空转")
+        self.assertGreaterEqual(len(clock.slept), 2, "每轮迭代都该有节拍")
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_poll_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
+class _RecordingPage(_FakePage):
+    def __init__(self):
+        _FakePage.__init__(self)
+        self.gotos = []
+
+    def goto(self, url, **kw):
+        self.gotos.append((url, kw))
+
+
+class TestLoginGotoFastLoad(unittest.TestCase):
+    """login() 的登录页导航必须用 domcontentloaded，不能等 load。
+
+    12306 登录页要拉滑块脚本和一堆第三方资源，默认 wait_until="load" 让窗口
+    白屏好几秒（session_ok 早就为同一原因改成 domcontentloaded 了）。
+    """
+
+    def test_login_page_goto_waits_domcontentloaded_only(self):
+        import browser_order as bo
+        page = _RecordingPage()
+        ctx = _FakeCtx()
+        ctx.pages = [page]
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "goto.lock"))
+        try:
+            with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
+                    mock.patch.object(bo, "session_ok",
+                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _ctx: None), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertTrue(bo.login(timeout_sec=5))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertEqual(page.gotos[0][0], bo.LOGIN_URL)
+        self.assertEqual(page.gotos[0][1].get("wait_until"), "domcontentloaded",
+                         "登录页导航别等 load，否则窗口白屏")
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_goto_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
+class _RouteRecordingPage(_RecordingPage):
+    """记录 page.route 注册的回调，好手动喂假请求验证拦截规则。"""
+
+    def __init__(self):
+        _RecordingPage.__init__(self)
+        self.routes = []
+
+    def route(self, pattern, handler):
+        self.routes.append((pattern, handler))
+
+
+class _StubRequest:
+    def __init__(self, rtype):
+        self.resource_type = rtype
+        self.url = "https://kyfw.12306.cn/otn/resources/login.html"
+
+
+class _StubRoute:
+    def __init__(self):
+        self.calls = []
+
+    def continue_(self):
+        self.calls.append("continue")
+
+    def abort(self):
+        self.calls.append("abort")
+
+
+class TestLoginNoRedundantReload(unittest.TestCase):
+    """登录窗口必须一出现就停在登录页，不能再「刷」一下。
+
+    2026-10-17 实测：12306 登录页自身 40 秒内零导航、零周期请求（framenavigated
+    和 xhr 都是空的），能刷的只有我们自己这一次导航——普通启动先给 about:blank，
+    再 goto 登录页，用户看到的就是页面重载。--app= 让首个窗口直接落在登录页上。
+    """
+
+    def test_login_launches_app_window_on_login_page(self):
+        import browser_order as bo
+        seen = {}
+        ctx = _FakeCtx()
+
+        def _fake_launch(_p, headless=False, extra_args=None):
+            seen["extra"] = list(extra_args or [])
+            return ctx
+
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "app.lock"))
+        try:
+            with mock.patch.object(bo, "launch", _fake_launch), \
+                    mock.patch.object(bo, "session_ok",
+                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _ctx: None), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertTrue(bo.login(timeout_sec=5))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertIn("--app=" + bo.LOGIN_URL, seen.get("extra", []),
+                      "登录窗口必须用 --app= 直接落在登录页，否则先出现空白再跳转")
+
+    def test_login_skips_goto_when_already_on_login_page(self):
+        import browser_order as bo
+        page = _RecordingPage()
+        page.url = bo.LOGIN_URL
+        ctx = _FakeCtx()
+        ctx.pages = [page]
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "reload.lock"))
+        try:
+            with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
+                    mock.patch.object(bo, "session_ok",
+                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _ctx: None), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertTrue(bo.login(timeout_sec=5))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertEqual(page.gotos, [],
+                         "已在登录页还导航，就是把用户填了一半的表单刷掉")
+
+    def test_login_still_navigates_from_blank_page(self):
+        import browser_order as bo
+        page = _RecordingPage()          # url 默认 about:blank
+        ctx = _FakeCtx()
+        ctx.pages = [page]
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "reload2.lock"))
+        try:
+            with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
+                    mock.patch.object(bo, "session_ok",
+                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _ctx: None), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertTrue(bo.login(timeout_sec=5))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertEqual([g[0] for g in page.gotos], [bo.LOGIN_URL],
+                         "空白页必须导航到登录页，否则窗口停在 about:blank")
+
+    def _run_with_page(self, page, lockname):
+        """跑一次 login，返回它挂在登录页上的 nav 拦截回调。"""
+        import browser_order as bo
+        ctx = _FakeCtx()
+        ctx.pages = [page]
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), lockname))
+        try:
+            with mock.patch.object(bo, "launch",
+                                   lambda _p, headless=False, extra_args=None: ctx), \
+                    mock.patch.object(bo, "session_ok",
+                                      lambda _ctx, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _ctx: None), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertTrue(bo.login(timeout_sec=5))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertEqual(len(page.routes), 1, "登录页必须挂上整页导航拦截")
+        return page.routes[0][1]
+
+    def test_login_page_cannot_reload_after_first_load(self):
+        page = _RouteRecordingPage()      # about:blank：首次加载要放行
+        handler = self._run_with_page(page, "guard1.lock")
+        first, second = _StubRoute(), _StubRoute()
+        handler(first, _StubRequest("document"))
+        handler(second, _StubRequest("document"))
+        self.assertEqual(first.calls, ["continue"])
+        self.assertEqual(second.calls, ["abort"],
+                         "登录页的第二次整页加载必须掐掉，否则扫码状态清零")
+
+    def test_login_page_blocks_navigation_when_already_on_login_url(self):
+        import browser_order as bo
+        page = _RouteRecordingPage()
+        page.url = bo.LOGIN_URL          # --app= 窗口：页面已经加载好了
+        handler = self._run_with_page(page, "guard2.lock")
+        r = _StubRoute()
+        handler(r, _StubRequest("document"))
+        self.assertEqual(r.calls, ["abort"],
+                         "已在登录页时任何整页导航都要挡住")
+        xhr = _StubRoute()
+        handler(xhr, _StubRequest("xhr"))
+        self.assertEqual(xhr.calls, ["continue"],
+                         "checkqr 之类的接口轮询必须放行，否则扫码确认收不到")
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_reload_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
+class TestLoginQueueNotice(unittest.TestCase):
+    """抢 profile 锁排队时必须先说话。
+
+    旧代码 @_exclusive(lock_timeout=90) 静默干等：引擎在体检/下单时点「重新登录」，
+    界面 90 秒没有任何反馈，用户当成卡死直接关程序（2026-10-17 实测 46 秒静默）。
+    """
+
+    def _run(self, busy):
+        import browser_order as bo
+        logs = []
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "queue.lock"))
+        try:
+            with mock.patch.object(bo, "busy", return_value=busy), \
+                    mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: _FakeCtx()), \
+                    mock.patch.object(bo, "session_ok",
+                                      lambda _c, page=None: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _c: None), \
+                    mock.patch.object(bo, "_log", lambda line: logs.append(line)), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                # lock_timeout 仍要能当关键字传：launcher.py:336 传 lock_timeout=120
+                ok = bo.login(timeout_sec=5, lock_timeout=30)
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        return ok, logs
+
+    def test_queue_notice_when_browser_busy(self):
+        ok, logs = self._run(True)
+        self.assertTrue(ok)
+        self.assertTrue(any("排队" in s for s in logs),
+                        "浏览器忙时必须提示在排队，实际日志：%r" % (logs,))
+
+    def test_no_queue_notice_when_free(self):
+        ok, logs = self._run(False)
+        self.assertTrue(ok)
+        self.assertFalse(any("排队" in s for s in logs),
+                         "锁空闲时不该打出排队噪声：%r" % (logs,))
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_queue_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
+class TestExpiredDialogReloginForce(unittest.TestCase):
+    """失效弹窗的「立即登录」必须跳过预检（force）。
+
+    这个弹窗只在看门狗已确认会话失效时出现，预检结果必然是「失效」，却要先打
+    一次 HTTP（verify_session timeout=15）再开一次真浏览器复核
+    （api.rpc_relogin → probe_session → _probe_browser_session → check_session），
+    把「拉起登录」拖成几十秒。force 直接进 _do，只开一次浏览器。
+    """
+
+    def test_dialog_button_passes_force(self):
+        with open(os.path.join(HERE, "ui", "app.js"), encoding="utf-8") as f:
+            js = f.read()
+        m = re.search(r"function showSessionExpiredDialog\(.*?\n\}", js, re.S)
+        self.assertIsNotNone(m, "ui/app.js 里找不到 showSessionExpiredDialog")
+        self.assertIn('call("relogin", { force: true })', m.group(0),
+                      "弹窗「立即登录」必须带 force，否则先跑一轮注定失败的预检")
+
+
+class TestSlowEndpointTuning(unittest.TestCase):
+    """两处针对 12306 慢响应的确定性调优（2026-10-17 本机实测）。
+
+    实测：静态 station_name.js 首次 1.1s / 二次 78ms；动态 leftTicket/init
+    首次 30.2s、二次 122s 超时。所以：建会话的超时要容得下 30 秒级响应，
+    浏览器要留住磁盘缓存、关掉后台网络（持久化 profile 的同步/prefetch
+    会跟抢票抢带宽）。
+    """
+
+    def test_ticket_session_init_timeout_tolerates_slow_endpoint(self):
+        import ticket
+        orig = ticket._SESSION
+        self.addCleanup(setattr, ticket, "_SESSION", orig)
+        fake = mock.MagicMock()
+        with mock.patch.object(ticket.requests, "Session", return_value=fake), \
+                mock.patch.object(ticket, "_SESSION", None):
+            ticket.get_session()
+        self.assertTrue(fake.get.called, "建会话必须先 GET leftTicket/init 拿 JSESSIONID")
+        _, kwargs = fake.get.call_args
+        self.assertGreaterEqual(kwargs.get("timeout") or 0, 30,
+                                "init 超时 15 秒容不下 12306 的 30 秒级响应")
+
+    def test_launch_enables_disk_cache_and_disables_background_net(self):
+        import browser_order as bo
+        fake_ctx = mock.MagicMock()
+        fake_chromium = mock.MagicMock()
+        fake_chromium.launch_persistent_context.return_value = fake_ctx
+        fake_p = mock.MagicMock()
+        fake_p.chromium = fake_chromium
+        with mock.patch.object(bo, "STATE_PATH", os.path.join(self._tmp(), "nope.json")):
+            got = bo.launch(fake_p, headless=True)
+        self.assertIs(got, fake_ctx)
+        _, kwargs = fake_chromium.launch_persistent_context.call_args
+        args = " ".join(kwargs.get("args") or [])
+        self.assertIn("--disk-cache-size=", args, "要给磁盘缓存留出空间")
+        self.assertIn("--disable-background-networking", args, "别让后台同步抢带宽")
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_tune_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
+class TestSessionWatchStep(TempDirCase):
+    """保活三件套：会话看门狗失效弹窗只推一次、恢复后复位、unknown 不推。"""
+
+    def test_ok_resets(self):
+        import api
+        api._SESSION_WATCH["expired_pushed"] = True
+        push_now, delay = api._session_watch_step(
+            {"ok": True, "unknown": False, "permanent": True, "message": "王小明"})
+        self.assertFalse(push_now)
+        self.assertEqual(delay, 60)
+        self.assertFalse(api._SESSION_WATCH["expired_pushed"])
+
+    def test_expired_pushes_once(self):
+        import api
+        api._SESSION_WATCH["expired_pushed"] = False
+        bad = {"ok": False, "unknown": False, "permanent": True, "message": "已跳转登录门户"}
+        p1, d1 = api._session_watch_step(bad)
+        p2, d2 = api._session_watch_step(bad)
+        self.assertTrue(p1)
+        self.assertFalse(p2)
+        self.assertEqual((d1, d2), (1800, 1800))
+
+    def test_expired_reset_then_push_again(self):
+        import api
+        api._SESSION_WATCH["expired_pushed"] = False
+        bad = {"ok": False, "unknown": False, "permanent": True, "message": "已跳转登录门户"}
+        self.assertTrue(api._session_watch_step(bad)[0])
+        api._session_watch_step({"ok": True, "unknown": False, "permanent": True, "message": "王小明"})
+        self.assertTrue(api._session_watch_step(bad)[0])
+
+    def test_unknown_no_push(self):
+        import api
+        api._SESSION_WATCH["expired_pushed"] = False
+        p, d = api._session_watch_step(
+            {"ok": False, "unknown": True, "permanent": False, "message": "浏览器正忙"})
+        self.assertFalse(p)
+        self.assertEqual(d, 60)
+
+
+class TestArmedPrepareLead(TempDirCase):
+    """保活三件套：自动开抢提前量 = max(3min, warm_minutes)，异常兜底 180 秒。"""
+
+    def test_uses_warm_minutes(self):
+        import api
+        self.assertEqual(api._armed_prepare_lead({"warm_minutes": 10}), 600)
+
+    def test_floor_three_minutes(self):
+        import api
+        # 下限 3 分钟（180s）；warm_minutes 显式 0 沿用旧语义（or 10 → 默认 10 分钟）
+        self.assertEqual(api._armed_prepare_lead({"warm_minutes": 1}), 180)
+        self.assertEqual(api._armed_prepare_lead({"warm_minutes": 2}), 180)
+        self.assertEqual(api._armed_prepare_lead({"warm_minutes": 0}), 600)
+        self.assertEqual(api._armed_prepare_lead({}), 600)
+
+    def test_bad_value_falls_back(self):
+        import api
+        self.assertEqual(api._armed_prepare_lead({"warm_minutes": "xyz"}), 180)
 
 
 class TestRunTaskStopAware(TempDirCase):
@@ -3283,6 +4017,11 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
             self._clock = clock
             self.qr_submit_clicked = False
             self.submit_order_clicked = False
+            self._state = None        # 测试注入：qr_submit 点击时置 v=True
+            self._wt = 0              # wait_for_timeout 调用计数
+            self._stop_on_wt = None   # 第 N 次 wait_for_timeout 时置 state v=True
+            self._dead_on_wt = None   # 第 N 次 wait_for_timeout 时抛死窗异常
+            self._ok_btns = []        # 旧确认控件回退名单（默认无）
             # 确认窗第 1 轮：倒计时未结束(btn92)；滑块回来后：已启用(btn92s)
             self._qr_states = [
                 {"found": True, "cls": "btn92", "shown": True},
@@ -3297,6 +4036,13 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
 
         def wait_for_timeout(self, ms):
             self._clock.now += ms / 1000.0
+            self._wt += 1
+            if self._dead_on_wt is not None and self._wt >= self._dead_on_wt:
+                raise type("TargetClosedError", (Exception,), {})(
+                    "Target page, context or browser has been closed")
+            if self._stop_on_wt is not None and self._wt >= self._stop_on_wt \
+                    and self._state is not None:
+                self._state["v"] = True
 
         def wait_for_url(self, *a, **k):
             pass
@@ -3323,7 +4069,7 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         def eval_on_selector_all(self, sel, js):
             if sel.startswith("#normal_passenger_id"):
                 return [{"id": "p1", "text": "张三"}]
-            return []  # 旧确认控件回退：没有可点的
+            return self._ok_btns  # 旧确认控件回退：默认没有可点的
 
         @property
         def url(self):
@@ -3344,6 +4090,8 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
             if "qr_submit_id" in js:
                 if "click" in js:
                     self.qr_submit_clicked = True
+                    if self._state is not None:
+                        self._state["v"] = True
                     return None
                 if self._qr_states:
                     return self._qr_states.pop(0)
@@ -3424,7 +4172,7 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         clock = self._Clock()
         page = self._Page(clock)
 
-        def fake_wait_slide_gone(p, sec):
+        def fake_wait_slide_gone(p, sec, stop=None):
             clock.now += 60.0  # 模拟用户手动过滑块花了 60 秒
             return 60.0
 
@@ -3469,6 +4217,144 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         ok, msg, extra, page = self._run_order()
         self.assertTrue(ok, "结果等待应被滑块耗时顺延，实际返回：%r" % (msg,))
         self.assertIn("已提交订单", msg)
+
+    def test_extract_pay_evidence_variants(self):
+        # 支付证据纯函数：锁定位/支付剩余时间两特征各状态全覆盖
+        locked_time = ("席位已锁定，请在提示时间内尽快完成支付，完成网上购票。"
+                       "支付剩余时间：00时19分34秒")
+        self.assertEqual(
+            browser_order._extract_pay_evidence(locked_time),
+            "席位已锁定+支付剩余时间00时19分34秒")
+        self.assertEqual(
+            browser_order._extract_pay_evidence("席位已锁定，请尽快支付"),
+            "席位已锁定")
+        self.assertEqual(
+            browser_order._extract_pay_evidence("支付剩余时间： 23时59分01秒"),
+            "支付剩余时间23时59分01秒")
+        self.assertEqual(browser_order._extract_pay_evidence("普通正文"), "")
+
+    def test_non_pay_order_url_is_ambiguous(self):
+        # 落在未完成订单列表/订单初始化页 ≠ 本次成功：应标 ambiguous
+        # 走官方回读，而不是旧代码那样直接 return True 停机
+        clock = self._Clock()
+        page = self._Page(clock)
+        page.PAY_URL = "https://kyfw.12306.cn/otn/queryOrder/initMyOrderNoComplete"
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page))
+        self.assertFalse(ok)
+        self.assertEqual(extra.get("reason"), "ambiguous")
+
+    def test_pay_url_extra_carries_pay_evidence(self):
+        # 付款页 URL 成功返回的 extra 必须带 page_kind 与 pay_evidence 键
+        ok, msg, extra, page = self._run_order()
+        self.assertTrue(ok)
+        self.assertEqual(extra.get("page_kind"), "payOrder")
+        self.assertIn("pay_evidence", extra)
+
+    # ---------- 方案A：should_stop 与 browser_dead ----------
+    def _run_stopped(self, stop_on_wt, qr_states=None, page_url=None):
+        """通用停止场景：第 stop_on_wt 次 wait_for_timeout 前置停止标志。"""
+        clock = self._Clock()
+        page = self._Page(clock)
+        state = {"v": False}
+        page._state = state
+        page._stop_on_wt = stop_on_wt
+        if qr_states is not None:
+            page._qr_states = qr_states
+        if page_url is not None:
+            page.PAY_URL = page_url
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock), \
+             mock.patch.object(browser_order, "_wait_slide_gone",
+                               side_effect=lambda p, sec, stop=None: 0.5):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page), should_stop=lambda: state["v"])
+        return ok, msg, extra, page
+
+    def test_stop_before_confirm_click_is_user_stopped(self):
+        # 确认窗第 1 轮就置停：qr_submit 从未被点，必须 user_stopped 且不记账失败
+        ok, msg, extra, page = self._run_stopped(stop_on_wt=1)
+        self.assertFalse(ok)
+        self.assertEqual(extra.get("reason"), "user_stopped")
+        self.assertFalse(page.qr_submit_clicked,
+                         "置停后绝不能再点确认按钮（重复下单窗口）")
+
+    def test_stop_after_confirm_click_is_ambiguous(self):
+        # 确认已点出去（第 2 轮 btn92s）后置停：结果未知，必须 ambiguous 交官方回读
+        ok, msg, extra, page = self._run_stopped(stop_on_wt=3)
+        self.assertFalse(ok)
+        self.assertEqual(extra.get("reason"), "ambiguous")
+        self.assertTrue(page.qr_submit_clicked)
+
+    def test_stop_in_result_wait_after_confirm_is_ambiguous(self):
+        # 结果等待期间置停且确认已点：同样 ambiguous 交官方回读，不盲重试
+        ok, msg, extra, page = self._run_stopped(stop_on_wt=9)
+        self.assertFalse(ok)
+        self.assertEqual(extra.get("reason"), "ambiguous")
+        self.assertTrue(page.qr_submit_clicked)
+
+    def test_stop_in_result_wait_before_confirm_is_user_stopped(self):
+        # 结果等待期间置停但从未点确认（按钮一直 btn92 禁用态）：user_stopped
+        ok, msg, extra, page = self._run_stopped(
+            stop_on_wt=30,
+            qr_states=[{"found": True, "cls": "btn92", "shown": True}] * 80)
+        self.assertFalse(ok)
+        self.assertEqual(extra.get("reason"), "user_stopped")
+        self.assertFalse(page.qr_submit_clicked)
+
+    def test_dead_window_unclicked_is_browser_dead(self):
+        # 确认窗按钮始终禁用（btn92）期间窗口死亡：_order_impl 内层 except
+        # 必须归一为 browser_dead，不再伪装普通失败（问题一）
+        clock = self._Clock()
+        page = self._Page(clock)
+        page._qr_states = [{"found": True, "cls": "btn92", "shown": True}] * 20
+        page._dead_on_wt = 3
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock), \
+             mock.patch.object(browser_order, "_wait_slide_gone",
+                               side_effect=lambda p, sec, stop=None: 0.5):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page))
+        self.assertFalse(ok)
+        self.assertEqual(extra.get("reason"), "browser_dead")
+        self.assertIn("TargetClosedError", msg)
+
+    def test_window_dead_exc_table(self):
+        # 死窗判定纯函数：只认窗口/上下文死亡与连接协议类异常，鬼魂异常返回 False
+        class TargetClosedError(Exception):
+            pass
+
+        class BrowserContextClosedError(Exception):
+            pass
+
+        class ProtocolError(Exception):
+            pass
+
+        class ConnectionClosedError(Exception):
+            pass
+
+        class ValueError(Exception):
+            pass
+        for exc, want in [
+                (TargetClosedError("Target closed"), True),
+                (BrowserContextClosedError("context was closed"), True),
+                (ProtocolError("Connection closed"), True),
+                (ConnectionClosedError("pipe closed"), True),
+                (ValueError("定位器炸了"), False),
+                (Exception("generic boom"), False)]:
+            self.assertIs(browser_order._window_dead_exc(exc), want,
+                          "%r 判定错误" % (type(exc).__name__,))
 
 
 # ============================ Task 43 ============================
@@ -4832,6 +5718,10 @@ class TestTask55ExcStreakStop(TempDirCase):
                               return_value=["二等座"]),
             mock.patch.object(launcher.browser_order, "order_via_browser",
                               side_effect=order_side_effect),
+            # 新链分流：launcher 模块级 import orderflow，patch run_orderflow
+            # 使 side_effect 对两条链同口径生效
+            mock.patch.object(launcher.orderflow, "run_orderflow",
+                              side_effect=order_side_effect),
         )
 
     def test_same_keyerror_3_times_triggers_stop(self):
@@ -4839,7 +5729,7 @@ class TestTask55ExcStreakStop(TempDirCase):
         g, waits = self._make_grabber()
         patches = self._patch_loop(KeyError("boom"))
         with patches[0], patches[1], patches[2], patches[3], \
-                patches[4], patches[5], patches[6]:
+                patches[4], patches[5], patches[6], patches[7]:
             g._run()
         self.assertIsNotNone(g.result, "同一 KeyError 连续 3 次仍无声自旋，未走停止逻辑")
         ok, msg = g.result
@@ -4861,7 +5751,7 @@ class TestTask55ExcStreakStop(TempDirCase):
 
         patches = self._patch_loop(boom)
         with patches[0], patches[1], patches[2], patches[3], \
-                patches[4], patches[5], patches[6]:
+                patches[4], patches[5], patches[6], patches[7]:
             g._run()
         self.assertIsNone(g.result, "交替出现的异常不应触发连续停止：%r" % (g.result,))
         self.assertEqual(len(waits), 8)
@@ -4881,7 +5771,7 @@ class TestTask55ExcStreakStop(TempDirCase):
 
         patches = self._patch_loop(side)
         with patches[0], patches[1], patches[2], patches[3], \
-                patches[4], patches[5], patches[6]:
+                patches[4], patches[5], patches[6], patches[7]:
             g._run()
         self.assertIsNotNone(g.result, "会话确认失效后仍在无限重试")
         ok, out = g.result
@@ -4901,7 +5791,7 @@ class TestTask55ExcStreakStop(TempDirCase):
                "(char 0)）。请先运行：python browser_order.py login")
         patches = self._patch_loop(lambda *a, **k: (False, msg, None))
         with patches[0], patches[1], patches[2], patches[3], \
-                patches[4], patches[5], patches[6]:
+                patches[4], patches[5], patches[6], patches[7]:
             g._run()
         self.assertIsNone(g.result, "瞬时校验异常不应停任务：%r" % (g.result,))
         self.assertEqual(len(waits), 3)
@@ -8233,6 +9123,30 @@ class TestTask77Order(unittest.TestCase):
         self.assertEqual(g.get("queryEndDate"), "2026-10-09")
         self.assertEqual(g.get("queryStartDate"), "2026-08-10")
 
+    def test_check_existing_orders_cache_block_message(self):
+        # 12306「取消次数过多」封禁：NoComplete 无 orderDBList，只有
+        # orderCacheDTO.message → 构造挡单记录，分类落 blocked 且文案带原文。
+        cache_msg = ("对不起，由于您取消次数过多，今日将不能继续受理您的订票请求。"
+                     "明日您可继续使用订票功能。")
+
+        def fake_post(url, data=None, timeout=None):
+            r = mock.MagicMock()
+            if "NoComplete" in url:
+                r.json.return_value = {"data": {"orderCacheDTO":
+                    {"status": 3, "message": {"message": cache_msg}}}}
+            else:
+                r.json.return_value = {"data": {"OrderDTODataList": []}}
+            return r
+
+        session = mock.MagicMock()
+        session.post.side_effect = fake_post
+        orders = order_mod.check_existing_orders(session, "2026-10-17")
+        self.assertTrue(any(x.get("_cache_block") for x in orders), orders)
+        cls, ono, raw = order_mod._classify_orders(
+            "2026-10-17", "K1970", ["王小明"], orders)
+        self.assertEqual(cls, "blocked")
+        self.assertIn("取消次数过多", raw)
+
     # ---- (f) 非 JSON 响应重试 3 次 ----
 
     def _non_json_resp(self):
@@ -8309,11 +9223,16 @@ class TestTask77Order(unittest.TestCase):
         self.assertEqual(recent["order_no"], "Emine")
 
     def test_classify_with_time_no_session_error_path(self):
-        # session=None 且无浏览器 state 文件 → error，recent 为 None（旧行为保持）
-        cls, ono, raw, recent = order_mod.classify_with_time(
-            "2026-10-10", "G101", ["张三"], not_before_ts=12345, session=None)
+        # 会话建立失败 → error，recent 为 None（旧行为保持）。
+        # 旧版真去读项目里的 .browser_state.json：有真实登录态时会打真 12306
+        # 接口（RULES.md：测试不打真实接口），且结论随登录状态漂移。
+        with mock.patch.object(order_mod, "session_from_browser_state",
+                               side_effect=RuntimeError("未找到 .browser_state.json")):
+            cls, ono, raw, recent = order_mod.classify_with_time(
+                "2026-10-10", "G101", ["张三"], not_before_ts=12345, session=None)
         self.assertEqual(cls, "error")
         self.assertIsNone(recent)
+        self.assertIn("官方订单查询失败", raw)
 
     # ---- (g2) classify_with_time 边界用例 ----
 
@@ -12004,6 +12923,614 @@ class TestTask106BareStringHardening(TempDirCase):
         self.assertEqual(launcher._display_seat_types(["张三", "李四"]),
                          ["张三", "李四"])
         self.assertEqual(launcher._display_seat_types(None), [])
+
+
+
+
+# ==================== orderflow（阶段化下单新链，REBUILD_PLAN.md） ====================
+
+class TestOrderflowClassifySnapshot(TempDirCase):
+    """classify_snapshot 纯函数六态 + 判定优先级。"""
+
+    def test_classify_snapshot_six_states(self):
+        import orderflow
+        pay = "https://kyfw.12306.cn/otn/confirmPassenger/payOrder/init"
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/leftTicket/init", "预订 余票充足"), "wait")
+        self.assertEqual(orderflow.classify_snapshot(pay, "订单提交成功，请尽快支付"), "success")
+        self.assertEqual(orderflow.classify_snapshot(pay, "席位已锁定，请在 30 分钟内完成支付"), "success")
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/queryOrder/MyOrderNoComplete/init", "订单提交成功"), "ambiguous")
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/leftTicket/init", "您有未完成订单，请先处理"), "dup")
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/leftTicket/init", "余票不足"), "fail")
+
+    def test_payorder_without_pay_word_waits(self):
+        # 坑：URL 已到 payOrder 但正文还没刷出付款特征词——只能判成功，
+        # 此时必须继续观察，不能当成成功也不能当成失败。
+        import orderflow
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/confirmPassenger/payOrder/init", "页面加载中"), "wait")
+
+    def test_dup_priority_over_fail(self):
+        # 与旧链一致：dup 词表优先于 fail 词表。
+        import orderflow
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/leftTicket/init", "余票不足；您有未支付订单"), "dup")
+
+    def test_url_ambiguous_priority_over_words(self):
+        # 旧单列表页即使正文带 dup 词，也先按 URL 判 ambiguous 交官方回读。
+        import orderflow
+        self.assertEqual(orderflow.classify_snapshot(
+            "https://kyfw.12306.cn/otn/queryOrder/MyOrderNoComplete/init", "您有未完成订单"), "ambiguous")
+
+    def test_confirm_pending_prompt_is_not_dup(self):
+        # 真机回归（2026-10-15 实跑 7 连误判）：点确认后 12306 在同一个同步栈里
+        # 弹「正在处理，请稍候。」提示框，框内固定带「未完成订单」链接文字
+        # （指向订单列表页）。据此判 dup 会在提交结果回来前就关页面。
+        import orderflow
+        url = "https://kyfw.12306.cn/otn/confirmPassenger/initDc?N"
+        body = ('【提示框】请 提示 正在处理，请稍候。查看订单处理情况，'
+                '请点击“未完成订单”\n中国铁路12306\n无障碍\n您好，王小明')
+        self.assertEqual(orderflow.classify_snapshot(url, body), "wait")
+        # 排队提示同理：订单已提交但还在排队，结果未定，继续观察。
+        self.assertEqual(orderflow.classify_snapshot(
+            url, "【提示框】订单已经提交，系统正在处理中，请稍等。"), "wait")
+
+    def test_link_noise_alone_is_not_dup(self):
+        # 只有提示框的链接文案、没有过程提示词：剔除后既非 dup 也非 fail。
+        import orderflow
+        url = "https://kyfw.12306.cn/otn/confirmPassenger/initDc?N"
+        body = '查看订单处理情况，请点击"未完成订单"\n中国铁路12306'
+        self.assertEqual(orderflow.classify_snapshot(url, body), "wait")
+
+    def test_real_dup_text_still_wins(self):
+        # 真 dup 文案不受噪声剔除影响（服务端拒绝时正文命中词表）。
+        import orderflow
+        url = "https://kyfw.12306.cn/otn/confirmPassenger/initDc?N"
+        body = ('【提示框】出票失败! 原因： 您有未完成订单，请先处理\n'
+                '查看订单处理情况，请点击“未完成订单”')
+        self.assertEqual(orderflow.classify_snapshot(url, body), "dup")
+
+
+class TestOrderflowDispatch(TempDirCase):
+    """order_ticket_via_browser 分流：order_flow_mode 开关选链。"""
+
+    def _base(self):
+        config = {"order_flow_mode": True, "browser_headless": False,
+                  "order_flow": {"read_poll_seconds": 0.5}}
+        task = {"passenger_names": ["张三"], "pax_purpose": {},
+                "purpose_code": "ADULT"}
+        ticket = {"train_code": "G101", "query_date": "2026-10-17"}
+        return config, task, ticket
+
+    def test_flow_mode_true_uses_orderflow(self):
+        import browser_order
+        import orderflow
+        config, task, ticket = self._base()
+        with mock.patch.object(orderflow, "run_orderflow",
+                               return_value=(True, "ok", {})) as rfo, \
+             mock.patch.object(browser_order, "order_via_browser",
+                               return_value=(False, "old", None)) as rov:
+            ok, msg, extra = browser_order.order_ticket_via_browser(
+                config, task, ticket, "二等座")
+        self.assertTrue(ok)
+        rfo.assert_called_once()
+        rov.assert_not_called()
+        self.assertEqual(extra.get("passengers"), "张三")
+
+    def test_flow_mode_false_uses_old_chain(self):
+        import browser_order
+        import orderflow
+        config, task, ticket = self._base()
+        config["order_flow_mode"] = False
+        with mock.patch.object(orderflow, "run_orderflow",
+                               return_value=(True, "new", {})) as rfo, \
+             mock.patch.object(browser_order, "order_via_browser",
+                               return_value=(True, "old", {})) as rov:
+            ok, msg, extra = browser_order.order_ticket_via_browser(
+                config, task, ticket, "二等座")
+        self.assertTrue(ok)
+        rfo.assert_not_called()
+        rov.assert_called_once()
+
+    def test_run_orderflow_contract_shape(self):
+        # 返回值契约与旧链一致 (ok, msg, extra)：launcher/engine 下游不区分链。
+        import orderflow
+        with mock.patch.object(orderflow, "_run_orderflow_locked",
+                               return_value=(False, "余票不足", {"reason": "fail"})), \
+             mock.patch.object(orderflow, "_safe_close_ctx", return_value=None):
+            ok, msg, extra = orderflow.run_orderflow(
+                {"train_code": "G101"}, "二等座", "O", ["张三"], "2026-10-17",
+                warm=None, should_stop=None, flow_cfg=None, logger=None)
+        self.assertFalse(ok)
+        self.assertIn("余票不足", msg)
+        self.assertEqual(extra.get("reason"), "fail")
+
+
+
+class TestOrderflowE2EMock(TempDirCase):
+    """离线端到端：假页面 + 假时钟驱动 _run_orderflow_core 七阶段管线。
+
+    冷启动链（launch/session_ok/_goto_and_query）全部 patch，走 warm 路径；
+    FILL/SUBMIT/CONFIRM 的 DOM 序列由 T1 提取的 _run_fill_submit_confirm
+    承担（旧测试已覆盖其内部），这里只验证阶段编排与 HOLD/JUDGE 语义。
+    """
+
+    class _Clock:
+        def __init__(self):
+            self.now = 1_700_000_000.0
+        def time(self):
+            return self.now
+        def sleep(self, s):
+            self.now += s
+        def strftime(self, fmt, t=None):
+            import time as _t
+            return _t.strftime(fmt, _t.localtime(self.now if t is None else t))
+        def localtime(self, t=None):
+            import time as _t
+            return _t.localtime(self.now if t is None else t)
+
+    class _HoldPage:
+        """HOLD 观察页：url/body/滑块可编程，其余未预期调用即炸。"""
+        def __init__(self, url, body="", slides=None):
+            self._url = url
+            self._body = body
+            self._slides = slides or []
+        @property
+        def url(self):
+            return self._url
+        def set_default_timeout(self, ms):
+            pass
+        def evaluate(self, js, arg=None):
+            if "document.body" in js:
+                return self._body
+            if "slide_passcode" in js:
+                return list(self._slides)
+            raise AssertionError("假页面未预期 evaluate: %r" % js[:60])
+
+    class _FakeCtx:
+        def __init__(self, new_pages=None):
+            self._new = list(new_pages or [])
+        def new_page(self):
+            return self._new.pop(0)
+        @property
+        def pages(self):
+            return [self]
+
+    class _Warm:
+        def __init__(self, page, ctx=None):
+            self.p = object()
+            self.ctx = ctx or TestOrderflowE2EMock._FakeCtx()
+            self.page = page
+            self.refreshed = []
+        def usable(self):
+            return True
+        def refresh(self, info):
+            self.refreshed.append(info)
+
+    INIT_URL = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+    PAY_URL = "https://kyfw.12306.cn/otn/confirmPassenger/payOrder/init"
+
+    def _core(self, page, should_stop=None, flow_cfg=None, slides=None,
+              slide_wait_result=None, reopen_entry=None, judge_result=None,
+              fill_stop=None):
+        import orderflow
+        clock = self._Clock()
+        warm = self._Warm(page)
+        stages, marks = [], []
+
+        def fake_fill(*a, **k):
+            stages.append("SUBMIT")
+            stages.append("CONFIRM")
+            if fill_stop is not None:
+                fill_stop["v"] = True  # 模拟确认已提交后用户按下停止
+            return {"ok": True, "msg": "", "extra": {}, "clicked": True,
+                    "picked": ["张三"], "dlg_seat": "二等座",
+                    "t_submit": clock.now}
+
+        patches = [
+            mock.patch.object(orderflow, "time", clock),
+            mock.patch.object(orderflow, "launch", side_effect=AssertionError("冷启动不应发生")),
+            mock.patch.object(orderflow, "session_ok", return_value=(True, "user")),
+            mock.patch.object(orderflow, "_goto_and_query", return_value=None),
+            mock.patch.object(orderflow, "_run_fill_submit_confirm", side_effect=fake_fill),
+            mock.patch.object(orderflow, "fetch_unpaid_order_no", return_value="E123"),
+            mock.patch.object(orderflow, "session_from_browser_state", return_value=object()),
+        ]
+        if slide_wait_result is not None:
+            patches.append(mock.patch.object(
+                orderflow, "_wait_slide_gone", return_value=slide_wait_result))
+        if reopen_entry is not None:
+            patches.append(mock.patch.object(
+                orderflow, "_reopen_and_order", return_value=reopen_entry))
+        if judge_result is not None:
+            patches.append(mock.patch.object(
+                orderflow, "_judge_official", return_value=judge_result))
+        with mock.patch.multiple.__self__ if False else _multi(patches):
+            out = orderflow._run_orderflow_core(
+                {"train_code": "G101", "from_name": "北京", "to_name": "上海"},
+                "二等座", "O", ["张三"], "2026-10-17",
+                headless=True, purpose="ADULT", warm=warm, alias_name=None,
+                purpose_map=None, should_stop=should_stop,
+                mark=lambda s: marks.append(s), stage=lambda s: stages.append(s),
+                flow_cfg=flow_cfg or {}, logger=None)
+        return out, stages, marks, warm
+
+    def test_e2e_payorder_success_hold(self):
+        # 七阶段顺序 DETECT→FILL→SUBMIT→CONFIRM→HOLD；付款页成功闭环
+        page = self._HoldPage(self.PAY_URL, self.pay_body_default())
+        (ok, msg, extra), stages, marks, warm = self._core(page)
+        self.assertTrue(ok, msg)
+        self.assertIn("已提交订单", msg)
+        self.assertEqual(extra["page_kind"], "payOrder")
+        self.assertIn("席位已锁定", extra["pay_evidence"])
+        self.assertEqual(extra["passengers"], "张三")
+        self.assertEqual(extra["order_no"], "E123")
+        self.assertEqual(stages, ["DETECT", "FILL", "SUBMIT", "CONFIRM", "HOLD"])
+
+    def pay_body_default(self):
+        return "席位已锁定，请在提示时间内尽快完成支付，支付剩余时间：00时19分34秒"
+
+    def test_e2e_dup_snapshot(self):
+        page = self._HoldPage(self.INIT_URL, "您有未完成订单，请先处理")
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "dup")
+        self.assertEqual(extra["dup_kind"], "未完成订单")
+
+    def test_e2e_fail_body(self):
+        page = self._HoldPage(self.INIT_URL, "余票不足")
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "余票不足")
+        self.assertIsNone(extra)
+
+    def test_e2e_slide_user_stopped(self):
+        # 坑 7：滑块出现即停交人工，返回 ambiguous + need_captcha
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous"})
+        page = self._HoldPage(self.INIT_URL, "", slides=["nc-container"])
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, slide_wait_result="user_stopped", judge_result=judge,
+            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                      "retry_open_times": 0})
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertTrue(extra["need_captcha"])
+        self.assertIn("手动停止", msg)
+
+    def test_e2e_stop_in_hold(self):
+        # stop_event 贯穿：确认已提交后用户按下停止，HOLD 顶部立即收手
+        # 返回 ambiguous（结果未知交官方回读），绝不静默继续轮询
+        state = {"v": False}
+        page = self._HoldPage(self.INIT_URL, "")
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, should_stop=lambda: state["v"], fill_stop=state)
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("手动停止", msg)
+
+    def test_e2e_hold_timeout_judge_fallback(self):
+        # 每页 10s 无果退出 → JUDGE 兜底官方回读
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
+        page = self._HoldPage(self.INIT_URL, "")
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, judge_result=judge, flow_cfg={"read_poll_seconds": 0.5,
+                                                "page_wait_seconds": 10,
+                                                "retry_open_times": 0})
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("JUDGE", stages)
+
+    def test_e2e_reopen_retry_new_page_success(self):
+        # 首读未获 → 官方回读无 dup → 新开页重下 → 新页读到付款页成功
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous"})
+        new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
+        clock = self._Clock()
+        reopen_entry = {"page": new_page, "t_submit": clock.now,
+                        "picked": ["张三"], "dlg_seat": "二等座"}
+        page = self._HoldPage(self.INIT_URL, "")
+        # reopen 的 t_submit 用测试时钟，core 里 deadline 用 orderflow.time；
+        # 传入同一 clock 的 now 保证窗口成立
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, judge_result=judge, reopen_entry=reopen_entry,
+            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                      "retry_open_times": 1})
+        self.assertTrue(ok, msg)
+        self.assertEqual(extra["page_kind"], "payOrder")
+        self.assertEqual(extra["order_no"], "E123")
+
+
+def _multi(patches):
+    """mock.patch 列表 → 上下文管理器：不进 __exit__ 前逐项 __enter__。"""
+    class _M:
+        def __enter__(self):
+            for p in patches:
+                p.__enter__()
+            return self
+        def __exit__(self, *a):
+            for p in reversed(patches):
+                p.__exit__(*a)
+            return False
+    return _M()
+
+
+class TestAutoStartEngine(TempDirCase):
+    """启动软件自动启动引擎（m00986）：引擎线程自动起 + 上次被动暂停的任务恢复监控。"""
+
+    def test_resume_only_engine_stopped_tasks(self):
+        import api
+        state = {"tasks": {
+            "被动暂停": {"status": "paused", "message": "引擎已停止"},
+            "用户暂停": {"status": "paused", "message": "手动暂停"},
+            "监控中": {"status": "monitoring", "message": ""},
+            "已取消": {"status": "cancelled", "message": "引擎已停止"},
+        }}
+        seen = {}
+
+        def _fake(fn):
+            fn(state)
+            seen.update(state)
+
+        with mock.patch.object(api, "update_state_locked", _fake), \
+             mock.patch.object(api.launcher, "log"):
+            n = api._resume_stopped_tasks()
+        self.assertEqual(n, 1)
+        self.assertEqual(seen["tasks"]["被动暂停"]["status"], "monitoring")
+        self.assertEqual(seen["tasks"]["被动暂停"]["message"], "软件启动自动恢复")
+        # 用户主动暂停 / 已取消 / 已在监控：原样不动
+        self.assertEqual(seen["tasks"]["用户暂停"]["status"], "paused")
+        self.assertEqual(seen["tasks"]["用户暂停"]["message"], "手动暂停")
+        self.assertEqual(seen["tasks"]["已取消"]["status"], "cancelled")
+        self.assertEqual(seen["tasks"]["监控中"]["status"], "monitoring")
+
+    def test_resume_survives_broken_state(self):
+        import api
+        # tasks 不是 dict：不能抛，返回 0
+        with mock.patch.object(api, "update_state_locked",
+                               lambda fn: fn({"tasks": None})), \
+             mock.patch.object(api.launcher, "log"):
+            self.assertEqual(api._resume_stopped_tasks(), 0)
+
+    def test_auto_start_engine_resumes_then_starts(self):
+        import api
+        order = []
+        with mock.patch.object(api, "load_config", return_value={}), \
+             mock.patch.object(api, "_resume_stopped_tasks",
+                               side_effect=lambda: order.append("resume")), \
+             mock.patch.object(api, "start_engine",
+                               side_effect=lambda: (order.append("start"), True)[1]):
+            self.assertTrue(api._auto_start_engine())
+        # 顺序：先落盘恢复任务状态，再起引擎（引擎首次创建会读 state）
+        self.assertEqual(order, ["resume", "start"])
+
+    def test_auto_start_engine_disabled_by_config(self):
+        import api
+        with mock.patch.object(api, "load_config",
+                               return_value={"auto_start_engine": False}), \
+             mock.patch.object(api, "_resume_stopped_tasks") as m_res, \
+             mock.patch.object(api, "start_engine") as m_st, \
+             mock.patch.object(api.launcher, "log"):
+            self.assertFalse(api._auto_start_engine())
+        self.assertFalse(m_res.called)
+        self.assertFalse(m_st.called)
+
+    def test_main_calls_auto_start_before_ready(self):
+        import api
+        events = []
+        with mock.patch.object(api, "log_pump"), \
+             mock.patch.object(api, "_armed_loop"), \
+             mock.patch.object(api, "_auto_start_engine",
+                               side_effect=lambda: events.append("auto")), \
+             mock.patch.object(api, "push",
+                               side_effect=lambda *a, **k: events.append("ready")), \
+             mock.patch.object(sys, "stdin", io.StringIO("")):
+            api.main()
+        # ready 之前自动启引擎：前端一就绪拿到的 engineRunning 就是 true
+        self.assertEqual(events, ["auto", "ready"])
+
+
+class TestReconcileHistory(TempDirCase):
+    """购票历史 × 12306 官方订单对账（api.rpc_reconcile_history）。
+
+    本地 result 记的是「这轮流程走到哪一步」，不是平台判决：本地 failed /
+    ambiguous / browser_dead 的记录背后可能真有一张未支付订单（实测 2026-10-17
+    K1970，12306 拒单原文「包含未付款订单」）。对账只读官方订单接口，不改
+    state.json / dedup / 引擎轮询，只把结论写回 order_history.json。
+    """
+
+    def _mod(self):
+        import api
+        return api
+
+    def _history(self, recs):
+        path = os.path.join(self.tmp, "order_history.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(recs, f, ensure_ascii=False)
+        return path
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _bytes(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _rec(self, **over):
+        r = {"time": "2026-10-17 15:22:08", "task": "确山-长葛", "result": "failed",
+             "train": "K1970", "date": "2026-10-18", "from": "确山", "to": "长葛",
+             "seat": "硬座", "passengers": ["张三"], "order_no": "", "message": "m"}
+        r.update(over)
+        return r
+
+    def _reconcile(self, path, session=None, orders=None, exc=None, limit=50):
+        """调一次对账：顶掉会话 / 官方订单查询，stdout 也顶掉（push 会写管道）。"""
+        api = self._mod()
+
+        def _sess(*_a, **_k):
+            if exc is not None:
+                raise exc
+            return session if session is not None else object()
+
+        with mock.patch.object(api, "load_config", lambda: {"history_file": path}), \
+                mock.patch.object(api, "WRITE", lambda _s: None), \
+                mock.patch.object(api.order_mod, "session_from_browser_state", _sess), \
+                mock.patch.object(api.order_mod, "check_existing_orders",
+                                  lambda _s, _d: list(orders or [])):
+            return api.rpc_reconcile_history({"limit": limit})
+
+    @staticmethod
+    def _unpaid_order():
+        return {"train": "K1970", "date": "2026-10-18", "passengers": ["张三"],
+                "order_no": "EC82278845", "status": "未完成/未支付", "_no_complete": True}
+
+    def test_unpaid_rewrites_result_and_keeps_evidence(self):
+        path = self._history([self._rec()])
+        r = self._reconcile(path, orders=[self._unpaid_order()])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["changed"], 1)
+        rec = self._read(path)[0]
+        self.assertEqual(rec["result"], "confirmed_unpaid")
+        self.assertEqual(rec["reconciled_from"], "failed")
+        self.assertEqual(rec["order_no"], "EC82278845")
+        self.assertEqual(rec["reconciled_raw"], "未完成/未支付")
+        self.assertTrue(rec["reconciled_at"])
+
+    def test_paid_rewrites_to_confirmed_paid(self):
+        paid = {"train": "K1970", "date": "2026-10-18", "passengers": ["张三"],
+                "order_no": "EC90000001", "status": "已支付"}
+        path = self._history([self._rec(result="ambiguous")])
+        self._reconcile(path, orders=[paid])
+        rec = self._read(path)[0]
+        self.assertEqual(rec["result"], "confirmed_paid")
+        self.assertEqual(rec["reconciled_from"], "ambiguous")
+
+    def test_non_matching_classes_keep_result_and_only_leave_evidence(self):
+        # none / cancelled / blocked / unknown 都不改判：blocked 只证明「有单」，
+        # 不能证明是这一单，改判等于凭空造订单号。
+        for cls_orders, label in (
+            ([], "none"),
+            ([{"train": "K1970", "date": "2026-10-18", "passengers": ["张三"],
+               "order_no": "E1", "status": "已退票"}], "cancelled"),
+            ([{"train": "K926", "date": "2026-10-18", "passengers": ["张三"],
+               "order_no": "E2", "status": "未支付", "_no_complete": True}], "blocked"),
+        ):
+            with self.subTest(label=label):
+                path = self._history([self._rec()])
+                r = self._reconcile(path, orders=cls_orders)
+                self.assertTrue(r["ok"])
+                self.assertEqual(r["changed"], 0)
+                rec = self._read(path)[0]
+                self.assertEqual(rec["result"], "failed")
+                self.assertEqual(rec["reconciled_cls"], label)
+                self.assertTrue(rec["reconciled_at"])
+                self.assertNotIn("order_no", [k for k, v in rec.items() if v])
+
+    def test_session_failure_returns_error_and_leaves_file_bytes_alone(self):
+        path = self._history([self._rec()])
+        before = self._bytes(path)
+        r = self._reconcile(path, exc=RuntimeError("browser_state 无 Cookie"))
+        self.assertFalse(r["ok"])
+        self.assertIn("重新登录", r["message"])
+        self.assertEqual(self._bytes(path), before)
+
+    def test_already_reconciled_records_are_skipped(self):
+        path = self._history([self._rec(reconciled_at="2026-10-17 16:00:00",
+                                        result="confirmed_unpaid")])
+        api = self._mod()
+        calls = []
+        with mock.patch.object(api, "load_config", lambda: {"history_file": path}), \
+                mock.patch.object(api, "WRITE", lambda _s: None), \
+                mock.patch.object(api.order_mod, "session_from_browser_state",
+                                  lambda *_a, **_k: object()), \
+                mock.patch.object(api.order_mod, "check_existing_orders",
+                                  lambda _s, d: calls.append(d) or [self._unpaid_order()]):
+            r = api.rpc_reconcile_history({"limit": 50})
+        self.assertEqual(calls, [])
+        self.assertEqual(r["checked"], 0)
+        self.assertEqual(self._read(path)[0]["result"], "confirmed_unpaid")
+
+    def test_no_candidates_skips_official_query_entirely(self):
+        # 全是 success 时不该打官方接口（12306 限流）
+        path = self._history([self._rec(result="success")])
+        api = self._mod()
+        calls = []
+        with mock.patch.object(api, "load_config", lambda: {"history_file": path}), \
+                mock.patch.object(api, "WRITE", lambda _s: None), \
+                mock.patch.object(api.order_mod, "check_existing_orders",
+                                  lambda _s, d: calls.append(d) or []):
+            r = api.rpc_reconcile_history({"limit": 50})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["checked"], 0)
+        self.assertEqual(calls, [])
+
+    def test_query_error_reports_and_writes_nothing(self):
+        path = self._history([self._rec()])
+        before = self._bytes(path)
+        api = self._mod()
+
+        def _boom(_s, _d):
+            raise IOError("HTTP 403")
+
+        with mock.patch.object(api, "load_config", lambda: {"history_file": path}), \
+                mock.patch.object(api, "WRITE", lambda _s: None), \
+                mock.patch.object(api.order_mod, "session_from_browser_state",
+                                  lambda *_a, **_k: object()), \
+                mock.patch.object(api.order_mod, "check_existing_orders", _boom):
+            r = api.rpc_reconcile_history({"limit": 50})
+        self.assertFalse(r["ok"])
+        self.assertEqual(self._bytes(path), before)
+
+    def test_one_query_per_date(self):
+        # 同一天多条记录只打一次官方接口（限流约束）
+        recs = [self._rec(time="2026-10-17 15:22:08"),
+                self._rec(time="2026-10-17 15:30:00", result="ambiguous")]
+        path = self._history(recs)
+        api = self._mod()
+        calls = []
+        with mock.patch.object(api, "load_config", lambda: {"history_file": path}), \
+                mock.patch.object(api, "WRITE", lambda _s: None), \
+                mock.patch.object(api.order_mod, "session_from_browser_state",
+                                  lambda *_a, **_k: object()), \
+                mock.patch.object(api.order_mod, "check_existing_orders",
+                                  lambda _s, d: calls.append(d) or [self._unpaid_order()]):
+            api.rpc_reconcile_history({"limit": 50})
+        self.assertEqual(calls, ["2026-10-18"])
+
+    def test_preserves_order_and_fields_of_untouched_records(self):
+        recs = [self._rec(time="2026-10-16 10:00:00", result="success",
+                          date="2026-10-17", order_no="EOLD"),
+                self._rec()]
+        path = self._history(recs)
+        self._reconcile(path, orders=[self._unpaid_order()])
+        out = self._read(path)
+        self.assertEqual([r["time"] for r in out],
+                         ["2026-10-16 10:00:00", "2026-10-17 15:22:08"])
+        self.assertEqual(out[0]["order_no"], "EOLD")
+        self.assertEqual(out[0]["result"], "success")
+
+
+class TestHistoryLabelSync(unittest.TestCase):
+    """前端 HISTORY_LABELS 必须与 appcommon.HISTORY_RESULT_LABEL 逐项一致。
+
+    Electron 端无构建、不能 import Python，两处各存一份是既有事实（任务书 3.5）。
+    漂移的代价是用户看到只在一边存在的文案（例如「已对账·有未付单」缺失时
+    直接露出 confirmed_unpaid 原文），所以用解析 app.js 源码代替人工核对。
+    """
+
+    def test_js_labels_match_python_side(self):
+        with open(os.path.join(HERE, "ui", "app.js"), encoding="utf-8") as f:
+            js = f.read()
+        m = re.search(r"const HISTORY_LABELS = \{(.*?)\n  \};", js, re.S)
+        self.assertIsNotNone(m, "ui/app.js 里找不到 HISTORY_LABELS 定义")
+        pairs = dict(re.findall(r'(\w+):\s*"([^"]*)"', m.group(1)))
+        self.assertEqual(pairs, appcommon.HISTORY_RESULT_LABEL)
 
 
 if __name__ == "__main__":

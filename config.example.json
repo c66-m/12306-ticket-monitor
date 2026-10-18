@@ -1,5 +1,6 @@
 {
   "_说明": "本文件为配置模板。复制为 config.json 后按需修改，切勿把真实邮箱/授权码提交到仓库。密码/验证码一律不处理。",
+  "auto_start_engine": true,
   "poll_interval_seconds": 7,
   "min_interval_seconds": 7,
   "order_retry_times": 3,
@@ -38,6 +39,12 @@
   "tasks": [],
   "order_mode": "browser",
   "browser_headless": false,
+  "order_flow_mode": true,
+  "order_flow": {
+    "read_poll_seconds": 0.5,
+    "page_wait_seconds": 10,
+    "retry_open_times": 1
+  },
   "task_defaults": {
     "auto_order": true,
     "stop_after_order": true,

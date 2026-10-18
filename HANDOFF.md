@@ -30,7 +30,7 @@ launcher.py(Grabber/任务库) engine.py(监控引擎) ticket.py(查票) order.p
 通信：`window.api.call(method, params)` → preload → `ipcMain.handle("rpc")` → 写 python stdin，
 逐行读 stdout 解析 → 回包。后端主动推送走 `push(tag, payload)` → `py-push` 事件 → 前端 `bridge.onPush`。
 后端线程共三个：`log_pump`（把 `launcher.LOGQ` 推给前端）、`_armed_loop`（每 2 s 扫抢票任务，
-到点自动开抢，`_armed_fired` 防重）、按需启动的监控引擎线程。
+到点自动开抢，`_armed_fired` 防重）、启动即自动起的监控引擎线程（`auto_start_engine=false` 可关）。
 
 ### 前端轮询节奏
 
@@ -41,6 +41,11 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 `api.py` 全局 `_engine_stop` 保存当前引擎线程的 `threading.Event`；`stop_engine()`：
 `set()` → `join(timeout=10)` → 返回 `not alive`（前端据此提示「已停止 / 仍在收尾」）。
 `engine.MonitorEngine.run(stop_event=None)` 内的检查点在循环头、due 循环、`stop_event.wait(1)` 三处。
+
+启动软件自动启动引擎（`api.main()` → `_auto_start_engine()`，2026-10-16）：先 `_resume_stopped_tasks()`
+把**上次被动暂停**的任务（`message=="引擎已停止"`，`_mark_running_tasks_paused` 的标记）恢复 monitoring，
+再 `start_engine()`（顺序不能反：`get_engine()` 首次创建会读 state 文件）。**用户手动暂停的任务不会被拉起**
+（message 是别的文案）。`config.json` 里 `auto_start_engine=false` 可关掉整个自动启动。
 
 ### 乘车人脱敏（曾是真 bug，已修）
 
@@ -138,9 +143,21 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ### tests/TEST_REPORT.md（历史存档 + 已加复核抬头）
 - 5.3KB，抬头写「日期:2026-10-06 · 基线:a8b4b57 · 测试套件(47 项)」，内容为当时的二次自我检查报告（append_monitor_task 并发丢数据、mtime 15.6ms 盲区、误导性日志等**已修项**）。
-- 当前基线是 **723 项**（2026-10-16 复核；本报告写于 47 项时代，早于 Electron 迁移与三轮重构），**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
+- 当前基线是 **726 项**（2026-10-16 复核；本报告写于 47 项时代，早于 Electron 迁移与三轮重构），**不要拿它的数字当现状**；保留只为追溯那几个并发 bug 的成因分析。
 
-## 0.98 本批（2026-10-16）：config/state 收敛 + 文档订正 + 会话失效判定修复
+## 0.99 本批（2026-10-17）：下单机制推翻重建（REBUILD_PLAN.md）
+
+- 用户指令「推翻之前全部下单操作重新设计」→ `_order_impl` 单体的编排重建为 `orderflow.py` 七阶段管线（DETECT/FILL/SUBMIT/CONFIRM/HOLD/JUDGE/LOG）。
+- 核心变化：提交后驻留——每 0.5s 读 page.url+body，读到「待付款」才关全部页面返回成功；首读未获先官方回读防 dup，再新开页面重下（retry_open_times=1），新旧页并存各自观察 10s；任一页读到失败词/dup 词/订单列表页即判即出；滑块出现即停交人工（等待不计入倒计时）；只认 payOrder 付款页为本次成功。
+- DOM 序列（填单/提交/确认、limit_tickets 四步强写、核对窗取证）提取为 `browser_order._run_fill_submit_confirm` 共享函数，旧链继续调用——选择器单源。
+- 分流：`order_flow_mode` 开关（config.json 默认 true）在 `browser_order.order_ticket_via_browser` 与 `launcher._run` 两处；旧 `_order_impl` 保留到 Task 9 实跑成功后退役。
+- 配置：`order_flow` 段 read_poll_seconds=0.5/page_wait_seconds=10/retry_open_times=1；键入 config_keys.py 防漂移。
+- 测试：tests/test_all.py 新增 TestOrderflowClassifySnapshot/TestOrderflowDispatch/TestOrderflowE2EMock 共 14 项；全量 754 OK (skipped=15)。
+- **2026-10-15 夜实跑踩到的真 bug（已修）**：HOLD 首读把 12306「提交过程提示框」里的固定链接文字「未完成订单」当成重复订单 → 每次点确认后 2-5ms 就判 dup 关页面，永远读不到付款页。根因是 `passengerInfo_js.js` 的 `O()`/`E()` 第一句同步 `m("正在处理，请稍候。",false,"",false,"work")`，而 `m(ai=false)` 固定写入「查看订单处理情况，请点击“未完成订单”」链接。修复：`orderflow.py` 加 `_PENDING_KEYS`（过程提示→wait）、`_LINK_NOISE`（判 dup/fail 前剔除链接文案）、`_READ_JS`（提示框原文前置）、dup 日志记 url+上下文、结论截断 160→400；全量 760 OK (skipped=15)。
+- **软件启动自动启动引擎（2026-10-16 用户要求）**：`api.main()` 在 `push("ready")` 之前调 `_auto_start_engine()`（`api.py` 新增 `_resume_stopped_tasks` / `_auto_start_engine` 两函数）——先把上次被动暂停的任务恢复 monitoring，再起引擎；`config.json` 新增 `auto_start_engine`（默认 true，键入 `config_keys.py` 防漂移）。测试 `TestAutoStartEngine` 5 项（只恢复「引擎已停止」标记、tasks 非 dict 不抛、resume→start 顺序、开关关闭时不调引擎、main 在 ready 前调自动启动）；全量 765 OK (skipped=15)。
+- 待办：Task 9 实跑（需重新登录 + 有票窗口）；实跑成功后退役旧链。
+
+## 0.98 本批（2026-10-16）：config/state 收敛 + 文档订正 + 会话失效判定修复 + 任务级自动下单开关
 
 - **config/state 家族跨文件重复已收敛**（原第 10 节待办，用户 2026-10-16 裁决「消掉」）：
   `load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records` 原在 `api.py`、`gui.py`、`monitor.py` 各有一份，现机械层单源到 `appcommon.py` 新分节「config.json 共享 plumbing」（appcommon.py:534 起）：
@@ -149,6 +166,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
   邮箱正则统一取**严格**口径（旧 `api.EMAIL_RE` 宽松，会让 gui 拒收的地址从桌面版设置页落进 config.json）。
   `state_file` / `history_file` 两键的路径解析在 api/gui/monitor/launcher 四处统一走 `appcommon.state_path_of / history_path_of`。
 - **monitor.update_config_locked 新增损坏/非 dict 的 CLI 提示**（旧版静默 `return False`）——仍在锁内、仍在 mutator 之前拒绝，只是补一句人话；无测试断言旧文案。
+- **顺带修掉一条「真打网络」的测试**（本轮全量跑暴露）：`TestTask77Order.test_classify_with_time_no_session_error_path` 在 `session=None` 时真去读项目里的 `.browser_state.json`，只要本机有登录态就会打真 12306 订单接口、结论随登录状态漂移（RULES.md 明写测试不打真实接口）。现改为 mock `order.session_from_browser_state` 抛 RuntimeError，断言语义不变并补一条文案断言。
 - **回归**：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 711 tests, OK (skipped=15)**。代码改动 5 个文件（api.py / appcommon.py / gui.py / launcher.py / monitor.py），文档订正 5 个（RULES / HANDOFF / README / PRODUCT / tests/TEST_REPORT）。
 - **本轮踩到的坑**：改造 `api.load_config` 时内部闭包 `_broken` 给模块级 `_CONFIG_CORRUPT_WARNED` 赋值忘了再声明 `global` → 名字退化成局部变量 → `UnboundLocalError`，被只覆盖该路径的 `test_api_load_config_gbk_still_returns_empty` 逮到。**模块级哨兵在嵌套函数里赋值，每层都要 `global`。**
 
@@ -192,6 +210,25 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 **回归**：`compileall` 干净；`tests\test_all.py` → **Ran 723 tests, OK (skipped=15)**。
 
 **教训**：同一个「会话失效」在**三条路径**上各判一次（`check_session_if_needed` / 下单结果 / launcher 兜底），修一条不等于修完；判据要单源（`session_failure_is_permanent`），文案要能被恢复逻辑认出来。
+
+### 有票却不自动下单：任务级开关在界面上「隐形」（2026-10-16 修，用户截图报告）
+
+**症状**（用户截图 + 原文「有票点击启动任务也在监控但是没反应」）：任务卡状态「监控中」、引擎运行中，「已抢到 0」，「全部任务 1」，全局日志停在 `[启动] 监控引擎已启动` 不再增长。
+
+**取证：不是引擎没跑，也不是没票**。`state.json` 的 `last_poll` 每轮都在更新（引擎确实在轮询）；`order_history.json` 尾部有 17:54:43 一条 `result: "hit_no_order"` / `message: "余票命中（任务未开启自动下单）"` / `notify: email:成功`。
+根因是该任务 `config.json` 里 `"auto_order": false`：`engine._run_task` 的 `if not auto_order:` 分支只写 dedup `NO_ORDER` + 发提醒邮件 + 记历史，然后 `continue`；之后每轮同一 key 命中 dedup → `[跳过] …已记录(不自动下单)`，静默。
+
+**结构性缺口（真缺陷）**：`rpc_list_monitor_tasks` 不返回 `auto_order`，任务编辑弹窗在 2026-10-13 重构时把四个开关移走（只留「设置 → 任务默认值」，且**只对新建任务生效**）→ **老任务的 `auto_order=false` 在界面上既看不见、也改不回来**，用户只能看到「有票没反应」。
+
+**修法**：
+- `api.py:350`：`rpc_list_monitor_tasks` 补 `"auto_order": bool(t.get("auto_order", True))`——缺省必须与引擎 `task.get("auto_order", True)` 同口径，否则老任务缺字段会被界面误标「仅提醒」。
+- `ui/app.js`：任务卡新增「仅提醒」徽章（`t.auto_order === false` 且非管理模式时渲染；`ui/style.css:529` 的 `.no-order` 用 warn 色）；任务编辑弹窗加回「自动下单」勾选框（`id=fAuto`，放进 `.check-row` 复用通用选中态绑定，无需额外事件代码），保存时**始终**回传 `p.auto_order`（后端 `_req_on` 显式传优先，缺省才回落到「任务默认值」）。
+- **从「仅提醒」改回自动下单要顺手清防重**：旧的 `NO_ORDER` dedup 会继续挡住下单（`empty_task_dedup` 只能走引擎，手改 `state.json` 会被 `_merge_state_for_save` 从内存复活）。故保存后对 `t.auto_order === false && p.auto_order` 的情况补一次 `resetTask`，再 `setTaskStatus` 还原编辑前状态——`resetTask` 会把任务拉回 monitoring，不还原就成了「编辑一下任务自己跑起来」。
+
+**测试**：新增 `TestPerTaskAutoOrder`（listMonitorTasks 暴露 auto_order 且缺字段按 True / createTask 带回 auto_order / build_monitor_task 保留 auto_order；旧任务字段缺失时的界面语义）。
+**回归**：`compileall` 干净；`tests\test_all.py` → **Ran 726 tests, OK (skipped=15)**。
+
+**教训**：① 「有票没反应」先看 `order_history.json` 有没有 `hit_no_order`——命中过就说明引擎是好的，问题在下单开关。② 功能开关从 UI 移除但后端仍消费时，必须留一个**只读标识**，否则用户无法区分「没票」和「不下单」。③ 测试里 `start_now` 走默认 True 会经 `get_engine()` 单例写项目**真实** `state.json`（mock `start_engine` 拦不住）——调 `rpc_create_task` 必须显式 `start_now=False`。
 
 ## 1. 位置与仓库现状（2026-10-16 复核）
 - 当前家：C:\develep\产物\12306（本项目唯一工作副本）。
@@ -277,7 +314,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 
 ## 7. 测试与验证口径
 - 语法检查：python -X utf8 -m compileall -q .
-- 全量测试：python -X utf8 tests\test_all.py → 现状 **Ran 723, OK (skipped=15)**（2026-10-16 复核，零失败）。
+- 全量测试：python -X utf8 tests\test_all.py → 现状 **Ran 726, OK (skipped=15)**（2026-10-16 复核，零失败）。
   历史：曾一度为 696/5/15、701/4/15，那批 Windows 平台差异失败（test_append_history_shape_invalid_abandon_rereads、
   test_cookie_path_absolute_passthrough、test_menu_notify_routes_password_through_protect_secret、
   test_load_session_relative_path_resolves_against_here、test_save_session_relative_path_resolves_against_here）
@@ -308,12 +345,13 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 ## 10. 未决 / 待办（没有授权就别动）
 - ~~main ahead 8：是否 git push~~ **已完成**：HEAD=190a919 已推送，与 origin/main 同步（见第 1 节）。
 - ~~交接文档校正未提交~~ **已完成**：3f683ff（HANDOFF/README）+ 671324a（PRODUCT.md）已提交，工作树干净。**下次 push 时这两个 commit 会一起上去**。
-- ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（现 723 OK）。
+- ~~5 个 Windows 平台失败测试是否补 skipif 守卫~~ 已全部修复转绿（现 726 OK）。
 - ~~浏览器模式会话失效被误判成瞬时故障（引擎永不标 failed、无限重试）~~ **已修（2026-10-16，见 §0.98 末节）**：session_ok 先判落点/正文的门户标志（顺序在 json.loads 之前），引擎改用白名单 session_failure_is_permanent；新增 5 条测试。
 - ~~**停止后日志仍在刷 + 会话失效无限重试**（2026-10-15 用户截图报告）~~ **已修（2026-10-15，见 §0.98 末节「停止后日志仍在刷」）**：这是与上一条**不同的两条路径**（下单路径 + 线程收尾）。
   其一：browser_order 的「浏览器会话不可用（…）」匹配不上 engine 的会话判据 → 落兜底 continue → 每趟车重试、永不 failed；现接 session_failure_is_permanent，launcher 侧（Grabber._run）同样接，避免撞满 MAX_ORDER_FAILS=5 才停。
   其二：engine 的 stop_event 原本只在 run() 内部可见，_run_task 感知不到停止，stopEngine 后在途一轮仍跑满（用户截图里 17:23:02→17:23:13 每 2 秒一条 ERR 就是这么来的）；现 run() 暴露 self._stop_event，_run_task 在两个循环头 getattr 兜底查 is_set() 即退出。
   **注意：需重启桌面端生效**（入口是 Electron 壳 + 子进程 api.py）。
+- ~~**有票却不自动下单：任务级开关在界面上「隐形」**（2026-10-15 用户截图报告「有票点击启动任务也在监控但是没反应」）~~ **已修（2026-10-16，见 §0.98 末节）**：`rpc_list_monitor_tasks` 不返回 `auto_order`，编辑弹窗在 2026-10-13 重构时移走四个开关（只剩「设置 → 任务默认值」且只管新建）→ 老任务 `auto_order=false` 时界面完全看不出来。现补 API 字段 + 卡片「仅提醒」徽章 + 编辑弹窗勾选框，改回自动下单时顺手 `resetTask` 清旧 `NO_ORDER` 防重。**界面改动需重启桌面端生效。**
 - 一等卧/二等卧/高级动卧（官方码 I/J/A）是否进下单码表（长期未决）。
 - 重新登录后做一次真实下单核对（核对窗席别 vs 订单详情，需登录实跑）。
 - ~~**config/state 家族跨文件重复尚未收敛**~~ **已完成（2026-10-16，见 §0.98；策略以参数/回调注入保留，未拉平）**（用户 2026-10-16 裁决「消掉」）：load_config / save_config / update_config_locked / update_state_locked / normalize_email_settings / read_history_records 在 api.py、gui.py、monitor.py 各有一份。实测三份不是机械重复而是**能力分层**（monitor 有 FileNotFoundError 分支 + `_DAMAGED_STAMP` 指纹拒写 + expect_stamp；gui 有 messagebox 弹窗与 `guisave` 临时名；api 最简但有 expect_stamp），收敛必须**参数化保留策略**（RULES.md §七 第 2 条是硬约束），落点是 appcommon.py（已具 state.json 共享 plumbing 分节，含 read_state_or_none / `_read_history_list`）。逐字等价可无痛下沉的只有 `load_state` 与 `normalize_email_settings`（后者须统一选 gui 的**严格** EMAIL_RE，api 现为宽松版）。
@@ -387,6 +425,6 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
 2. git status -sb + `git log --oneline origin/main..main` 看实况（本文档不记 sha；是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
-4. python -X utf8 tests\test_all.py（预期 723 OK / skipped=15）
+4. python -X utf8 tests\test_all.py（预期 726 OK / skipped=15）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
 6. 需要下线实跑就先重新登录，再动代码。

@@ -48,5 +48,5 @@
 - 各写方的防护语义是**参数**不是噪音，别「统一」掉：engine 的 deepcopy 快照 + 直写兜底（`fallback_direct=True`）、launcher 的 `_CFG_WRITE_LOCK` + mtime 二次检测、gui 的 guisave 临时名。Windows 读侧 `read_state_or_none` 有 PermissionError 退避重试（与写方 os.replace 撞车窗口）。
   同上口径，config.json 的防护语义也是参数：monitor 的坏档指纹拒写（`damaged_fingerprint=_DAMAGED_STAMP`，文件指纹未变就绝不覆写证据）、四个写方的乐观并发检查（`expect_fingerprint` / monitor 的 `expect_stamp`）、state.json 的临时名前缀（`tmp_kind` = apisave/guisave/monsave/launcher）——收敛后由 `appcommon` 内部保留，调用方继续传各自的值，**别拉平成一个默认值**。
 - **拆 launcher.py（1168 行，2026-10-16 实测；旧文写作「约 3000 行」已过期）门禁**：必须等一次真实抢票验证通过 + 工作树无在途功能；拆前单独出拆分清单（4+ 文件）给用户确认。门面只需保 `import launcher` 兼容——`python launcher.py` **已于 2026-10-13 停止支持**（launcher.py 不再有 `__main__`，不再是入口，见 README.md，旧条款失效）。拆分清单原稿已删，真拆时重新起草。
-- **拆 browser_order._order_impl（599 行：`browser_order.py:726` 至下一定义 `:1324`，2026-10-16 实测）门禁**：必须等「重新登录 + 真实下单取证核对窗原文」的验证窗口；拆时 `mark()` 计时点原样保留、日志格式一行不动。
+- **拆 browser_order._order_impl 门禁（2026-10-17 更新）**：拆分已被「推翻重建」取代——fill/submit/confirm 段已提取为共享函数 `browser_order._run_fill_submit_confirm`（旧链继续调用，选择器单源），新链 `orderflow.py` 七阶段管线复用该函数；双链由 `order_flow_mode` 分流（默认新链）。旧 `_order_impl` 退役仍须等 Task 9 实跑成功一次（REBUILD_PLAN.md §0）。
 - 两项拆分做完前，禁止往这两个函数/文件里加新功能（新功能先进 ticket.py/appcommon.py 层）。

@@ -534,8 +534,16 @@ class MonitorEngine(object):
                     # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
                     # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
                     try:
+                        # 不用 fallback_direct：replace 重试耗尽时宁丢本轮落盘，
+                        # 绝不直写——直写被强杀/打断会撕裂 state.json（单字符截断），
+                        # 下一次 launcher 读到即挪档，防重记录全丢。
                         appcommon.atomic_write_json(self.state_path, snapshot,
-                                                    fallback_direct=True)
+                                                    fallback_direct=False)
+                    except OSError as e:
+                        # Windows 下目标被其它句柄占用：跳过本次落盘，内存态保留，
+                        # 下次 _save_state 重试。
+                        LOG.warning("state.json 替换失败，本次跳过落盘: %s", e)
+                        return self.state
                     except RuntimeError as e:
                         # Task 72：序列化期间被并发修改（防御性：快照本已是独立
                         # 深拷贝，正常到不了；若到，同样跳过落盘不逃出主循环）
@@ -627,6 +635,24 @@ class MonitorEngine(object):
         state = self._sanitize_state_tasks(state)
         return state
 
+    def _adopt_state(self, new_state):
+        """接管一份新 state，但保持 tasks[name] 的对象同一性。
+
+        worker 线程握着 entry = state["tasks"][name] 的引用（见 _run_task），
+        下单结果写回 busy_count / fail_streak / message 全走它。直接把
+        self.state 换成新 dict，那些写入就落进脱管的老字典——不报错、不落盘、
+        静默丢失。这里把新内容合并进旧 dict，引用保持有效。"""
+        old_tasks = self.state.get("tasks") if isinstance(self.state, dict) else None
+        new_tasks = new_state.get("tasks") if isinstance(new_state, dict) else None
+        if isinstance(old_tasks, dict) and isinstance(new_tasks, dict):
+            for name, new_task in list(new_tasks.items()):
+                cur = old_tasks.get(name)
+                if isinstance(cur, dict) and isinstance(new_task, dict):
+                    cur.clear()
+                    cur.update(new_task)
+                    new_tasks[name] = cur
+        self.state = new_state
+
     def _sync_state(self):
         """检测 state.json 是否被外部（GUI/其他进程）修改，有则重新加载。"""
         try:
@@ -638,7 +664,7 @@ class MonitorEngine(object):
             if new_state is None:
                 # 锁争用超时：保留旧内存态且不推进 mtime，下轮继续尝试重载
                 return
-            self.state = new_state
+            self._adopt_state(new_state)
             self._state_mtime = m
 
     def _sync_config(self):
@@ -1009,11 +1035,16 @@ class MonitorEngine(object):
                         retry_map.pop(key, None)
                         if self.task_status(task) == "retrying":
                             self.set_task_status(task, "monitoring", "冷却结束，恢复下单尝试")
+                    # 暂停再检：轮询/冷却期间用户可能刚点暂停。开跑下单前
+                    # 必须复查任务状态——否则在途轮次仍会提交下单（问题二）
+                    if self.task_status(task) not in ACTIVE_STATUSES:
+                        return False, False
                     # 自动下单（记录本次发起时刻，供提交后结果未知/防重复时做时间戳归因）
                     attempt_ts = time.time()
                     result_msg, extra = self._order_once(task, info, date, seat_name)
                     if result_msg == "ok":
                         retry_map.pop(key, None)
+                        self.state.setdefault("dup_streak", {}).pop(key, None)
                         self.state["dedup"][key] = "SUBMITTED"
                         self._save_state()
                         self._record_success(task, info, date, seat_name, extra)
@@ -1058,6 +1089,9 @@ class MonitorEngine(object):
                             "notify": "未通知",
                         })
                         LOG.info("[防重决策] 任务「%s」%s", name, decision)
+                        if cls not in ("none", "cancelled"):
+                            # 官方能看到单（或查询失败）：连击态中断，下次从零计
+                            self.state.setdefault("dup_streak", {}).pop(key, None)
                         if cls == "paid":
                             self.state["dedup"][key] = "SUBMITTED"
                             self._save_state()
@@ -1090,6 +1124,22 @@ class MonitorEngine(object):
                                     return True, False
                             continue
                         if cls in ("cancelled", "none"):
+                            # 连击退避：官方反复说无单但网页端反复判 dup，说明存在
+                            # 官方接口看不见的挡单（如「取消次数过多」当日封禁）。
+                            # 连发 3 次后停止自动重试，防刷封禁/烧账号信用。
+                            streaks = self.state.setdefault("dup_streak", {})
+                            streak = streaks.get(key, 0) + 1
+                            streaks[key] = streak
+                            self._save_state()
+                            if streak >= 3:
+                                streaks.pop(key, None)
+                                self._save_state()
+                                self.set_task_status(task, "failed",
+                                    "网页端连续 %d 次判重复下单但官方查无此单：疑似账号被限"
+                                    "（如取消次数过多），请到 12306 核对后恢复任务" % streak)
+                                LOG.error("[警告] 任务「%s」%s 连续 %d 次 dup 且官方无单，"
+                                          "停止自动重试", name, date, streak)
+                                return True, False
                             self.state["dedup"].pop(key, None)
                             self._save_state()
                             continue
@@ -1190,6 +1240,82 @@ class MonitorEngine(object):
                             self.set_task_status(task, "failed", "登录会话失效，" + hint)
                             LOG.error("[错误] 任务「%s」抢票失败：%s", name, msg)
                             return True, False
+                        if (extra or {}).get("reason") == "browser_dead":
+                            # 浏览器窗口/上下文异常关闭：结果不可知。绝不盲重试
+                            # （重开窗口循环下单有重复下单风险），先回读官方订单
+                            # 接口定生死（问题一）。
+                            try:
+                                cls, ono, raw, recent = order_mod.classify_with_time(
+                                    date, train_code, task.get("passenger_names") or [],
+                                    not_before_ts=attempt_ts,
+                                    session=self._classify_session())
+                            except Exception as _e:
+                                cls, ono, raw, recent = "error", "", "", None
+                                LOG.error("[窗口异常] 任务「%s」官方订单回读失败：%s", name, _e)
+                            if cls == "unpaid" and recent:
+                                # 窗口虽然死了，官方接口显示本次已生成未支付订单：
+                                # 如实捞回来报成功，防用户以为没下成又去重复下单
+                                self.state["dedup"][key] = "SUBMITTED"
+                                self._save_state()
+                                self._record_success(
+                                    task, info, date, seat_name,
+                                    {"passengers": "、".join(p_names), "order_no": ono})
+                                LOG.info("[窗口异常] 任务「%s」%s 浏览器窗口关闭，但官方已生成订单 %s，判定本次成功",
+                                         name, date, _mask_order_no(ono))
+                                if stop_after:
+                                    self.set_task_status(
+                                        task, "success",
+                                        "本次已提交订单（未支付），下单时间 %s" % (
+                                            recent.get("order_time") or "未知"))
+                                    return True, False
+                                if self.task_status(task) == "retrying":
+                                    self.set_task_status(task, "monitoring", "下单成功，恢复正常监控")
+                                return True, False
+                            if cls in ("none", "cancelled"):
+                                # 官方确认无本次订单：停止自动重试，交人工（可能
+                                # 是浏览器崩溃导致的脏状态，人工重启最稳）
+                                self.set_task_status(
+                                    task, "failed",
+                                    "浏览器窗口异常关闭，官方确认无此订单，已停止自动重试"
+                                    "（如仍要抢票请恢复任务）")
+                                appcommon.append_history(self.history_path, {
+                                    "time": self._now(), "task": name,
+                                    "result": "browser_dead",
+                                    "train": train_code, "date": date,
+                                    "from": info["from_name"], "to": info["to_name"],
+                                    "seat": seat_name, "passengers": p_names,
+                                    "order_no": ono,
+                                    "message": "浏览器窗口异常关闭；官方回读=%s，已停止自动重试" % cls,
+                                    "notify": "",
+                                })
+                                LOG.error("[窗口异常] 任务「%s」浏览器窗口关闭，官方回读=%s，停止自动重试",
+                                          name, cls)
+                                return True, False
+                            # unpaid 但时间对不上 / blocked / unknown / error：保守停
+                            self.set_task_status(
+                                task, "failed",
+                                "浏览器窗口异常关闭，官方订单状态无法确认——"
+                                "请先到 12306「未支付订单」核对后再恢复任务")
+                            appcommon.append_history(self.history_path, {
+                                "time": self._now(), "task": name,
+                                "result": "browser_dead",
+                                "train": train_code, "date": date,
+                                "from": info["from_name"], "to": info["to_name"],
+                                "seat": seat_name, "passengers": p_names,
+                                "order_no": ono,
+                                "message": "浏览器窗口异常关闭；官方回读=%s，无法确认" % cls,
+                                "notify": "",
+                            })
+                            LOG.error("[窗口异常] 任务「%s」浏览器窗口关闭，官方回读=%s，停止自动重试",
+                                      name, cls)
+                            return True, False
+                        if (extra or {}).get("reason") == "user_stopped":
+                            # 用户点了暂停/停止，下单链在浏览器侧已中止：
+                            # 这是用户主动意图，不算失败——不记账、不通知、不重试，
+                            # 本轮直接收尾（问题二：旧行为会当普通失败每轮重试下单）
+                            LOG.info("[停止] 任务「%s」%s %s 下单已被用户停止：%s",
+                                     name, date, train_code, msg)
+                            return False, False
                         if order_mod.is_busy_error(msg):
                             # 系统忙：进入"等待重试"状态 + 冷却退避，避免刷请求与刷日志
                             try:
@@ -1246,6 +1372,8 @@ class MonitorEngine(object):
         name = task["name"]
         order_no = extra.get("order_no") or ""
         alias_seat = extra.get("alias_seat") or ""
+        pay_evidence = extra.get("pay_evidence") or ""
+        page_kind = extra.get("page_kind") or ""
         # 勾选无座→网页端同价按硬座出票：通知与历史里要如实写清楚
         seat_display = seat_name + ("（勾选 %s，网页端同价按 %s 出票）" % (
             extra.get("selected_seat") or seat_name, alias_seat) if alias_seat else "")
@@ -1261,6 +1389,8 @@ class MonitorEngine(object):
                  passengers=extra.get("passengers", ""))
         if order_no:
             body += "订单号：{0}\n".format(order_no)
+        if pay_evidence:
+            body += "付款页证据：{0}\n".format(pay_evidence)
         body += "\n（本条由监控系统自动发送）"
         try:
             notify_results = self._notify(task, subject, body)
@@ -1275,14 +1405,17 @@ class MonitorEngine(object):
             "to": info["to_name"], "seat": seat_name,
             "passengers": (extra.get("passengers") or "").split("、") if extra else [],
             "order_no": order_no,
+            "pay_evidence": pay_evidence,
+            "page_kind": page_kind,
             "message": "订单提交成功（未支付）" + ("，勾选 %s 同价按 %s 出票" % (
                 extra.get("selected_seat") or seat_name, alias_seat) if alias_seat else ""),
             "notify": notify_txt,
         })
-        LOG.info("[抢到] 任务「%s」已提交订单：%s %s %s 乘车人:%s 订单号:%s",
+        LOG.info("[抢到] 任务「%s」已提交订单：%s %s %s 乘车人:%s 订单号:%s 付款页证据:%s",
                  name, date, info["train_code"], seat_display,
                  _mask_names((extra.get("passengers", "") or "").split("、")),
-                 _mask_order_no(order_no) if order_no else "未知")
+                 _mask_order_no(order_no) if order_no else "未知",
+                 pay_evidence or "无")
 
     def _note_failure(self, task, message):
         name = task["name"]
@@ -1344,9 +1477,11 @@ class MonitorEngine(object):
         self._last_session_check = now
         auto_tasks = [t for t in self.tasks if t.get("auto_order", True)
                       and self.task_status(t) in ACTIVE_STATUSES]
-        if not auto_tasks:
-            return
         browser_mode = (self.config.get("order_mode") or "http") == "browser"
+        if not auto_tasks and not browser_mode:
+            # http 模式待命时不体检（该模式已弃用）；浏览器模式待命也要保活，
+            # 登录失效才能被及时发现并弹窗提醒（api 会话看门狗同步在跑）。
+            return
         if browser_mode:
             # 浏览器模式下会话由 .browser_profile 承载，必须用真实页面校验；
             # 继续验 session_cookies.json 只会得到已失效的旧结果。
@@ -1384,12 +1519,16 @@ class MonitorEngine(object):
                 if st.get("status") == "failed" and "登录会话失效" in st.get("message", ""):
                     self.set_task_status(t, "monitoring", "会话已恢复，自动重新监控")
         elif permanent:
-            LOG.error("[错误] 登录会话已失效：%s", who)
-            LOG.error("[错误] 以下任务的抢票已停止：%s",
-                      "、".join("「%s」" % t["name"] for t in auto_tasks))
-            LOG.error("[错误] 请重新登录后再恢复任务")
-            for t in auto_tasks:
-                self.set_task_status(t, "failed", "登录会话失效，请重新登录后恢复任务")
+            if not auto_tasks:
+                # 没有活动任务就不标任务；界面弹窗（api 会话看门狗）负责提醒
+                LOG.error("[错误] 登录会话已失效：%s（当前无活动任务，等待重新登录）", who)
+            else:
+                LOG.error("[错误] 登录会话已失效：%s", who)
+                LOG.error("[错误] 以下任务的抢票已停止：%s",
+                          "、".join("「%s」" % t["name"] for t in auto_tasks))
+                LOG.error("[错误] 请重新登录后再恢复任务")
+                for t in auto_tasks:
+                    self.set_task_status(t, "failed", "登录会话失效，请重新登录后恢复任务")
         else:
             # 临时故障：不标记失败，5 分钟后再校验，监控继续
             self._last_session_check = now - 900
@@ -1632,9 +1771,14 @@ def _merge_state_for_save(disk_state, mem_state, tombstoned):
         merged_tasks.pop(name, None)
     mem_dedup = mem_state.get("dedup")
     mem_retry = mem_state.get("retry")
+    mem_dup = mem_state.get("dup_streak")
     return {
         "dedup": dict(mem_dedup) if isinstance(mem_dedup, dict) else {},
         "retry": dict(mem_retry) if isinstance(mem_retry, dict) else {},
+        # dup_streak 必须落盘：它是跨轮累加的「网页连续判 dup 而官方查无此单」
+        # 计数，攒到 3 就判定账号被限流并停手。不落盘这个阈值永远攒不满，
+        # 每次重启都清零，等于刹车片根本没装上。
+        "dup_streak": dict(mem_dup) if isinstance(mem_dup, dict) else {},
         "tasks": merged_tasks,
     }
 

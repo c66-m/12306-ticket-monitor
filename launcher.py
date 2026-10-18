@@ -46,6 +46,10 @@ import filelock
 import logutil
 import notify
 import order as order_mod
+try:
+    import orderflow  # 新链：阶段化下单管线（REBUILD_PLAN.md），缺失时回落旧链
+except ImportError:
+    orderflow = None
 import passengers as passengers_mod
 import ticket
 
@@ -243,9 +247,10 @@ class Grabber(threading.Thread):
         log = self._log
         lc = self.lc
         # 历史文件路径与监控系统同源(config.history_file),别写错文件
-        # 读失败（缺文件/坏档）按空配置走缺省名——appcommon 单源口径
-        hist_path = appcommon.history_path_of(
-            appcommon.read_config_or_empty(os.path.join(HERE, "config.json")), HERE)
+        # 读失败（缺文件/坏档）按空配置走缺省名——appcommon 单源口径。
+        # mon_cfg 留变量：下单分流要读 order_flow_mode / order_flow（新链开关）
+        mon_cfg = appcommon.read_config_or_empty(os.path.join(HERE, "config.json"))
+        hist_path = appcommon.history_path_of(mon_cfg, HERE)
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
         trains = _normalize_trains(lc.get("trains"), log)
@@ -346,7 +351,7 @@ class Grabber(threading.Thread):
         warm = None
         lead = 0
         try:
-            lead = max(0, int(lc.get("warm_minutes") or 10))
+            lead = max(3, int(lc.get("warm_minutes") or 10))  # 至少提前 3 分钟：登录+预热需要时间
         except Exception:
             pass
         if lead > 0 and st and datetime.now() < st - timedelta(minutes=lead):
@@ -445,10 +450,21 @@ class Grabber(threading.Thread):
                         sc, _alias = ticket.order_seat_code(seat, sc, info.get("train_code"))
                         if _alias:
                             log("[席别] %s 网页端下单页不下发，按同价改判为 %s 下单" % (seat, _alias))
-                        ok, msg, extra = browser_order.order_via_browser(
-                            info, seat, sc, names, date, headless=False, verify_timeout=90,
-                            purpose=purpose_of(lc), purpose_map=purpose_map_of(lc),
-                            warm=warm, alias_name=_alias)
+                        # 新链分流：order_flow_mode（默认 True）走阶段化管线
+                        # orderflow；旧链保留到实跑验证成功后退役（双链并存）
+                        if orderflow is not None and mon_cfg.get("order_flow_mode", True):
+                            ok, msg, extra = orderflow.run_orderflow(
+                                info, seat, sc, names, date, headless=False,
+                                purpose=purpose_of(lc), purpose_map=purpose_map_of(lc),
+                                warm=warm, alias_name=_alias,
+                                should_stop=self.stop_event.is_set,
+                                flow_cfg=mon_cfg.get("order_flow") or {}, logger=LOG)
+                        else:
+                            ok, msg, extra = browser_order.order_via_browser(
+                                info, seat, sc, names, date, headless=False, verify_timeout=90,
+                                purpose=purpose_of(lc), purpose_map=purpose_map_of(lc),
+                                warm=warm, alias_name=_alias,
+                                should_stop=self.stop_event.is_set)
                     except RuntimeError as e:
                         if note_exc(e):
                             self.result = (False, "下单异常连续 %d 次（%s: %s），已自动停止"

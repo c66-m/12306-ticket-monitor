@@ -1,4 +1,8 @@
+import os
+
 from PIL import Image, ImageDraw, ImageFont
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 S = 512
 grad = Image.new("RGB", (S, S))
@@ -18,6 +22,6 @@ f = ImageFont.truetype("C:/Windows/Fonts/seguiemj.ttf", int(S * 0.60))
 em = Image.new("RGBA", (S, S), (0, 0, 0, 0))
 ImageDraw.Draw(em).text((S/2, S/2 + int(S*0.035)), "\U0001F684", font=f, anchor="mm", embedded_color=True)
 img = Image.alpha_composite(img, em)
-img.save(r"C:\develep\产物\12306\electron\icon.ico", sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
-img.resize((256,256), Image.LANCZOS).save(r"C:\develep\产物\12306\_icon_preview.png")
+img.save(os.path.join(ROOT, "electron", "icon.ico"), sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
+img.resize((256,256), Image.LANCZOS).save(os.path.join(ROOT, "_icon_preview.png"))
 print("ok", img.size)

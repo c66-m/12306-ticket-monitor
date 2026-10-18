@@ -1643,9 +1643,7 @@ _mask_id = appcommon.mask_id_partial
 
 # ----------------------------- 购票历史 -----------------------------
 
-HISTORY_RESULT_LABEL = {"success": "下单成功", "dup": "防重跳过",
-                        "failed": "下单失败", "hit_no_order": "命中未下单",
-                        "ambiguous": "结果待人工核对"}
+HISTORY_RESULT_LABEL = appcommon.HISTORY_RESULT_LABEL
 
 
 def read_history_records(limit=200):

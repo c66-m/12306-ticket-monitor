@@ -3,7 +3,7 @@
 日期:2026-10-06  ·  基线:a8b4b57(含并行会话的在途改动)
 
 > **2026-10-16 复核：本报告是历史存档**——第一~九节的结论与其成因分析保留价值，但**已不是当前事实基线**。
-> 现状：`tests/test_all.py` 为 **723 项**（skipped=15），`python tests/test_all.py` 全绿；架构、文件清单、文件行数以 `HANDOFF.md` 为准，业务规则以 `RULES.md` 为准。
+> 现状：`tests/test_all.py` 为 **726 项**（skipped=15），`python tests/test_all.py` 全绿；架构、文件清单、文件行数以 `HANDOFF.md` 为准，业务规则以 `RULES.md` 为准。
 > 本轮复核增量见文末「十、2026-10-16 复核增量」。
 
 ## 一、测试执行概况
@@ -75,5 +75,8 @@ Windows 优先(msvcrt 跨进程锁、DPAPI),非 Windows 路径均有降级:锁�
   其一：`browser_order._order_impl` 返回「浏览器会话不可用（…）」既不匹配「会话已失效」也不匹配「未找到会话文件」，engine._run_task 落到兜底 `continue` → 每趟车重试一遍、永不标 `failed`；现判据接 `browser_order.session_failure_is_permanent`，命中即 failed 并提示「重新登录」。
   其二：`run()` 的 `stop_event` 原本只在 run() 内部可见，`_run_task` 感知不到停止，`executor.shutdown(wait=False)` 之后在途一轮仍跑满（18 趟车约 36 秒日志）；现 `run()` 暴露 `self._stop_event`，`_run_task` 在两个循环头 `getattr` 兜底查 `is_set()` 即退出。
   launcher 侧（`Grabber._run`）同样接判据，避免撞满 `MAX_ORDER_FAILS=5` 才停；engine 兜底分支的「抢票失败」改为「[重试] …本轮未成功」，与真终止区分。
-- 回归：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 723 tests, OK (skipped=15)**。
+- 回归（config/state 收敛与三处会话失效修复批次）：`python -X utf8 -m compileall -q .` 干净；`python -X utf8 tests\test_all.py` → **Ran 723 tests, OK (skipped=15)**。
+- **任务级「自动下单」开关在界面上隐形（已修）**：任务 `auto_order=false` 时引擎只记历史（`hit_no_order`）+ 发提醒邮件、不下单（`engine._run_task` 的 `if not auto_order:` 分支），而 `rpc_list_monitor_tasks` 不返回该字段、编辑弹窗又没有这个开关（2026-10-13 重构时移走，只剩「设置 → 任务默认值」且仅对新建生效）→ 老任务的这一项在界面上既看不见也改不回来，表现即「有票没反应」。现补 API 字段（缺省与引擎同口径 `True`）、任务卡「仅提醒」徽章（`.no-order`）、编辑弹窗勾选框；从「仅提醒」改回自动下单时顺手 `resetTask` 清旧 `NO_ORDER` 防重（`resetTask` 会把任务拉回 monitoring，故再 `setTaskStatus` 还原编辑前状态）。
+- **顺带修掉一条「真打网络」的测试**：`TestTask77Order.test_classify_with_time_no_session_error_path` 在 `session=None` 时真读项目 `.browser_state.json`，本机有登录态就会打真 12306 订单接口、结论随登录状态漂移（违反 RULES.md「测试不打真实接口」）；现 mock `order.session_from_browser_state` 抛 RuntimeError。
+- 回归（本批末）：`compileall` 干净；`python -X utf8 tests\test_all.py` → **Ran 726 tests, OK (skipped=15)**；新增 `TestPerTaskAutoOrder` 3 例。
 

@@ -24,6 +24,9 @@ ticket.py（免登录轻客户端轮询余票）
 engine.py / launcher.py（设防重记录 → 发起下单）
    │
    ▼
+orderflow.py（阶段化管线：检测→填单→提交→确认→驻留判定→日志；order_flow_mode 开关默认新链）
+   │
+   ▼
 browser_order.py（真实 Edge：提交订单 → 排队 → 停在未支付）
    │  结果已知 / 未知（ambiguous）
    ▼
@@ -42,7 +45,7 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `ui/index.html` + `ui/app.js` + `ui/style.css` | 主窗 87 / 1671 / 960 行 | **唯一界面（纯 HTML/CSS/JS，无框架）**：顶栏（会话胶囊 / 监控开关 / 窗口键：置顶 · 小窗 · 最小化 · 最大化 · 关闭）+ 侧边栏 = 监控任务 / 抢票任务 / 乘车人 / 历史 / 设置 + 主区 + 底部全局日志。渲染、轮询、外观设置全在 app.js |
 | `ui/mini.html` + `ui/mini.js` + `ui/mini.css` | 小窗 3 文件 | **抢票小窗（B7 第二步）**：460×420 无边框，只显示账号 / 进行中任务 / 抢票日志；打开时主窗隐藏，关闭自动还原。外观经 `--appear` 启动参数继承主窗 |
 | `electron/main.js` + `electron/preload.js` | 221 / 27 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
-| `api.py` | 1222 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停、日志泵、抢票定时调度、config/state 原子写 |
+| `api.py` | 1273 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停（启动时自动起，`auto_start_engine=false` 可关）、日志泵、抢票定时调度、config/state 原子写 |
 | `launcher.py` | 1164 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查 |
 | `gui.py` | 4296 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）原地保留。新功能一律改 `ui/` |
 | `monitor.py` | 1140 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
@@ -52,7 +55,8 @@ state.json / orders.json / 购票历史 / 邮件通知
 | 模块 | 规模 | 职责 |
 |---|---|---|
 | `ticket.py` | 823 行 | **余票查询与解析**（免登录）：车站码表、queryG 竖线字段解析、p20~p33 逐席别判余票；席别命名（卧铺共享字段、p35 码串）、「车次=席别」规则解析与候选求交 |
-| `browser_order.py` | 1708 行 | **浏览器下单**（Playwright）：`#submitOrder_id` → checkOrderInfo → getQueueCount → 核对窗 → `#qr_submit_id` 倒计时 → confirmSingleForQueue → 停在支付页；席别/票种走官方事件链强写内部状态并回读校验；滑块一出现即中止 |
+| `orderflow.py` | 404 行 | **下单编排管线**（新链，默认启用）：七阶段状态机；HOLD 每 0.5s 读页，读到「待付款」才关全部页面；首读未获先官方回读防 dup 再新开重下（retry_open_times）；滑块即停交人工；复用 `_run_fill_submit_confirm` DOM 序列与 order.py 归因 |
+| `browser_order.py` | 1909 行 | **浏览器下单**（Playwright）：`#submitOrder_id` → checkOrderInfo → getQueueCount → 核对窗 → `#qr_submit_id` 倒计时 → confirmSingleForQueue → 停在支付页；席别/票种走官方事件链强写内部状态并回读校验；滑块一出现即中止 |
 | `order.py` | 1042 行 | **订单事实来源**：官方订单接口回读（未支付 / 未出行 / 历史三列表）、状态分类（paid/unpaid/cancelled/none/blocked/unknown/error）、时间戳归因（`classify_with_time`、`find_recent_order`）、纯 HTTP 下单后备链路 |
 | `engine.py` | 1621 行 | **监控引擎**：多任务调度与优先级、自适应轮询频率、防重复下单三层、断点续连、下单决策（含 dup/ambiguous 的官方回读归因分支） |
 

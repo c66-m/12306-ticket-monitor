@@ -2,7 +2,8 @@ from PIL import Image, ImageDraw, ImageFilter
 import os
 
 SRC = r"C:\Users\Admini\.dsh\attachments\v1\objects\32\3201cefa709b4b13ab1561e46c82747ecfd0c0a368d9c8d05de5bd665af0939a"
-DEST = r"C:\develep\产物\12306\electron"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEST = os.path.join(ROOT, "electron")
 
 im = Image.open(SRC).convert("RGBA")
 N = 1024
@@ -37,5 +38,5 @@ for row, (bg, off) in enumerate([((255,255,255), 0), ((32,34,42), 190)]):
         box = t if s > 32 else t.resize((s * 3, s * 3), Image.LANCZOS)
         sheet.alpha_composite(box, (x, off + 20 + (128 - box.height) // 2))
         x += box.width + 16
-sheet.save(r"C:\develep\产物\12306\_icon_preview.png")
+sheet.save(os.path.join(ROOT, "_icon_preview.png"))
 print("preview ok")

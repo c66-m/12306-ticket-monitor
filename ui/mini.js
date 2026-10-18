@@ -136,6 +136,7 @@ bridge.onPush((msg) => {
   else if (m === "backendRestart") { $("#mEngineText").textContent = "后端重启中"; $("#mEngine").classList.remove("on"); }
   else if (m === "backendRestarted") { $("#mEngineText").textContent = "后端已拉起"; }
   else if (m === "ready") refresh();
+  else if (m === "sessionExpired") feedLog("[提醒] 登录已失效，请回主窗重新登录");
 });
 
 applyAppearance();

@@ -526,6 +526,16 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   color: var(--ink-3);
 }
 .mon-badge.on { color: var(--accent); }
+.no-order {
+  flex: 0 0 auto;
+  font-size: .68rem;
+  font-weight: 600;
+  white-space: nowrap;
+  padding: .1rem .45rem;
+  border-radius: 999px;
+  color: var(--warn);
+  background: var(--warn-bg);
+}
 .tk-pause { flex: 0 0 auto; white-space: nowrap; }
 
 /* -------- 查票 -------- */

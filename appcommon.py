@@ -21,6 +21,26 @@ LOG = logging.getLogger("monitor")
 
 MAX_DATE_SPAN_DAYS = 5   # 乘车日期区间最多相差天数（= 6 个日期）
 
+# 购票历史 result → 中文标签（前端 / GUI / 终端共用一份，别再各写各的）。
+# `failed` 的语义是「本轮未成功，下轮继续重试」（无票/排队/下单页状态变化都走
+# 这条），不是「下单失败」——写成「下单失败」会让人以为任务终止、单子没了，
+# 而真实情况常常是 12306 已经生成了未支付订单（拒绝重复下单的原文是
+# 「包含未付款订单」）。改文案前先读 engine.py 里各 result 的产出点。
+HISTORY_RESULT_LABEL = {
+    "success": "下单成功",
+    "dup": "防重跳过",
+    "notified": "已通知",
+    "hit_no_order": "有余票未下单",
+    "ambiguous": "结果待核对",
+    "browser_dead": "浏览器中断",
+    "seat_unavailable": "席别不可售",
+    "failed": "本轮未成功",
+    "error": "异常",
+    # 与 12306 官方订单对账后的改判结论（api.rpc_reconcile_history 写入）
+    "confirmed_unpaid": "已对账·有未付单",
+    "confirmed_paid": "已对账·已支付",
+}
+
 
 # ----------------------------- PII 脱敏 -----------------------------
 # 脱敏口径的单源：engine / order / launcher_utils / browser_order / gui /

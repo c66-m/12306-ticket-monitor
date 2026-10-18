@@ -527,6 +527,10 @@ function taskRow(t, mgr) {
   const mon = ["monitoring", "retrying"].includes(st);
   const monBadge = mgr ? "" :
     '<span class="mon-badge' + (mon ? " on" : "") + '">' + (mon ? "● 监控中" : "○ 未监控") + "</span>";
+  // 「仅提醒」标：auto_order=false 的任务命中余票只记历史+发邮件，不下单
+  // （老任务常存成 false，之前界面上完全看不出来 → 用户以为"有票没反应"）
+  const ordBadge = (mgr || t.auto_order !== false) ? "" :
+    '<span class="no-order" title="未开自动下单：命中余票只记录并邮件提醒，不会下单">仅提醒</span>';
   const pauseBtn = mgr ? "" :
     '<button class="btn btn-mini ' + (mon ? "btn-ghost" : "btn-call") + ' tk-pause" data-act="' + (mon ? "pause" : "resume") + '" data-name="' + esc(t.name) + '" title="' + (mon ? "暂停监控" : "恢复监控") + '">' + (mon ? "⏸ 暂停" : "▶ 恢复") + "</button>";
   return '<div class="task' + (mgr ? " mgr" : "") + (mgr && S.mgrSel.includes(t.name) ? " sel" : "") + '" data-name="' + esc(t.name) + '">' +
@@ -534,7 +538,7 @@ function taskRow(t, mgr) {
     '<span class="train-no">' + esc(t.trains[0] || "—") + "</span>" +
     '<div class="route"><div class="line"><b>' + esc(t.name) + '</b><span class="arrow">→</span><span>' + esc(route) + "</span></div>" +
     '<div class="sub">' + (esc(sub) || "（无配置）") + (t.message ? " · " + esc(t.message) : "") + "</div></div>" +
-    monBadge + pauseBtn +
+    ordBadge + monBadge + pauseBtn +
     '<span class="status ' + cls + '">' + esc(label) + "</span></div>";
 }
 
@@ -543,6 +547,9 @@ async function openMonitorTaskForm(edit) {
   if (!S.pax.length) await refreshPax();
   const t = edit || {};
   const isEdit = !!edit;
+  // 「自动下单」开关：编辑取任务原值，新建取设置里的任务默认值（与后端 _req_on 同口径）
+  const autoOn = isEdit ? t.auto_order !== false
+    : (((S.settings || {}).task_defaults || {}).auto_order) !== false;
   const { modal, close } = openModal(
     "<h3>" + (isEdit ? "编辑任务" : "新建监控任务") + "</h3>" +
     '<div class="mt-top"><div class="form-row grow"><label>出发站</label>' + stationInput("from", t.from) + "</div>" +
@@ -565,6 +572,8 @@ async function openMonitorTaskForm(edit) {
     '<div class="form-row"><label>优先级 (1-10)</label><input type="number" id="fPrio" min="1" max="10" value="' + esc(t.priority || 5) + '"></div>' +
     '<div class="form-row"><label>票种</label><select id="fPurpose"><option value="ADULT"' + ((t.purpose || "ADULT") === "ADULT" ? " selected" : "") + '>成人票</option><option value="0X00"' + ((t.purpose || "") === "0X00" ? " selected" : "") + '>学生票</option></select></div>' +
     "</div>" +
+    // 放进 .check-row：选中态由 :636 的通用绑定负责，无需额外事件代码
+    '<div class="form-row"><label>自动下单</label><div class="check-row"><label class="check' + (autoOn ? " on" : "") + '" id="fAuto" title="关掉后命中余票只记录并发提醒邮件，不会真的下单"><input type="checkbox"' + (autoOn ? " checked" : "") + ">命中余票就直接下单</label></div></div>" +
     '<div class="form-actions"><button class="btn btn-ghost" id="fCancel">取消</button>' +
     '<button class="btn btn-call" id="fSave">' + (isEdit ? "保存" : "创建") + "</button></div>");
 
@@ -651,17 +660,29 @@ async function openMonitorTaskForm(edit) {
       passengers: paxNames, purpose: modal.querySelector("#fPurpose").value,
       priority: modal.querySelector("#fPrio").value,
     };
-    // 四个开关（自动下单/抢到后停止/邮件通知/立即启动）不再出现在本弹窗：
-    // 编辑时显式回传任务原值，新建时不传 → 后端取设置里的全局默认
+    // 「自动下单」是本弹窗的显式开关，始终回传勾选值（后端 _req_on 显式传优先）。
+    // 其余三个开关仍不出现：编辑时回传任务原值，新建时不传 → 后端取设置里的全局默认
+    p.auto_order = !!modal.querySelector("#fAuto input").checked;
     if (isEdit) {
-      p.auto_order = !!t.auto_order;
       p.stop_after_order = !!t.stop_after_order;
       p.notify = !!(t.notify || (t.notify_channels || []).length);
       p.start_now = false; // 编辑 ≠ 新建：保存后别顺手把引擎拉起来
     }
     try {
-      if (isEdit) await call("deleteTask", { name: t.name }); // 无原地编辑接口：删旧建新
-      await call("createTask", p);
+      // 无原地编辑接口：编辑 = 删旧建新。顺序必须是「先建后删」——反过来的话
+      // createTask 一旦失败，旧任务已经被删掉，任务就永久消失了。
+      const r = await call("createTask", p);
+      if (isEdit && t.name && t.name !== r.name) {
+        try { await call("deleteTask", { name: t.name }); }
+        catch (e) { toast("旧任务删除失败，请在列表里手动删掉「" + t.name + "」", "err"); }
+      }
+      // 「仅提醒」改回「自动下单」时，之前命中余票留下的防重记录会继续挡住下单
+      // → 顺手清掉；resetTask 附带恢复监控，用原状态回设，别让编辑顺带改运行态
+      if (isEdit && t.auto_order === false && p.auto_order) {
+        await call("resetTask", { name: r.name });
+        if (!["monitoring", "retrying"].includes(t.status))
+          await call("setTaskStatus", { name: r.name, status: t.status || "paused", message: "编辑任务" });
+      }
       close(); toast(isEdit ? "已保存" : "任务已创建");
       refreshMonitor();
     } catch (e) { /* call 已 toast */ }
@@ -1128,11 +1149,19 @@ function paxRow(p) {
 async function openPaxForm(edit) {
   let t = edit ? Object.assign({}, edit) : {};
   // 列表接口返回的是掩码证件号/手机号，编辑时必须取回明文（否则保存会把掩码写进磁盘）
+  let detailFailed = false;
   if (edit && edit.name) {
     try {
       const d = await call("passengerDetail", { name: edit.name });
       if (d && d.ok && d.passenger) t = Object.assign({}, edit, d.passenger);
-    } catch (e) { /* call 已提示 */ }
+      else detailFailed = true;
+    } catch (e) { detailFailed = true; /* call 已提示 */ }
+  }
+  // 取不回明文时绝不能沿用列表里的掩码：那张掩码被原样保存一次，真证件号就永久没了。
+  // 清空敏感字段逼用户重填，比静默写坏安全。
+  if (detailFailed) {
+    t = Object.assign({}, t, { id_no: "", mobile: "" });
+    toast("未能读取原证件号，请重新填写", "err");
   }
   const { modal, close } = openModal(
     "<h3>" + (edit ? "编辑乘车人" : "新增乘车人") + "</h3>" +
@@ -1175,16 +1204,36 @@ async function openPaxForm(edit) {
 
 // ================= 历史页 =================
 function renderHistory(root) {
-  const recs = S.history.filter((r) => hitSearch(r.task || "", r.train || "", r.from || "", r.to || "", r.result || "", r.message || ""));
+  const recs = S.history.filter((r) => hitSearch(r.task || "", r.train || "", r.date || "", r.from || "", r.to || "", r.result || "", r.message || ""));
   root.innerHTML =
-    '<div class="card glass glass-surface" style="flex:1"><div class="sec-head"><h3>购票历史</h3><span class="more">最近 ' + S.history.length + " 条</span></div>" +
-    '<div class="set" style="overflow-y:auto">' + recs.map((r) => {
-      const cls = r.result === "success" ? "succ" : r.result === "dup" ? "pause" : r.result === "notified" ? "run" : r.result === "failed" || r.result === "error" ? "fail" : "canc";
-      return '<div class="s"><span class="k"><b>' + esc(r.train || "—") + "</b> " + esc([r.from, r.to].filter(Boolean).join(" → ") || "") + "</span>" +
+    '<div class="card glass glass-surface" style="flex:1"><div class="sec-head"><h3>购票历史</h3><span style="display:flex;gap:8px;align-items:center">' +
+    '<span class="more">最近 ' + S.history.length + ' 条</span>' +
+    '<button class="btn btn-mini btn-ghost" id="hReconcile" title="拿当前登录会话查 12306 官方订单（只读：不下单、不支付、不取消）">核对订单</button></span></div>' +
+    '<div class="set" style="overflow-y:auto">' + (recs.map((r) => {
+      const cls = r.result === "success" ? "succ"
+        : r.result === "confirmed_unpaid" || r.result === "confirmed_paid" ? "succ"
+        : r.result === "dup" ? "pause"
+        : r.result === "notified" || r.result === "hit_no_order" ? "run"
+        : r.result === "ambiguous" || r.result === "seat_unavailable" ? "pause"
+        : r.result === "browser_dead" || r.result === "error" ? "fail"
+        : "canc";
+      return '<div class="s"><span class="k"><b>' + esc(r.train || "—") + "</b> " + esc([r.from, r.to].filter(Boolean).join(" → ") || "") +
+        (r.date ? ' <span class="muted" style="font-size:11px;opacity:.72">' + esc(r.date) + "</span>" : "") + "</span>" +
         '<span class="v">' + esc(r.time || "") + "</span>" +
         '<span class="chip status ' + cls + '">' + esc(HISTORY_LABELS[r.result] || r.result) + "</span></div>" +
         (r.message ? '<div class="muted" style="margin:-4px 0 6px 2px;font-size:11px">' + esc(r.message) + "</div>" : "");
-    }).join("") || '<div class="muted" style="padding:20px;text-align:center">暂无记录</div>' + "</div></div>";
+    }).join("") || '<div class="muted" style="padding:20px;text-align:center">暂无记录</div>') + "</div></div>";
+
+  const hb = root.querySelector("#hReconcile");
+  if (hb) hb.onclick = async () => {
+    hb.disabled = true;
+    try {
+      const r = await call("reconcileHistory", { limit: 50 });
+      toast(r.message || "已核对", r.ok ? undefined : "err");
+      if (r.changed) await refreshHistory();
+    } catch (e) { /* call() 已 toast 并记日志 */ }
+    finally { hb.disabled = false; }
+  };
 }
 
 // ================= 设置页 =================
@@ -1287,7 +1336,17 @@ function renderSettings(root) {
     toast(S.session.ok ? "会话有效" : "未登录：" + (S.session.message || ""), S.session.ok ? "" : "err");
   };
   root.querySelector("#sRelogin").onclick = async () => {
-    const r = await call("relogin");
+    // 先让后端预检：会话有效时不弹窗（弹了是「窗口一闪」），确认后才强制重登
+    let r = await call("relogin").catch(() => null);
+    if (!r) return;
+    if (r.running) { toast(r.message || "登录窗口已经打开了"); return; }
+    if (r.already) {
+      const yes = await confirmBox("重新登录", "当前已登录（" + (r.name || "已登录") +
+        "），仍要重新拉起登录窗口吗？", "重新登录");
+      if (!yes) return;
+      r = await call("relogin", { force: true }).catch(() => null);
+      if (!r) return;
+    }
     toast(r.message || "已拉起浏览器");
     setTimeout(refreshSession, 5000);
   };
@@ -1479,7 +1538,16 @@ async function refreshHistory() {
 // ================= 常量（与 Python 侧对齐） =================
 const SEAT_CHOICES = ["商务座", "特等座", "优选一等座", "一等座", "二等座", "高级软卧", "动卧", "软卧", "硬卧", "软座", "硬座", "无座"];
 const ID_TYPE_NAMES = { "1": "二代身份证", "2": "一代身份证", "C": "港澳通行证", "G": "台湾通行证", "B": "护照", "H": "永久居留证", "L": "其他" };
-const HISTORY_LABELS = { success: "下单成功", dup: "防重跳过", notified: "已通知", failed: "下单失败", error: "异常" };
+// failed = 本轮未成功、下轮继续重试，不是「下单失败」（真失败时 12306 往往
+  // 已经生成了未支付订单，拒绝重复下单的原文是「包含未付款订单」）。
+  // 与 appcommon.HISTORY_RESULT_LABEL 保持一致。
+  const HISTORY_LABELS = {
+    success: "下单成功", dup: "防重跳过", notified: "已通知",
+    hit_no_order: "有余票未下单", ambiguous: "结果待核对",
+    browser_dead: "浏览器中断", seat_unavailable: "席别不可售",
+    failed: "本轮未成功", error: "异常",
+    confirmed_unpaid: "已对账·有未付单", confirmed_paid: "已对账·已支付",
+  };
 const _DEFAULT_LC = {
   version: 1, passenger_names: [], from: "", to: "", fromCode: "", toCode: "",
   trains: [], seat_types: [], seat_priority: "", date: "", date_to: "",
@@ -1487,11 +1555,25 @@ const _DEFAULT_LC = {
   purpose_code: "ADULT", pax_purpose: {}, id: "", name: "", status: "idle",
 };
 
+// 会话失效文案：engine「登录会话失效」/orderflow「浏览器会话不可用」/browser_order「已跳转登录门户」
+// 「登录会话已?失效」两种写法都要（engine.py:1506「已失效」/ :1222「失效」），
+// gui.py:4036 的 tkinter 版用的是同一判据。
+const _SESSION_DEAD_RE = /登录会话已?失效|浏览器会话不可用|已跳转登录门户/;
+
 // ================= 推送订阅 =================
 bridge.onPush((msg) => {
   const m = msg && msg.method, p = (msg && msg.params) || {};
-  if (m === "log") pushLog(p.line || "", p.tag);
-  else if (m === "backendDead") {
+  if (m === "log") {
+    const line = p.line || "";
+    pushLog(line, p.tag);
+    // 引擎/下单自己发现会话失效（LOG.error 经 stderr→py-push 过来），比 60 秒一轮的
+    // 会话看门狗更早。就地弹窗，否则只剩日志区一行小字，用户当成「点了没反应」。
+    // 5 分钟冷却：看门狗和引擎会先后报同一件事，不能连着弹两次。
+    if (_SESSION_DEAD_RE.test(line) && Date.now() - (S._expiredAt || 0) > 300000) {
+      S._expiredAt = Date.now();
+      showSessionExpiredDialog(line);
+    }
+  } else if (m === "backendDead") {
     // 主进程会自动拉起新后端（backendRestart 推送随后到）；这里只提示崩溃
     toast("后端已退出（code " + p.code + "），正在自动重启…", "err");
     pushLog("[系统] 后端已退出（code " + p.code + "），自动重启中", "err");
@@ -1508,8 +1590,31 @@ bridge.onPush((msg) => {
     // 后端在登录流程结束时推的「已登录/未完成」：立刻刷新账号显示，
     // 不用等 60 秒轮的 session 轮询（对话框关掉后界面还是「未登录」就出在这）
     refreshSession();
+  } else if (m === "sessionExpired") {
+    showSessionExpiredDialog(p.message || "");
   }
 });
+
+// 登录失效弹窗（api 会话看门狗推 sessionExpired）：只弹一次，防叠加
+function showSessionExpiredDialog(message) {
+  if (S._expiredDialogOpen) return;
+  S._expiredDialogOpen = true;
+  const { modal, close } = openModal(
+    "<h3>登录已失效</h3>" +
+    '<p class="muted" style="margin:8px 0 14px">' + esc(message || "12306 登录状态已失效") + "</p>" +
+    '<p class="muted">不重新登录的话，自动抢票无法继续。</p>' +
+    '<div class="form-actions"><button class="btn btn-ghost" data-a="later">稍后</button>' +
+    '<button class="btn btn-call" data-a="relogin">立即登录</button></div>');
+  modal.querySelector('[data-a=later]').onclick = () => { close(); S._expiredDialogOpen = false; };
+  modal.querySelector('[data-a=relogin]').onclick = async () => {
+    close(); S._expiredDialogOpen = false;
+    // force：弹窗只在看门狗已确认会话失效时出现，预检注定失败却要先打一次
+    // HTTP + 开一次真浏览器复核，白白多拖几十秒
+    const r = await call("relogin", { force: true }).catch(() => null);
+    if (r && r.running) toast(r.message || "登录窗口已经打开了");
+    setTimeout(refreshSession, 3000);
+  };
+}
 
 // ================= 全局交互 =================
 // 顶栏搜索框：站名两段式（先出发后到达）/ 页签名跳转 / 其它当任务过滤
@@ -1618,8 +1723,17 @@ document.addEventListener("keydown", (e) => {
 
 // 头像 = 登录入口（与会话卡同款）：已登录 → 乘车人，未登录 → 拉起登录
 async function doLogin() {
-  toast("正在拉起登录…");
-  await call("relogin");
+  toast("正在检查登录状态…");
+  const r = await call("relogin").catch(() => null);
+  if (!r) return;
+  if (r.running) { toast(r.message || "登录窗口已经打开了"); return; }
+  if (r.already) {          // 会话其实还活着：说清楚，别拉窗口让用户看它一闪而过
+    toast(r.message || "当前已登录");
+    refreshSession();
+    return;
+  }
+  toast(r.message || "已拉起浏览器");
+  setTimeout(refreshSession, 5000);
 }
 
 function bindGlobal() {
