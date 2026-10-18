@@ -21,6 +21,12 @@ const S = {
   pax: [], paxStamp: null,
   presets: [], presetBusy: false,
   settings: null, session: null, account: null, settingsStamp: null,
+  // 登录失效弹窗的两个防重标记：
+  //   _expiredDialogOpen —— 同一时刻只允许一个弹窗（防叠加）
+  //   _expiredDismissed  —— 用户点过「稍后」，本次失效期间不再打扰
+  //                        （会话恢复后由 refreshSession 复位）
+  _expiredDialogOpen: false,
+  _expiredDismissed: false,
   history: [],
   queryHistory: [],
   searchQ: "", stationHits: [], searchDD: [], searchLoading: false, trainRes: null, pickFrom: null,
@@ -1506,6 +1512,8 @@ async function refreshSession() {
     // 保留上一次结论，免得登录成功后界面又显示「未登录」
     if (S.session.unknown) { renderSessionCard(); return; }
     const ok = S.session.ok;
+    // 会话恢复：复位「已忽略」与冷却窗口，下次真失效时重新提示
+    if (ok) { S._expiredDismissed = false; S._expiredAt = 0; writeExpiredDismissed(false); }
     const name = ok ? ((S.account && S.account.name) || "已登录") : "未登录";
     const sub = ok ? "会话有效 · 点击管理" : "点击此处登录";
     renderSessionCard();
@@ -1595,19 +1603,53 @@ bridge.onPush((msg) => {
   }
 });
 
-// 登录失效弹窗（api 会话看门狗推 sessionExpired）：只弹一次，防叠加
+// 「稍后」记忆的存储层：sessionStorage 可能不可用（隐私模式 / 受限沙箱），
+// 失败时静默退化为纯内存标记，不影响主流程。
+const EXPIRED_DISMISSED_KEY = "sessionExpiredDismissed";
+
+function readExpiredDismissed() {
+  try { return sessionStorage.getItem(EXPIRED_DISMISSED_KEY) === "1"; }
+  catch (e) { return false; }
+}
+
+function writeExpiredDismissed(on) {
+  try {
+    if (on) sessionStorage.setItem(EXPIRED_DISMISSED_KEY, "1");
+    else sessionStorage.removeItem(EXPIRED_DISMISSED_KEY);
+  } catch (e) { /* 存储不可用：内存标记已生效 */ }
+}
+
+// 登录失效弹窗（api 会话看门狗推 sessionExpired）
+// 两层防重：_expiredDialogOpen 防同时叠加；_expiredDismissed 记住「用户已点稍后」，
+// 本次失效期间不再打扰（会话恢复后由 refreshSession 复位，下次真失效仍会提示）。
 function showSessionExpiredDialog(message) {
-  if (S._expiredDialogOpen) return;
+  if (S._expiredDialogOpen || S._expiredDismissed) return;
+  // 刷新 / 重载界面后仍记得「点过稍后」：sessionStorage 是窗口级存储，
+  // 关掉软件即失效，所以下次启动仍会正常提示一次。
+  if (readExpiredDismissed()) { S._expiredDismissed = true; return; }
   S._expiredDialogOpen = true;
+  // 统一冷却时间戳：日志（引擎自报）与看门狗（sessionExpired 推送）两个来源共用
+  // 同一个 5 分钟窗口。此前只有日志分支设 _expiredAt，sessionExpired 分支不设，
+  // 于是两条链路各自判断、先后各弹一次。
+  S._expiredAt = Date.now();
   const { modal, close } = openModal(
     "<h3>登录已失效</h3>" +
     '<p class="muted" style="margin:8px 0 14px">' + esc(message || "12306 登录状态已失效") + "</p>" +
     '<p class="muted">不重新登录的话，自动抢票无法继续。</p>' +
     '<div class="form-actions"><button class="btn btn-ghost" data-a="later">稍后</button>' +
     '<button class="btn btn-call" data-a="relogin">立即登录</button></div>');
-  modal.querySelector('[data-a=later]').onclick = () => { close(); S._expiredDialogOpen = false; };
+  // remember=true：用户明确表示「知道了」（点稍后 / 点遮罩关闭）→ 本次失效不再弹。
+  const dismiss = (remember) => {
+    close();
+    S._expiredDialogOpen = false;
+    if (remember) { S._expiredDismissed = true; writeExpiredDismissed(true); }
+  };
+  modal.querySelector('[data-a=later]').onclick = () => dismiss(true);
+  // 点遮罩也算「稍后」：openModal 默认的遮罩关闭不会复位标记，这里统一接管，
+  // 否则会留下「关掉后标记仍为 true → 以后永远不弹」的隐性 bug。
+  $("#overlay").onclick = (e) => { if (e.target.id === "overlay") dismiss(true); };
   modal.querySelector('[data-a=relogin]').onclick = async () => {
-    close(); S._expiredDialogOpen = false;
+    dismiss(false);   // 用户想解决；登录失败后应允许再次提示
     // force：弹窗只在看门狗已确认会话失效时出现，预检注定失败却要先打一次
     // HTTP + 开一次真浏览器复核，白白多拖几十秒
     const r = await call("relogin", { force: true }).catch(() => null);

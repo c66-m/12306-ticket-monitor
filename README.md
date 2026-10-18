@@ -75,6 +75,7 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `tools/clean_profile.py` | 约 135 行 | 清 `.browser_profile/` 可再生产物（缓存/遥测/崩溃转储），保留登录态；无参干跑、`--force` 真删，抢不到 profile 锁即认为浏览器在跑并拒绝清理 |
 | `tools/migrate_data_dir.py` | 约 185 行 | 根目录 → `data/` 的一次性数据迁移（幂等、先备份、md5 校验后才删源）；支持 `--dry-run` 与 `--rollback` |
 | `tools/check.py` | 约 270 行 | **一键自检**：语法编译 → 遗留引用扫描（`launcher`→`grabber`、`gui`→`legacy`、数据文件 `HERE` 硬拼）→ 数据完整性（存在/非空/JSON 可解析）→ 车站四库一致性 → 全量测试。`--quick` 跳过测试（约 1 秒）。退出码 0/1，可直接接 CI |
+| `tools/verify_session_dialog.py` | 约 110 行 | **登录失效弹窗去重的手动验证**（真实 Chromium 加载真实 `ui/app.js`，mock RPC 桥）：首弹 / 重复推送不叠加 / 点稍后后两个来源都不再弹 / 会话恢复后能重新提示。7 项断言，不进 807 单元测试（避免拖入浏览器依赖） |
 | `pyproject.toml` | — | 项目元数据与工具口径（**不打包分发**）：`requires-python >=3.9`、运行时依赖（与 requirements.txt 同源）、ruff 检查范围（排除 legacy/产物目录）、pytest 收集路径 |
 | `data/` | 数据目录 | 运行时数据与静态资产（2026-10-18 从根目录分离）：`state.json` / `orders.json` / `order_history.json` / `passengers.json` / `grab_tasks.json` / `session_cookies.json` / `.browser_state.json` + 车站四份库文件。路径统一由 `appcommon.data_path()` 解析（`data/` 优先、旧根目录布局兼容回退）。`config.json` / `launcher_config.json` 是用户可手改的配置，仍留根目录；`.browser_profile/`（Playwright 身份目录）与 `logs/` 也维持原位置 |
 | `notify.py` | 约 145 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
@@ -109,7 +110,7 @@ state.json / orders.json / 购票历史 / 邮件通知
 ## 改完代码怎么验证
 
 ```bash
-python tools/check.py          # 全量自检：编译 / 遗留引用 / 数据 / 车站库 / 800 测试
+python tools/check.py          # 全量自检：编译 / 遗留引用 / 数据 / 车站库 / 807 测试
 python tools/check.py --quick  # 跳过测试，约 1 秒
 ```
 
