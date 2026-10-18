@@ -592,11 +592,16 @@ def _login_locked(timeout_sec=300, stop_event=None):
         page.route("**/*", _no_reload)
         if need_nav:
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        probe = ctx.new_page()   # 复用同一支探针页校验，不再反复开/关标签页
-        probe.goto("about:blank")
+        # 探针页延迟到「检测到登录信号」再创建：未登录时它对 CHECK_URL 的导航
+        # 会被 302 到登录门户，用户会看到两个登录页（2026-10-18 反馈）。
+        # 登录成功后才有必要校验，那时探针页不会落到登录门户。
+        probe = None
         deadline = time.time() + timeout_sec
         next_fast = 0.0   # 有登录信号时的校验节拍（2 秒）
-        next_slow = 0.0   # 无信号时的兜底节拍（15 秒）
+        # 兜底校验推迟启动：扫码正常在几秒到十几秒内完成，过早兜底会让探针页
+        # 先对 CHECK_URL 跳一次登录门户，用户会以为「开了两个登录页」。
+        # 生产（timeout 300s）推迟 20 秒；测试用短超时时按一半缩短，保证覆盖到。
+        next_slow = time.time() + min(20.0, timeout_sec / 2.0)
         ok, who = False, ""
         while time.time() < deadline:
             if stop_event is not None:
@@ -634,24 +639,37 @@ def _login_locked(timeout_sec=300, stop_event=None):
             if signal and now >= next_fast:
                 next_fast = now + 2
                 next_slow = now + 15
+                if probe is None:
+                    probe = ctx.new_page()
+                    probe.goto("about:blank")
                 try:
                     ok, who = session_ok(ctx, page=probe)
                 except Exception:
                     ok, who = False, ""
+                    # 探针页可能已被用户关掉：重建一次再等下一轮
                     try:
-                        if probe.is_closed():
-                            probe = ctx.new_page()
-                            probe.goto("about:blank")
+                        probe = ctx.new_page()
+                        probe.goto("about:blank")
                     except Exception:
-                        pass
+                        probe = None
                 if ok:
                     break
             elif not signal and now >= next_slow:
                 next_slow = now + 15
+                # 兜底校验：tk cookie 没出现时（12306 改版 / 扫码后 cookie 未落地）
+                # 用探针页导航一次确认登录态。未登录时它会被 302 到登录门户，
+                # 所以校验完立刻回空白——用户最多看到短暂的空白页，而不是第二个
+                # 「登录页」（2026-10-18 反馈的正是探针页停在登录门户）。
+                if probe is None:
+                    probe = ctx.new_page()
                 try:
                     ok, who = session_ok(ctx, page=probe)
                 except Exception:
                     ok, who = False, ""
+                try:
+                    probe.goto("about:blank")
+                except Exception:
+                    probe = None
                 if ok:
                     break
         if ok:
