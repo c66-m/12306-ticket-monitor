@@ -3457,7 +3457,7 @@ class TestLoginGotoFastLoad(unittest.TestCase):
 
 
 class _RouteRecordingPage(_RecordingPage):
-    """记录 page.route 注册的回调，好手动喂假请求验证拦截规则。"""
+    """记录 page.route 注册的回调（用于断言「没挂拦截」）。"""
 
     def __init__(self):
         _RecordingPage.__init__(self)
@@ -3465,23 +3465,6 @@ class _RouteRecordingPage(_RecordingPage):
 
     def route(self, pattern, handler):
         self.routes.append((pattern, handler))
-
-
-class _StubRequest:
-    def __init__(self, rtype):
-        self.resource_type = rtype
-        self.url = "https://kyfw.12306.cn/otn/resources/login.html"
-
-
-class _StubRoute:
-    def __init__(self):
-        self.calls = []
-
-    def continue_(self):
-        self.calls.append("continue")
-
-    def abort(self):
-        self.calls.append("abort")
 
 
 class TestLoginNoRedundantReload(unittest.TestCase):
@@ -3561,7 +3544,7 @@ class TestLoginNoRedundantReload(unittest.TestCase):
                          "空白页必须导航到登录页，否则窗口停在 about:blank")
 
     def _run_with_page(self, page, lockname):
-        """跑一次 login，返回它挂在登录页上的 nav 拦截回调。"""
+        """跑一次 login，返回它用过的 page（用于检查是否挂了拦截）。"""
         import browser_order as bo
         ctx = _FakeCtx()
         ctx.pages = [page]
@@ -3579,32 +3562,22 @@ class TestLoginNoRedundantReload(unittest.TestCase):
                 self.assertTrue(bo.login(timeout_sec=5))
         finally:
             bo._PROFILE_LOCK = orig_lock
-        self.assertEqual(len(page.routes), 1, "登录页必须挂上整页导航拦截")
-        return page.routes[0][1]
+        return page
 
-    def test_login_page_cannot_reload_after_first_load(self):
-        page = _RouteRecordingPage()      # about:blank：首次加载要放行
-        handler = self._run_with_page(page, "guard1.lock")
-        first, second = _StubRoute(), _StubRoute()
-        handler(first, _StubRequest("document"))
-        handler(second, _StubRequest("document"))
-        self.assertEqual(first.calls, ["continue"])
-        self.assertEqual(second.calls, ["abort"],
-                         "登录页的第二次整页加载必须掐掉，否则扫码状态清零")
+    def test_login_page_installs_no_navigation_guard(self):
+        """登录页不能挂文档级拦截，否则 12306 自己的跳转会被 abort。
 
-    def test_login_page_blocks_navigation_when_already_on_login_url(self):
+        2026-10-18：旧实现把「首次之后的 document 请求」一律 abort，而 12306
+        的「账号登录」需要导航到 /otn/login/userLogin——被 abort 后窗口停在
+        ERR_FAILED 错误页，登录完全不可用（用户截图）。
+        页面本身并不刷新（探针页删除后实测 30 秒零导航），拦截只剩副作用。
+        """
         import browser_order as bo
         page = _RouteRecordingPage()
         page.url = bo.LOGIN_URL          # --app= 窗口：页面已经加载好了
-        handler = self._run_with_page(page, "guard2.lock")
-        r = _StubRoute()
-        handler(r, _StubRequest("document"))
-        self.assertEqual(r.calls, ["abort"],
-                         "已在登录页时任何整页导航都要挡住")
-        xhr = _StubRoute()
-        handler(xhr, _StubRequest("xhr"))
-        self.assertEqual(xhr.calls, ["continue"],
-                         "checkqr 之类的接口轮询必须放行，否则扫码确认收不到")
+        self._run_with_page(page, "guard1.lock")
+        self.assertEqual(page.routes, [],
+                         "登录页不得挂文档拦截：站内跳转（账号登录页）会被掐成 ERR_FAILED")
 
     def _tmp(self):
         d = tempfile.mkdtemp(prefix="t12306_reload_")

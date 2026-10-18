@@ -611,22 +611,12 @@ def _login_locked(timeout_sec=300, stop_event=None):
         # --app= 已经让第一个窗口直接落在登录页上，这里只在没落上时补一次导航：
         # 用户要的是「别再刷这一下」，不是把窗口停在 about:blank。
         need_nav = not (page.url or "").startswith(LOGIN_URL)
-        # 登录页上一律不许再整页刷新/跳转：扫到一半被重载，二维码和"已扫描"状态
-        # 全部作废（用户 2026-10-17 反馈"刷新太快，妨碍扫码"）。只放行登录页自己
-        # 这一次文档加载，之后所有 document 请求（reload / location 跳转 / 自动
-        # 重定向）一律 abort。扫码成功不靠页面跳转判定——login 循环靠 tk cookie
-        # 加探针页校验，掐掉导航没有副作用。
-        allowed = {"left": 1 if need_nav else 0}
-
-        def _no_reload(route, request):
-            if request.resource_type == "document":
-                if allowed["left"] > 0:
-                    allowed["left"] -= 1
-                    return route.continue_()
-                return route.abort()
-            return route.continue_()
-
-        page.route("**/*", _no_reload)
+        # 不挂任何文档级拦截：登录页里的「账号登录」会正常导航到
+        # /otn/login/userLogin，一律 abort 会把窗口停在 ERR_FAILED 错误页
+        # （2026-10-18 反馈，截图为证）。此前那条「禁止整页刷新」是给
+        # 「扫码时页面一直刷」打的补丁，但真正的原因是探针页每 2 秒导航一次
+        # CHECK_URL——探针页已删除，页面本身 30 秒内零导航（实测），
+        # 拦截只剩副作用，去掉。
         if need_nav:
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
         # 登录期间一律不开新页面、不做整页导航：用户正对着登录页扫码，多一个
