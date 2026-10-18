@@ -23,7 +23,7 @@ ui/            界面（纯 HTML/CSS/JS，无框架）
 electron/      壳（Node）
   main.js      221 行：spawn python api.py + JSON-RPC 桥 + 窗口（无边框 1440×900）+ win/win-top 通道
   preload.js   27 行：contextBridge 暴露 window.api = { call, onPush, win, top }
-api.py         1222 行：JSON-RPC 后端（stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项）
+api.py         约 1460 行：JSON-RPC 后端（stdin/stdout 逐行 JSON-RPC 2.0，METHODS 37 项）
   ↓ 复用既有业务模块
 grabber.py(Grabber/任务库) engine.py(监控引擎) ticket.py(查票) order.py(browser_order.py)/...
 ```
@@ -57,7 +57,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 ### api.py 本轮新增的 RPC
 
 `resetTask`（清防重记录并恢复监控）、`renameGrabTask`、`deletePreset`、`pushQueryHistory`、
-`ipLocate`、`checkUpdate`、`passengerDetail`。完整 38 项见 `api.py` 的 METHODS 表（api.py:1177-1214）。协议分派已抽成 `rpc_dispatch(line)`（api.py:1217），可脱离真管道被测试。
+`ipLocate`、`checkUpdate`、`passengerDetail`。完整 37 项见 `api.py` 末尾的 `METHODS` 表。协议分派已抽成 `rpc_dispatch(line)`，可脱离真管道被测试。
 
 ### 启动与调试
 
@@ -262,7 +262,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 | ui/style.css | 960 | 当前界面样式（玻璃拟态 + 主题变量 + 外观设置项 + .eye-wrap/.g-result/.wb.on 等本轮新增） |
 | electron/main.js | 221 | Electron 壳：spawn python api.py、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、win/win-top 通道、F11、DSH_DEBUG 日志开关 |
 | electron/preload.js | 27 | contextBridge：window.api = { call, onPush, win, top } |
-| api.py | 1222 | **JSON-RPC 后端**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项；引擎启停（_engine_stop）、日志泵 log_pump、抢票定时调度 _armed_loop、config/state 原子写与文件锁 |
+| api.py | 约 1460 | **JSON-RPC 后端**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 37 项；引擎启停（_engine_stop）、日志泵 log_pump、抢票定时调度 _armed_loop、config/state 原子写与文件锁 |
 | grabber.py | 1188 | **抢票业务模块（无界面）**：Grabber、任务库/配置 IO、车站搜索/类型探测、append_monitor_task、merge_trains_from_monitor、check_update、ensure_passengers、resolve_dates。**2026-10-18 由 launcher.py 改名**，调用方用 `import grabber as launcher` 别名 |
 | launcher_utils.py | 290 | 纯业务工具（席别表/掩码 mask_id·mask_mobile/归一化/时间/车型/IP 定位 ip_locate/build_monitor_task）；无 tkinter 依赖 |
 | engine.py | 1621 | 监控引擎：多任务调度、自适应频率、防重三层、历史/重试冷却；run(stop_event=None) 支持优雅退出 |
@@ -426,7 +426,7 @@ monitor 2 s / grab 1 s / history 30 s / session 60 s（`ui/app.js` 尾部 setInt
 1. cd C:\develep\产物\12306（**测试必须在项目目录下跑**：tests 用相对路径读产品文件，换目录会 FileNotFoundError 假失败）
 2. git status -sb + `git log --oneline origin/main..main` 看实况（本文档不记 sha；是否 push 待裁决）
 3. python -X utf8 -m compileall -q .
-4. python -X utf8 tests\test_all.py（预期 800 OK / skipped=15）
+4. python -X utf8 tests\test_all.py（预期 807 OK / skipped=15；行数为量级参考，精确值用 wc -l）
 5. 改界面/后端就去 ui/ 与 api.py（**别再去 legacy/gui.py 加功能**，它是 legacy）；改完按第 7 节做一次 CDP 界面冒烟
 6. 需要下线实跑就先重新登录，再动代码。
 

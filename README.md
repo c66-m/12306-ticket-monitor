@@ -38,47 +38,50 @@ state.json / orders.json / 购票历史 / 邮件通知
 
 ## 模块地图
 
+> 「规模（约）」只作量级参考（取整到十位），**不构成契约**——精确行数用 `wc -l` 现查。
+> 早先写死精确行数，改几次代码就全部漂移（2026-10-18 核对时 20 个模块里 18 个不准）。
+
 ### 入口层（2026-10-14 Electron 架构：ui + api.py + electron）
 
-| 模块 | 规模 | 职责 |
+| 模块 | 规模（约） | 职责 |
 |---|---|---|
-| `ui/index.html` + `ui/app.js` + `ui/style.css` | 主窗 87 / 1671 / 960 行 | **唯一界面（纯 HTML/CSS/JS，无框架）**：顶栏（会话胶囊 / 监控开关 / 窗口键：置顶 · 小窗 · 最小化 · 最大化 · 关闭）+ 侧边栏 = 监控任务 / 抢票任务 / 乘车人 / 历史 / 设置 + 主区 + 底部全局日志。渲染、轮询、外观设置全在 app.js |
+| `ui/index.html` + `ui/app.js` + `ui/style.css` | 主窗约 90 / 1790 / 970 行 | **唯一界面（纯 HTML/CSS/JS，无框架）**：顶栏（会话胶囊 / 监控开关 / 窗口键：置顶 · 小窗 · 最小化 · 最大化 · 关闭）+ 侧边栏 = 监控任务 / 抢票任务 / 乘车人 / 历史 / 设置 + 主区 + 底部全局日志。渲染、轮询、外观设置全在 app.js |
 | `ui/mini.html` + `ui/mini.js` + `ui/mini.css` | 小窗 3 文件 | **抢票小窗（B7 第二步）**：460×420 无边框，只显示账号 / 进行中任务 / 抢票日志；打开时主窗隐藏，关闭自动还原。外观经 `--appear` 启动参数继承主窗 |
-| `electron/main.js` + `electron/preload.js` | 221 / 27 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
-| `api.py` | 1273 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 38 项（api.py:1177-1214）；引擎启停（启动时自动起，`auto_start_engine=false` 可关）、日志泵、抢票定时调度、config/state 原子写 |
-| `grabber.py` | 1188 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查。**2026-10-18 由 `launcher.py` 改名**（原名暗示「启动器」，与职责不符）；调用方统一 `import grabber as launcher` 别名，数百处调用点零改动 |
-| `legacy/gui.py` | 4300 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）而保留在 `legacy/` 包内。新功能一律改 `ui/` |
-| `monitor.py` | 1140 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
+| `electron/main.js` + `electron/preload.js` | 约 250 / 30 行 | **Electron 壳**：spawn `python api.py`、JSON-RPC 桥（60 s 超时）、无边框窗口 1440×900、窗口通道 win/win-top、F11、`DSH_DEBUG` 日志开关；preload 暴露 `window.api = { call, onPush, win, top }` |
+| `api.py` | 约 1460 行 | **JSON-RPC 后端（界面后端 = 唯一入口）**：stdin/stdout 逐行 JSON-RPC 2.0，METHODS 37 项（见文件末尾 METHODS 表）；引擎启停（启动时自动起，`auto_start_engine=false` 可关）、日志泵、抢票定时调度、config/state 原子写 |
+| `grabber.py` | 约 1200 行 | **抢票业务模块（无界面）**：Grabber 抢票线程、任务库（grab_tasks.json）、配置读写、车站搜索/类型探测、与监控系统联动（append_monitor_task / merge_trains_from_monitor）、更新检查。**2026-10-18 由 `launcher.py` 改名**（原名暗示「启动器」，与职责不符）；调用方统一 `import grabber as launcher` 别名，数百处调用点零改动 |
+| `legacy/gui.py` | 约 4300 行 | **legacy（已停用）**：旧 Tkinter 单窗口界面，不再是入口；仅因 `tests/test_all.py` 深度引用（288 处）而保留在 `legacy/` 包内。新功能一律改 `ui/` |
+| `monitor.py` | 约 1140 行 | **命令行后备入口**：交互式菜单（任务/乘车人/历史/启动监控），适合无 GUI 环境，功能以桌面版为准 |
 
 ### 核心链路
 
-| 模块 | 规模 | 职责 |
+| 模块 | 规模（约） | 职责 |
 |---|---|---|
-| `ticket.py` | 823 行 | **余票查询与解析**（免登录）：车站码表、queryG 竖线字段解析、p20~p33 逐席别判余票；席别命名（卧铺共享字段、p35 码串）、「车次=席别」规则解析与候选求交 |
-| `orderflow.py` | 404 行 | **下单编排管线**（新链，默认启用）：七阶段状态机；HOLD 每 0.5s 读页，读到「待付款」才关全部页面；首读未获先官方回读防 dup 再新开重下（retry_open_times）；滑块即停交人工；复用 `_run_fill_submit_confirm` DOM 序列与 order.py 归因 |
-| `browser_order.py` | 1909 行 | **浏览器下单**（Playwright）：`#submitOrder_id` → checkOrderInfo → getQueueCount → 核对窗 → `#qr_submit_id` 倒计时 → confirmSingleForQueue → 停在支付页；席别/票种走官方事件链强写内部状态并回读校验；滑块一出现即中止 |
-| `order.py` | 1042 行 | **订单事实来源**：官方订单接口回读（未支付 / 未出行 / 历史三列表）、状态分类（paid/unpaid/cancelled/none/blocked/unknown/error）、时间戳归因（`classify_with_time`、`find_recent_order`）、纯 HTTP 下单后备链路 |
-| `engine.py` | 1621 行 | **监控引擎**：多任务调度与优先级、自适应轮询频率、防重复下单三层、断点续连、下单决策（含 dup/ambiguous 的官方回读归因分支） |
+| `ticket.py` | 约 830 行 | **余票查询与解析**（免登录）：车站码表、queryG 竖线字段解析、p20~p33 逐席别判余票；席别命名（卧铺共享字段、p35 码串）、「车次=席别」规则解析与候选求交 |
+| `orderflow.py` | 约 460 行 | **下单编排管线**（新链，默认启用）：七阶段状态机；HOLD 每 0.5s 读页，读到「待付款」才关全部页面；首读未获先官方回读防 dup 再新开重下（retry_open_times）；滑块即停交人工；复用 `_run_fill_submit_confirm` DOM 序列与 order.py 归因 |
+| `browser_order.py` | 约 2010 行 | **浏览器下单**（Playwright）：`#submitOrder_id` → checkOrderInfo → getQueueCount → 核对窗 → `#qr_submit_id` 倒计时 → confirmSingleForQueue → 停在支付页；席别/票种走官方事件链强写内部状态并回读校验；滑块一出现即中止 |
+| `order.py` | 约 1050 行 | **订单事实来源**：官方订单接口回读（未支付 / 未出行 / 历史三列表）、状态分类（paid/unpaid/cancelled/none/blocked/unknown/error）、时间戳归因（`classify_with_time`、`find_recent_order`）、纯 HTTP 下单后备链路 |
+| `engine.py` | 约 1790 行 | **监控引擎**：多任务调度与优先级、自适应轮询频率、防重复下单三层、断点续连、下单决策（含 dup/ambiguous 的官方回读归因分支） |
 
 ### 基础层
 
-| 模块 | 规模 | 职责 |
+| 模块 | 规模（约） | 职责 |
 |---|---|---|
-| `appcommon.py` | 768 行 | 跨界面共享机械层：数据目录解析（`data_path` / `state_path_of` / `history_path_of`）、日期区间解析、原子文件写（临时名 + replace 重试）、state.json 读容错、PII 脱敏口径（`mask_order_no` / `mask_one_name` / `mask_names` / `mask_id_partial`）、北京时间（`beijing_tz`）、展示归一化（normalize/display 车次与席别）单一实现 |
-| `filelock.py` | 144 行 | 跨进程文件锁（msvcrt 字节锁）：grabber 与界面/engine 是独立进程却共改 config/state.json，原子替换挡不住并发读改写 |
-| `logutil.py` | 132 行 | 按天滚动日志 handler，保持 `logs/<prefix>_YYYYMMDD.log` 命名习惯（标准库 handler 会改变命名，故自实现） |
-| `config_keys.py` | 22 行 | 配置键唯一定义处：代码读取的键 ⊆ example 模板键（测试防漂移回归） |
+| `appcommon.py` | 约 800 行 | 跨界面共享机械层：数据目录解析（`data_path` / `state_path_of` / `history_path_of`）、日期区间解析、原子文件写（临时名 + replace 重试）、state.json 读容错、PII 脱敏口径（`mask_order_no` / `mask_one_name` / `mask_names` / `mask_id_partial`）、北京时间（`beijing_tz`）、展示归一化（normalize/display 车次与席别）单一实现 |
+| `filelock.py` | 约 145 行 | 跨进程文件锁（msvcrt 字节锁）：grabber 与界面/engine 是独立进程却共改 config/state.json，原子替换挡不住并发读改写 |
+| `logutil.py` | 约 175 行 | 按天滚动日志 handler，保持 `logs/<prefix>_YYYYMMDD.log` 命名习惯（标准库 handler 会改变命名，故自实现） |
+| `config_keys.py` | 约 25 行 | 配置键唯一定义处：代码读取的键 ⊆ example 模板键（测试防漂移回归） |
 | `tools/gen_icon.py`、`tools/gen_icon_emoji.py` | — | 图标生成脚本（产出 ui/appicon.png、electron/icon.ico） |
-| `tools/clean_profile.py` | 135 行 | 清 `.browser_profile/` 可再生产物（缓存/遥测/崩溃转储），保留登录态；无参干跑、`--force` 真删，抢不到 profile 锁即认为浏览器在跑并拒绝清理 |
-| `tools/migrate_data_dir.py` | 183 行 | 根目录 → `data/` 的一次性数据迁移（幂等、先备份、md5 校验后才删源）；支持 `--dry-run` 与 `--rollback` |
-| `tools/check.py` | 270 行 | **一键自检**：语法编译 → 遗留引用扫描（`launcher`→`grabber`、`gui`→`legacy`、数据文件 `HERE` 硬拼）→ 数据完整性（存在/非空/JSON 可解析）→ 车站四库一致性 → 全量测试。`--quick` 跳过测试（约 1 秒）。退出码 0/1，可直接接 CI |
+| `tools/clean_profile.py` | 约 135 行 | 清 `.browser_profile/` 可再生产物（缓存/遥测/崩溃转储），保留登录态；无参干跑、`--force` 真删，抢不到 profile 锁即认为浏览器在跑并拒绝清理 |
+| `tools/migrate_data_dir.py` | 约 185 行 | 根目录 → `data/` 的一次性数据迁移（幂等、先备份、md5 校验后才删源）；支持 `--dry-run` 与 `--rollback` |
+| `tools/check.py` | 约 270 行 | **一键自检**：语法编译 → 遗留引用扫描（`launcher`→`grabber`、`gui`→`legacy`、数据文件 `HERE` 硬拼）→ 数据完整性（存在/非空/JSON 可解析）→ 车站四库一致性 → 全量测试。`--quick` 跳过测试（约 1 秒）。退出码 0/1，可直接接 CI |
 | `pyproject.toml` | — | 项目元数据与工具口径（**不打包分发**）：`requires-python >=3.9`、运行时依赖（与 requirements.txt 同源）、ruff 检查范围（排除 legacy/产物目录）、pytest 收集路径 |
 | `data/` | 数据目录 | 运行时数据与静态资产（2026-10-18 从根目录分离）：`state.json` / `orders.json` / `order_history.json` / `passengers.json` / `grab_tasks.json` / `session_cookies.json` / `.browser_state.json` + 车站四份库文件。路径统一由 `appcommon.data_path()` 解析（`data/` 优先、旧根目录布局兼容回退）。`config.json` / `launcher_config.json` 是用户可手改的配置，仍留根目录；`.browser_profile/`（Playwright 身份目录）与 `logs/` 也维持原位置 |
-| `notify.py` | 147 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
-| `passengers.py` | 496 行 | 乘车人管理：DPAPI（Windows）/ Fernet / 明文三级加密，按环境自动选最安全可用者 |
-| `station_db.py` | 152 行 | 全量车站本地库（3404 站）：在库=运营中；车型标签来自实际查询学习。`rebuild` 从车站索引+车型表合成，`check` 校验三份同源车站文件的 name↔code 漂移（非零退出） |
-| `capture_session.py` | 305 行 | 会话抓取：Playwright 打开 Edge 人工登录一次，Cookie 持久化到 `session_cookies.json` |
-| `probe_login.py` | 520 行 | 登录链路诊断：域名连通性、二维码申请/轮询、会话有效性验证（只诊断，不绕过） |
+| `notify.py` | 约 145 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
+| `passengers.py` | 约 495 行 | 乘车人管理：DPAPI（Windows）/ Fernet / 明文三级加密，按环境自动选最安全可用者 |
+| `station_db.py` | 约 155 行 | 全量车站本地库（3404 站）：在库=运营中；车型标签来自实际查询学习。`rebuild` 从车站索引+车型表合成，`check` 校验三份同源车站文件的 name↔code 漂移（非零退出） |
+| `capture_session.py` | 约 295 行 | 会话抓取：Playwright 打开 Edge 人工登录一次，Cookie 持久化到 `session_cookies.json` |
+| `probe_login.py` | 约 520 行 | 登录链路诊断：域名连通性、二维码申请/轮询、会话有效性验证（只诊断，不绕过） |
 | `web-dashboard/` | 静态稿 | 车票监控控制台**设计稿**（`DESIGN.md` + 单文件 `index.html` + 预览图）：纯静态、零依赖、无后端，是 `ui/` 玻璃拟态方向的演进提案，**未被 Electron 壳加载**。注意：其中的 `PRODUCT.md` 与根目录的 `PRODUCT.md` 同名不同物 |
 | `runs/` | — | 独立侦察工具（`fofa_client.py`，FOFA 资产采集）。**与抢票主链路无关** |
 
