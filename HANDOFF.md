@@ -580,3 +580,40 @@ playwright 1.58.0 / cryptography 50.0.2）。升级 playwright 必须跟跑
 - 真实浏览器：直接 `goto /otn/login/userLogin`、以及用 JS 从登录页跳该地址，
   均正常落在 12306 页面上，不再出现「无法访问此页面」。
 - 806 tests OK (skipped=15)；真实 data/ 与 config.json md5 未变。
+
+## 18. 2026-10-18 编辑任务被「重建」且跑不起来
+
+**现象**：在任务上改日期后，列表里多出一条同名任务；新任务一点就失败
+「监控日期已全部过期，任务自动停止」。
+
+**根因（两个叠加）**：
+
+1. **没有原地编辑接口**：编辑 = 删旧建新。但任务名由「线路+车次+席别」生成，
+   改日期后名字**完全一样**，前端 `t.name !== r.name` 恒为假 → 旧任务不删，
+   列表出现两条同名任务。
+2. **区间起止可以颠倒**：真实数据里出现 `date_range=['2026-10-19','2026-10-18']`。
+   前端 `dateSpan` 对倒置区间返回 `[]`，落盘成 `dates=[]` 的空日期任务；引擎
+   `expand_dates` 对倒置区间直接跳过 → 一条日期都没有 → 「已全部过期」。
+   更麻烦的是 `state.json` 以**任务名**为键，同名重建会继承旧任务的 failed 状态，
+   新任务于是也永远跑不起来。
+
+**改动**：
+
+- `api.py`
+  - `_split_date_input`：区间倒置时自动交换并记一条警告；
+  - `rpc_create_task`：日期为空直接返回 `{ok: false, error: ...}`，不再造出必失败的任务；
+  - `rpc_delete_task`：支持 `uid` 精确删除（同名任务按名字只能删到第一条）；
+  - `rpc_list_monitor_tasks`：返回 `uid`，供前端精确删除。
+- `ui/app.js`
+  - 保存前校验「结束日期不能早于开始日期」；
+  - `createTask` 返回 error 时提示并**保留弹窗**（否则会继续删旧任务）；
+  - 编辑成功后**无条件按 uid 删旧任务**（不再靠名字差异判断）；
+  - 删除后按编辑前的运行态显式回设新任务状态（monitoring / paused），
+    避免继承旧任务的 failed。
+- 数据：清理用户库里的 3 条同名任务（1 条空日期 + 2 条重复）→ 保留
+  `dates=['2026-10-19']` 一条，状态 failed → paused。备份在
+  `/tmp/config_before_dedup.json`、`/tmp/state_before_dedup.json`。
+
+**验证**：真实浏览器（mock RPC）7/7 —— 倒置日期被拦、createTask 恰好一次、
+deleteTask 带 uid、状态被回设、提交日期为新选值；全量 809 tests OK；
+`tools/check.py --quick` 5/5。

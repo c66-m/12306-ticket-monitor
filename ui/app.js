@@ -492,7 +492,8 @@ function bindTaskRows(root) {
         toast("已重置防重，任务恢复监控"); refreshMonitor();
       } });
       items.push({ i: 3, label: "🗑 删除", danger: true, fn: async () => {
-        if (await confirmBox("删除任务", "确定删除「" + t.name + "」？")) { await call("deleteTask", { name }); toast("已删除"); refreshMonitor(); }
+        // 带 uid：同名任务（编辑 bug 留下的重复）按名字删只会删到第一条
+        if (await confirmBox("删除任务", "确定删除「" + t.name + "」？")) { await call("deleteTask", { uid: t.uid, name }); toast("已删除"); refreshMonitor(); }
       } });
       showDD(items, e.clientX, e.clientY);
     };
@@ -650,6 +651,9 @@ async function openMonitorTaskForm(edit) {
     const d1 = modal.querySelector("#fD1").value, d2 = modal.querySelector("#fD2").value;
     if (!from || !to) { toast("请选择出发站和到达站", "err"); modal.querySelector('[data-st="from"] input').focus(); return; }
     if (!d1) { toast("请选择开始日期", "err"); modal.querySelector("#fD1").focus(); return; }
+    // 结束早于开始：dateSpan 会返回空数组，落盘成「空日期任务」，引擎随即判
+    // 「监控日期已全部过期」把它标成失败（2026-10-18 用户实测）。ISO 串可直接比。
+    if (d2 && d2 < d1) { toast("结束日期不能早于开始日期", "err"); modal.querySelector("#fD2").focus(); return; }
     const dates = dateSpan(d1, d2 || d1);
     if (dates.length > 5) { toast("日期跨度不能超过 5 天", "err"); modal.querySelector("#fD2").focus(); return; }
     const seats = checkedSeats(modal);
@@ -678,16 +682,25 @@ async function openMonitorTaskForm(edit) {
       // 无原地编辑接口：编辑 = 删旧建新。顺序必须是「先建后删」——反过来的话
       // createTask 一旦失败，旧任务已经被删掉，任务就永久消失了。
       const r = await call("createTask", p);
-      if (isEdit && t.name && t.name !== r.name) {
-        try { await call("deleteTask", { name: t.name }); }
+      if (r && r.error) { toast(r.error, "err"); return; }   // 日期为空等校验失败
+      // 旧任务必须删：新任务名由「线路+车次+席别」生成，改日期后名字完全一样，
+      // 原先靠 t.name !== r.name 判断 → 永远为假 → 旧任务不删，列表里出现两条
+      // 同名任务（2026-10-18 用户反馈）。按 uid 删才不会误删新建的那条。
+      if (isEdit && (t.uid || t.name)) {
+        try { await call("deleteTask", { uid: t.uid || undefined, name: t.name }); }
         catch (e) { toast("旧任务删除失败，请在列表里手动删掉「" + t.name + "」", "err"); }
       }
-      // 「仅提醒」改回「自动下单」时，之前命中余票留下的防重记录会继续挡住下单
-      // → 顺手清掉；resetTask 附带恢复监控，用原状态回设，别让编辑顺带改运行态
-      if (isEdit && t.auto_order === false && p.auto_order) {
-        await call("resetTask", { name: r.name });
-        if (!["monitoring", "retrying"].includes(t.status))
-          await call("setTaskStatus", { name: r.name, status: t.status || "paused", message: "编辑任务" });
+      if (isEdit) {
+        // 「仅提醒」改回「自动下单」：先清旧防重记录，否则命中余票仍会被挡住
+        if (t.auto_order === false && p.auto_order) await call("resetTask", { name: r.name });
+        // state.json 以任务名为键：同名重建会继承旧记录——旧任务若是 failed /
+        // 「日期已全部过期」，新任务一出生就是 failed，点恢复也跑不起来。
+        // 删旧任务会清掉该名字的状态，这里按编辑前的运行态显式回设一次。
+        const wasActive = ["monitoring", "retrying"].includes(t.status);
+        await call("setTaskStatus", {
+          name: r.name, status: wasActive ? "monitoring" : "paused",
+          message: wasActive ? "编辑任务，恢复监控" : "编辑任务",
+        });
       }
       close(); toast(isEdit ? "已保存" : "任务已创建");
       refreshMonitor();

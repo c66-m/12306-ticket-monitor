@@ -13734,6 +13734,63 @@ class TestApiRpcContract(TempDirCase):
                 self.assertTrue("result" in resp or "error" in resp)
 
 
+class TestMonitorTaskEdit(unittest.TestCase):
+    """编辑任务（改日期）= 删旧建新，必须只留一条、且新任务能跑起来。
+
+    2026-10-18 实测两个 bug：
+      1) 任务名由「线路+车次+席别」生成，改日期后名字不变，前端按
+         t.name !== r.name 判断 → 旧任务不删，列表出现两条同名任务；
+      2) 结束日期早于开始日期时前端 dateSpan 返回 []，落盘成空日期任务，
+         引擎判「监控日期已全部过期」；状态又按任务名存储，新任务继承 failed。
+    """
+
+    def _api(self):
+        import api as api_mod
+        old = api_mod.CONFIG_PATH
+        self.addCleanup(setattr, api_mod, "CONFIG_PATH", old)
+        return api_mod
+
+    def _tmp_cfg(self, tasks):
+        d = tempfile.mkdtemp(prefix="t12306_edit_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks}, f, ensure_ascii=False)
+        return p
+
+    def test_split_date_input_swaps_reversed_range(self):
+        api_mod = self._api()
+        with mock.patch.object(api_mod, "push"):
+            _dates, rng = api_mod._split_date_input(
+                {"dates": [], "date_range": ["2026-10-19", "2026-10-18"]})
+        self.assertEqual(rng, ["2026-10-18", "2026-10-19"],
+                         "起止颠倒必须自动交换，否则引擎展开不出日期")
+
+    def test_create_task_rejects_empty_dates(self):
+        api_mod = self._api()
+        with mock.patch.object(api_mod, "push"), \
+                mock.patch.object(api_mod.launcher, "append_monitor_task") as m_app:
+            r = api_mod.rpc_create_task({
+                "from": "郑州", "to": "上海", "dates": [], "date_range": [],
+                "trains": ["K1970"], "seat_types": ["硬座"],
+                "passengers": ["张三"], "auto_order": False,
+            })
+        self.assertFalse(r.get("ok"))
+        self.assertIn("日期", r.get("error") or "")
+        m_app.assert_not_called()
+
+    def test_delete_task_by_uid_deletes_the_right_duplicate(self):
+        api_mod = self._api()
+        task = lambda uid: {"uid": uid, "name": "同名任务", "dates": ["2026-10-19"]}
+        api_mod.CONFIG_PATH = self._tmp_cfg([task("u1"), task("u2")])
+        deleted = []
+        with mock.patch.object(api_mod, "delete_task_everywhere",
+                               lambda _app, t: deleted.append(t["uid"])):
+            r = api_mod.rpc_delete_task({"uid": "u2", "name": "同名任务"})
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(deleted, ["u2"], "同名任务必须按 uid 精确删除，不能删到第一条")
+
+
 if __name__ == "__main__":
     # 全局兜底：跑完对一次真实数据指纹。TempDirCase 只在继承它的用例里守着，
     # 其余用例写穿隔离时无人告警（2026-10-18 就这样清空了 grab_tasks.json）。

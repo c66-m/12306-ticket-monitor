@@ -372,6 +372,8 @@ def rpc_list_monitor_tasks(_p):
         rec = (state.get("tasks") or {}).get(name) or {}
         tasks_out.append({
             "name": name,
+            # uid 供前端精确删除/替换：同名任务（改日期后名字不变）只能靠它区分
+            "uid": t.get("uid") or "",
             "from": t.get("from") or "",
             "to": t.get("to") or "",
             "fromCode": _name2code.get(t.get("from") or "", ""),
@@ -419,7 +421,14 @@ def _split_date_input(p):
              if isinstance(x, str) and x.strip()]
     raw = p.get("date_range")
     if isinstance(raw, (list, tuple)) and len(raw) == 2:
-        return dates, [str(raw[0]), str(raw[1])]
+        a, b = str(raw[0]), str(raw[1])
+        if a and b and a > b:
+            # 开始晚于结束：ISO 串可直接比较。不交换的话引擎展开不出任何日期，
+            # 任务会被判「监控日期已全部过期」直接失败（2026-10-18 实测）。
+            a, b = b, a
+            push("log", {"line": "[提醒] 结束日期早于开始日期，已自动交换为 %s ~ %s"
+                         % (a, b), "tag": "warn"})
+        return dates, [a, b]
     text = str(raw or "").strip()
     if not text:
         return dates, []
@@ -466,6 +475,11 @@ def rpc_create_task(p):
             seats = [s for s in seats if s in ticket.SEAT_NAME_TO_CODE]
             push("log", {"line": "[提醒] 席别 %s 暂不支持自动下单，已从该监控任务移除" % "、".join(bad), "tag": "warn"})
     dates, date_range = _split_date_input(p)
+    if not dates and not date_range:
+        # 空日期任务进了引擎只会得到「监控日期已全部过期」然后失败——
+        # 在创建时就拦下，前端能直接看到原因（前端 dateSpan 对倒置区间返回 []）。
+        return {"ok": False,
+                "error": "监控日期为空：结束日期不能早于开始日期，请重新选择"}
     task = launcher.build_monitor_task(
         str(p.get("from") or ""), str(p.get("to") or ""),
         dates, date_range,
@@ -552,11 +566,16 @@ def rpc_pause_all(_p):
 
 
 def rpc_delete_task(p):
-    name = p.get("name")
+    uid, name = p.get("uid"), p.get("name")
     cfg = load_config()
-    task = next((t for t in cfg.get("tasks") or [] if t.get("name") == name), None)
+    task = None
+    if uid:
+        # 优先按 uid：编辑产生的重复任务名字完全相同，按名字删只能删到第一条
+        task = next((t for t in cfg.get("tasks") or [] if t.get("uid") == uid), None)
+    if task is None and name:
+        task = next((t for t in cfg.get("tasks") or [] if t.get("name") == name), None)
     if not task:
-        return {"ok": False, "error": "任务不存在：" + str(name)}
+        return {"ok": False, "error": "任务不存在：" + str(uid or name)}
     delete_task_everywhere(None, task)  # app=None → 文件路径清 state
     return {"ok": True}
 
