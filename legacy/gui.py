@@ -43,9 +43,10 @@ from tkinter import messagebox, simpledialog, ttk
 
 import tkinter as tk
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+HERE = os.path.dirname(os.path.abspath(__file__))          # legacy/ 自身
+APP_ROOT = os.path.dirname(HERE)                            # 项目根（config/logs/业务模块所在）
+if APP_ROOT not in sys.path:
+    sys.path.insert(0, APP_ROOT)
 
 import appcommon
 import engine as engine_mod
@@ -55,9 +56,9 @@ import notify as notify_mod
 import order as order_mod
 import passengers as passengers_mod
 import ticket
-import launcher
+import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
 
-CONFIG_PATH = os.path.join(HERE, "config.json")
+CONFIG_PATH = os.path.join(APP_ROOT, "config.json")
 
 # 席别勾选列表：唯一定义在 ticket.py（含动卧），此处只引用
 SEAT_CHOICES = list(ticket.SEAT_CHOICES)
@@ -98,7 +99,7 @@ def setup_logging():
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     for h in list(log.handlers):
         log.removeHandler(h)
-    log_dir = os.path.join(HERE, "logs")
+    log_dir = os.path.join(APP_ROOT, "logs")
     try:
         # 按天滚动：长跑跨天后日志自动切到新日期的文件
         fh = logutil.DayFileHandler(log_dir, "monitor")
@@ -168,7 +169,7 @@ def save_config(config):
 
 def load_state():
     return engine_mod.load_state_file(
-        appcommon.state_path_of(load_config(), HERE))
+        appcommon.state_path_of(load_config(), APP_ROOT))
 
 
 def _state_tasks_dict():
@@ -194,7 +195,7 @@ def _state_tasks_dict():
 
 def save_state(state):
     """原子写入 state.json（与引擎线程的原子写入相互兼容，最后写入者生效）。"""
-    path = appcommon.state_path_of(load_config(), HERE)
+    path = appcommon.state_path_of(load_config(), APP_ROOT)
     # 跨进程锁：与 launcher.append_monitor_task 的 state 段互斥（state.json.lock）
     try:
         with filelock.file_lock(path + ".lock"):
@@ -250,7 +251,7 @@ def update_state_locked(mutator):
     mutator(state) 就地修改读到的 dict；返回其返回值。
     路径解析沿用 save_state 的口径（config 的 state_file，默认 state.json）。
     """
-    path = appcommon.state_path_of(load_config(), HERE)
+    path = appcommon.state_path_of(load_config(), APP_ROOT)
 
     def _on_non_dict(state):
         # Task 75e：合法非 dict JSON（如 []）直接透传会导致 mutator 的
@@ -1651,7 +1652,7 @@ def read_history_records(limit=200):
     顶层非 list 时记 warning 后按空历史展示（Task 94b——旧代码切片在 try 外，
     非 list 经 eager 构造的 HistoryPanel 崩 GUI 启动）。
     机械层单源在 appcommon.read_history_records，这里只注入日志口径。"""
-    path = appcommon.history_path_of(load_config(), HERE)
+    path = appcommon.history_path_of(load_config(), APP_ROOT)
     return appcommon.read_history_records(
         path, limit=limit,
         on_non_list=lambda history: LOG.warning(
@@ -1873,7 +1874,7 @@ class SettingsTab(ttk.Frame):
         run_async(self, do_check, on_done)
 
     def relogin(self):
-        script = os.path.join(HERE, "capture_session.py")
+        script = os.path.join(APP_ROOT, "capture_session.py")
         self.status_label.config(text="浏览器已打开，请在弹出的窗口中完成登录（最多 5 分钟）...")
         self.p_list.delete(0, "end")
         self.p_list.insert("end", "登录完成后会自动刷新，稍候即可")
@@ -1920,7 +1921,7 @@ def _relogin_ok_via_script(script):
     except Exception:
         timeout = 420  # 与 GUI_SUBPROCESS_TIMEOUT(=MAX_WAIT_SEC+120) 同值兜底
     try:
-        proc = subprocess.run([sys.executable, script], cwd=HERE, timeout=timeout)
+        proc = subprocess.run([sys.executable, script], cwd=APP_ROOT, timeout=timeout)
     except subprocess.TimeoutExpired:
         LOG.error("重新登录失败：capture_session.py 运行超时（%ss）", timeout)
         return False
@@ -2557,11 +2558,12 @@ class GrabTaskForm(ttk.Frame):
         if launcher.merge_trains_from_monitor(self.lc, self._save_cfg):
             self.trains_var.set(",".join(self.lc["trains"]))
         try:
-            self._monitor_mtime = os.path.getmtime(os.path.join(HERE, "config.json"))
+            self._monitor_mtime = os.path.getmtime(
+                os.path.join(APP_ROOT, "config.json"))
         except OSError:
             pass
         try:
-            self._pax_mtime = os.path.getmtime(os.path.join(HERE, "passengers.json"))
+            self._pax_mtime = os.path.getmtime(appcommon.data_path("passengers.json"))
         except OSError:
             pass
         st = launcher.parse_dt(self.lc.get("start_time") or "")
@@ -3125,7 +3127,7 @@ class GrabTaskForm(ttk.Frame):
 
     def _sync_monitor(self):
         """config.json 有变化时，把监控系统新加的车次合并进来。"""
-        path = os.path.join(HERE, "config.json")
+        path = os.path.join(APP_ROOT, "config.json")
         try:
             mt = os.path.getmtime(path)
         except OSError:
@@ -3138,7 +3140,7 @@ class GrabTaskForm(ttk.Frame):
 
     def _sync_pax(self):
         """passengers.json 有变化（监控系统增删改乘车人）时刷新勾选区。"""
-        path = os.path.join(HERE, "passengers.json")
+        path = appcommon.data_path("passengers.json")
         try:
             mt = os.path.getmtime(path)
         except OSError:
@@ -3393,7 +3395,7 @@ class GrabTaskForm(ttk.Frame):
     def _pax_saved_by_dialog(self):
         self._refresh_pax()
         try:
-            self._pax_mtime = os.path.getmtime(os.path.join(HERE, "passengers.json"))
+            self._pax_mtime = os.path.getmtime(appcommon.data_path("passengers.json"))
         except OSError:
             pass
 
@@ -4099,7 +4101,7 @@ class MonitorApp:
     def _warn_relogin_http(self):
         """http 模式弹窗重登：等 capture_session.py 退出码判成败，再写回 UI。"""
         def _run():
-            ok = _relogin_ok_via_script(os.path.join(HERE, "capture_session.py"))
+            ok = _relogin_ok_via_script(os.path.join(APP_ROOT, "capture_session.py"))
             _RESULT_QUEUE.put((self.root,
                                lambda _r, _e: self._after_warn_relogin(ok), None, None))
 

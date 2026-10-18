@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
 """12306 抢票业务模块 —— 抢票引擎 / 任务库 / 车站搜索 / 与监控系统联动。
 
+2026-10-18 改名：launcher.py → grabber.py。原名暗示「启动器」，实际是核心抢票
+业务模块（Tkinter 启动器界面早已删除），名字与职责不符。调用方统一用
+`import grabber as launcher` 别名，避免数百处 `launcher.xxx` 调用点被迫改写。
+
 2026-10-13 界面重构：原「抢票启动器」独立界面已推翻，全部界面收敛进
-gui.py 的单窗口面板（朴素 ttk，无主题/无图片/无动画）。本模块只保留
-不依赖 tkinter 的业务能力：
+Tkinter 单窗口面板（朴素 ttk，无主题/无图片/无动画；该界面现已是
+legacy/gui.py）。本模块只保留不依赖 tkinter 的业务能力：
 
     1. 抢票引擎：Grabber 线程（校验会话 → 循环查询 → 命中即下单）
-    2. 任务库：grab_tasks.json 读写（每个任务 = 一份独立配置 + id/name/status）
-    3. 配置：launcher_config.json 读写（预设/车站历史/查询历史等）
+    2. 任务库：data/grab_tasks.json 读写（每个任务 = 一份独立配置 + id/name/status）
+    3. 配置：launcher_config.json 读写（预设/车站历史/查询历史等；仍留根目录）
     4. 车站：全量索引惰性加载 + 模糊搜索 + 高铁/普速类型探测与缓存
     5. 联动：append_monitor_task（写入监控系统任务表）、merge_trains_from_monitor
     6. 其他：更新检查、日期区间解析、乘车人首跑导入
 
-界面侧调用约定：gui.py 里所有对 launcher 的调用都走 `launcher.xxx` 限定名，
+调用约定：界面侧所有对本模块的调用都走 `launcher.xxx` 限定名（别名），
 测试 patch 模块属性即可生效（与旧口径一致）。
 
 （历史上本文件兼有 tkinter 界面，重构后界面全部删除；旧版备份在
@@ -31,16 +35,14 @@ from datetime import datetime, timedelta
 
 import requests
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import appcommon
+
+appcommon.ensure_utf8_stdio()
+
 import browser_order
 import filelock
 import logutil
@@ -53,8 +55,8 @@ except ImportError:
 import passengers as passengers_mod
 import ticket
 
-import launcher_utils
-from launcher_utils import (
+import grabber_utils as launcher_utils
+from grabber_utils import (
     SEAT_OPTIONS, SEAT_ORDER, MONITOR_SEAT_CHOICES,
     FONT, _DEFAULT_LC, PURPOSE_LABELS, LABEL_TO_PURPOSE,
     _ORDER_NO_RE, _FW_TRANS,
@@ -72,8 +74,18 @@ from launcher_utils import (
 
 __version__ = "1.0.0"
 LAUNCHER_CFG_PATH = os.path.join(HERE, "launcher_config.json")
-GRAB_TASKS_PATH = os.path.join(HERE, "grab_tasks.json")
+GRAB_TASKS_PATH = appcommon.data_path("grab_tasks.json")
 LOG_DIR = os.path.join(HERE, "logs")
+
+
+def _monitor_cfg_path():
+    """监控系统的 config.json（用户配置，留根目录）。
+
+    做成函数而不是模块常量：常量在 import 时即固定，测试 patch 模块 HERE
+    无法重定向（既有 9 个用例正是靠 patch HERE 隔离真实配置的）；函数每次
+    读全局 HERE，patch 立即生效。
+    """
+    return os.path.join(HERE, "config.json")
 
 LOGQ = queue.Queue()
 
@@ -249,7 +261,7 @@ class Grabber(threading.Thread):
         # 历史文件路径与监控系统同源(config.history_file),别写错文件
         # 读失败（缺文件/坏档）按空配置走缺省名——appcommon 单源口径。
         # mon_cfg 留变量：下单分流要读 order_flow_mode / order_flow（新链开关）
-        mon_cfg = appcommon.read_config_or_empty(os.path.join(HERE, "config.json"))
+        mon_cfg = appcommon.read_config_or_empty(_monitor_cfg_path())
         hist_path = appcommon.history_path_of(mon_cfg, HERE)
         from_, to_ = (lc.get("from") or "").strip(), (lc.get("to") or "").strip()
         date = (lc.get("date") or "").strip()
@@ -675,7 +687,7 @@ class Grabber(threading.Thread):
     def _notify_success(self, info, seat, msg):
         log = self._log
         try:
-            with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8-sig") as f:
+            with open(_monitor_cfg_path(), "r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
             nc = (cfg.get("notify") or {}).get("email") or {}
             if not nc.get("enabled"):
@@ -699,7 +711,7 @@ def merge_trains_from_monitor(lc, saver=None):
     规则：监控里新出现的车次自动加入；被同步过的车次记录在
     synced_trains，用户在抢票侧删掉后不会再次自动加回。返回是否合并。"""
     try:
-        with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8-sig") as f:
+        with open(_monitor_cfg_path(), "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except Exception as e:
         log("[提醒] 读取监控系统 config.json 失败，本轮不合并车次：%s" % e)
@@ -770,7 +782,7 @@ def append_monitor_task(task, start_now=True):
     监控引擎主循环每轮 _sync_config() 检测 mtime 变化后自动重建调度表，
     处于「监控中」状态的新任务会被自动捡起来，无需重启监控软件。"""
     with _CFG_WRITE_LOCK:  # 同进程多窗口并发串行化
-        cfg_path = os.path.join(HERE, "config.json")
+        cfg_path = _monitor_cfg_path()
         # 临时名带线程标识：同进程多窗口并发追加时共用一个名字会互相踩
         # （Windows 下 os.replace 撞上别人打开的句柄直接 PermissionError）
         tmp = cfg_path + ".launcher%s" % threading.get_ident()
@@ -953,7 +965,7 @@ def search_stations(text, limit=12):
 # 实测：许昌东=高铁 许昌=普速 长葛=普速 长葛北=高铁 驻马店西=高铁。
 # 结果缓存进 station_kind.json，只探一次。
 
-STATION_KIND_PATH = os.path.join(HERE, "station_kind.json")
+STATION_KIND_PATH = appcommon.data_path("station_kind.json")
 _KIND_HUBS = ["BJP", "SHH", "GZQ", "ZZF"]      # 北京 / 上海 / 广州 / 郑州
 _KIND_ORDER = {"高铁": 0, "动车": 1, "普速": 2}
 _KIND_COLOR = {"高铁": "#0969da", "动车": "#1a7f37", "普速": "#6e7781"}
@@ -1154,11 +1166,11 @@ def resolve_dates(lc):
 def ensure_passengers():
     """首次运行：passengers.json 不存在时，把 config.json 任务里的乘车人名字
     迁入加密乘客库（证件号留空，待用户在「新增/编辑」里补全）。"""
-    if os.path.exists(os.path.join(HERE, "passengers.json")):
+    if os.path.exists(appcommon.data_path("passengers.json")):
         return
     names = []
     try:
-        with open(os.path.join(HERE, "config.json"), "r", encoding="utf-8-sig") as f:
+        with open(_monitor_cfg_path(), "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
         for t in (cfg.get("tasks") or []):
             for n in (t.get("passenger_names") or []):

@@ -12,22 +12,20 @@ station_kind.json 的实际查询学习，未学习过的标「待识别」，�
     python station_db.py check            # 校验四份车站文件一致性（漂移非零退出）
 """
 
+import appcommon
 import json
 import os
 import sys
 import time
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+appcommon.ensure_utf8_stdio()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, "stations_db.json")
+DB_PATH = appcommon.data_path("stations_db.json")
 
 
 def rebuild(force=False):
-    import launcher  # 复用 get_station_index / station_kind / search_stations
+    import grabber as launcher  # 复用 get_station_index / station_kind / search_stations
     idx = launcher.get_station_index()
     if not idx and not force:
         # Task 82 (P3)：车站索引为空（离线/无缓存降级）时拒绝落盘——不得以
@@ -72,7 +70,7 @@ def rebuild(force=False):
 
 
 def search(text, limit=20):
-    import launcher
+    import grabber as launcher
     return launcher.search_stations(text, limit=limit)
 
 
@@ -89,7 +87,10 @@ def check():
     for name in ("station_name.json", "station_index.json",
                  "stations_db.json", "station_kind.json"):
         try:
-            with open(os.path.join(HERE, name), "r", encoding="utf-8-sig") as f:
+            # 2026-10-18：数据文件已迁入 data/，走统一解析（HERE 是项目根时落 data/，
+            # 测试把 HERE 换成临时目录时严格落临时目录）。
+            with open(appcommon.resolve_data_file(HERE, name), "r",
+                      encoding="utf-8-sig") as f:
                 data[name] = json.load(f)
         except Exception as e:
             print("不一致：%s 读取失败：%r" % (name, e))
@@ -144,7 +145,7 @@ if __name__ == "__main__":
     elif args and args[0] in ("check", "--check"):
         sys.exit(check())
     elif args and args[0] == "query":
-        import launcher  # 延迟导入：import station_db 时不拖入 GUI 模块
+        import grabber as launcher  # 延迟导入：import station_db 时不拖入 GUI 模块
         for st in search(" ".join(args[1:]) or "", limit=20):
             kind = launcher.load_station_kinds().get(st["code"], "待识别")
             print("{name} {code} {kind}".format(kind=kind, **st))

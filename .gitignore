@@ -36,6 +36,10 @@ data_migration_backup/
 
 # ===== 开发调试产物（含个人测试数据，不上传）=====
 _*
+# 例外：Python 包的 __init__.py 不是调试产物——`_*` 会误伤下划线开头的包入口
+# （2026-10-18 legacy/ 包初始化文件被静默忽略，clone 后 import 失败才发现）。
+!__init__.py
+!**/__init__.py
 *.png
 # 例外：web-dashboard 的设计稿预览图是交付物本身（DESIGN.md 引用它们说明视觉方向），入库
 !web-dashboard/preview-*.png

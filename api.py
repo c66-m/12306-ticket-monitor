@@ -22,8 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import launcher
-import launcher_utils
+import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
+import grabber_utils as launcher_utils
 import ticket
 import engine as engine_mod
 import passengers as passengers_mod

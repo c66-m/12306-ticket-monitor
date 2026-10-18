@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""launcher.py 的纯工具子模块：不引用任何被测试 mock 的符号、不依赖 tkinter。
+"""grabber.py 的纯工具子模块：不引用任何被测试 mock 的符号、不依赖 tkinter。
 
-被 mock 的符号（log, HERE, Grabber, 等）保留在 launcher.py 中，
+（2026-10-18 随 launcher.py → grabber.py 一同改名；调用方用
+`import grabber_utils as launcher_utils` 别名，调用点不变。）
+
+被 mock 的符号（log, HERE, Grabber, 等）保留在 grabber.py 中，
 本模块只包含不被 mock 的全局变量与工具函数。
 
 2026-10-13 界面重构：TrainCard（tk.Frame）与复选框图标工具已随旧 UI 删除，
