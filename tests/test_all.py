@@ -53,6 +53,7 @@ import grabber as launcher          # noqa: E402  （2026-10-18 改名：launche
 from legacy import gui                  # noqa: E402  （legacy/：已停用，仅测试引用）
 import browser_order                 # noqa: E402
 import appcommon                     # noqa: E402
+from rpc import common as rpc_common  # noqa: E402  （A-4 迁移：gui.* 的 rpc 侧等价实现）
 import filelock                      # noqa: E402
 import probe_login                   # noqa: E402
 import time                          # noqa: E402
@@ -1273,18 +1274,19 @@ class TestRemindNonmodal(TempDirCase):
 
 class TestGuiUnit(TempDirCase):
     def test_normalize_email(self):
-        email = gui.normalize_email_settings({
+        email = appcommon.normalize_email_settings({
             "username": "a@qq.com", "from": "", "to": ["b@qq.com"]})
         self.assertEqual(email["from"], "a@qq.com")   # 发件人留空回退发件邮箱
         with self.assertRaises(ValueError):
-            gui.normalize_email_settings({"username": "bad", "to": []})
+            appcommon.normalize_email_settings({"username": "bad", "to": []})
 
     def test_mask_id(self):
-        self.assertEqual(gui._mask_id("110101199001011234"), "110***********1234")
+        self.assertEqual(appcommon.mask_id_partial("110101199001011234"),
+                         "110***********1234")
 
     def test_remove_task_by_uid(self):
         cfg = {"tasks": [{"uid": "u1", "name": "A"}, {"uid": "u2", "name": "B"}]}
-        gui.remove_task_from_config(cfg, {"uid": "u1", "name": "A"})
+        appcommon.remove_task_from_config(cfg, {"uid": "u1", "name": "A"})
         self.assertEqual([t["name"] for t in cfg["tasks"]], ["B"])
 
     def test_format_dates(self):
@@ -5099,13 +5101,28 @@ class TestLockedRMW(TempDirCase):
             self.addCleanup(p.stop)
         return cfg
 
+    def _patch_rpc_paths(self, patch_here=False):
+        # A-4 迁移：迁到 rpc.common 的两例改 patch rpc 侧路径常量
+        # （CONFIG_PATH＋相对 state_file 解析用的 HERE，替代 gui.APP_ROOT）。
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [], "state_file": "state.json"}, f)
+        p = mock.patch.object(rpc_common, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
+        if patch_here:
+            p = mock.patch.object(rpc_common, "HERE", self.tmp)
+            p.start()
+            self.addCleanup(p.stop)
+        return cfg
+
     def test_gui_update_config_locked_concurrent_no_lost_update(self):
         # RED on old code: gui 根本没有 update_config_locked（AttributeError）
-        cfg = self._patch_gui_paths()
+        cfg = self._patch_rpc_paths()
         n = 16
 
         def worker(i):
-            gui.update_config_locked(
+            rpc_common.update_config_locked(
                 lambda c: c.setdefault("tasks", []).append({"name": "t%d" % i}))
 
         ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
@@ -5121,11 +5138,11 @@ class TestLockedRMW(TempDirCase):
 
     def test_gui_update_state_locked_concurrent_no_lost_update(self):
         # RED on old code: gui 根本没有 update_state_locked（AttributeError）
-        self._patch_gui_paths()
+        self._patch_rpc_paths(patch_here=True)
         n = 16
 
         def worker(i):
-            gui.update_state_locked(
+            rpc_common.update_state_locked(
                 lambda s: s.setdefault("tasks", {}).setdefault(
                     "t%d" % i, {}) .__setitem__("status", "monitoring"))
 
@@ -5774,10 +5791,12 @@ class TestDeleteTaskClearsState(TempDirCase):
             json.dump({"tasks": {"t1": {"status": "monitoring",
                                        "fail_streak": 0}},
                        "dedup": {}, "retry": {}}, f)
-        for name, val in (("CONFIG_PATH", cfg), ("APP_ROOT", self.tmp)):
-            p = mock.patch.object(gui, name, val)
-            p.start()
-            self.addCleanup(p.stop)
+        # A-4 迁移：原 patch gui.CONFIG_PATH/APP_ROOT，现改 patch
+        # rpc.common.CONFIG_PATH（config 里 state_file 是绝对路径，rpc 侧
+        # 路径解析不依赖 HERE）；引擎各例以显式 config_path 构造、不受影响。
+        p = mock.patch.object(rpc_common, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
         return cfg, st
 
     def _dead_app(self):
@@ -5793,7 +5812,8 @@ class TestDeleteTaskClearsState(TempDirCase):
         # RED on old code: 根本没有 delete_task_everywhere（AttributeError）；
         # 旧 _op 只调 update_config_locked 删 config，state 条目成孤儿
         cfg, st = self._patch_gui_paths()
-        gui.delete_task_everywhere(self._dead_app(), {"name": "t1", "uid": "u1"})
+        rpc_common.delete_task_everywhere(self._dead_app(),
+                                          {"name": "t1", "uid": "u1"})
         self.assertEqual(self._read(cfg)["tasks"], [])
         self.assertNotIn("t1", self._read(st)["tasks"])
 
@@ -5805,7 +5825,7 @@ class TestDeleteTaskClearsState(TempDirCase):
         app.engine_thread = mock.Mock()
         app.engine_thread.is_alive.return_value = True
         app.get_ops_engine.return_value = eng
-        gui.delete_task_everywhere(app, {"name": "t1", "uid": "u1"})
+        rpc_common.delete_task_everywhere(app, {"name": "t1", "uid": "u1"})
         eng.note_task_deleted.assert_called_once_with("t1")
         self.assertEqual(self._read(cfg)["tasks"], [])
 
@@ -8936,12 +8956,12 @@ class TestTask75Gui(TempDirCase):
 
     def test_load_config_corrupt_returns_empty(self):
         cfg = self._write_config("{bad json,")
-        with mock.patch.object(gui, "CONFIG_PATH", cfg):
-            gui._CONFIG_CORRUPT_WARNED = False
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg):
+            rpc_common._CONFIG_CORRUPT_WARNED = False
             try:
-                self.assertEqual(gui.load_config(), {})
+                self.assertEqual(rpc_common.load_config(), {})
             finally:
-                gui._CONFIG_CORRUPT_WARNED = False
+                rpc_common._CONFIG_CORRUPT_WARNED = False
 
     def test_load_config_corrupt_warns_once(self):
         cfg = self._write_config("{bad json,")
@@ -10010,21 +10030,21 @@ class TestTask84LauncherP3(TempDirCase):
 
     # ---- (b) update_config_locked 写路径损坏配置 ----
 
+    # A-4 迁移：弹窗断言（messagebox.showerror）随 legacy 退役删除，
+    # 拒写核心断言（抛友好异常＋旧文件不覆写）改指 rpc.common 保留。
     def test_update_config_locked_damaged_config_friendly_abort(self):
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             f.write("{损坏的 json,,,")
         with open(cfg, "rb") as f:
             before = f.read()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "messagebox") as mb:
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg):
             with self.assertRaises(Exception) as cm:
-                gui.update_config_locked(lambda c: c)
+                rpc_common.update_config_locked(lambda c: c)
         self.assertNotIsInstance(
             cm.exception, (json.JSONDecodeError, UnicodeDecodeError),
             "损坏配置不得抛出原始 JSON 解析异常（traceback）")
         self.assertIn("损坏", str(cm.exception))
-        mb.showerror.assert_called_once()
         with open(cfg, "rb") as f:
             self.assertEqual(f.read(), before,
                              "损坏的旧文件不得被覆盖")
@@ -10617,21 +10637,21 @@ class TestTask89GuiLeftovers(TempDirCase):
     def test_display_trains_string_is_single_not_char_split(self):
         # 旧代码无此 helper（AttributeError）；且旧展示表达式 ",".join("G101")
         # 会产出 "G,1,0,1"。
-        self.assertEqual(gui._display_trains("G101"), ["G101"])
-        self.assertEqual(gui._display_trains("g101"), ["G101"])  # 与引擎口径一致转大写
+        self.assertEqual(appcommon.display_trains("G101"), ["G101"])
+        self.assertEqual(appcommon.display_trains("g101"), ["G101"])  # 与引擎口径一致转大写
 
     def test_display_trains_list_and_illegal_shapes(self):
-        self.assertEqual(gui._display_trains(["G101", "K225"]), ["G101", "K225"])
-        self.assertEqual(gui._display_trains(None), [])
-        self.assertEqual(gui._display_trains(123), [])
-        self.assertEqual(gui._display_trains(["G101", 123, "  "]), ["G101"])
+        self.assertEqual(appcommon.display_trains(["G101", "K225"]), ["G101", "K225"])
+        self.assertEqual(appcommon.display_trains(None), [])
+        self.assertEqual(appcommon.display_trains(123), [])
+        self.assertEqual(appcommon.display_trains(["G101", 123, "  "]), ["G101"])
 
     def test_trains_roundtrip_no_pollution(self):
         # 对话框载入→展示→用户未改→保存 的完整链条：字符串/列表/空输入
         # 都不得污染 config。
         for raw, expect in [("G101", ["G101"]), (["G101", "K225"], ["G101", "K225"]),
                             ([], []), (None, [])]:
-            displayed = ",".join(gui._display_trains(raw))
+            displayed = ",".join(appcommon.display_trains(raw))
             # 下行即 TaskEditDialog.save 的解析表达式（逐字）
             saved = [t.strip() for t in
                      displayed.replace("，", ",").split(",") if t.strip()]
@@ -11500,8 +11520,12 @@ class TestTask94GuiStartupRobustness(TempDirCase):
         return self._write_bytes(name, text.encode("utf-8"))
 
     def _reset_corrupt_flag(self):
+        # A-4 迁移：本类迁例改指 rpc.common 后，两模块各有独立的
+        # _CONFIG_CORRUPT_WARNED，须同时复位（gui 侧留给未迁的 4 例）。
         gui._CONFIG_CORRUPT_WARNED = False
         self.addCleanup(setattr, gui, "_CONFIG_CORRUPT_WARNED", False)
+        rpc_common._CONFIG_CORRUPT_WARNED = False
+        self.addCleanup(setattr, rpc_common, "_CONFIG_CORRUPT_WARNED", False)
 
     # ---- (a) load_config：非 UTF-8 编码 ----
 
@@ -11521,8 +11545,8 @@ class TestTask94GuiStartupRobustness(TempDirCase):
         # 任意非 UTF-8 编码都不只限 GBK：latin-1 的 0xE9 单字节非法。
         cfg = self._write_bytes("config.json", '{"a": "\xe9"}'.encode("latin-1"))
         self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg):
-            self.assertEqual(gui.load_config(), {})
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg):
+            self.assertEqual(rpc_common.load_config(), {})
 
     # ---- (a) load_config：合法但非 dict ----
 
@@ -11541,8 +11565,8 @@ class TestTask94GuiStartupRobustness(TempDirCase):
     def test_load_config_valid_dict_unchanged(self):
         cfg = self._write_text("config.json", '{"a": 1}')
         self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg):
-            self.assertEqual(gui.load_config(), {"a": 1})
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg):
+            self.assertEqual(rpc_common.load_config(), {"a": 1})
 
     def test_config_json_corrupt_detects_gbk_and_non_dict(self):
         self._reset_corrupt_flag()
@@ -11584,24 +11608,24 @@ class TestTask94GuiStartupRobustness(TempDirCase):
     def test_read_history_records_non_list_number_returns_empty(self):
         cfg = self._history_cfg('42')
         self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "APP_ROOT", self.tmp):
-            self.assertEqual(gui.read_history_records(), [])
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg), \
+             mock.patch.object(rpc_common, "HERE", self.tmp):
+            self.assertEqual(rpc_common.read_history_records(), [])
 
     def test_read_history_records_valid_list_unchanged(self):
         cfg = self._history_cfg('[{"t": 1}, {"t": 2}, {"t": 3}]')
         self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "APP_ROOT", self.tmp):
-            recs = gui.read_history_records(limit=2)
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg), \
+             mock.patch.object(rpc_common, "HERE", self.tmp):
+            recs = rpc_common.read_history_records(limit=2)
         self.assertEqual([r["t"] for r in recs], [3, 2])
 
     def test_read_history_records_missing_file_returns_empty(self):
         cfg = self._write_text("config.json", '{"history_file": "order_history.json"}')
         self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "APP_ROOT", self.tmp):
-            self.assertEqual(gui.read_history_records(), [])
+        with mock.patch.object(rpc_common, "CONFIG_PATH", cfg), \
+             mock.patch.object(rpc_common, "HERE", self.tmp):
+            self.assertEqual(rpc_common.read_history_records(), [])
 
 
 class TestTask95WarmReuseSessionRevalidation(TempDirCase):
@@ -12827,10 +12851,10 @@ class TestTask103LauncherGuiP3(TempDirCase):
 
     def test_c_display_seat_types_unit(self):
         # 裸字符串按单个席别，不逐字符拆；非法形状视为空。
-        self.assertEqual(gui._display_seat_types("二等座"), ["二等座"])
-        self.assertEqual(gui._display_seat_types(["一等座"]), ["一等座"])
-        self.assertEqual(gui._display_seat_types(None), [])
-        self.assertEqual(gui._display_seat_types(123), [])
+        self.assertEqual(appcommon.display_seat_types("二等座"), ["二等座"])
+        self.assertEqual(appcommon.display_seat_types(["一等座"]), ["一等座"])
+        self.assertEqual(appcommon.display_seat_types(None), [])
+        self.assertEqual(appcommon.display_seat_types(123), [])
 
     # ---- (d) update_config_locked 写侧拒绝非 dict（P3） ----
 
@@ -12862,10 +12886,20 @@ class TestTask103LauncherGuiP3(TempDirCase):
         with open(cfg, encoding="utf-8") as f:
             self.assertEqual(f.read(), "[]", "旧文件不得被覆盖")
 
+    def _patch_rpc_config(self, content):
+        # A-4 迁移：与 _patch_gui_config 同形，改 patch rpc.common 一侧。
+        cfg = os.path.join(self.tmp, "config.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(content)
+        p = mock.patch.object(rpc_common, "CONFIG_PATH", cfg)
+        p.start()
+        self.addCleanup(p.stop)
+        return cfg
+
     def test_d_update_config_locked_dict_still_works(self):
         # 正向对照：dict 配置写侧流程不变。
-        cfg = self._patch_gui_config('{"a": 1}')
-        gui.update_config_locked(lambda c: c.update({"b": 2}))
+        cfg = self._patch_rpc_config('{"a": 1}')
+        rpc_common.update_config_locked(lambda c: c.update({"b": 2}))
         with open(cfg, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"a": 1, "b": 2})
 
@@ -13170,19 +13204,19 @@ class TestTask106BareStringHardening(TempDirCase):
         # 预选静默为空。调用点改后表达式应正确预选。
         task = {"passenger_names": "张三"}
         psg_items = ["张三", "李四"]
-        selected = [n for n in gui._display_seat_types(task.get("passenger_names"))
+        selected = [n for n in appcommon.display_seat_types(task.get("passenger_names"))
                     if n in psg_items]
         self.assertEqual(selected, ["张三"])
         # 正向对照：干净 list 行为不变。
         task2 = {"passenger_names": ["张三", "李四"]}
-        selected2 = [n for n in gui._display_seat_types(task2.get("passenger_names"))
+        selected2 = [n for n in appcommon.display_seat_types(task2.get("passenger_names"))
                      if n in psg_items]
         self.assertEqual(selected2, ["张三", "李四"])
 
     def test_display_helper_passenger_names_contract(self):
         # 2892/576 调用点依赖的契约：_display_seat_types 用于 passenger_names
         # 时，裸字符串按单个姓名处理（中文名不 strip/upper，与席别同口径）。
-        self.assertEqual(gui._display_seat_types("张三"), ["张三"])
+        self.assertEqual(appcommon.display_seat_types("张三"), ["张三"])
         self.assertEqual(launcher._display_seat_types("张三"), ["张三"])
         self.assertEqual(launcher._display_seat_types(["张三", "李四"]),
                          ["张三", "李四"])
