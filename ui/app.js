@@ -28,6 +28,7 @@ const S = {
   _expiredDialogOpen: false,
   _expiredDismissed: false,
   history: [],
+  problems: [], problemFilter: "all",
   queryHistory: [],
   searchQ: "", stationHits: [], searchDD: [], searchLoading: false, trainRes: null, pickFrom: null,
   mgr: false, mgrSel: [], // 任务列表管理模式
@@ -89,8 +90,7 @@ function showDD(items, x, y) {
 }
 
 // 日志
-function pushLog(line, tag) {
-  const logs = $("#logs");
+function makeLogLine(line, tag) {
   const d = new Date();
   const ts = d.toTimeString().slice(0, 8);
   const tagMap = { ok: "OK", warn: "WARN", err: "ERR", info: "INFO" };
@@ -98,7 +98,24 @@ function pushLog(line, tag) {
   const div = document.createElement("div");
   div.className = "log-line t-" + (tag || "info");
   div.innerHTML = '<span class="ts">' + ts + '<span class="tag">' + t + '</span><span>' + esc(line) + '</span>';
-  logs.appendChild(div);
+  return div;
+}
+
+function pushLog(line, tag) {
+  const logs = $("#logs");
+  if (!logs) return;
+  logs.appendChild(makeLogLine(line, tag));
+  while (logs.children.length > 400) logs.firstChild.remove();
+  logs.scrollTop = logs.scrollHeight;
+}
+
+// 批量日志：一次 DocumentFragment 插入、只滚一次（后端 150ms 攒批）
+function pushLogBatch(items) {
+  const logs = $("#logs");
+  if (!logs || !items || !items.length) return;
+  const frag = document.createDocumentFragment();
+  for (const it of items) frag.appendChild(makeLogLine(it.line || "", it.tag));
+  logs.appendChild(frag);
   while (logs.children.length > 400) logs.firstChild.remove();
   logs.scrollTop = logs.scrollHeight;
 }
@@ -109,6 +126,7 @@ const PAGES = {
   grab: { crumb: "抢票任务", title: "抢票任务" },
   pax: { crumb: "乘车人", title: "乘车人" },
   history: { crumb: "历史记录", title: "历史" },
+  errlog: { crumb: "问题日志", title: "问题日志" },
   settings: { crumb: "设置", title: "设置" },
 };
 
@@ -118,16 +136,45 @@ function goto(page) {
   const bs = $("#btnSettings");
   if (bs) bs.classList.toggle("active", page === "settings");
   $("#crumb").textContent = "/ " + PAGES[page].crumb;
-  renderPage();
+  // 切页即收起设置放大面板（面板只在设置页语境使用，避免跨页残留）
+  closeSettingPanel();
+  renderPage(true); // 导航走抽屉动画
+  // 问题日志是落盘数据，进页时拉一次最新（不在后台定时刷，避免展开的堆栈被重置）
+  if (page === "errlog") refreshProblemLogs();
 }
 
-function renderPage() {
+function renderPage(animate) {
   const c = $("#content");
-  c.innerHTML = "";
+  const hasOld = c.firstElementChild !== null;
+  // 动画切换：不清空，旧页执行退回动画后移除，新页从抽屉拉出
+  if (animate && hasOld) {
+    const old = c.firstElementChild;
+    old.classList.add("page-out");
+    old.addEventListener("animationend", function onOut(e) {
+      if (e.animationName === "page-draw-out") {
+        old.remove();
+        old.removeEventListener("animationend", onOut);
+      }
+    });
+  } else if (!animate) {
+    c.innerHTML = ""; // 刷新重建路径：无动画直接清空
+  }
   const el = document.createElement("div");
-  el.className = "page";
+  el.className = "page" + (animate ? " page-in" : "");
   c.appendChild(el);
-  ({ monitor: renderMonitor, grab: renderGrab, pax: renderPax, history: renderHistory, settings: renderSettings })[S.page](el);
+  if (animate) {
+    // 进入动画结束移除 page-in：恢复毛玻璃（动画期间禁用 backdrop-filter 防模糊）
+    el.addEventListener("animationend", function onIn(e) {
+      if (e.animationName === "page-draw-in") {
+        el.classList.remove("page-in");
+        el.removeEventListener("animationend", onIn);
+      }
+    });
+  }
+  ({
+    monitor: renderMonitor, grab: renderGrab, pax: renderPax,
+    history: renderHistory, errlog: renderProblemLog, settings: renderSettings,
+  })[S.page](el);
 }
 
 // 搜索过滤（列表项文本匹配）
@@ -485,12 +532,6 @@ function bindTaskRows(root) {
       else items.push({ i: 0, label: "▶ 恢复", fn: () => setTask(name, "monitoring", "手动恢复") });
       items.push({ i: 1, label: "✕ 取消", fn: () => setTask(name, "cancelled", "手动取消") });
       if (t.status === "paused") items.push({ i: 2, label: "✎ 编辑", fn: () => openMonitorTaskForm(t) });
-      items.push({ i: 4, label: "♻ 重置防重", fn: async () => {
-        if (!await confirmBox("重置防重", "清除「" + t.name + "」的本地下单防重记录并恢复监控？")) return;
-        const r = await call("resetTask", { name });
-        if (r && r.error) return toast(r.error, "err");
-        toast("已重置防重，任务恢复监控"); refreshMonitor();
-      } });
       items.push({ i: 3, label: "🗑 删除", danger: true, fn: async () => {
         // 带 uid：同名任务（编辑 bug 留下的重复）按名字删只会删到第一条
         if (await confirmBox("删除任务", "确定删除「" + t.name + "」？")) { await call("deleteTask", { uid: t.uid, name }); toast("已删除"); refreshMonitor(); }
@@ -706,8 +747,7 @@ async function openMonitorTaskForm(edit) {
         catch (e) { toast("旧任务删除失败，请在列表里手动删掉「" + t.name + "」", "err"); }
       }
       if (isEdit) {
-        // 「仅提醒」改回「自动下单」：先清旧防重记录，否则命中余票仍会被挡住
-        if (t.auto_order === false && p.auto_order) await call("resetTask", { name: r.name });
+        // 防重已下线：不再有"旧防重记录挡住余票"的问题，无需额外清理。
         // state.json 以任务名为键：同名重建会继承旧记录——旧任务若是 failed /
         // 「日期已全部过期」，新任务一出生就是 failed，点恢复也跑不起来。
         // 删旧任务会清掉该名字的状态，这里按编辑前的运行态显式回设一次。
@@ -819,7 +859,6 @@ function renderGrab(root) {
     '<div class="sec-head"><h3>抢票任务</h3><span style="display:flex;gap:8px">' +
     '<button class="btn btn-mini btn-ghost" id="gPreset">预设 ▾</button>' +
     '<button class="btn btn-mini btn-ghost" id="gHist">🕘 查询历史</button>' +
-    '<button class="btn btn-mini btn-ghost" id="gLoc">📍 定位</button>' +
     '<button class="btn btn-mini btn-call" id="gNew">＋ 新任务</button></span></div>' +
     '<div class="grid-3" id="gGrid"></div>';
   root.querySelector("#gNew").onclick = () => openGrabForm();
@@ -836,14 +875,6 @@ function renderGrab(root) {
     showDD(hist.map((h, i) => ({
       i, label: h.from + " → " + h.to, fn: () => applyQueryHistory(h),
     })), e.clientX, e.clientY);
-  };
-  // B1 本机 IP 归属地
-  root.querySelector("#gLoc").onclick = async () => {
-    const r = await call("ipLocate").catch(() => null);
-    const t = (r && r.text) || "";
-    const bad = !t || t.indexOf("定位失败") === 0;
-    toast(bad ? (t || "定位失败（网络不可用）") : "本机 IP 归属地：" + t, bad ? "err" : "");
-    pushLog("[定位] " + (t || "获取失败"), bad ? "warn" : "info");
   };
   renderGrabGrid(root.querySelector("#gGrid"));
 }
@@ -916,8 +947,6 @@ function renderGrabGrid(el) {
         : '<button class="btn btn-mini btn-call" data-g="start">▶ 开抢</button>') +
       '<button class="btn btn-mini btn-ghost" data-g="edit">✎ 编辑</button>' +
       (hasRes ? '<button class="btn btn-mini btn-ghost" data-g="detail">📄 结果详情</button>' : "") +
-      '<button class="btn btn-mini btn-ghost" data-g="rename">✎ 改名</button>' +
-      '<button class="btn btn-mini btn-ghost" data-g="del" style="color:var(--err)">🗑</button>' +
       "</div></div>";
   }).join("");
 
@@ -929,35 +958,10 @@ function renderGrabGrid(el) {
       if (b.dataset.g === "start") { await call("startGrab", { id: t.id }); toast("已开抢"); }
       if (b.dataset.g === "stop") { await call("stopGrab", { id: t.id }); toast("已停止"); }
       if (b.dataset.g === "edit") openGrabForm(t);
-      if (b.dataset.g === "rename") openRenameForm(t);
       if (b.dataset.g === "detail") openGrabResult(t);
-      if (b.dataset.g === "del" && await confirmBox("删除", "删除抢票任务「" + (t.name || t.id) + "」？")) {
-        await call("deleteGrabTask", { id: t.id }); toast("已删除"); refreshGrab();
-      }
       if (b.dataset.g === "start" || b.dataset.g === "stop") setTimeout(refreshGrab, 400);
     };
   });
-}
-
-// 抢票任务改名（B5）
-function openRenameForm(t) {
-  if (!t) return;
-  const { modal, close } = openModal(
-    "<h3>重命名抢票任务</h3>" +
-    '<div class="form-row"><label>任务名</label><input id="rName" value="' + esc(t.name || "") + '"></div>' +
-    '<div class="form-actions"><button class="btn btn-ghost" id="rCancel">取消</button>' +
-    '<button class="btn btn-call" id="rSave">保存</button></div>');
-  modal.querySelector("#rCancel").onclick = close;
-  const inp = modal.querySelector("#rName");
-  inp.focus(); inp.select();
-  modal.querySelector("#rSave").onclick = async () => {
-    const name = inp.value.trim();
-    if (!name) return toast("请填写任务名", "err");
-    const r = await call("renameGrabTask", { id: t.id, name });
-    if (r && r.error) return toast(r.error, "err");
-    close(); toast("已改名"); refreshGrab();
-  };
-  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") modal.querySelector("#rSave").click(); });
 }
 
 // 抢票任务表单
@@ -983,7 +987,10 @@ async function openGrabForm(edit, preset) {
     (t.trains || []).forEach((code) => { perTrain[String(code).toUpperCase()] = new Set(t.seat_types); });
   const { modal, close } = openModal(
     "<h3>" + (edit ? "编辑抢票任务" : "新建抢票任务") + "</h3>" +
-    '<div class="form-row"><label>任务名</label><input id="gName" value="' + esc(t.name || "") + '"></div>' +
+    '<div class="form-row"><label>任务名</label><span style="display:flex;gap:8px;flex:1">' +
+    '<input id="gName" value="' + esc(t.name || "") + '" style="flex:1">' +
+    (edit ? '<button class="btn btn-mini btn-ghost" id="gRename">改名</button>' : "") +
+    "</span></div>" +
     '<div class="mt-top"><div class="form-row grow"><label>出发站</label>' + stationInput("gfrom", t.from) + "</div>" +
     '<div class="form-row grow"><label>到达站</label>' + stationInput("gto", t.to) + "</div></div>" +
     '<div class="form-row"><label>车次与席别（点查询后逐车选择席别）</label>' +
@@ -1009,11 +1016,38 @@ async function openGrabForm(edit, preset) {
     (S.pax.length ? "" : '<span class="muted">暂无乘车人</span>') + "</div></div>" +
     '<div class="form-actions"><button class="btn btn-ghost" id="gCancel">取消</button>' +
     (edit ? "" : '<button class="btn btn-ghost" id="gPresetSave">存为预设</button>') +
+    (edit ? '<button class="btn btn-ghost" id="gDelete">删除</button>' : "") +
     '<button class="btn btn-call" id="gSave">' + (edit ? "保存" : "创建") + "</button></div>");
 
   modal.querySelector("#gCancel").onclick = close;
   bindStation(modal, "gfrom", t.from || "", t.fromCode || "");
   bindStation(modal, "gto", t.to || "", t.toCode || "");
+
+  // 改名：编辑弹窗内独立按钮（复用 openRenameForm 逻辑）
+  const renameBtn = modal.querySelector("#gRename");
+  if (renameBtn && edit) {
+    renameBtn.onclick = async () => {
+      const name = modal.querySelector("#gName").value.trim();
+      if (!name) return toast("请填写任务名", "err");
+      const r = await call("renameGrabTask", { id: edit.id, name });
+      if (r && r.error) return toast(r.error, "err");
+      toast("已改名");
+      close();
+      refreshGrab();
+    };
+  }
+
+  // 删除：编辑弹窗底部普通样式按钮（不套红色）
+  const delBtn = modal.querySelector("#gDelete");
+  if (delBtn && edit) {
+    delBtn.onclick = async () => {
+      if (!await confirmBox("删除", "删除抢票任务「" + (edit.name || edit.id) + "」？")) return;
+      await call("deleteGrabTask", { id: edit.id });
+      toast("已删除");
+      close();
+      refreshGrab();
+    };
+  }
 
   // 车次查询：识别每趟车的席别（哪些有硬/软卧、一/二等座、硬座/无座），逐车点选席别
   modal.querySelector("#gQuery").onclick = async () => {
@@ -1270,18 +1304,171 @@ function renderHistory(root) {
   };
 }
 
+// ================= 问题日志页 =================
+// 数据源：后端 data/problem_log.jsonl（logutil.ProblemLogHandler 写入的
+// WARNING/ERROR 台账），不是底部「全局日志」那份内存缓冲——那份重启即丢。
+const PROBLEM_LEVELS = {
+  ERROR: ["错误", "fail"],
+  WARNING: ["警告", "pause"],
+  INFO: ["信息", "run"],
+};
+
+function problemRowHtml(r, i) {
+  const lv = PROBLEM_LEVELS[r.level] || [String(r.level || "—"), "canc"];
+  const msg = String(r.message || "").trim();
+  const first = msg.split("\n")[0];
+  const short = first.length > 120 ? first.slice(0, 120) + "…" : first;
+  return '<div class="s pl-item" data-i="' + i + '" title="点击展开堆栈 / 详情">' +
+    '<span class="k"><b>' + esc(short) + "</b>" +
+    (r.source ? ' <span class="muted" style="font-size:11px;opacity:.72">' + esc(r.source) + "</span>" : "") +
+    "</span>" +
+    '<span class="v">' + esc(r.ts || "") + "</span>" +
+    '<span class="chip status ' + lv[1] + '">' + esc(lv[0]) + "</span></div>" +
+    '<div class="problem-trace hidden" data-t="' + i + '">' + esc(r.trace || msg) + "</div>";
+}
+
+function renderProblemLog(root) {
+  const all = S.problems || [];
+  const f = S.problemFilter || "all";
+  const rows = all.filter((r) => f === "all" || r.level === f);
+  const count = (lv) => all.filter((r) => r.level === lv).length;
+  const chip = (k, label) => {
+    const n = k === "all" ? all.length : count(k);
+    return '<button class="btn btn-mini ' + (f === k ? "btn-call" : "btn-ghost") +
+      '" data-fl="' + k + '">' + esc(label) + " " + n + "</button>";
+  };
+  root.innerHTML =
+    '<div class="card glass glass-surface" style="flex:1"><div class="sec-head"><h3>问题日志</h3>' +
+    '<span style="display:flex;gap:8px;align-items:center">' +
+    chip("all", "全部") + chip("ERROR", "错误") + chip("WARNING", "警告") +
+    '<button class="btn btn-mini btn-ghost" id="plRefresh">刷新</button>' +
+    '<button class="btn btn-mini btn-ghost" id="plClear">清空</button></span></div>' +
+    '<div class="set" style="overflow-y:auto">' +
+    (rows.length ? rows.map(problemRowHtml).join("")
+      : '<div class="empty-hint"><div class="big">🧾</div><p>暂无问题记录</p>' +
+        '<p class="muted">引擎告警与接口异常会自动记到这里，重启不丢</p></div>') +
+    "</div></div>";
+
+  root.querySelectorAll("[data-fl]").forEach((b) => {
+    b.onclick = () => { S.problemFilter = b.dataset.fl; renderProblemLog(root); };
+  });
+  root.querySelectorAll(".pl-item").forEach((el) => {
+    el.onclick = () => {
+      const t = root.querySelector('[data-t="' + el.dataset.i + '"]');
+      if (t) t.classList.toggle("hidden");
+    };
+  });
+  const rb = root.querySelector("#plRefresh");
+  if (rb) rb.onclick = async () => {
+    rb.disabled = true;
+    try { await refreshProblemLogs(); } finally { rb.disabled = false; }
+  };
+  const cb = root.querySelector("#plClear");
+  if (cb) cb.onclick = async () => {
+    if (!await confirmBox("清空问题日志", "确定清空全部问题记录？此操作不可恢复。")) return;
+    const r = await call("clearProblemLogs", { confirm: true });
+    if (r && r.ok === false) return toast("清空失败", "err");
+    await refreshProblemLogs();
+    toast("已清空问题日志");
+  };
+}
+
 // ================= 设置页 =================
+// 设置气泡：只保留外观 / 邮件通知（其余设置项已按用户要求彻底移除）
+const SET_BUBBLES = [
+  { key: "appear", ic: "🎨", name: "外观", desc: "主题、模糊、圆角、主色与背景" },
+  { key: "mail", ic: "📧", name: "邮件通知", desc: "SMTP 服务器与订单通知" },
+];
+
 function renderSettings(root) {
+  root.innerHTML =
+    '<div class="sec-head"><h3>设置</h3><span class="more">点击气泡查看与修改对应设置</span></div>' +
+    '<div class="set-wrap set-bubbles">' + SET_BUBBLES.map((b) => {
+      const st = statusOfSetting(b.key);
+      return '<div class="set-bubble" data-set="' + b.key + '" title="点击打开">' +
+        '<span class="b-ic">' + b.ic + "</span>" +
+        '<span class="b-name">' + b.name + "</span>" +
+        '<span class="b-desc">' + b.desc + "</span>" +
+        (st ? '<span class="b-status">' + st + "</span>" : "") +
+        "</div>";
+    }).join("") + "</div>";
+  root.querySelectorAll(".set-bubble").forEach((b) => {
+    b.onclick = () => openSettingPanel(b.dataset.set, b);
+  });
+}
+
+// 气泡底部小状态（邮件启用与否等）
+function statusOfSetting(key) {
+  const s = S.settings || {};
+  if (key === "mail") return s.notify_enabled ? "已启用" : "未启用";
+  return "";
+}
+
+// 打开设置面板：从气泡位置放大到主区正中（15/20 ≈ 75%），关闭时缩回气泡
+function openSettingPanel(key, bubbleEl) {
+  const panel = document.getElementById("setPanel");
+  if (!panel) return;
+  const html = settingsPanelHtml(key);
+  if (!html) return;
+  // 记录气泡中心坐标，作为放大/缩回的动画原点
+  if (bubbleEl) {
+    const r = bubbleEl.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const pr = panel.getBoundingClientRect();
+    panel.style.setProperty("--ox", (cx - pr.left) + "px");
+    panel.style.setProperty("--oy", (cy - pr.top) + "px");
+  }
+  // 清掉上一次关闭动画的残留监听（否则打开动画结束会被误判成关闭完成）
+  panel.onanimationend = null;
+  panel.classList.remove("closing", "done");
+  panel.innerHTML =
+    '<div class="set-panel-head"><h3>' + panelTitle(key) + "</h3>" +
+    '<button class="btn btn-mini btn-ghost btn-panel-close" id="setPanelClose">✕ 关闭</button></div>' +
+    '<div class="set-panel-content">' + html + "</div>";
+  panel.classList.add("show");
+  // 背景模糊遮罩：1s 渐变（透明→模糊）
+  const bd = document.getElementById("setBackdrop");
+  if (bd) bd.classList.add("show");
+  panel.querySelector("#setPanelClose").onclick = closeSettingPanel;
+  bindSettingsPanel(panel, key);
+}
+
+function closeSettingPanel() {
+  const panel = document.getElementById("setPanel");
+  if (!panel) return;
+  panel.onanimationend = null;
+  // 背景模糊遮罩同步淡出
+  const bd = document.getElementById("setBackdrop");
+  if (bd) bd.classList.remove("show");
+  // 未在展示状态时直接复位，不挂动画（goto 切页等场景）
+  if (!panel.classList.contains("show")) {
+    panel.classList.remove("closing", "done");
+    return;
+  }
+  // 退出动画：缩小回气泡原点，动画结束后才真正隐藏
+  panel.classList.add("closing");
+  panel.onanimationend = (e) => {
+    if (e.animationName === "setpop-out") {
+      panel.classList.remove("show", "closing", "done");
+      panel.onanimationend = null;
+    }
+  };
+}
+
+function panelTitle(key) {
+  const b = SET_BUBBLES.find((x) => x.key === key);
+  return b ? b.name : key;
+}
+
+// 各面板 HTML（保留全部原字段与 id；事件在 bindSettingsPanel 统一绑定）
+function settingsPanelHtml(key) {
   const s = S.settings || {};
   const email = s.email || {};
-  const td = s.task_defaults || { auto_order: true, stop_after_order: true, notify: true, start_now: true };
-  const ses = S.session;
   const a = S.appear || {};
   const wallOpts = [["image", "壁纸"], ["flat", "蓝白"], ["flat-sunset", "晚霞"], ["flat-green", "松绿"], ["custom", "自定义"]];
-  root.innerHTML =
-    '<div class="set-wrap">' +
-    '<div class="card glass glass-surface"><div class="sec-head"><h3>外观</h3><span class="more">即时生效 · 本地保存</span></div>' +
-    '<div class="appear-row"><label>主题</label><div class="seg" id="aTheme">' +
+  if (key === "appear") return (
+    '<div class="card glass glass-surface"><div class="appear-row"><label>主题</label><div class="seg" id="aTheme">' +
     ["light|浅色", "dark|深色", "sys|跟随系统"].map((x) => { const p = x.split("|"); return '<button data-v="' + p[0] + '"' + (a.theme === p[0] ? ' class="on"' : "") + ">" + p[1] + "</button>"; }).join("") +
     "</div></div>" +
     '<div class="appear-row"><label>模糊度</label><input type="range" id="aBlur" min="0" max="40" step="1" value="' + (a.blur ?? 16) + '"><span class="val" id="aBlurV">' + (a.blur ?? 16) + "px</span></div>" +
@@ -1305,7 +1492,9 @@ function renderSettings(root) {
     wallOpts.map(([v, t]) => '<button data-v="' + v + '"' + (a.wall === v ? ' class="on"' : "") + ">" + t + "</button>").join("") +
     "</div></div>" +
     '<div class="appear-row" id="aWRow"' + (a.wall === "custom" ? "" : ' style="display:none"') + '><label>图片</label><input class="grow" id="aWallUrl" placeholder="https://... 或本地路径" value="' + esc(a.custom || "") + '"><button class="btn btn-mini btn-ghost" id="aWallPick">选文件</button><input type="file" id="aWallFile" accept="image/*" style="display:none"></div>' +
-    '<div class="form-actions"><button class="btn btn-ghost" id="aReset">恢复默认外观</button><button class="btn btn-ghost" id="aWipe">清空本地数据</button></div></div>' +
+    '<div class="form-actions"><button class="btn btn-ghost" id="aReset">恢复默认外观</button><button class="btn btn-ghost" id="aWipe">清空本地数据</button></div></div>'
+  );
+  if (key === "mail") return (
     '<div class="card glass glass-surface"><div class="sec-head"><h3>邮件通知（SMTP）</h3><span class="status ' + (s.notify_enabled ? "succ" : "canc") + '">' + (s.notify_enabled ? "已启用" : "未启用") + "</span></div>" +
     '<div class="form-row"><label>启用</label><label class="check"><input type="checkbox" id="sEnabled"' + (email.enabled ? " checked" : "") + ">发送订单通知邮件</label></div>" +
     '<div class="form-row"><label>SMTP 服务器</label><input id="sHost" value="' + esc(email.smtp_host || "") + '" placeholder="smtp.qq.com"></div>' +
@@ -1314,152 +1503,88 @@ function renderSettings(root) {
     '<div class="form-row"><label>授权码</label><input type="password" id="sPwd" value="' + esc(email.password || "") + '" placeholder="******"></div>' +
     '<div class="form-row"><label>收件人（逗号分隔）</label><input id="sTo" value="' + esc((email.to || []).join(",")) + '"></div>' +
     '<div class="form-actions"><button class="btn btn-ghost" id="sTest">发送测试邮件</button>' +
-    '<button class="btn btn-call" id="sSave">保存设置</button></div></div>' +
-    '<div class="card glass glass-surface"><div class="sec-head"><h3>下单与登录</h3></div>' +
-    '<div class="form-row"><label>下单方式</label><select id="sMode"><option value="browser"' + (s.order_mode === "browser" ? " selected" : "") + '>浏览器模式（真实 Edge 滑块）</option><option value="http"' + (s.order_mode === "http" ? " selected" : "") + ">HTTP 模式</option></select></div>" +
-    '<div class="form-row"><label>监控轮询间隔（秒）</label><input type="number" id="sPoll" min="7" value="' + esc(s.poll_interval_seconds ?? 7) + '"></div>' +
-    '<div class="sec-head" style="margin-top:10px"><h3>登录会话</h3></div>' +
-    '<div class="s"><span class="k">当前状态</span><span class="status ' + (ses && ses.ok ? "succ" : "canc") + '">' + esc(ses ? (ses.ok ? "已登录" : "未登录") : "检测中…") + "</span></div>" +
-    (ses && !ses.ok ? '<div class="muted">' + esc(ses.message || "") + "</div>" : "") +
-    '<div class="form-actions"><button class="btn btn-ghost" id="sCheck">检查会话</button>' +
-    '<button class="btn btn-call" id="sRelogin">重新登录</button></div></div>' +
-    // ---- 任务默认值（原先在新建任务弹窗里的四个开关）----
-    '<div class="card glass glass-surface"><div class="sec-head"><h3>任务默认值</h3><span class="more">新建监控任务时自动套用</span></div>' +
-    [["auto_order", "自动下单", "有票就直接下单"], ["stop_after_order", "抢到后停止", "成功后不再继续抢"],
-     ["notify", "邮件通知", "抢到后发邮件（需先在下面配好 SMTP）"], ["start_now", "立即启动", "创建后马上开始监控"]]
-      .map(([k, t, d]) => '<div class="form-row"><label title="' + esc(d) + '">' + t + '</label>' +
-        '<label class="check' + (td[k] ? " on" : "") + '" data-td="' + k + '"><input type="checkbox"' + (td[k] ? " checked" : "") + ">" + esc(d) + "</label></div>").join("") +
-    "</div>" +
-    // ---- 关于（B2 检查更新 + B1 归属地）----
-    '<div class="card glass glass-surface"><div class="sec-head"><h3>关于</h3><span class="more" id="abCur">—</span></div>' +
-    '<div class="s"><span class="k">本机 IP 归属地</span><span class="v" id="abIp">未获取</span></div>' +
-    '<div class="muted" id="abUpd"></div>' +
-    '<div class="form-actions"><button class="btn btn-ghost" id="abLoc">获取归属地</button>' +
-    '<button class="btn btn-call" id="abUpdBtn">检查更新</button></div></div></div>';
+    '<button class="btn btn-call" id="sSave">保存设置</button></div></div>'
+  );
+  return "";
+}
 
-  root.querySelector("#sSave").onclick = async () => {
+// 面板事件绑定（原 renderSettings 的绑定逻辑整体迁移，查询范围改 panel）
+function bindSettingsPanel(panel, key) {
+  if (key === "appear") bindAppearPanel(panel);
+  if (key === "mail") bindMailPanel(panel);
+}
+
+function bindMailPanel(p) {
+  p.querySelector("#sSave").onclick = async () => {
     const emailNew = {
-      enabled: root.querySelector("#sEnabled").checked,
-      smtp_host: root.querySelector("#sHost").value.trim(),
-      smtp_port: Number(root.querySelector("#sPort").value) || 465,
-      username: root.querySelector("#sUser").value.trim(),
-      password: root.querySelector("#sPwd").value,
-      from: root.querySelector("#sUser").value.trim(),
-      to: root.querySelector("#sTo").value.split(/[,，\s]+/).filter(Boolean),
+      enabled: p.querySelector("#sEnabled").checked,
+      smtp_host: p.querySelector("#sHost").value.trim(),
+      smtp_port: Number(p.querySelector("#sPort").value) || 465,
+      username: p.querySelector("#sUser").value.trim(),
+      password: p.querySelector("#sPwd").value,
+      from: p.querySelector("#sUser").value.trim(),
+      to: p.querySelector("#sTo").value.split(/[,，\s]+/).filter(Boolean),
     };
-    if (!await saveSettings({
-      email: emailNew,
-      order_mode: root.querySelector("#sMode").value,
-      poll_interval_seconds: Number(root.querySelector("#sPoll").value),
-    })) return;
-    toast("设置已保存"); refreshSettings();
+    if (!await saveSettings({ email: emailNew })) return;
+    toast("设置已保存");
+    // 保存后重开面板：refreshSettings 会重渲染气泡，面板浮层独立保留
+    closeSettingPanel();
+    openSettingPanel("mail");
   };
-  root.querySelector("#sTest").onclick = async () => {
+  p.querySelector("#sTest").onclick = async () => {
     toast("正在发送测试邮件…");
     const r = await call("testEmail");
     toast((r.message || "") + (r.ok ? "" : "（失败）"), r.ok ? "" : "err");
   };
-  root.querySelector("#sCheck").onclick = async () => {
-    toast("正在校验会话…");
-    // force：走真实浏览器复核，绕过 20 秒缓存（用户点这一下就是要确切结论）
-    S.session = await call("checkSession", { force: true }).catch(() => null);
-    if (!S.session) { toast("校验失败", "err"); return; }
-    if (S.session.unknown) { toast("这一轮没验成：" + (S.session.message || "稍后自动重试"), "err"); renderSessionCard(); return; }
-    S.account = await call("getAccount").catch(() => null);
-    renderSessionCard();
-    toast(S.session.ok ? "会话有效" : "未登录：" + (S.session.message || ""), S.session.ok ? "" : "err");
-  };
-  root.querySelector("#sRelogin").onclick = async () => {
-    // 先让后端预检：会话有效时不弹窗（弹了是「窗口一闪」），确认后才强制重登
-    let r = await call("relogin").catch(() => null);
-    if (!r) return;
-    if (r.running) { toast(r.message || "登录窗口已经打开了"); return; }
-    if (r.already) {
-      const yes = await confirmBox("重新登录", "当前已登录（" + (r.name || "已登录") +
-        "），仍要重新拉起登录窗口吗？", "重新登录");
-      if (!yes) return;
-      r = await call("relogin", { force: true }).catch(() => null);
-      if (!r) return;
-    }
-    toast(r.message || "已拉起浏览器");
-    setTimeout(refreshSession, 5000);
-  };
+}
 
-  // ---- 外观 ----
-  // ---- 关于：版本 / 归属地 / 检查更新（B2）----
-  const abCur = root.querySelector("#abCur"), abIp = root.querySelector("#abIp"), abUpd = root.querySelector("#abUpd");
-  const doCheck = async (notify) => {
-    const r = await call("checkUpdate").catch(() => null);
-    if (!r) return;
-    abCur.textContent = "v" + (r.current || "?");
-    if (r.has_new) abUpd.textContent = "发现新版本 " + r.version + (r.notes ? "：" + r.notes : "");
-    else abUpd.textContent = r.configured ? "已是最新版本" : "未配置更新地址（launcher_config.json → update_url）";
-    if (notify) toast(r.has_new ? "发现新版本 " + r.version : (r.configured ? "已是最新版本" : "未配置更新地址"));
+function bindAppearPanel(p) {
+  const save = () => {
+    applyAppearance();
+    const content = document.getElementById("content");
+    if (content) renderSettings(content);
   };
-  root.querySelector("#abUpdBtn").onclick = () => doCheck(true);
-  root.querySelector("#abLoc").onclick = async () => {
-    abIp.textContent = "获取中…";
-    const r = await call("ipLocate").catch(() => null);
-    abIp.textContent = (r && r.text) || "获取失败";
-    abIp.title = abIp.textContent;
-  };
-  doCheck(false);
-
-  // ---- 任务默认值：勾一下立刻落盘（不整页重渲染，免得丢焦点）----
-  root.querySelectorAll("[data-td]").forEach((el) => {
-    el.querySelector("input").addEventListener("change", async (e) => {
-      el.classList.toggle("on", e.target.checked);
-      const next = {};
-      root.querySelectorAll("[data-td]").forEach((x) => { next[x.dataset.td] = x.querySelector("input").checked; });
-      S.settings = Object.assign({}, S.settings, { task_defaults: next });
-      if (!await saveSettings({ task_defaults: next })) return;
-      toast("任务默认值已保存");
-    });
-  });
-
-  const save = () => { applyAppearance(); renderSettings(root); };
-  root.querySelectorAll("#aTheme button").forEach((b) => b.onclick = () => { S.appear.theme = b.dataset.v; save(); });
+  p.querySelectorAll("#aTheme button").forEach((b) => b.onclick = () => { S.appear.theme = b.dataset.v; save(); });
   const bindRange = (id, key) => {
-    const el = root.querySelector("#" + id), lab = root.querySelector("#" + id + "V");
-    el.oninput = () => {
-      S.appear[key] = Number(el.value); lab.textContent = el.value + "px";
-      applyAppearance();
-    };
+    const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
+    if (!el) return;
+    el.oninput = () => { S.appear[key] = Number(el.value); lab.textContent = el.value + "px"; applyAppearance(); };
     el.onchange = () => save();
   };
   bindRange("aBlur", "blur"); bindRange("aRadius", "radius"); bindRange("aFs", "fs");
-  // 玻璃透明度 / 日志高度：单位与数值不同，单独绑
   const bindRange2 = (id, key, unit) => {
-    const el = root.querySelector("#" + id), lab = root.querySelector("#" + id + "V");
+    const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
     if (!el) return;
     el.oninput = () => { S.appear[key] = Number(el.value); lab.textContent = el.value + unit; applyAppearance(); };
     el.onchange = () => save();
   };
   bindRange2("aGlass", "glass", "%"); bindRange2("aLogh", "logh", "rem");
-  const aFont = root.querySelector("#aFont");
+  const aFont = p.querySelector("#aFont");
   if (aFont) aFont.onchange = () => { S.appear.font = aFont.value; save(); };
   [["aDensity", "density"], ["aMotion", "motion"]].forEach(([bid, key]) => {
-    root.querySelectorAll("#" + bid + " button").forEach((b) => b.onclick = () => { S.appear[key] = b.dataset.v; save(); });
+    p.querySelectorAll("#" + bid + " button").forEach((b) => b.onclick = () => { S.appear[key] = b.dataset.v; save(); });
   });
-  root.querySelectorAll("#aAccent .swatch").forEach((b) => b.onclick = () => { S.appear.accent = b.dataset.v; save(); });
-  root.querySelectorAll("#aWall button").forEach((b) => b.onclick = () => {
+  p.querySelectorAll("#aAccent .swatch").forEach((b) => b.onclick = () => { S.appear.accent = b.dataset.v; save(); });
+  p.querySelectorAll("#aWall button").forEach((b) => b.onclick = () => {
     S.appear.wall = b.dataset.v; applyAppearance();
-    root.querySelector("#aWRow").style.display = b.dataset.v === "custom" ? "" : "none";
-    root.querySelectorAll("#aWall button").forEach((x) => x.classList.toggle("on", x === b));
+    p.querySelector("#aWRow").style.display = b.dataset.v === "custom" ? "" : "none";
+    p.querySelectorAll("#aWall button").forEach((x) => x.classList.toggle("on", x === b));
   });
-  const wurl = root.querySelector("#aWallUrl");
+  const wurl = p.querySelector("#aWallUrl");
   if (wurl) wurl.onchange = () => { S.appear.custom = wurl.value.trim(); save(); };
-  const wfile = root.querySelector("#aWallFile");
-  root.querySelector("#aWallPick").onclick = () => wfile.click();
-  wfile.onchange = () => {
-    const f = wfile.files && wfile.files[0];
-    if (!f) return;
-    const fr = new FileReader();
-    fr.onload = () => { S.appear.custom = String(fr.result); save(); toast("背景已更新"); };
-    fr.readAsDataURL(f);
-  };
-  root.querySelector("#aReset").onclick = () => { S.appear = Object.assign({}, APPEAR_DEF); save(); toast("外观已恢复默认"); };
-  root.querySelector("#aWipe").onclick = async () => {
+  const wfile = p.querySelector("#aWallFile");
+  if (wfile) {
+    p.querySelector("#aWallPick").onclick = () => wfile.click();
+    wfile.onchange = () => {
+      const f = wfile.files && wfile.files[0];
+      if (!f) return;
+      const fr = new FileReader();
+      fr.onload = () => { S.appear.custom = String(fr.result); save(); toast("背景已更新"); };
+      fr.readAsDataURL(f);
+    };
+  }
+  p.querySelector("#aReset").onclick = () => { S.appear = Object.assign({}, APPEAR_DEF); save(); toast("外观已恢复默认"); };
+  p.querySelector("#aWipe").onclick = async () => {
     if (!await confirmBox("清空本地数据？", "仅清除本机保存的外观偏好与缓存，不影响服务器上的任务与配置。")) return;
     try { localStorage.clear(); } catch (e) { /* 忽略 */ }
     toast("已清空本地数据"); setTimeout(() => location.reload(), 600);
@@ -1485,6 +1610,25 @@ async function refreshMonitor() {
   S.monitorBusy = false;
 }
 
+// 秒级刷新只在「除倒计时以外的内容」变化时重建整页；只变倒计时就原地改文本
+let _grabSig = "";
+
+function grabSig(tasks) {
+  return JSON.stringify(tasks.map((t) => [t.id, t.name, t.from, t.to,
+    t.trains, t.seat_types, t.running, t.status, t.result_msg, t.result_ok,
+    t.result_at, t.armed, t.auto_fired]));
+}
+
+function updateGrabCountdowns() {
+  const grid = $("#gGrid");
+  if (!grid) return;
+  for (let i = 0; i < grid.children.length && i < S.grab.length; i++) {
+    const el = grid.children[i].querySelector(".g-count");
+    const txt = S.grab[i].countdown || "—";
+    if (el && el.textContent !== txt) el.textContent = txt;
+  }
+}
+
 async function refreshGrab() {
   if (S.grabBusy) return;
   S.grabBusy = true;
@@ -1492,7 +1636,11 @@ async function refreshGrab() {
     const r = await call("grabTicker");
     S.grab = r.tasks || [];
     $("#badge-grab").textContent = S.grab.filter((t) => t.running).length;
-    if (S.page === "grab") renderPage();
+    if (S.page === "grab") {
+      const sig = grabSig(S.grab);
+      if (sig !== _grabSig) { _grabSig = sig; renderPage(); }
+      else updateGrabCountdowns();
+    }
   } catch (e) { /* ignore */ }
   S.grabBusy = false;
 }
@@ -1571,6 +1719,16 @@ async function refreshHistory() {
   try { const r = await call("listHistory", { limit: 200 }); S.history = r.records || []; if (S.page === "history") renderPage(); } catch (e) { /* ignore */ }
 }
 
+async function refreshProblemLogs() {
+  try {
+    const r = await call("listProblemLogs", { limit: 200 });
+    S.problems = r.records || [];
+    const b = $("#badge-errlog");
+    if (b) b.textContent = S.problems.filter((x) => x.level === "ERROR").length;
+    if (S.page === "errlog") renderPage();
+  } catch (e) { /* ignore */ }
+}
+
 // ================= 常量（与 Python 侧对齐） =================
 const SEAT_CHOICES = ["商务座", "特等座", "优选一等座", "一等座", "二等座", "高级软卧", "动卧", "软卧", "硬卧", "软座", "硬座", "无座"];
 const ID_TYPE_NAMES = { "1": "二代身份证", "2": "一代身份证", "C": "港澳通行证", "G": "台湾通行证", "B": "护照", "H": "永久居留证", "L": "其他" };
@@ -1600,8 +1758,9 @@ const _SESSION_DEAD_RE = /登录会话已?失效|浏览器会话不可用|已跳
 bridge.onPush((msg) => {
   const m = msg && msg.method, p = (msg && msg.params) || {};
   if (m === "log") {
-    const line = p.line || "";
-    pushLog(line, p.tag);
+    const items = Array.isArray(p.lines) ? p.lines : [{ line: p.line || "", tag: p.tag }];
+    pushLogBatch(items);
+    const line = items.map((x) => x.line || "").join("\n");
     // 引擎/下单自己发现会话失效（LOG.error 经 stderr→py-push 过来），比 60 秒一轮的
     // 会话看门狗更早。就地弹窗，否则只剩日志区一行小字，用户当成「点了没反应」。
     // 5 分钟冷却：看门狗和引擎会先后报同一件事，不能连着弹两次。
@@ -1834,7 +1993,7 @@ function bindGlobal() {
 }
 
 async function refreshAll() {
-  await Promise.allSettled([refreshMonitor(), refreshGrab(), refreshPax(), refreshPresets(), refreshSettings(), refreshSession(), refreshHistory()]);
+  await Promise.allSettled([refreshMonitor(), refreshGrab(), refreshPax(), refreshPresets(), refreshSettings(), refreshSession(), refreshHistory(), refreshProblemLogs()]);
 }
 // 主进程关掉小窗后会调它对齐数据（主窗隐藏期间轮询被降频）
 window.refreshAll = refreshAll;
@@ -1845,10 +2004,15 @@ bindGlobal();
 bindSearch();
 renderPage();
 refreshAll();
-setInterval(() => { if (S.page === "monitor") refreshMonitor(); }, 2000);
-setInterval(refreshGrab, 1000);
-setInterval(() => { if (S.page === "history") refreshHistory(); }, 30000);
-setInterval(refreshSession, 60000);
+// 窗口隐藏（打开迷你小窗/最小化）时停掉后台轮询，回到前台立刻对齐一次：
+// 隐藏期间主窗的定时器仍会跑，白白和后端争 RPC 队列（2026-10-19 审查）。
+setInterval(() => { if (!document.hidden && S.page === "monitor") refreshMonitor(); }, 2000);
+setInterval(() => { if (!document.hidden) refreshGrab(); }, 1000);
+setInterval(() => { if (!document.hidden && S.page === "history") refreshHistory(); }, 30000);
+setInterval(() => { if (!document.hidden) refreshSession(); }, 60000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshAll();
+});
 // B2：启动静默检查更新（未配置 update_url 时后端直接返回，无网络开销）
 call("checkUpdate").then((r) => {
   if (r && r.has_new) { toast("发现新版本 " + r.version); pushLog("[更新] 发现新版本 " + r.version, "info"); }
