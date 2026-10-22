@@ -70,10 +70,20 @@ def push(method, params):
     emit({"jsonrpc": "2.0", "method": method, "params": params})
 
 
-def reply(id_, result=None, error=None):
+def reply(id_, result=None, error=None, code=None, evidence=None):
+    """回 JSON-RPC 响应。error 给定时走 A-3b 统一错误协议：
+    {"code": ..., "message": ..., "evidence": {...}}。
+
+    message 是用户可见文案，与旧 {"message": ...} 形状逐字一致（前端只
+    消费 message）；code 是机器可判的错误类别；evidence 只许放方法名 /
+    异常类名 / 简短原因类别——禁止请求 params 原文（参数含乘车人等 PII，
+    脱敏红线）。处理函数返回值内的 {"error": ...} 是业务结果载荷，不经
+    本函数包装，与信封 error 无关。"""
     obj = {"jsonrpc": "2.0", "id": id_}
     if error is not None:
-        obj["error"] = {"message": str(error)}
+        obj["error"] = {"code": code or "error",
+                        "message": str(error),
+                        "evidence": evidence if evidence is not None else {}}
     else:
         obj["result"] = result
     emit(obj)

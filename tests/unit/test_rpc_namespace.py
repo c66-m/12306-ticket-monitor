@@ -31,8 +31,8 @@ class TestRpcNamespace(unittest.TestCase):
         api = self.api
         replies = []
         orig = api.reply
-        api.reply = lambda id_, result=None, error=None: replies.append(
-            (id_, result, error))
+        api.reply = lambda id_, result=None, error=None, code=None, \
+            evidence=None: replies.append((id_, result, error, code, evidence))
         try:
             api.rpc_dispatch('{"id": 1, "method": "settings.get", "params": {}}')
         finally:
@@ -44,13 +44,16 @@ class TestRpcNamespace(unittest.TestCase):
         api = self.api
         replies = []
         orig = api.reply
-        api.reply = lambda id_, result=None, error=None: replies.append(
-            (id_, result, error))
+        api.reply = lambda id_, result=None, error=None, code=None, \
+            evidence=None: replies.append((id_, result, error, code, evidence))
         try:
             api.rpc_dispatch('{"id": 2, "method": "nope.missing", "params": {}}')
         finally:
             api.reply = orig
+        # A-3b 错误协议：message 文案不变，新增 code/evidence 断言
         self.assertIn("未知方法", replies[0][2] or "")
+        self.assertEqual(replies[0][3], "unknown_method")
+        self.assertEqual(replies[0][4], {"method": "nope.missing"})
 
 
 if __name__ == "__main__":

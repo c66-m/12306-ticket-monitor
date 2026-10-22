@@ -3,7 +3,8 @@
 
 协议：stdin/stdout 逐行 JSON-RPC 2.0。
   请求：{"jsonrpc":"2.0","id":N,"method":"<name>","params":{...}}
-  响应：{"jsonrpc":"2.0","id":N,"result":...} 或 {"error":{"message":...}}
+  响应：{"jsonrpc":"2.0","id":N,"result":...} 或
+        {"error":{"code":...,"message":...,"evidence":{...}}}（A-3b 错误协议）
   推送：{"jsonrpc":"2.0","method":"log"/"status","params":{...}}（无 id）
 
 业务层全部复用 launcher / ticket / engine / passengers / order / notify，
@@ -197,7 +198,11 @@ def _rpc_handle(id_, method, fn, params):
         logutil.append_problem("ERROR", "api.%s" % method,
                                "%s: %s" % (type(e).__name__, e),
                                traceback.format_exc())
-        reply(id_, error="%s: %s" % (type(e).__name__, e))
+        # A-3b：message 保持旧文案逐字不变；evidence 只放方法名与异常
+        # 类名，绝不回显 params（可能含乘车人 PII）。
+        reply(id_, error="%s: %s" % (type(e).__name__, e),
+              code="handler_error",
+              evidence={"method": method, "exc_type": type(e).__name__})
 
 def rpc_dispatch(line, threaded=False):
     """处理一行 JSON-RPC 请求并回包。
@@ -212,12 +217,14 @@ def rpc_dispatch(line, threaded=False):
     try:
         msg = json.loads(line)
     except Exception as e:
-        reply(None, error="JSON 解析失败：%s" % e)
+        reply(None, error="JSON 解析失败：%s" % e, code="bad_request",
+              evidence={"reason": "invalid_json"})
         return
     if not isinstance(msg, dict):
         # stdin 是信任边界：非对象载荷原来会 AttributeError 冒泡出主循环，
         # 直接带崩后端进程（前端仍会以为后端活着）。
-        reply(None, error="请求必须是 JSON 对象")
+        reply(None, error="请求必须是 JSON 对象", code="bad_request",
+              evidence={"reason": "not_object"})
         return
     id_ = msg.get("id")
     method = msg.get("method") or ""
@@ -225,7 +232,8 @@ def rpc_dispatch(line, threaded=False):
     # 旧名直连（前端现状）或命名空间入口（tasks.list 风格，P4-B 新增契约）
     fn = METHODS.get(method) or _NS_METHODS.get(method)
     if fn is None:
-        reply(id_, error="未知方法：" + method)
+        reply(id_, error="未知方法：" + method, code="unknown_method",
+              evidence={"method": method})
         return
     # 命名空间入口同样映射到慢方法集合（旧名集合判断两者皆可）
     is_slow = (method in _SLOW_METHODS

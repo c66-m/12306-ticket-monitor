@@ -11240,12 +11240,17 @@ class TestTask110ApiRpcDispatch(TempDirCase):
         (m,) = self._feed('{"id": 7, "method": "nope"}')
         self.assertEqual(m["id"], 7)
         self.assertIn("未知方法", m["error"]["message"])
+        # A-3b 错误协议：code/evidence 新增字段，message 文案不变
+        self.assertEqual(m["error"]["code"], "unknown_method")
+        self.assertEqual(m["error"]["evidence"], {"method": "nope"})
         self.assertNotIn("result", m)
 
     def test_malformed_json_reports_error_without_id(self):
         (m,) = self._feed("{not json")
         self.assertIsNone(m["id"])
         self.assertIn("JSON 解析失败", m["error"]["message"])
+        self.assertEqual(m["error"]["code"], "bad_request")
+        self.assertEqual(m["error"]["evidence"], {"reason": "invalid_json"})
 
     def test_non_object_payload_does_not_kill_backend(self):
         # 旧代码：json 合法但不是对象 → msg.get 抛 AttributeError 冒泡出
@@ -11259,6 +11264,8 @@ class TestTask110ApiRpcDispatch(TempDirCase):
         (m,) = self._replies(buf)
         self.assertIsNone(m["id"])
         self.assertIn("请求必须是 JSON 对象", m["error"]["message"])
+        self.assertEqual(m["error"]["code"], "bad_request")
+        self.assertEqual(m["error"]["evidence"], {"reason": "not_object"})
 
     def test_blank_line_is_silent(self):
         self.assertEqual(self._feed("", "   "), [])
@@ -11277,6 +11284,10 @@ class TestTask110ApiRpcDispatch(TempDirCase):
         (m,) = self._replies(buf)
         self.assertEqual(m["id"], 2)
         self.assertIn("ValueError", m["error"]["message"])
+        # A-3b：handler 异常的 evidence 只含方法名与异常类名，不得带 params
+        self.assertEqual(m["error"]["code"], "handler_error")
+        self.assertEqual(m["error"]["evidence"],
+                         {"method": "boom", "exc_type": "ValueError"})
 
 
 def _raise_boom(_p):
@@ -14045,7 +14056,10 @@ class TestApiRpcContract(TempDirCase):
                 self.assertTrue("result" in resp or "error" in resp,
                                 "%s 返回既无 result 也无 error" % method)
                 if "error" in resp:
+                    # A-3b 错误协议形状：{code, message, evidence} 三件齐全
                     self.assertIn("message", resp["error"])
+                    self.assertIn("code", resp["error"])
+                    self.assertIn("evidence", resp["error"])
 
     # ---- 3. 分发层错误包装 ----
 
@@ -14053,11 +14067,15 @@ class TestApiRpcContract(TempDirCase):
         resp = self._call("noSuchMethod")
         self.assertIn("error", resp)
         self.assertIn("未知方法", resp["error"]["message"])
+        self.assertEqual(resp["error"]["code"], "unknown_method")
+        self.assertEqual(resp["error"]["evidence"], {"method": "noSuchMethod"})
 
     def test_bad_json_returns_error(self):
         resp = self._dispatch("{not json")
         self.assertIn("error", resp)
         self.assertIn("JSON 解析失败", resp["error"]["message"])
+        self.assertEqual(resp["error"]["code"], "bad_request")
+        self.assertEqual(resp["error"]["evidence"], {"reason": "invalid_json"})
 
     def test_non_object_payload_returns_error(self):
         for payload in ("[1, 2]", '"text"', "42", "null"):
@@ -14065,6 +14083,9 @@ class TestApiRpcContract(TempDirCase):
                 resp = self._dispatch(payload)
                 self.assertIn("error", resp)
                 self.assertIn("JSON 对象", resp["error"]["message"])
+                self.assertEqual(resp["error"]["code"], "bad_request")
+                self.assertEqual(resp["error"]["evidence"],
+                                 {"reason": "not_object"})
 
     def test_handler_exception_is_wrapped(self):
         def boom(_params):
@@ -14074,6 +14095,10 @@ class TestApiRpcContract(TempDirCase):
         self.assertIn("error", resp)
         self.assertIn("ValueError", resp["error"]["message"])
         self.assertIn("handler 炸了", resp["error"]["message"])
+        # A-3b：evidence 只含方法名与异常类名（params 可能含 PII，禁止回显）
+        self.assertEqual(resp["error"]["code"], "handler_error")
+        self.assertEqual(resp["error"]["evidence"],
+                         {"method": "__boom", "exc_type": "ValueError"})
 
     def test_threaded_dispatch_does_not_block_slow_method(self):
         # 慢方法（查票/会话）不能堵住 stdin 分发线程（2026-10-19 审查 P1）

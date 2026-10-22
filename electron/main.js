@@ -103,7 +103,15 @@ function startPython() {
       if (p) {
         pending.delete(msg.id);
         if (p.timer) clearTimeout(p.timer);
-        if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        if (msg.error) {
+          // A-3b 错误协议 {code, message, evidence}：message 语义与旧
+          // {"message"} 形状一致，渲染层只消费 message（行为不变）；
+          // code/evidence 挂到 Error 上备用（方法名/异常类名，无 PII）。
+          const err = new Error(msg.error.message || JSON.stringify(msg.error));
+          err.code = msg.error.code;
+          err.evidence = msg.error.evidence;
+          p.reject(err);
+        }
         else p.resolve(msg.result);
       }
     } else if (msg.method) {
