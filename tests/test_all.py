@@ -3800,10 +3800,10 @@ class TestExpiredDialogReloginForce(unittest.TestCase):
     """
 
     def test_dialog_button_passes_force(self):
-        with open(os.path.join(HERE, "ui", "app.js"), encoding="utf-8") as f:
+        with open(os.path.join(HERE, "ui", "components", "session.js"), encoding="utf-8") as f:
             js = f.read()
         m = re.search(r"function showSessionExpiredDialog\(.*?\n\}", js, re.S)
-        self.assertIsNotNone(m, "ui/app.js 里找不到 showSessionExpiredDialog")
+        self.assertIsNotNone(m, "ui/components/session.js 里找不到 showSessionExpiredDialog")
         self.assertIn('call("relogin", { force: true })', m.group(0),
                       "弹窗「立即登录」必须带 force，否则先跑一轮注定失败的预检")
 
@@ -13917,10 +13917,10 @@ class TestHistoryLabelSync(unittest.TestCase):
     """
 
     def test_js_labels_match_python_side(self):
-        with open(os.path.join(HERE, "ui", "app.js"), encoding="utf-8") as f:
+        with open(os.path.join(HERE, "ui", "pages", "history.js"), encoding="utf-8") as f:
             js = f.read()
         m = re.search(r"const HISTORY_LABELS = \{(.*?)\n  \};", js, re.S)
-        self.assertIsNotNone(m, "ui/app.js 里找不到 HISTORY_LABELS 定义")
+        self.assertIsNotNone(m, "ui/pages/history.js 里找不到 HISTORY_LABELS 定义")
         pairs = dict(re.findall(r'(\w+):\s*"([^"]*)"', m.group(1)))
         self.assertEqual(pairs, appcommon.HISTORY_RESULT_LABEL)
 
