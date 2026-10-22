@@ -1144,134 +1144,6 @@ class TestValidateAutoNoModal(TempDirCase):
         mw.assert_not_called()
 
 
-class _FakeTkWidget:
-    """Task 45: 记录方法调用的 Tk 构件替身（无真实显示）。
-
-    winfo_* 返回 0 让居中算术可跑；方法按名缓存，保证 top.destroy
-    每次取到的是同一个可调用对象，便于断言按钮 command 身份。
-    """
-
-    def __init__(self, master=None, **kw):
-        self.master = master
-        self.kw = kw
-        self.calls = []          # [(name, args, kwargs)]
-        self.destroyed = False
-        self._methods = {}
-
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        if name not in self._methods:
-            def _rec(*a, **k):
-                self.calls.append((name, a, k))
-                if name == "destroy":
-                    self.destroyed = True
-                if name == "winfo_exists":
-                    return 0 if self.destroyed else 1
-                return 0 if name.startswith("winfo_") else None
-            self._methods[name] = _rec
-        return self._methods[name]
-
-    def called(self, name):
-        return any(c[0] == name for c in self.calls)
-
-
-class _FakeParent(_FakeTkWidget):
-    pass
-
-
-class TestRemindNonmodal(TempDirCase):
-    """Task 45: 开抢提醒非模态（2026-10-13 重构后目标为 gui.GrabTaskForm）。
-
-    改前 _tick 里 messagebox.showinfo 是模态的：冻住 Tk 主线程的 after 链，
-    无人值守时自动开抢永远到不了——提醒功能杀死核心功能。
-    改后：bell + 日志 + 非模态 Toplevel（不 grab、不 wait_window），不阻塞 _tick。
-    """
-
-    def _make_app(self):
-        app = gui.GrabTaskForm.__new__(gui.GrabTaskForm)
-        app._mp = _FakeParent()
-        app._top = mock.Mock()
-        return app
-
-    def _patched_tk(self):
-        tops, labels, buttons = [], [], []
-
-        def _toplevel(master=None, **kw):
-            w = _FakeTkWidget(master, **kw)
-            tops.append(w)
-            return w
-
-        def _label(master=None, **kw):
-            w = _FakeTkWidget(master, **kw)
-            labels.append(w)
-            return w
-
-        def _button(master=None, **kw):
-            w = _FakeTkWidget(master, **kw)
-            buttons.append(w)
-            return w
-
-        p1 = mock.patch.object(gui.tk, "Toplevel", _toplevel)
-        p2 = mock.patch.object(gui.ttk, "Label", _label)
-        p3 = mock.patch.object(gui.ttk, "Button", _button)
-        return p1, p2, p3, tops, labels, buttons
-
-    def test_notify_nonmodal_creates_toplevel(self):
-        app = self._make_app()
-        p1, p2, p3, tops, labels, buttons = self._patched_tk()
-        with p1, p2, p3:
-            app._notify_nonmodal("开抢提醒", "距离开抢不到 5 分钟！")
-        self.assertEqual(len(tops), 1)
-        top = tops[0]
-        self.assertIs(top.master, app._mp)
-        self.assertIn(("title", ("开抢提醒",), {}), top.calls)
-        self.assertTrue(any("距离开抢不到 5 分钟" in str(l.kw.get("text", ""))
-                            for l in labels))
-
-    def test_notify_nonmodal_never_blocks(self):
-        # 非模态的核心证据：绝不调用 grab_set / wait_window
-        app = self._make_app()
-        p1, p2, p3, tops, labels, buttons = self._patched_tk()
-        with p1, p2, p3:
-            app._notify_nonmodal("开抢提醒", "msg")
-        top = tops[0]
-        self.assertFalse(top.called("grab_set"))
-        self.assertFalse(top.called("wait_window"))
-        self.assertFalse(top.called("focus_force"))
-        # 提醒窗不自动消失：等用户点"知道了"
-        self.assertFalse(top.destroyed)
-        # "知道了"按钮确实能关掉窗口
-        self.assertEqual(len(buttons), 1)
-        cmd = buttons[0].kw.get("command")
-        self.assertIs(cmd, top.destroy)
-        cmd()
-        self.assertTrue(top.destroyed)
-
-    def test_notify_nonmodal_replaces_old_window(self):
-        # 重复提醒不堆窗口：新窗出现前旧窗先关掉
-        app = self._make_app()
-        p1, p2, p3, tops, labels, buttons = self._patched_tk()
-        with p1, p2, p3:
-            app._notify_nonmodal("开抢提醒", "第一次")
-            app._notify_nonmodal("开抢提醒", "第二次")
-        self.assertEqual(len(tops), 2)
-        self.assertTrue(tops[0].destroyed)
-        self.assertFalse(tops[1].destroyed)
-
-    def test_tick_has_no_blocking_dialog(self):
-        # 回归 pin：_tick 里绝不能再出现模态弹窗（任何模态都会冻住 after 链）
-        import inspect
-        src = inspect.getsource(gui.GrabTaskForm._tick)
-        self.assertNotIn("showinfo", src)
-        self.assertNotIn("showwarning", src)
-        self.assertNotIn("showerror", src)
-        self.assertNotIn("askyesno", src)
-        self.assertNotIn("grab_set", src)
-        self.assertNotIn("wait_window", src)
-        self.assertIn("_notify_nonmodal", src)
-
-
 class TestGuiUnit(TempDirCase):
     def test_normalize_email(self):
         email = appcommon.normalize_email_settings({
@@ -1288,12 +1160,6 @@ class TestGuiUnit(TempDirCase):
         cfg = {"tasks": [{"uid": "u1", "name": "A"}, {"uid": "u2", "name": "B"}]}
         appcommon.remove_task_from_config(cfg, {"uid": "u1", "name": "A"})
         self.assertEqual([t["name"] for t in cfg["tasks"]], ["B"])
-
-    def test_format_dates(self):
-        t = {"dates": ["2026-10-08"], "date_range": []}
-        self.assertEqual(gui.format_dates(t), "2026-10-08")
-        t = {"dates": [], "date_range": ["2026-10-08", "2026-10-11"]}
-        self.assertIn("4天", gui.format_dates(t))
 
 
 # ============================ 集成 / 端到端 ============================
@@ -5091,16 +4957,6 @@ class TestLockedRMW(TempDirCase):
     改后：三入口经 update_config_locked / update_state_locked，整包在锁内。
     """
 
-    def _patch_gui_paths(self):
-        cfg = os.path.join(self.tmp, "config.json")
-        with open(cfg, "w", encoding="utf-8") as f:
-            json.dump({"tasks": [], "state_file": "state.json"}, f)
-        for name, val in (("CONFIG_PATH", cfg), ("APP_ROOT", self.tmp)):
-            p = mock.patch.object(gui, name, val)
-            p.start()
-            self.addCleanup(p.stop)
-        return cfg
-
     def _patch_rpc_paths(self, patch_here=False):
         # A-4 迁移：迁到 rpc.common 的两例改 patch rpc 侧路径常量
         # （CONFIG_PATH＋相对 state_file 解析用的 HERE，替代 gui.APP_ROOT）。
@@ -5156,15 +5012,6 @@ class TestLockedRMW(TempDirCase):
         self.assertEqual(len(state["tasks"]), n)
         for i in range(n):
             self.assertEqual(state["tasks"]["t%d" % i]["status"], "monitoring")
-
-    def test_gui_save_config_still_writes_standalone(self):
-        # 回归 pin：旧的 load_config/save_config 独立读写行为不变
-        cfg = self._patch_gui_paths()
-        config = gui.load_config()
-        config["order_mode"] = "browser"
-        gui.save_config(config)
-        with open(cfg, encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["order_mode"], "browser")
 
     def test_monitor_save_config_holds_file_lock(self):
         # RED on old code: monitor.save_config 只原子写、不加锁
@@ -5906,39 +5753,6 @@ class TestDeleteTaskClearsState(TempDirCase):
         self.assertEqual(e.state["tasks"]["t1"]["status"], "monitoring")
 
 
-class TestReloginScriptResult(TempDirCase):
-    """Task 53(b): capture_session.py 重登链按退出码判定成败。
-
-    改前：subprocess.run(...) 后 ok = True 硬编码——退出码 1（失败）的登录
-    也被当成成功，_after_relogin 置侧边栏"已登录"。
-    改后：退出码非 0 → ok=False 并如实提示；超时同样失败（不挂死）。
-    """
-
-    def test_script_exit_1_is_not_ok(self):
-        # RED on old code: 根本没有 _relogin_ok_via_script（AttributeError）；
-        # 旧内联代码在 returncode=1 时仍置 ok=True（失败被当成功）
-        proc = mock.Mock()
-        proc.returncode = 1
-        with mock.patch.object(gui.subprocess, "run",
-                               return_value=proc) as run:
-            self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
-        run.assert_called_once()
-
-    def test_script_exit_0_is_ok(self):
-        # 回归 pin：成功路径语义不变
-        proc = mock.Mock()
-        proc.returncode = 0
-        with mock.patch.object(gui.subprocess, "run", return_value=proc):
-            self.assertTrue(gui._relogin_ok_via_script("capture_session.py"))
-
-    def test_script_timeout_is_failure_not_hang(self):
-        # 300s 超时 → False（不挂死、不抛到界面）
-        import subprocess as _sp
-        with mock.patch.object(gui.subprocess, "run",
-                               side_effect=_sp.TimeoutExpired("cmd", 300)):
-            self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
-
-
 class TestTask55ExcStreakStop(TempDirCase):
     """Task 55(a): 下单异常被 except 吞掉 + 5 秒重试 → 无限活锁。
 
@@ -6209,24 +6023,6 @@ class TestFileLockTimeout(TempDirCase):
             with self.assertRaises(TimeoutError) as cm:
                 launcher.append_monitor_task(task)
         self.assertIn("文件被占用", str(cm.exception))
-
-    def test_gui_update_config_locked_timeout_warns_user(self):
-        with self._timeout_lock(), mock.patch.object(gui, "messagebox") as mb:
-            with self.assertRaises(TimeoutError) as cm:
-                gui.update_config_locked(lambda c: c)
-        self.assertIn("文件被占用，稍后重试", str(cm.exception))
-        mb.showwarning.assert_called_once()
-        args, _ = mb.showwarning.call_args
-        self.assertIn("文件被占用，稍后重试", args[1])
-
-    def test_gui_update_state_locked_timeout_warns_user(self):
-        with self._timeout_lock(), mock.patch.object(gui, "messagebox") as mb, \
-                mock.patch.object(gui, "load_config",
-                                  return_value={"state_file": "state.json"}):
-            with self.assertRaises(TimeoutError) as cm:
-                gui.update_state_locked(lambda s: s)
-        self.assertIn("文件被占用，稍后重试", str(cm.exception))
-        mb.showwarning.assert_called_once()
 
     def test_monitor_save_config_timeout_no_crash(self):
         import monitor as monitor_mod
@@ -7391,23 +7187,6 @@ class TestTask65InteractionLoginChain(TempDirCase):
         out = "\n".join(str(c.args[0]) for c in mprint.call_args_list if c.args)
         self.assertIn("登录页", out)
         self.assertTrue(capture_session._goto_login_page(mock.Mock()))
-
-    # ---- (f) warn 重登 http 路径统一 ----
-
-    def test_warn_relogin_http_waits_and_writes_back(self):
-        app = object.__new__(gui.MonitorApp)
-        app.root = mock.Mock()
-        app._after_warn_relogin = mock.Mock()
-        with mock.patch.object(gui, "_relogin_ok_via_script",
-                               return_value=True) as mok, \
-             mock.patch.object(gui.subprocess, "Popen",
-                               side_effect=AssertionError("must not Popen")):
-            app._warn_relogin_http()  # 旧代码无此方法 → AttributeError 变红
-            root, cb, _a, _b = gui._RESULT_QUEUE.get(timeout=10)
-        mok.assert_called_once()
-        self.assertIn("capture_session.py", mok.call_args.args[0])
-        cb(None, None)
-        app._after_warn_relogin.assert_called_once_with(True)
 
     # ---- (g) 类名精确匹配 ----
 
@@ -8686,37 +8465,6 @@ class TestTask74Launcher(TempDirCase):
     gui.GrabTaskForm / gui.GrabTab；本类断言口径不变，目标类随之平移。
     """
 
-    def _var(self, value):
-        v = mock.Mock()
-        v.get.return_value = value
-        return v
-
-    def _make_app(self, **kw):
-        app = object.__new__(gui.GrabTaskForm)
-        app.grabber = None
-        app.lc = {"from": "", "to": "", "trains": [], "seat_types": [],
-                  "date": "", "purpose_code": "ADULT", "passenger_names": []}
-        app.from_ent = self._var(kw.get("from_", "北京"))
-        app.to_ent = self._var(kw.get("to_", "上海"))
-        app.trains_var = self._var(kw.get("trains", "G101"))
-        app.seat_vars = {"二等座": self._var(True)}
-        app.seat_pri_var = self._var("")
-        app.date_var = self._var(kw.get("date", "2026-10-10"))
-        app.date_to_var = self._var("")
-        app.start_var = self._var("")
-        app.remind_var = self._var(kw.get("remind", "10"))
-        app.warm_var = self._var(kw.get("warm", "10"))
-        app.pax_vars = kw.get("pax_vars", {})
-        app.pax_purpose_vars = {}
-        app._save_cfg = mock.Mock()
-        app._set_status = mock.Mock()
-        app._put_log = mock.Mock()
-        app._top = mock.Mock()
-        app.go_btn = mock.Mock()
-        app.logq = mock.Mock()
-        app._auto_vfail_last_msg = None
-        return app
-
     # ---- (b) kind_rank 大小写 ----
 
     def test_search_stations_kind_rank_case_insensitive(self):
@@ -8755,95 +8503,6 @@ class TestTask74Launcher(TempDirCase):
         self.assertEqual(lc["synced_trains"], ["G2", "G3"])
         self.assertEqual(lc["trains"], ["G1"])
 
-    # ---- (d) 先校验后落盘 + 失败只记一条 warning ----
-
-    def test_start_grab_no_disk_write_on_validate_fail(self):
-        app = self._make_app()  # pax_vars={} → 自动开抢校验失败（未选乘车人）
-        app.start_grab(auto=True)
-        app._save_cfg.assert_not_called()  # 旧代码：_ui_to_lc 内已落盘
-
-    def test_start_grab_saves_on_validate_pass(self):
-        # 回归 pin：校验通过时仍落盘一次并启动线程（行为不变）
-        app = self._make_app(pax_vars={"张三": self._var(True)})
-        with mock.patch.object(launcher, "Grabber") as m_grabber:
-            ok = app.start_grab(auto=False)
-        self.assertTrue(ok)
-        self.assertEqual(app._save_cfg.call_count, 1)
-        m_grabber.assert_called_once()
-
-    def test_validate_fail_warn_once(self):
-        app = self._make_app()
-        app._validate_fail("未选乘车人", "未勾选乘车人，自动开抢已跳过", True)
-        app._validate_fail("未选乘车人", "未勾选乘车人，自动开抢已跳过", True)
-        app._top.bell.assert_called_once()
-        self.assertEqual(app._put_log.call_count, 1)  # 旧代码：每 500ms 记一条
-
-    # ---- (e) Spinbox 非数字兜底 ----
-
-    def test_ui_to_lc_spinbox_non_numeric(self):
-        app = self._make_app(remind="abc", warm="xyz")
-        app._ui_to_lc()  # 旧代码：int("abc") 抛 ValueError
-        self.assertEqual(app.lc["remind_minutes"], 10)
-        self.assertEqual(app.lc["warm_minutes"], 10)
-
-    def test_tick_remind_non_numeric_no_crash(self):
-        import queue
-        app = object.__new__(gui.GrabTaskForm)
-        app.grabber = None
-        future = (datetime.datetime.now() + datetime.timedelta(hours=2)
-                  ).strftime("%Y-%m-%d %H:%M:%S")
-        app.start_var = self._var(future)
-        app.warm_var = self._var("10")
-        app.remind_var = self._var("abc")
-        app.countdown_lbl = mock.Mock()
-        app.after = mock.Mock()
-        app.armed = False
-        app.auto_refresh_var = self._var(False)  # _tick 先调 _auto_refresh_trains
-        app.refresh_sec_var = self._var(2)
-        app.dataq = queue.Queue()       # 重构后 _tick 先 _drain 数据队列
-        try:
-            app._monitor_mtime = os.path.getmtime(
-                os.path.join(launcher.HERE, "config.json"))
-        except OSError:
-            app._monitor_mtime = 0.0
-        app.lc = {"trains": [], "from": "", "to": ""}
-        app._save_cfg = lambda *a, **k: None
-        try:
-            app._pax_mtime = os.path.getmtime(
-                appcommon.data_path("passengers.json"))
-        except OSError:
-            app._pax_mtime = float("inf")
-        app.pax_vars = {}               # _refresh_pax 需要的空勾选集
-        app.pax_purpose_vars = {}
-
-        app._put_log = lambda *a, **k: None
-        app._querying = False
-        app._tick()  # 旧代码：ValueError 从 _tick 逃出（控制台 traceback）
-        app.countdown_lbl.configure.assert_called()
-
-    # ---- (f) 测试会话异常可见（重构后统一走 launcher 日志队列） ----
-
-    def test_test_session_error_routed_to_log(self):
-        # 重构后单窗口只有一个全局日志区：子线程结果统一走 launcher 日志
-        # 队列（线程安全），异常不得静默吞掉。
-        app = object.__new__(gui.GrabTaskForm)
-        app._put_log = mock.Mock()
-
-        def run_sync(target, daemon=True):
-            target()
-            m = mock.Mock()
-            m.start = mock.Mock()
-            return m
-
-        with mock.patch.object(launcher.browser_order, "check_session",
-                               side_effect=RuntimeError("boom")), \
-             mock.patch("threading.Thread", side_effect=run_sync):
-            # launcher 业务日志统一走 LOG.info（事件等级在文案 [错误] 前缀里）
-            with self.assertLogs(launcher.LOG, level="INFO") as cm:
-                app._test_session()
-        self.assertTrue(any("会话校验异常" in m for m in cm.output),
-                        "会话校验异常必须落日志：%s" % cm.output)
-
     # ---- (g) 历史记录非 dict 跳过 ----
 
     def test_history_item_text_skips_non_dict(self):
@@ -8881,67 +8540,6 @@ class TestTask74Launcher(TempDirCase):
         self.assertEqual(panel.tasks, [])
         m_save.assert_called()
 
-    # ---- (h) 收尾保留已抢到 ----
-
-    def test_on_window_closed_keeps_ok(self):
-        panel = object.__new__(gui.GrabTab)
-        panel.tasks = [{"id": "t1", "name": "n1", "status": "ok"},
-                       {"id": "t2", "name": "n2", "status": "running"}]
-        panel._refresh_list = mock.Mock()
-        panel._put_log = mock.Mock()
-        with mock.patch.object(launcher, "save_grab_tasks"):
-            panel._on_window_closed("t1")
-            panel._on_window_closed("t2")
-        self.assertEqual(panel.tasks[0]["status"], "ok")  # 旧代码：被抹成 idle
-        self.assertEqual(panel.tasks[1]["status"], "idle")
-
-    # ---- (g) rework：构造时过滤，self.items 与列表框行号 1:1 ----
-
-    def test_history_pick_aligned_with_junk_in_middle(self):
-        import tkinter as tk
-        from tkinter import ttk
-        good1 = {"from": "北京", "to": "上海", "date": "2026-10-10"}
-        good2 = {"from": "广州", "to": "深圳", "date": "2026-10-11"}
-        picked = []
-        lb = mock.Mock()
-        lb.curselection.return_value = (1,)  # 用户双击显示的第 2 行
-        with mock.patch.object(tk.Toplevel, "__init__", return_value=None), \
-             mock.patch.object(gui.QueryHistoryDialog, "title"), \
-             mock.patch.object(gui.QueryHistoryDialog, "geometry"), \
-             mock.patch.object(gui.QueryHistoryDialog, "transient"), \
-             mock.patch.object(ttk, "Frame", return_value=mock.Mock()), \
-             mock.patch.object(ttk, "Label", return_value=mock.Mock()), \
-             mock.patch.object(ttk, "Scrollbar", return_value=mock.Mock()), \
-             mock.patch.object(tk, "Listbox", return_value=lb):
-            with self.assertLogs(launcher.LOG, level="WARNING"):
-                dlg = gui.QueryHistoryDialog(
-                    mock.Mock(), [good1, "junk-string", good2], picked.append)
-        dlg.destroy = mock.Mock()  # 无显示环境，_pick 的 destroy 用桩
-        # junk 被过滤：列表框只插入 2 行
-        self.assertEqual(lb.insert.call_count, 2)
-        # 双击显示的第 2 行（索引 1）必须拿到 good2，而不是错位的 "junk-string"
-        dlg._pick()
-        self.assertEqual(picked, [good2])  # 旧代码：picked == ["junk-string"]
-
-    # ---- (d) rework：warn 按失败原因去重，原因变化重新提示 ----
-
-    def test_validate_fail_warn_per_reason(self):
-        app = self._make_app()
-        app._validate_fail("t", "原因A", True)
-        app._validate_fail("t", "原因A", True)   # 同原因 → 不再提示
-        app._validate_fail("t", "原因B", True)   # 原因变化 → 重新提示
-        app._validate_fail("t", "原因B", True)
-        self.assertEqual(app._top.bell.call_count, 2)  # 旧代码：1（原因B 静默）
-        self.assertEqual(app._put_log.call_count, 2)
-
-    def test_validate_fail_warn_resets_after_pass(self):
-        app = self._make_app()
-        app._validate_fail("t", "原因A", True)
-        # 模拟 start_grab(auto=True) 校验通过后的重置：新一轮 armed 会话同原因再报
-        app._auto_vfail_last_msg = None
-        app._validate_fail("t", "原因A", True)
-        self.assertEqual(app._put_log.call_count, 2)
-
 
 class TestTask75Gui(TempDirCase):
     """Task 75: gui P2/P3 bundle（a–e）。无 Tk 真机，全部 mock tkinter。"""
@@ -8962,37 +8560,6 @@ class TestTask75Gui(TempDirCase):
                 self.assertEqual(rpc_common.load_config(), {})
             finally:
                 rpc_common._CONFIG_CORRUPT_WARNED = False
-
-    def test_load_config_corrupt_warns_once(self):
-        cfg = self._write_config("{bad json,")
-        with mock.patch.object(gui, "CONFIG_PATH", cfg):
-            gui._CONFIG_CORRUPT_WARNED = False
-            try:
-                with self.assertLogs(gui.LOG, level="WARNING") as cm:
-                    gui.load_config()
-                    gui.load_config()
-            finally:
-                gui._CONFIG_CORRUPT_WARNED = False
-        warns = [r for r in cm.records if "解析失败" in r.getMessage()]
-        self.assertEqual(len(warns), 1)
-
-    def test_main_corrupt_config_friendly_prompt_and_starts(self):
-        cfg = self._write_config("{bad json,")
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui.tk, "Tk") as mock_tk, \
-             mock.patch.object(gui, "messagebox") as mock_mb, \
-             mock.patch.object(gui, "MonitorApp") as mock_app, \
-             mock.patch.object(gui, "setup_logging"), \
-             mock.patch.object(gui, "_ensure_stdio"):
-            gui._CONFIG_CORRUPT_WARNED = False
-            try:
-                gui.main()
-            finally:
-                gui._CONFIG_CORRUPT_WARNED = False
-        self.assertEqual(mock_mb.showerror.call_count, 1)
-        self.assertIn("损坏", mock_mb.showerror.call_args[0][1])
-        mock_app.assert_called_once()  # 仍以空配置启动，不直接退出
-        mock_tk.return_value.mainloop.assert_called_once()
 
     # ---- (b) 编辑保存保留 seats_by_date ----
 
@@ -9017,111 +8584,6 @@ class TestTask75Gui(TempDirCase):
         new = self._edited({"name": "t"})
         self.assertEqual(new["seats_by_date"], {})
         self.assertEqual(new["notify_channels"], ["email"])
-
-    # ---- (c) refresh 缓存日期文本：非法日期只警告一次 ----
-
-    def _make_task_page(self):
-        page = gui.TaskPage.__new__(gui.TaskPage)
-        page.app = mock.Mock()
-        page.app.engine_thread = None
-        page.tree = mock.Mock()
-        page.tree.selection.return_value = ()
-        page.tree.get_children.return_value = ()
-        page.tree.yview.return_value = (0.0, 1.0)
-        page.edit_btn = mock.Mock()
-        page._task_by_iid = {}
-        page._dates_text_cache = {}
-        return page
-
-    def test_refresh_caches_date_text_no_warning_spam(self):
-        task = {"name": "t1", "from": "A", "to": "B",
-                "dates": "20261001", "trains": [], "seat_types": []}
-        page = self._make_task_page()
-        with mock.patch.object(gui, "load_config",
-                               return_value={"tasks": [task]}), \
-             mock.patch.object(gui, "load_state",
-                               return_value={"tasks": {}}):
-            with self.assertLogs(gui.LOG, level="WARNING") as cm:
-                page.refresh()
-                page.refresh()
-                page.refresh()
-        warns = [r for r in cm.records if "非列表" in r.getMessage()]
-        # 旧代码：每次 refresh 都调 expand_dates → 3 条 warning 刷屏
-        self.assertEqual(len(warns), 1)
-
-    def test_refresh_cache_invalidates_on_config_change(self):
-        page = self._make_task_page()
-        t1 = {"name": "t1", "dates": ["2026-10-01"]}
-        t2 = {"name": "t1", "dates": ["2026-10-02"]}
-        with mock.patch.object(gui, "load_config",
-                               return_value={"tasks": [t1]}), \
-             mock.patch.object(gui, "load_state",
-                               return_value={"tasks": {}}):
-            page.refresh()
-            shown1 = page._dates_text_cache[("t1", repr(["2026-10-01"]), repr(None))]
-        with mock.patch.object(gui, "load_config",
-                               return_value={"tasks": [t2]}), \
-             mock.patch.object(gui, "load_state",
-                               return_value={"tasks": {}}):
-            page.refresh()
-        self.assertEqual(shown1, "2026-10-01")
-        self.assertNotIn(("t1", repr(["2026-10-01"]), repr(None)),
-                         page._dates_text_cache)
-
-    # ---- (d) 非连续 dates 如实展示/回写 ----
-
-    def test_date_display_text_non_contiguous(self):
-        text, non_contig = gui._date_display_text(["2026-10-03", "2026-10-01"])
-        self.assertTrue(non_contig)
-        self.assertEqual(text, "2026-10-01、2026-10-03")
-
-    def test_date_display_text_contiguous_single_empty(self):
-        self.assertEqual(gui._date_display_text(["2026-10-01", "2026-10-02"]),
-                         ("2026-10-01~2026-10-02", False))
-        self.assertEqual(gui._date_display_text(["2026-10-01"]),
-                         ("2026-10-01", False))
-        self.assertEqual(gui._date_display_text([]), ("", False))
-
-    def test_resolve_saved_dates_keeps_original_when_untouched(self):
-        # 非连续展示且用户未改动 → 原样回写，不静默扩展为连续区间
-        dates, dr = gui._resolve_saved_dates(
-            "2026-10-01、2026-10-03", True,
-            ["2026-10-01", "2026-10-03"], [],
-            "2026-10-01、2026-10-03")
-        self.assertEqual(dates, ["2026-10-01", "2026-10-03"])
-        self.assertEqual(dr, [])
-
-    def test_resolve_saved_dates_parses_edited(self):
-        dates, dr = gui._resolve_saved_dates(
-            "2026-10-01、2026-10-03", True,
-            ["2026-10-01", "2026-10-03"], [],
-            "2026-10-05~2026-10-06")
-        self.assertEqual(dates, [])
-        self.assertEqual(dr, ["2026-10-05", "2026-10-06"])
-
-    def test_resolve_saved_dates_illegal_raises(self):
-        with self.assertRaises(ValueError):
-            gui._resolve_saved_dates("", False, [], [], "not-a-date")
-
-    # ---- (e) 非 dict state 按 {} 处理 ----
-
-    def test_update_state_locked_non_dict_state(self):
-        cfg = self._write_config(json.dumps({"state_file": "state.json"}))
-        def mutator(state):
-            state.setdefault("tasks", {}).setdefault("t", {})["status"] = "paused"
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui.engine_mod, "load_state_file",
-                               return_value=[]), \
-             mock.patch.object(gui.filelock, "file_lock") as mock_lock, \
-             mock.patch.object(gui.appcommon, "write_state") as mock_write:
-            mock_lock.return_value.__enter__.return_value = None
-            with self.assertLogs(gui.LOG, level="WARNING") as cm:
-                gui.update_state_locked(mutator)
-        # 旧代码：state.setdefault 直接 AttributeError
-        mock_write.assert_called_once()
-        saved = mock_write.call_args[0][1]
-        self.assertEqual(saved, {"tasks": {"t": {"status": "paused"}}})
-        self.assertTrue(any("非 dict" in r.getMessage() for r in cm.records))
 
 
 class TestTask76TicketSession(TempDirCase):
@@ -9581,32 +9043,6 @@ class TestTask77Order(unittest.TestCase):
         self.assertIn("E123****7890", out)
 
 
-class TestTask80GuiPassengersSave(TempDirCase):
-    """Task 80(b)：save_passengers 拒写（return False）必须被 GUI 处理。
-
-    旧代码三处裸调：磁盘盒子不可解密时显示"完成"/刷新列表，但磁盘未写，
-    重启后修改丢失。helper 失败时弹 error（与 LOG.error 口径一致）。"""
-
-    def test_save_failure_shows_error_not_done(self):
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False), \
-             mock.patch.object(gui, "messagebox") as mb:
-            ok = gui._save_passengers_or_warn([], parent=None)
-        self.assertFalse(ok)
-        mb.showerror.assert_called_once()
-        # 绝不能弹"完成"
-        mb.showinfo.assert_not_called()
-
-    def test_save_success_no_popup(self):
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=True), \
-             mock.patch.object(gui, "messagebox") as mb:
-            ok = gui._save_passengers_or_warn([], parent=None)
-        self.assertTrue(ok)
-        mb.showerror.assert_not_called()
-        mb.showinfo.assert_not_called()
-
-
 class TestTask80PassengersCrypto(TempDirCase):
     """Task 80(c)(d)：passengers 加密回退与哨兵。"""
 
@@ -9969,11 +9405,6 @@ class TestTask86StationDbCheck(TempDirCase):
 class TestTask84LauncherP3(TempDirCase):
     """Task 84: launcher P3 bundle（a–d）。无 Tk 真机，全部 mock/桩测试。"""
 
-    def _var(self, value):
-        v = mock.Mock()
-        v.get.return_value = value
-        return v
-
     # ---- (a) trains 字符串不得逐字符拆 ----
 
     def test_normalize_trains_string_single_with_warning(self):
@@ -10081,44 +9512,6 @@ class TestTask84LauncherP3(TempDirCase):
         self.assertIn("张**", text)
 
     # ---- (d) save_passengers 拒写（False）不得显示成功 ----
-
-    def _make_passenger_dialog(self):
-        # 2026-10-13 重构：launcher 侧对话框已删除，乘车人对话框统一为
-        # gui.PassengerDialog（抢票表单内快速编辑）。
-        dlg = object.__new__(gui.PassengerDialog)
-        dlg.plist = []
-        dlg._pax_stamp = gui.passengers_mod._STAMP_UNSET
-        dlg.name_var = self._var("张三")
-        dlg.id_var = self._var("110101199001011234")
-        dlg.default_var = self._var(False)
-        dlg.type_var = self._var("二代身份证")
-        dlg.mob_var = self._var("13800000000")
-        dlg.adult_var = self._var(True)
-        dlg.pick = mock.Mock()
-        dlg.on_saved = None
-        return dlg
-
-    def test_passenger_dialog_save_refusal_shows_error_not_success(self):
-        dlg = self._make_passenger_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False), \
-             mock.patch.object(gui, "messagebox") as mb:
-            gui.PassengerDialog._save(dlg)
-        mb.showerror.assert_called_once()
-        mb.showinfo.assert_not_called()
-        dlg.pick.configure.assert_not_called()
-
-    def test_passenger_dialog_delete_refusal_no_refresh(self):
-        dlg = self._make_passenger_dialog()
-        dlg.plist = [{"name": "张三"}]
-        dlg._pax_stamp = gui.passengers_mod._STAMP_UNSET
-        dlg.pick.get.return_value = "张三"
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False), \
-             mock.patch.object(gui, "messagebox") as mb:
-            gui.PassengerDialog._delete(dlg)
-        mb.showerror.assert_called_once()
-        dlg.pick.configure.assert_not_called()
 
     def test_ensure_passengers_refusal_no_false_success_log(self):
         cfg = os.path.join(self.tmp, "config.json")
@@ -10659,226 +10052,6 @@ class TestTask89GuiLeftovers(TempDirCase):
         # 旧代码链条：",".join("G101") → "G,1,0,1" → ["G","1","0","1"]（污染）
         self.assertEqual([t for t in "G,1,0,1".split(",") if t],
                          ["G", "1", "0", "1"])
-
-    def test_edit_dialog_load_wiring_uses_normalized_trains(self):
-        import inspect
-        src = inspect.getsource(gui.TaskEditDialog.__init__)
-        # 旧代码：",".join(task.get("trains") or []) —— 字符串被逐字符拆
-        self.assertNotIn('",".join(task.get("trains") or [])', src)
-        self.assertIn('_display_trains(task.get("trains"))', src)
-
-    # ---- (b) 任务行展示 ----
-
-    def test_task_row_display_wiring_uses_normalized_trains(self):
-        import inspect
-        src1 = inspect.getsource(gui.StartMonitorDialog.__init__)
-        self.assertNotIn('"/".join(t.get("trains") or [])', src1)
-        self.assertIn('_display_trains(t.get("trains"))', src1)
-        src2 = inspect.getsource(gui.TaskPage.refresh)
-        self.assertNotIn('"/".join(t.get("trains") or [])', src2)
-        self.assertNotIn('"/".join(t.get("seat_types") or [])', src2)
-        self.assertIn('_display_trains(t.get("trains"))', src2)
-        self.assertIn('_display_trains(t.get("seat_types"))', src2)
-
-    # ---- (c) PassengerDialog 乐观并发 ----
-
-    def _make_passenger_dialog(self):
-        # 2026-10-13 重构：乘车人列表页 = gui.PassengerPanel（原 gui.PassengerDialog
-        # 的列表部分）；抢票表单内的快速编辑 = gui.PassengerDialog。
-        dlg = object.__new__(gui.PassengerPanel)
-        dlg.passengers = [{"name": "A"}]
-        dlg._pax_stamp = "old-stamp"
-        return dlg
-
-    def test_passenger_dialog_save_abandons_on_external_write(self):
-        dlg = self._make_passenger_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False) as m_save, \
-             mock.patch.object(gui.passengers_mod, "passengers_stamp",
-                               return_value="new-stamp"), \
-             mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(gui.PassengerPanel, "refresh") as m_refresh:
-            ok, reason = dlg._save_passengers_or_refresh(None)
-        # 指纹必须透传给共享函数（锁内检查用）
-        m_save.assert_called_once_with(dlg.passengers, expect_stamp="old-stamp")
-        self.assertFalse(ok)
-        self.assertEqual(reason, "stale")
-        mb.showwarning.assert_called_once()  # 明确警告，不静默
-        mb.showerror.assert_not_called()
-        m_refresh.assert_called_once()  # 重载最新数据，用户重做
-
-    def test_passenger_dialog_save_refusal_shows_error_not_warning(self):
-        dlg = self._make_passenger_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False), \
-             mock.patch.object(gui.passengers_mod, "passengers_stamp",
-                               return_value="old-stamp"), \
-             mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(gui.PassengerPanel, "refresh") as m_refresh:
-            ok, reason = dlg._save_passengers_or_refresh(None)
-        self.assertFalse(ok)
-        self.assertEqual(reason, "refused")
-        mb.showerror.assert_called_once()  # 不可解密盒子走 error（Task 80 口径）
-        mb.showwarning.assert_not_called()
-        m_refresh.assert_not_called()  # 拒写不重载，不丢内存数据
-
-    def test_passenger_dialog_save_success(self):
-        dlg = self._make_passenger_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=True) as m_save, \
-             mock.patch.object(gui, "messagebox") as mb:
-            ok, reason = dlg._save_passengers_or_refresh(None)
-        self.assertTrue(ok)
-        self.assertEqual(reason, "ok")
-        m_save.assert_called_once_with(dlg.passengers, expect_stamp="old-stamp")
-        mb.showwarning.assert_not_called()
-        mb.showerror.assert_not_called()
-
-    def test_passenger_dialog_refresh_takes_stamp(self):
-        dlg = object.__new__(gui.PassengerPanel)
-        dlg.listbox = mock.Mock()
-        with mock.patch.object(gui.passengers_mod, "load_passengers",
-                               return_value=[{"name": "A"}]), \
-             mock.patch.object(gui.passengers_mod, "passengers_stamp",
-                               return_value="s1"):
-            dlg.refresh()
-        self.assertEqual(dlg.passengers, [{"name": "A"}])
-        self.assertEqual(dlg._pax_stamp, "s1")
-
-
-class TestTask90LauncherPassengerDialogStamp(TempDirCase):
-    """Task 90：乘车人快速编辑对话框的指纹缺口（Task 89 评审确认真实）。
-
-    与 gui.PassengerPanel 的 Task 89c 同类：跨进程锁（Task 88d）已保证
-    写原子性，但 load→弹窗思考→save 窗口内被外部写入会静默覆写。
-    改后：保存加乐观并发检查（Task 87/88d/89c 同口径）——指纹变化→
-    警告并放弃（重载最新数据，用户重做）；不可解密盒子/锁超时→error。
-
-    2026-10-13 重构：launcher 侧对话框已删除，统一为 gui.PassengerDialog。
-    """
-
-    def _make_dialog(self):
-        dlg = object.__new__(gui.PassengerDialog)
-        dlg.plist = [{"name": "A"}]
-        dlg._pax_stamp = "old-stamp"
-        dlg.pick = mock.Mock()
-        return dlg
-
-    def test_save_passengers_or_warn_accepts_expect_stamp(self):
-        # 旧代码：_save_passengers_or_warn(passengers, parent) 无 expect_stamp
-        # 参数（TypeError）；且指纹不透传 → 思考窗口内外部写入被静默覆写。
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=True) as m_save, \
-             mock.patch.object(gui, "messagebox"):
-            ok = gui._save_passengers_or_warn([{"name": "A"}], None,
-                                              expect_stamp="s1")
-        self.assertTrue(ok)
-        m_save.assert_called_once_with([{"name": "A"}], expect_stamp="s1")
-
-    def test_save_abandons_on_external_write(self):
-        dlg = self._make_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False) as m_save, \
-             mock.patch.object(gui.passengers_mod, "passengers_stamp",
-                               return_value="new-stamp"), \
-             mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(gui.PassengerDialog,
-                               "_refresh_plist") as m_refresh:
-            ok, reason = dlg._save_passengers_or_refresh(None)
-        # 指纹必须透传给共享函数（锁内检查用）
-        m_save.assert_called_once_with(dlg.plist, expect_stamp="old-stamp")
-        self.assertFalse(ok)
-        self.assertEqual(reason, "stale")
-        mb.showwarning.assert_called_once()  # 明确警告，不静默
-        mb.showerror.assert_not_called()
-        m_refresh.assert_called_once()  # 重载最新数据，用户重做
-
-    def test_save_refusal_shows_error_not_warning(self):
-        dlg = self._make_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=False), \
-             mock.patch.object(gui.passengers_mod, "passengers_stamp",
-                               return_value="old-stamp"), \
-             mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(gui.PassengerDialog,
-                               "_refresh_plist") as m_refresh:
-            ok, reason = dlg._save_passengers_or_refresh(None)
-        self.assertFalse(ok)
-        self.assertEqual(reason, "refused")
-        mb.showerror.assert_called_once()  # 不可解密盒子走 error（Task 80 口径）
-        mb.showwarning.assert_not_called()
-        m_refresh.assert_not_called()  # 拒写不重载，不丢内存数据
-
-    def test_save_success(self):
-        dlg = self._make_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               return_value=True) as m_save, \
-             mock.patch.object(gui, "messagebox") as mb:
-            ok, reason = dlg._save_passengers_or_refresh(None)
-        self.assertTrue(ok)
-        self.assertEqual(reason, "ok")
-        m_save.assert_called_once_with(dlg.plist, expect_stamp="old-stamp")
-        mb.showwarning.assert_not_called()
-        mb.showerror.assert_not_called()
-
-    def test_init_takes_stamp_wiring(self):
-        # 对话框打开时记下 load 的字节指纹（旧代码无此行）
-        import inspect
-        src = inspect.getsource(gui.PassengerDialog.__init__)
-        self.assertIn("self._pax_stamp = passengers_mod.passengers_stamp()", src)
-
-    def test_delete_goes_through_stamp_check(self):
-        # _delete 走指纹：外部写入→放弃删除，不静默覆写、不通知已保存
-        dlg = self._make_dialog()
-        dlg.pick.get.return_value = "A"
-        with mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(gui, "_save_passengers_or_warn",
-                               return_value=True), \
-             mock.patch.object(gui.PassengerDialog,
-                               "_save_passengers_or_refresh",
-                               create=True,
-                               return_value=(False, "stale")) as m_s, \
-             mock.patch.object(gui.PassengerDialog, "_refresh_plist",
-                               create=True) as m_refresh, \
-             mock.patch.object(dlg, "_notify_saved") as m_notify:
-            mb.askyesno.return_value = True
-            dlg._delete()
-        m_s.assert_called_once_with(dlg)
-        # _refresh_plist 的调用发生在真实的 _save_passengers_or_refresh 内部，
-        # 已由 test_save_abandons_on_external_write 覆盖
-        m_notify.assert_not_called()  # 未保存成功，不通知
-
-    def test_save_wiring_abandons_on_stale(self):
-        # _save 走指纹：外部写入→放弃保存，不显示"已保存"、不通知
-        dlg = self._make_dialog()
-        dlg.name_var = mock.Mock()
-        dlg.name_var.get.return_value = "B"
-        dlg.id_var = mock.Mock()
-        dlg.id_var.get.return_value = "123"
-        dlg.mob_var = mock.Mock()
-        dlg.mob_var.get.return_value = ""
-        dlg.type_var = mock.Mock()
-        dlg.type_var.get.return_value = "二代身份证"
-        dlg.adult_var = mock.Mock()
-        dlg.adult_var.get.return_value = True
-        dlg.default_var = mock.Mock()
-        dlg.default_var.get.return_value = False
-        with mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(gui, "_save_passengers_or_warn",
-                               return_value=True), \
-             mock.patch.object(gui.PassengerDialog,
-                               "_save_passengers_or_refresh",
-                               create=True,
-                               return_value=(False, "stale")) as m_s, \
-             mock.patch.object(gui.PassengerDialog, "_refresh_plist",
-                               create=True) as m_refresh, \
-             mock.patch.object(dlg, "_notify_saved") as m_notify:
-            dlg._save()
-        m_s.assert_called_once_with(dlg)
-        # _refresh_plist 的调用发生在真实的 _save_passengers_or_refresh 内部，
-        # 已由 test_save_abandons_on_external_write 覆盖
-        m_notify.assert_not_called()
-        mb.showinfo.assert_not_called()  # 不显示"已保存"
 
 
 class TestTask91TopLevelConfigShape(TempDirCase):
@@ -11529,18 +10702,6 @@ class TestTask94GuiStartupRobustness(TempDirCase):
 
     # ---- (a) load_config：非 UTF-8 编码 ----
 
-    def test_load_config_gbk_bytes_returns_empty(self):
-        # GBK 编码的中文在 UTF-8 下非法：旧代码只抓 JSONDecodeError，
-        # UnicodeDecodeError 逃出崩启动。
-        cfg = self._write_bytes("config.json",
-                                '{"station": "北京西"}'.encode("gbk"))
-        self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg):
-            with self.assertLogs(gui.LOG, level="ERROR") as cm:
-                self.assertEqual(gui.load_config(), {})
-        self.assertTrue(any("UTF-8" in r.getMessage() for r in cm.records),
-                        "必须明确指出编码问题")
-
     def test_load_config_latin1_bytes_returns_empty(self):
         # 任意非 UTF-8 编码都不只限 GBK：latin-1 的 0xE9 单字节非法。
         cfg = self._write_bytes("config.json", '{"a": "\xe9"}'.encode("latin-1"))
@@ -11550,41 +10711,11 @@ class TestTask94GuiStartupRobustness(TempDirCase):
 
     # ---- (a) load_config：合法但非 dict ----
 
-    def test_load_config_non_dict_list_returns_empty(self):
-        # 合法 JSON 但顶层是 list：旧代码 json.load 成功返回 []，
-        # 下游 load_config().get(...) 抛 AttributeError 崩启动。
-        cfg = self._write_text("config.json", "[]")
-        self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg):
-            with self.assertLogs(gui.LOG, level="ERROR") as cm:
-                self.assertEqual(gui.load_config(), {})
-        self.assertTrue(any("不是" in r.getMessage() and "dict" in r.getMessage()
-                            or "对象" in r.getMessage() for r in cm.records),
-                        "必须明确指出顶层不是对象")
-
     def test_load_config_valid_dict_unchanged(self):
         cfg = self._write_text("config.json", '{"a": 1}')
         self._reset_corrupt_flag()
         with mock.patch.object(rpc_common, "CONFIG_PATH", cfg):
             self.assertEqual(rpc_common.load_config(), {"a": 1})
-
-    def test_config_json_corrupt_detects_gbk_and_non_dict(self):
-        self._reset_corrupt_flag()
-        bad_gbk = self._write_bytes("c1.json", '{"x": "中文"}'.encode("gbk"))
-        bad_list = self._write_text("c2.json", "[]")
-        bad_json = self._write_text("c3.json", "{bad json,")
-        good = self._write_text("c4.json", '{"a": 1}')
-        missing = os.path.join(self.tmp, "nope.json")
-        with mock.patch.object(gui, "CONFIG_PATH", bad_gbk):
-            self.assertTrue(gui._config_json_corrupt())
-        with mock.patch.object(gui, "CONFIG_PATH", bad_list):
-            self.assertTrue(gui._config_json_corrupt())
-        with mock.patch.object(gui, "CONFIG_PATH", bad_json):
-            self.assertTrue(gui._config_json_corrupt())
-        with mock.patch.object(gui, "CONFIG_PATH", good):
-            self.assertFalse(gui._config_json_corrupt())
-        with mock.patch.object(gui, "CONFIG_PATH", missing):
-            self.assertFalse(gui._config_json_corrupt())
 
     # ---- (b) read_history_records：切片在 try 块外 ----
 
@@ -11592,18 +10723,6 @@ class TestTask94GuiStartupRobustness(TempDirCase):
         cfg = self._write_text("config.json", '{"history_file": "order_history.json"}')
         self._write_text("order_history.json", history_content)
         return cfg
-
-    def test_read_history_records_non_list_dict_returns_empty(self):
-        # 顶层是 dict：history[-limit:] 在 try 外抛 TypeError 崩启动
-        # （HistoryPanel eager 构造）。
-        cfg = self._history_cfg('{"a": 1}')
-        self._reset_corrupt_flag()
-        with mock.patch.object(gui, "CONFIG_PATH", cfg), \
-             mock.patch.object(gui, "APP_ROOT", self.tmp):
-            with self.assertLogs(gui.LOG, level="WARNING") as cm:
-                self.assertEqual(gui.read_history_records(), [])
-        self.assertTrue(any("列表" in r.getMessage() for r in cm.records),
-                        "必须明确指出历史不是列表")
 
     def test_read_history_records_non_list_number_returns_empty(self):
         cfg = self._history_cfg('42')
@@ -11733,221 +10852,6 @@ class TestTask95WarmReuseSessionRevalidation(TempDirCase):
         ok, msg, extra, calls = self._run(None, session_ok_result=(True, "张三"))
         self.assertNotIn("session_ok", calls, "无 warm 时不应调用会话复验")
         self.assertIsNone(calls["warm"])
-
-
-class TestTask96LauncherP3(TempDirCase):
-    """Task 96：launcher P3 bundle（a 回归 / b Spinbox / c 脏条目 / d 脏配置 / e 关窗同步）。
-
-    无 Tk 真机，全部 mock/桩测试（沿 Task 74/84/90 口径）。
-    """
-
-    # ---- (a) Task 90 回归：成功保存后未刷新 _pax_stamp ----
-
-    def _make_pax_dialog(self):
-        dlg = object.__new__(gui.PassengerDialog)
-        dlg.plist = [{"name": "A"}]
-        dlg._pax_stamp = "old-stamp"
-        dlg.pick = mock.Mock()
-        return dlg
-
-    def test_second_save_no_false_alarm(self):
-        # 回归（Task 90/commit 516f92e）：成功保存后未刷新 _pax_stamp，
-        # 同一会话第二次保存必误报"被外部修改"并放弃。
-        disk = {"stamp": "old-stamp"}
-
-        def fake_save(passengers, expect_stamp):
-            if expect_stamp is not gui.passengers_mod._STAMP_UNSET \
-                    and expect_stamp != disk["stamp"]:
-                return False  # 指纹不匹配 → 锁内放弃（真实 save_passengers 语义）
-            disk["stamp"] = "stamp-after-write"
-            return True
-
-        dlg = self._make_pax_dialog()
-        with mock.patch.object(gui.passengers_mod, "save_passengers",
-                               side_effect=fake_save), \
-             mock.patch.object(gui.passengers_mod, "passengers_stamp",
-                               side_effect=lambda: disk["stamp"]), \
-             mock.patch.object(gui, "messagebox"), \
-             mock.patch.object(gui.PassengerDialog, "_refresh_plist"):
-            ok1, r1 = dlg._save_passengers_or_refresh(None)
-            ok2, r2 = dlg._save_passengers_or_refresh(None)
-        self.assertTrue(ok1)
-        self.assertEqual(r1, "ok")
-        self.assertTrue(ok2, "第二次保存不应误报外部修改（回归）")
-        self.assertEqual(r2, "ok")
-
-    # ---- (b) 新建监控任务"优先级" Spinbox 手输非数字 ----
-
-    def _make_new_task_dialog(self):
-        import tkinter as tk
-        dlg = object.__new__(gui.NewTaskDialog)
-
-        def _v(value):
-            v = mock.Mock()
-            v.get.return_value = value
-            return v
-
-        dlg.from_ent = _v("北京")
-        dlg.to_ent = _v("上海")
-        dlg.name2code = {"北京": "BJP", "上海": "SHH"}
-        dlg.date_var = _v("2026-10-10")
-        sv = _v(True)
-        dlg.seat_vars = {"二等座": sv}
-        dlg.auto_var = _v(False)
-        dlg.trains_var = _v("G101")
-        dlg.pax_vars = {}
-        dlg.seat_pri_var = _v("")
-        dlg.purpose_var = _v("成人票")
-        dlg.stop_var = _v(True)
-        dlg.notify_var = _v(True)
-        dlg.prio_var = mock.Mock()
-        dlg.prio_var.get.side_effect = tk.TclError(
-            'expected integer but got "abc"')
-        dlg.app = mock.Mock()
-        dlg.app.lc = {}
-        dlg.app.log_line = mock.Mock()
-        dlg.on_created = None
-        dlg.destroy = mock.Mock()
-        dlg._parse_dates = mock.Mock(return_value=(["2026-10-10"], []))
-        return dlg
-
-    def test_prio_spinbox_non_numeric_uses_default(self):
-        # Task 96b：Spinbox 手输非数字 → tk.IntVar.get() 抛 TclError（Task 74e 同类）。
-        # 改后：友好提示 + 安全默认值 5，不抛。
-        dlg = self._make_new_task_dialog()
-        with mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(launcher, "append_monitor_task",
-                               return_value="任务名") as m_append:
-            dlg.create(False)
-        mb.showwarning.assert_called_once()
-        m_append.assert_called_once()
-        task = m_append.call_args[0][0]
-        self.assertEqual(task["priority"], 5)
-
-    def test_prio_spinbox_numeric_still_works(self):
-        # 数字输入不受影响：不弹警告，原值透传。
-        dlg = self._make_new_task_dialog()
-        dlg.prio_var.get.side_effect = None
-        dlg.prio_var.get.return_value = 8
-        with mock.patch.object(gui, "messagebox") as mb, \
-             mock.patch.object(launcher, "append_monitor_task",
-                               return_value="任务名") as m_append:
-            dlg.create(False)
-        mb.showwarning.assert_not_called()
-        task = m_append.call_args[0][0]
-        self.assertEqual(task["priority"], 8)
-
-    # ---- (c) grab_tasks.json 非 dict 条目 ----
-
-    def test_add_row_skips_non_dict(self):
-        # Task 96c：grab_tasks.json 含非 dict 条目 → _add_row 的 task.get 崩启动。
-        # 改后：记 warning 后跳过展示，不崩。
-        panel = object.__new__(gui.GrabTab)
-        panel._tv_iid = {}
-        panel.tree = mock.Mock()
-        with mock.patch.object(gui, "LOG") as m_log:
-            panel._add_row("junk-string")
-            panel._add_row(123)
-            panel._add_row(None)
-        panel.tree.insert.assert_not_called()
-        self.assertEqual(panel._tv_iid, {})
-        self.assertEqual(m_log.warning.call_count, 3)
-
-    def test_add_row_dict_still_renders(self):
-        # 正常 dict 条目不受影响：仍建行。
-        panel = object.__new__(gui.GrabTab)
-        panel._tv_iid = {}
-        panel.tree = mock.Mock()
-        panel.tree.insert.return_value = "iid1"
-        task = {"id": "t1", "name": "京沪", "from": "北京", "to": "上海",
-                "date": "2026-10-10"}
-        with mock.patch.object(gui, "LOG") as m_log:
-            panel._add_row(task)
-        panel.tree.insert.assert_called_once()
-        self.assertIn("iid1", panel._tv_iid)
-        m_log.warning.assert_not_called()
-
-    # ---- (d) launcher_config.json 脏值 ----
-
-    def _make_app_for_sync(self, lc_extra):
-        app = object.__new__(gui.GrabTaskForm)
-        lc = {"from": "", "to": "", "trains": [], "seat_types": [],
-              "date": "", "date_to": "", "start_time": "",
-              "station_history": [], "passenger_names": [],
-              "pax_purpose": {}, "remind_minutes": 10, "warm_minutes": 10,
-              "presets": []}
-        lc.update(lc_extra)
-        app.lc = lc
-        app.from_ent = mock.Mock()
-        app.to_ent = mock.Mock()
-        app.trains_var = mock.Mock()
-        app.date_var = mock.Mock()
-        app.date_to_var = mock.Mock()
-        app.seat_vars = {}
-        app.seat_pri_var = mock.Mock()
-        app.start_var = mock.Mock()
-        app.remind_var = mock.Mock()
-        app.warm_var = mock.Mock()
-        app.preset_cb = mock.Mock()
-        app._put_log = mock.Mock()
-        app._refresh_pax = mock.Mock()
-        app._save_cfg = mock.Mock()
-        return app
-
-    def test_sync_from_lc_dirty_values(self):
-        # Task 96d：remind_minutes 非数字 / presets 非 dict 条目 → 不崩，
-        # 脏值记 warning 后用安全默认值。
-        app = self._make_app_for_sync({
-            "remind_minutes": "abc", "warm_minutes": "xyz",
-            "presets": ["junk", {"name": "p1"}]})
-        with mock.patch.object(launcher, "merge_trains_from_monitor",
-                               return_value=False), \
-             mock.patch("os.path.getmtime", side_effect=OSError("no")):
-            app._sync_from_lc()
-        app.remind_var.set.assert_called_with(10)
-        app.warm_var.set.assert_called_with(10)
-        app.preset_cb.configure.assert_called_once_with(values=["p1"])
-        warns = [c for c in app._put_log.call_args_list
-                 if "警告" in str(c)]
-        self.assertGreaterEqual(len(warns), 3)  # remind/warm/presets 各一条
-
-    def test_sync_from_lc_clean_values_unchanged(self):
-        # 干净配置不受影响：原值透传，无警告。
-        app = self._make_app_for_sync({
-            "remind_minutes": 15, "warm_minutes": 20,
-            "presets": [{"name": "p1"}, {"name": "p2"}]})
-        with mock.patch.object(launcher, "merge_trains_from_monitor",
-                               return_value=False), \
-             mock.patch("os.path.getmtime", side_effect=OSError("no")):
-            app._sync_from_lc()
-        app.remind_var.set.assert_called_with(15)
-        app.warm_var.set.assert_called_with(20)
-        app.preset_cb.configure.assert_called_once_with(values=["p1", "p2"])
-        warns = [c for c in app._put_log.call_args_list
-                 if "警告" in str(c)]
-        self.assertEqual(len(warns), 0)
-
-    # ---- (e) 抢票表单 close() 同步界面编辑 ----
-
-    def test_grab_task_form_close_syncs_ui(self):
-        # Task 96e：关闭前未调 _ui_to_lc → 2 秒内关闭丢界面编辑。
-        # 改后：close() 先把界面编辑同步到配置（save=False），再做状态修正
-        # 并统一落盘；已抢到（ok）状态不被抹除。
-        form = object.__new__(gui.GrabTaskForm)
-        form.grabber = None
-        form.lc = {"status": "running"}
-        form._ui_to_lc = mock.Mock()
-        form._save_cfg = mock.Mock()
-        form.close(stop_thread=True)
-        form._ui_to_lc.assert_called_once_with(save=False)
-        self.assertEqual(form.lc["status"], "idle")
-        form._save_cfg.assert_called_once()
-        # 「已抢到」不被关窗抹成「就绪」
-        form.lc = {"status": "ok"}
-        form._save_cfg.reset_mock()
-        form.close(stop_thread=True)
-        self.assertEqual(form.lc["status"], "ok")
-        form._save_cfg.assert_called_once()
 
 
 class TestTask97MonitorP3(TempDirCase):
@@ -12309,26 +11213,6 @@ class TestTask98ProbeLoginP3(unittest.TestCase):
 class TestTask99CaptureSessionP3(unittest.TestCase):
     """Task 99: capture_session P3（gui 超时误判 / 轮询无 Ctrl+C / 相对路径 CWD 歧义 / 已关闭浏览器 defensive）。"""
 
-    # ---- (a) gui 重登超时必须覆盖脚本实际总耗时 ----
-
-    def test_relogin_script_timeout_covers_script_total(self):
-        # RED on old code: timeout 硬编码 300 == MAX_WAIT_SEC(300)，
-        # 没留启动开销+最终验证的时间 → 用户在等待末尾登录成功会被误判"运行超时"
-        import capture_session
-        proc = mock.Mock()
-        proc.returncode = 0
-        with mock.patch("legacy.gui.subprocess.run", return_value=proc) as mrun:
-            self.assertTrue(gui._relogin_ok_via_script("capture_session.py"))
-        timeout = mrun.call_args.kwargs["timeout"]
-        self.assertGreaterEqual(timeout, capture_session.MAX_WAIT_SEC + 60)
-
-    def test_relogin_script_timeout_still_returns_false(self):
-        # 超时仍视为失败返回 False（行为不变，只是阈值对齐）
-        import capture_session
-        with mock.patch("legacy.gui.subprocess.run",
-                        side_effect=subprocess.TimeoutExpired("cmd", 1)):
-            self.assertFalse(gui._relogin_ok_via_script("capture_session.py"))
-
     # ---- (b) 300s 轮询 Ctrl+C 优雅退出 ----
 
     def test_wait_for_login_ctrl_c_cancels_gracefully(self):
@@ -12666,24 +11550,6 @@ class TestTask101CrossModuleP3(TempDirCase):
         self.assertEqual([p["name"] for p in picked], ["张三"])
         mw.assert_not_called()
 
-    # ---- (f) gui 非 dict state：友好处理，不打不开对话框 ----
-    def test_f_nondict_state_safe(self):
-        with mock.patch.object(gui, "load_state", return_value=[]):
-            with mock.patch.object(gui.LOG, "warning") as mw:
-                self.assertEqual(gui._state_tasks_dict(), {})
-        self.assertTrue(mw.called, "非 dict state 应记警告")
-
-    def test_f_nondict_tasks_section_safe(self):
-        with mock.patch.object(gui, "load_state",
-                               return_value={"tasks": ["x"]}):
-            with mock.patch.object(gui.LOG, "warning"):
-                self.assertEqual(gui._state_tasks_dict(), {})
-
-    def test_f_dict_state_passthrough(self):
-        st = {"tasks": {"t1": {"status": "paused"}}}
-        with mock.patch.object(gui, "load_state", return_value=st):
-            self.assertEqual(gui._state_tasks_dict(), {"t1": {"status": "paused"}})
-
     # ---- (g) 锁内 stale-warm 关闭：不释放装饰器持有的锁 ----
     def _fake_warm(self):
         import browser_order as bo
@@ -12819,34 +11685,6 @@ class TestTask103LauncherGuiP3(TempDirCase):
         self.assertEqual(launcher._display_seat_types(None), [])
         self.assertEqual(launcher._display_seat_types(123), [])
 
-    def test_b_rebuild_seats_dirty_seat_types_default_checked(self):
-        # P3：lc["seat_types"] 为裸字符串 "二等座" 时，旧代码
-        # set("二等座") → {"二","等","座"}，default 匹配恒失败 → 回退勾选
-        # names[0]（展示错误）。改后应勾选"二等座"。
-        app = object.__new__(gui.GrabTaskForm)
-        app.lc = {"seat_types": "二等座"}
-        app.seat_vars = {}
-        app.seat_box = mock.Mock()
-        app.seat_box.winfo_children.return_value = []
-        app.sf = mock.Mock()
-        app._put_log = mock.Mock()
-        bool_values = {}
-
-        def fake_boolvar(value=False):
-            m = mock.Mock()
-            m.get.return_value = value
-            bool_values.setdefault("last", []).append(value)
-            return m
-
-        with mock.patch.object(gui.tk, "BooleanVar",
-                               side_effect=fake_boolvar), \
-             mock.patch.object(gui.ttk, "Checkbutton"), \
-             mock.patch.object(gui.ttk, "Label"):
-            app._rebuild_seats()
-        self.assertIn("二等座", app.seat_vars)
-        self.assertTrue(app.seat_vars["二等座"].get(),
-                        "脏字符串席别应按单个席别勾选，而非回退到首个席别")
-
     # ---- (c) gui 任务对话框席别预选成员检查（P3） ----
 
     def test_c_display_seat_types_unit(self):
@@ -12858,36 +11696,28 @@ class TestTask103LauncherGuiP3(TempDirCase):
 
     # ---- (d) update_config_locked 写侧拒绝非 dict（P3） ----
 
-    def _patch_gui_config(self, content):
-        cfg = os.path.join(self.tmp, "config.json")
-        with open(cfg, "w", encoding="utf-8") as f:
-            f.write(content)
-        p = mock.patch.object(gui, "CONFIG_PATH", cfg)
-        p.start()
-        self.addCleanup(p.stop)
-        return cfg
-
+    # A-4 迁移：弹窗断言（messagebox.showerror）随 legacy 退役删除，
+    # 拒写核心断言（RuntimeError＋mutator 不执行＋旧文件不覆写）改指 rpc.common 保留。
     def test_d_update_config_locked_rejects_non_dict(self):
         # P3：config.json 内容为 []（合法 JSON 但非 dict）时，旧代码
-        # mutator([]) 抛裸 TypeError（Tk console）。改后：warning + error
-        # 弹窗 + 友好 RuntimeError，mutator 不执行，文件不被覆盖。
-        cfg = self._patch_gui_config("[]")
+        # mutator([]) 抛裸 TypeError（Tk console）。改后：友好 RuntimeError，
+        # mutator 不执行，文件不被覆盖（legacy 的 error 弹窗随 legacy 退役）。
+        cfg = self._patch_rpc_config("[]")
         calls = []
 
         def mutator(config):
             calls.append(config)
             config["x"] = 1
 
-        with mock.patch.object(gui, "messagebox") as mb:
-            with self.assertRaises(RuntimeError):
-                gui.update_config_locked(mutator)
+        with self.assertRaises(RuntimeError):
+            rpc_common.update_config_locked(mutator)
         self.assertEqual(calls, [], "非 dict 时 mutator 不得执行")
-        mb.showerror.assert_called_once()
         with open(cfg, encoding="utf-8") as f:
             self.assertEqual(f.read(), "[]", "旧文件不得被覆盖")
 
     def _patch_rpc_config(self, content):
-        # A-4 迁移：与 _patch_gui_config 同形，改 patch rpc.common 一侧。
+        # A-4 迁移：与旧 _patch_gui_config 同形，改 patch rpc.common 一侧
+        # （旧 helper 已随迁移完成删除）。
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             f.write(content)
@@ -12920,15 +11750,6 @@ class TestTask104LoadSanitize(TempDirCase):
             json.dump(obj, f)
         return path
 
-    def _make_panel(self, tasks):
-        panel = object.__new__(gui.GrabTab)
-        panel.tasks = tasks
-        panel.forms = {}
-        panel._tv_iid = {}
-        panel._refresh_list = mock.Mock()
-        panel._put_log = mock.Mock()
-        return panel
-
     # ---- (1) grab_tasks 入口 sanitize ----
 
     def test_grab_tasks_load_drops_non_dict(self):
@@ -12941,35 +11762,6 @@ class TestTask104LoadSanitize(TempDirCase):
         self.assertEqual([t.get("id") for t in tasks], ["a", "b"])
         warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
         self.assertTrue(warns, "应记 warning")
-
-    def test_find_safe_after_sanitized_load(self):
-        # 改前：_find 遍历到 "junk" 时 t.get 抛 AttributeError。
-        path = self._write("grab_tasks.json", {"tasks": [
-            {"id": "a", "name": "A"}, "junk", None]})
-        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
-             mock.patch.object(launcher, "log"):
-            panel = self._make_panel(launcher.load_grab_tasks())
-        self.assertEqual(panel._find("a")["name"], "A")
-        self.assertIsNone(panel._find("zzz"))  # 改前在此抛 AttributeError
-
-    def test_on_window_closed_safe_and_destroy_reached(self):
-        # 改前：_on_window_closed 在 finally 块内抛 AttributeError，
-        # 则 _on_close 的 self.destroy() 被跳过→僵尸窗口。
-        path = self._write("grab_tasks.json", {"tasks": [
-            {"id": "a", "name": "A", "status": "idle"}, "junk", None]})
-        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
-             mock.patch.object(launcher, "log"), \
-             mock.patch.object(launcher, "save_grab_tasks") as sg:
-            panel = self._make_panel(launcher.load_grab_tasks())
-            # 模拟 GrabTaskWindow._on_close 的 finally 段：
-            destroyed = []
-            try:
-                pass
-            finally:
-                panel._on_window_closed("a")  # 改前在此抛 AttributeError
-                destroyed.append(True)        # = self.destroy() 被执行
-        self.assertEqual(destroyed, [True])
-        sg.assert_called_once()
 
     # ---- (2) launcher_config presets 入口 sanitize（Task 103 评审扩展） ----
 
@@ -12995,21 +11787,6 @@ class TestTask104LoadSanitize(TempDirCase):
         self.assertEqual(lc["presets"], [])
         warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
         self.assertTrue(warns, "应记 warning")
-
-    def test_current_preset_safe_after_sanitized_load(self):
-        # 改前：_current_preset 遍历到 "junk" 时 p.get 抛 AttributeError。
-        # （用不存在的名字，迫使遍历走完整个列表。）
-        cfg = self._write("launcher_config.json",
-                          {"presets": [{"name": "p1"}, "junk"]})
-        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
-             mock.patch.object(launcher, "log"):
-            lc = launcher.load_launcher_config()
-        app = object.__new__(gui.GrabTaskForm)
-        app.lc = lc
-        cb = mock.Mock()
-        cb.get.return_value = "zzz"  # 不存在，迫使遍历经过脏条目
-        app.preset_cb = cb
-        self.assertIsNone(app._current_preset())  # 改前在此抛 AttributeError
 
     def test_save_preset_safe_after_sanitized_load(self):
         # 改前：_save_preset 的去重推导式在 "junk".get 处抛 AttributeError。
@@ -13064,103 +11841,6 @@ class TestTask106BareStringHardening(TempDirCase):
     可直接调用的方法（_load_preset/_import_from_main/_sync_from_lc/_run）
     用 object.__new__ + mock 做真实方法测试。
     """
-
-    def _seat_var_mocks(self, choices=("软卧", "高级软卧", "硬卧")):
-        set_values = {}
-        seat_vars = {}
-        for s in choices:
-            m = mock.Mock()
-            m.set.side_effect = lambda v, s=s: set_values.__setitem__(s, v)
-            seat_vars[s] = m
-        return seat_vars, set_values
-
-    # ---- (2a) 抢票表单 _load_preset（直接方法测试；重构后位于 gui.GrabTaskForm） ----
-
-    def _load_preset_app(self, seat_types):
-        app = object.__new__(gui.GrabTaskForm)
-        app.from_ent = mock.Mock()
-        app.to_ent = mock.Mock()
-        app.trains_var = mock.Mock()
-        app.seat_pri_var = mock.Mock()
-        app.date_var = mock.Mock()
-        app._put_log = mock.Mock()
-        app.seat_vars, set_values = self._seat_var_mocks()
-        app._current_preset = mock.Mock(
-            return_value={"name": "p1", "seat_types": seat_types})
-        return app, set_values
-
-    def test_3145_load_preset_dirty_string_no_substring(self):
-        # P3：preset["seat_types"] 为裸字符串 "高级软卧" 时，旧代码
-        # s in ("高级软卧" or []) 走子串检查 → "软卧" 被误勾选。
-        app, set_values = self._load_preset_app("高级软卧")
-        app._load_preset()
-        self.assertFalse(set_values["软卧"],
-                         "子串误判：'软卧' 不应被 '高级软卧' 误勾选")
-        self.assertTrue(set_values["高级软卧"])
-        self.assertFalse(set_values["硬卧"])
-
-    def test_3145_load_preset_clean_list_unchanged(self):
-        # 正向对照：干净 list 形状预选行为不变（精确匹配）。
-        app, set_values = self._load_preset_app(["软卧"])
-        app._load_preset()
-        self.assertTrue(set_values["软卧"])
-        self.assertFalse(set_values["高级软卧"])
-        self.assertFalse(set_values["硬卧"])
-
-    # ---- (2b) 「新建监控任务」带入行程（重构后为 prefill 契约） ----
-
-    def test_3374_import_from_main_dirty_string_no_substring(self):
-        # 重构后「从主界面带入」= 打开对话框时经 prefill 传入行程；
-        # 车次走 _display_trains 归一化（裸字符串按单值，绝不逐字符拆），
-        # 席别由 NewTaskDialog 按 _display_seat_types 精确匹配（无子串检查入口）。
-        import inspect
-        form = object.__new__(gui.GrabTaskForm)
-        form.app = mock.Mock()
-        form.from_ent = mock.Mock()
-        form.from_ent.get.return_value = "北京"
-        form.to_ent = mock.Mock()
-        form.to_ent.get.return_value = "上海"
-        form.date_var = mock.Mock()
-        form.date_var.get.return_value = "2026-10-10"
-        form.trains_var = mock.Mock()
-        form.trains_var.get.return_value = "G101"
-        with mock.patch.object(gui, "NewTaskDialog") as m_dlg:
-            form.open_new_monitor_task()
-        prefill = m_dlg.call_args.kwargs.get("prefill") \
-            or m_dlg.call_args[1].get("prefill")
-        self.assertEqual(prefill["trains"], ["G101"],
-                         "带入的车次不得逐字符拆（G,1,0,1）")
-        self.assertEqual(prefill["from"], "北京")
-        self.assertEqual(prefill["to"], "上海")
-        # 调用点契约：对话框消费 prefill 时同样走归一化
-        src = inspect.getsource(gui.NewTaskDialog.__init__)
-        self.assertIn('_display_trains(prefill.get("trains"))', src)
-
-    # ---- (2c) 抢票表单 _sync_from_lc（直接方法测试；重构后位于 gui.GrabTaskForm） ----
-
-    def test_2326_sync_from_lc_dirty_string_no_substring(self):
-        # P3：lc["seat_types"] 为裸字符串 "高级软卧" 时同上子串误判。
-        app = object.__new__(gui.GrabTaskForm)
-        app.lc = {"seat_types": "高级软卧"}
-        app.from_ent = mock.Mock()
-        app.to_ent = mock.Mock()
-        for attr in ("trains_var", "date_var", "date_to_var", "seat_pri_var",
-                     "start_var", "remind_var", "warm_var"):
-            setattr(app, attr, mock.Mock())
-        app.remind_var.get.return_value = "10"
-        app.warm_var.get.return_value = "10"
-        app.seat_vars, set_values = self._seat_var_mocks()
-        app._put_log = mock.Mock()
-        app.preset_cb = mock.Mock()
-        app._refresh_pax = mock.Mock()
-        app._save_cfg = mock.Mock()
-        with mock.patch.object(launcher, "merge_trains_from_monitor",
-                               return_value=False):
-            app._sync_from_lc()
-        self.assertFalse(set_values["软卧"],
-                         "子串误判：'软卧' 不应被 '高级软卧' 误勾选")
-        self.assertTrue(set_values["高级软卧"])
-        self.assertFalse(set_values["硬卧"])
 
     # ---- (3) launcher.py:573-574 Grabber._run（直接方法测试） ----
 
