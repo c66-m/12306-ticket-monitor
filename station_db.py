@@ -25,8 +25,8 @@ DB_PATH = appcommon.data_path("stations_db.json")
 
 
 def rebuild(force=False):
-    import grabber as launcher  # 复用 get_station_index / station_kind / search_stations
-    idx = launcher.get_station_index()
+    import grabber  # 复用 get_station_index / station_kind / search_stations
+    idx = grabber.get_station_index()
     if not idx and not force:
         # Task 82 (P3)：车站索引为空（离线/无缓存降级）时拒绝落盘——不得以
         # count=0 静默覆盖已有 stations_db.json（种子库曾被实际清零）。
@@ -34,10 +34,10 @@ def rebuild(force=False):
         msg = ("stations_db.json 重建失败：车站索引为空（可能离线或无缓存），"
                "为保护已有车站库已拒绝写入，旧库已保留；网络恢复后重试，"
                "或使用 `python station_db.py rebuild --force` 显式覆盖。")
-        launcher.log("[车站] " + msg)
+        grabber.log("[车站] " + msg)
         print(msg)
         return None
-    kinds = launcher.load_station_kinds()
+    kinds = grabber.load_station_kinds()
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     rows = [{"name": st["name"], "code": st["code"], "py": st["py"],
              "spy": st["spy"], "kind": kinds.get(st["code"], "待识别"),
@@ -70,8 +70,8 @@ def rebuild(force=False):
 
 
 def search(text, limit=20):
-    import grabber as launcher
-    return launcher.search_stations(text, limit=limit)
+    import grabber
+    return grabber.search_stations(text, limit=limit)
 
 
 def check():
@@ -149,9 +149,9 @@ if __name__ == "__main__":
     elif args and args[0] in ("check", "--check"):
         sys.exit(check())
     elif args and args[0] == "query":
-        import grabber as launcher  # 延迟导入：import station_db 时不拖入 GUI 模块
+        import grabber  # 延迟导入：import station_db 时不拖入 GUI 模块
         for st in search(" ".join(args[1:]) or "", limit=20):
-            kind = launcher.load_station_kinds().get(st["code"], "待识别")
+            kind = grabber.load_station_kinds().get(st["code"], "待识别")
             print("{name} {code} {kind}".format(kind=kind, **st))
     else:
         print(__doc__)

@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """grabber.py 的纯工具子模块：不引用任何被测试 mock 的符号、不依赖 tkinter。
 
-（2026-10-18 随 launcher.py → grabber.py 一同改名；调用方用
-`import grabber_utils as launcher_utils` 别名，调用点不变。）
+（2026-10-18 随 launcher.py → grabber.py 一同改名；调用方曾以
+launcher_utils 为本模块别名，P4-B A-4 已清除别名，调用点统一写作
+`grabber_utils.xxx`。）
 
 被 mock 的符号（log, HERE, Grabber, 等）保留在 grabber.py 中，
 本模块只包含不被 mock 的全局变量与工具函数。

@@ -7,7 +7,7 @@
         {"error":{"code":...,"message":...,"evidence":{...}}}（A-3b 错误协议）
   推送：{"jsonrpc":"2.0","method":"log"/"status","params":{...}}（无 id）
 
-业务层全部复用 launcher / ticket / engine / passengers / order / notify，
+业务层全部复用 grabber / ticket / engine / passengers / order / notify，
 本文件只做：JSON-RPC 分发 + LOGQ 日志泵 + 引擎线程管理。零业务逻辑。
 """
 import datetime
@@ -24,8 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
-import grabber_utils as launcher_utils
+import grabber
+import grabber_utils
 import ticket
 import engine as engine_mod
 import passengers as passengers_mod

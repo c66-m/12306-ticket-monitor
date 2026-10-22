@@ -65,7 +65,7 @@ OPTIONAL_DATA = ("session_cookies.json", ".browser_state.json")
 # 已改名/已归档模块的遗留引用（生产代码里出现即失败）
 LEGACY_REF_PATTERNS = (
     (re.compile(r"^\s*import launcher\s*$", re.M),
-     "import launcher —— 模块已改名：请用 `import grabber as launcher`"),
+     "import launcher —— 模块已改名：请用 `import grabber`"),
     (re.compile(r"^\s*from launcher import", re.M),
      "from launcher import —— 模块已改名：请用 `from grabber import ...`"),
     (re.compile(r"^\s*import gui\s*$", re.M),

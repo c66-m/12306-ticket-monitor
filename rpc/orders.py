@@ -15,7 +15,7 @@ import traceback
 
 from rpc.common import (HERE, _warn, load_config, push, read_history_records)
 
-import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
+import grabber
 import appcommon
 import filelock
 import order as order_mod
@@ -52,14 +52,14 @@ def rpc_push_query_history(p):
             "date": (p.get("date") or "").strip()}
     if not (item["from"] and item["to"]):
         return {"ok": False, "error": "缺少 from/to"}
-    cfg = launcher.load_launcher_config()
+    cfg = grabber.load_launcher_config()
     hist = [h for h in (cfg.get("query_history") or [])
             if not (isinstance(h, dict)
                     and h.get("from") == item["from"] and h.get("to") == item["to"]
                     and h.get("date") == item["date"])]
     hist.insert(0, item)
     cfg["query_history"] = hist[:10]
-    appcommon.atomic_write_json(launcher.LAUNCHER_CFG_PATH, cfg)
+    appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
     return {"ok": True, "query_history": cfg["query_history"]}
 
 # ---------------- 历史 ----------------

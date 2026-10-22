@@ -104,7 +104,7 @@ def mask_names(names):
 def mask_id_partial(id_no):
     """身份证脱敏（界面/日志显示用）：保留前 3 位与后 4 位。
 
-    与 launcher_utils.mask_id 是**两种口径**：这里对长度 < 8 的输入原样返回
+    与 grabber_utils.mask_id 是**两种口径**：这里对长度 < 8 的输入原样返回
     且不 strip；mask_id 对长度 <= 8 原样返回但先 strip。界面路径用本函数，
     账号路径用 mask_id，勿互换。
     """

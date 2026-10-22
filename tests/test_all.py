@@ -49,7 +49,7 @@ import order as order_mod            # noqa: E402
 import notify as notify_mod          # noqa: E402
 import logutil                       # noqa: E402
 import passengers as pax_mod         # noqa: E402
-import grabber as launcher          # noqa: E402  （2026-10-18 改名：launcher.py → grabber.py）
+import grabber          # noqa: E402  （2026-10-18 改名：launcher.py → grabber.py）
 from legacy import gui                  # noqa: E402  （legacy/：已停用，仅测试引用）
 import browser_order                 # noqa: E402
 import appcommon                     # noqa: E402
@@ -995,30 +995,30 @@ class TestLauncherUnit(TempDirCase):
     def test_parse_dt_formats(self):
         # 2026-10-13 界面重构：_resolve_dates 从 LauncherApp 静态方法挪到
         # launcher 模块级函数（界面全部收进 gui.py 单窗口）。
-        r = launcher.resolve_dates({"date": "2026-10-07", "date_to": "2026-10-12"})
+        r = grabber.resolve_dates({"date": "2026-10-07", "date_to": "2026-10-12"})
         self.assertEqual(len(r), 6)
         with self.assertRaises(RuntimeError):
-            launcher.resolve_dates({"date": "2026-10-07", "date_to": "2026-10-14"})
+            grabber.resolve_dates({"date": "2026-10-07", "date_to": "2026-10-14"})
 
     def test_fmt_countdown(self):
-        self.assertEqual(launcher.fmt_countdown(-5), "00:00:00")
-        self.assertIn("天", launcher.fmt_countdown(90061))
+        self.assertEqual(grabber.fmt_countdown(-5), "00:00:00")
+        self.assertIn("天", grabber.fmt_countdown(90061))
 
     def test_purpose_of(self):
         lc = {"purpose_code": "ADULT", "passenger_names": ["张三", "李四"],
               "pax_purpose": {"李四": "0X00"}}
-        self.assertEqual(launcher.purpose_of(lc), "ADULT")       # 混选按成人口径查票
-        self.assertEqual(launcher.purpose_of(lc, "李四"), "0X00")
+        self.assertEqual(grabber.purpose_of(lc), "ADULT")       # 混选按成人口径查票
+        self.assertEqual(grabber.purpose_of(lc, "李四"), "0X00")
         lc2 = {"purpose_code": "0X00", "passenger_names": ["张三"], "pax_purpose": {}}
-        self.assertEqual(launcher.purpose_of(lc2), "0X00")
+        self.assertEqual(grabber.purpose_of(lc2), "0X00")
 
     def test_new_grab_task_unique_id(self):
-        t1, t2 = launcher.new_grab_task(1), launcher.new_grab_task(2)
+        t1, t2 = grabber.new_grab_task(1), grabber.new_grab_task(2)
         self.assertNotEqual(t1["id"], t2["id"])
         self.assertEqual(t1["status"], "idle")
 
     def test_search_stations_local(self):
-        sts = launcher.search_stations("bjb")
+        sts = grabber.search_stations("bjb")
         self.assertTrue(sts)
         self.assertIn("code", sts[0])
 
@@ -1026,28 +1026,28 @@ class TestLauncherUnit(TempDirCase):
         # 必须把缓存文件也指向临时目录：只清 _station_kinds 的话，_merge_kind 里
         # 的 load_station_kinds() 会把真实 station_kind.json 又读回来（VNP 实际
         # 是 "高铁+动车"），用例就变成跟真实缓存赛跑。
-        snapshot = dict(launcher._station_kinds)
-        old_path = launcher.STATION_KIND_PATH
-        launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
+        snapshot = dict(grabber._station_kinds)
+        old_path = grabber.STATION_KIND_PATH
+        grabber.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
 
         def _restore():
-            launcher._station_kinds.clear()
-            launcher._station_kinds.update(snapshot)
-            launcher.STATION_KIND_PATH = old_path
+            grabber._station_kinds.clear()
+            grabber._station_kinds.update(snapshot)
+            grabber.STATION_KIND_PATH = old_path
 
         self.addCleanup(_restore)
-        launcher._station_kinds.clear()
-        ts = [threading.Thread(target=lambda k=k: [launcher._merge_kind("VNP", k)
+        grabber._station_kinds.clear()
+        ts = [threading.Thread(target=lambda k=k: [grabber._merge_kind("VNP", k)
                                                    for _ in range(100)])
               for k in ("高铁", "普速")]
         [t.start() for t in ts]
         [t.join() for t in ts]
-        self.assertEqual(launcher._station_kinds["VNP"], "高铁+普速")
+        self.assertEqual(grabber._station_kinds["VNP"], "高铁+普速")
         # 多值串（探测返回 "高铁+动车+普速"）必须拆开合并，不能整串塞进去
-        self.assertTrue(launcher._merge_kind("VNP", "高铁+动车+普速"))
-        self.assertEqual(launcher._station_kinds["VNP"], "高铁+动车+普速")
-        self.assertFalse(launcher._merge_kind("VNP", "动车"))
-        self.assertEqual(launcher._station_kinds["VNP"], "高铁+动车+普速")
+        self.assertTrue(grabber._merge_kind("VNP", "高铁+动车+普速"))
+        self.assertEqual(grabber._station_kinds["VNP"], "高铁+动车+普速")
+        self.assertFalse(grabber._merge_kind("VNP", "动车"))
+        self.assertEqual(grabber._station_kinds["VNP"], "高铁+动车+普速")
 
 
 class TestValidateAutoNoModal(TempDirCase):
@@ -1056,7 +1056,7 @@ class TestValidateAutoNoModal(TempDirCase):
     无人值守自动开抢时，模态 messagebox 会冻住 Tk 主线程导致定时开抢被杀。
     auto=True 时校验失败只 bell + 记日志 + 返回 False；手动路径行为不变。
 
-    2026-10-13 界面重构：_validate 随抢票界面从 launcher.LauncherApp 迁到
+    2026-10-13 界面重构：_validate 随抢票界面从 grabber.LauncherApp 迁到
     gui.GrabTaskForm（单窗口页签内的抢票表单），行为与断言不变。
     """
 
@@ -1431,29 +1431,29 @@ class TestLauncherIntegration(TempDirCase):
         LAUNCHER_CFG_PATH 是 import 时按真实 HERE 算好的常量，只改 HERE 不管用：
         merge_trains_from_monitor 默认 saver=save_launcher_config 会写到**真实**
         launcher_config.json（历史事故：整个配置被覆盖成空壳）。"""
-        real = launcher.HERE
-        real_cfg = launcher.LAUNCHER_CFG_PATH
-        launcher.HERE = self.tmp
-        launcher.LAUNCHER_CFG_PATH = os.path.join(self.tmp, "launcher_config.json")
-        self.addCleanup(setattr, launcher, "HERE", real)
-        self.addCleanup(setattr, launcher, "LAUNCHER_CFG_PATH", real_cfg)
+        real = grabber.HERE
+        real_cfg = grabber.LAUNCHER_CFG_PATH
+        grabber.HERE = self.tmp
+        grabber.LAUNCHER_CFG_PATH = os.path.join(self.tmp, "launcher_config.json")
+        self.addCleanup(setattr, grabber, "HERE", real)
+        self.addCleanup(setattr, grabber, "LAUNCHER_CFG_PATH", real_cfg)
         return real
 
     def test_append_and_merge_roundtrip(self):
         self._with_here()
         json.dump({"tasks": [{"name": "监控A", "trains": ["K225", "K925"]}]},
                   open(os.path.join(self.tmp, "config.json"), "w", encoding="utf-8"))
-        name = launcher.append_monitor_task({"name": "任务X"}, start_now=False)
+        name = grabber.append_monitor_task({"name": "任务X"}, start_now=False)
         self.assertEqual(name, "任务X")
         lc = {"trains": ["K225", "G1"], "synced_trains": []}
-        self.assertTrue(launcher.merge_trains_from_monitor(lc))
+        self.assertTrue(grabber.merge_trains_from_monitor(lc))
         self.assertIn("K925", lc["trains"])
 
     def test_append_corrupt_state_keeps_bad_and_skips(self):
         self._with_here()
         json.dump({"tasks": []}, open(os.path.join(self.tmp, "config.json"), "w", encoding="utf-8"))
         open(os.path.join(self.tmp, "state.json"), "w", encoding="utf-8").write("{broken")
-        launcher.append_monitor_task({"name": "T"}, start_now=True)
+        grabber.append_monitor_task({"name": "T"}, start_now=True)
         self.assertTrue([f for f in os.listdir(self.tmp) if f.startswith("state.json.bad-")])
         st = json.load(open(os.path.join(self.tmp, "state.json"), encoding="utf-8"))
         self.assertEqual(st["tasks"]["T"]["status"], "monitoring")   # start_now 不降级
@@ -1465,7 +1465,7 @@ class TestLauncherIntegration(TempDirCase):
 
         def add(n):
             try:
-                launcher.append_monitor_task({"name": "P%d" % n}, start_now=False)
+                grabber.append_monitor_task({"name": "P%d" % n}, start_now=False)
             except Exception as e:
                 errs.append(e)
         ts = [threading.Thread(target=add, args=(i,)) for i in range(3)]
@@ -1945,28 +1945,28 @@ class TestSearchStations(TempDirCase):
     """车站搜索匹配度排序：精确优先、普速小站不被挤出（长葛问题）。"""
 
     def test_hanzi_exact_first_and_prefix_after(self):
-        r = launcher.search_stations("长葛")
+        r = grabber.search_stations("长葛")
         self.assertEqual(r[0]["name"], "长葛")
         self.assertIn("长葛北", [x["name"] for x in r])
 
     def test_hanzi_single_char_includes_pusu(self):
-        r = [x["name"] for x in launcher.search_stations("长", limit=12)]
+        r = [x["name"] for x in grabber.search_stations("长", limit=12)]
         self.assertIn("长葛", r)
         # 同档(2字"长"字站约10个)按索引序,长葛位次不保证,但在结果内即可达
 
     def test_fault_tolerance_fullwidth_and_spaces(self):
         # Task 74b：kind_rank 生效后"cq"系查询首选为普速优先的重庆北（同上注释）；
         # 本用例 pin 的是全角/空格容错（仍有效），不是首选站本身。
-        self.assertEqual(launcher.search_stations("ｃｑ")[0]["name"], "重庆北")   # 全角
-        r = [x["name"] for x in launcher.search_stations("长　葛")]
+        self.assertEqual(grabber.search_stations("ｃｑ")[0]["name"], "重庆北")   # 全角
+        r = [x["name"] for x in grabber.search_stations("长　葛")]
         self.assertEqual(r[0], "长葛")                                        # 全角空格+忽略空白
-        r2 = launcher.search_stations("chong qing")
+        r2 = grabber.search_stations("chong qing")
         self.assertEqual(r2[0]["name"], "重庆")  # 空格剔除：拼音全拼精确命中仍优先
 
     def test_covers_all_matches_within_2s(self):
         import time as _time
         t0 = _time.perf_counter()
-        r = launcher.search_stations("长", limit=None)      # 全量命中
+        r = grabber.search_stations("长", limit=None)      # 全量命中
         dt = _time.perf_counter() - t0
         names = [x["name"] for x in r]
         self.assertGreater(len(r), 12)                      # 旧实现 12 个封顶,现全量
@@ -1977,9 +1977,9 @@ class TestSearchStations(TempDirCase):
         # Task 74b 后 kind_rank 生效（普速优先）：重庆北/东/西均为"高铁+动车+普速"
         # 含普速 → rank 0，排在无 kind 记录的重庆(CQW) 之前。旧期望"重庆"是
         # kind 查询恒 miss 时的失效排序。
-        self.assertEqual(launcher.search_stations("cq")[0]["name"], "重庆北")
-        self.assertEqual(launcher.search_stations("chang")[0]["name"], "长春")
-        self.assertEqual(launcher.search_stations("bjd")[0]["name"], "北京东")
+        self.assertEqual(grabber.search_stations("cq")[0]["name"], "重庆北")
+        self.assertEqual(grabber.search_stations("chang")[0]["name"], "长春")
+        self.assertEqual(grabber.search_stations("bjd")[0]["name"], "北京东")
 
 
 class TestGrabberStationMapDegraded(TempDirCase):
@@ -1991,7 +1991,7 @@ class TestGrabberStationMapDegraded(TempDirCase):
         lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
               "trains": ["G101"], "seat_types": ["二等座"],
               "seat_priority": "", "passenger_names": []}
-        g = launcher.Grabber(lc, logq=queue.Queue())
+        g = grabber.Grabber(lc, logq=queue.Queue())
         g._log = g.logq.put  # 不写真实日志文件
         return g
 
@@ -2024,9 +2024,9 @@ class TestGrabberStationMapDegraded(TempDirCase):
         with mock.patch.object(ticket, "load_station_map",
                                return_value=({"北京": "BJP", "上海": "SHH"},
                                              {"BJP": "北京", "SHH": "上海"})), \
-             mock.patch.object(launcher.browser_order, "check_session",
+             mock.patch.object(grabber.browser_order, "check_session",
                                return_value=(False, "未登录")), \
-             mock.patch.object(launcher.browser_order, "login",
+             mock.patch.object(grabber.browser_order, "login",
                                side_effect=Exception("no browser")):
             g._run()
         ok, msg = g.result
@@ -3075,7 +3075,7 @@ class TestPerTaskAutoOrder(TempDirCase):
         with mock.patch.object(api, "load_config", return_value=cfg), \
              mock.patch.object(api, "load_state", return_value={}), \
              mock.patch.object(api, "start_engine") as m_eng, \
-             mock.patch.object(api.launcher, "append_monitor_task"):
+             mock.patch.object(api.grabber, "append_monitor_task"):
             r = api.rpc_create_task({
                 "from": "长葛", "to": "郑州", "dates": ["2026-10-16"],
                 "trains": ["K262"], "seat_types": ["硬座"],
@@ -3089,7 +3089,7 @@ class TestPerTaskAutoOrder(TempDirCase):
         self.assertFalse(m_eng.called)
 
     def test_build_monitor_task_keeps_auto_order(self):
-        t = launcher.build_monitor_task("长葛", "郑州", ["2026-10-16"], [],
+        t = grabber.build_monitor_task("长葛", "郑州", ["2026-10-16"], [],
                                        ["K262"], ["硬座"], ["王小明"],
                                        "ADULT", True, False, 5)
         self.assertTrue(t["auto_order"])
@@ -5764,7 +5764,7 @@ class TestTask55ExcStreakStop(TempDirCase):
         lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
               "trains": ["G101"], "seat_types": ["二等座"],
               "seat_priority": "", "passenger_names": ["张三"]}
-        g = launcher.Grabber(lc, logq=queue.Queue())
+        g = grabber.Grabber(lc, logq=queue.Queue())
         g._log = g.logq.put  # 不写真实日志文件
         waits = []
         g.stop_event = mock.Mock()
@@ -5783,18 +5783,18 @@ class TestTask55ExcStreakStop(TempDirCase):
             mock.patch.object(ticket, "load_station_map",
                               return_value=({"北京": "BJP", "上海": "SHH"},
                                             {"BJP": "北京", "SHH": "上海"})),
-            mock.patch.object(launcher.browser_order, "busy", return_value=False),
-            mock.patch.object(launcher.browser_order, "check_session",
+            mock.patch.object(grabber.browser_order, "busy", return_value=False),
+            mock.patch.object(grabber.browser_order, "check_session",
                               return_value=(True, "user")),
             mock.patch.object(ticket, "query_tickets", return_value=[{"row": 1}]),
             mock.patch.object(ticket, "parse_row", return_value=train),
             mock.patch.object(ticket, "seat_candidates_for",
                               return_value=["二等座"]),
-            mock.patch.object(launcher.browser_order, "order_via_browser",
+            mock.patch.object(grabber.browser_order, "order_via_browser",
                               side_effect=order_side_effect),
             # 新链分流：launcher 模块级 import orderflow，patch run_orderflow
             # 使 side_effect 对两条链同口径生效
-            mock.patch.object(launcher.orderflow, "run_orderflow",
+            mock.patch.object(grabber.orderflow, "run_orderflow",
                               side_effect=order_side_effect),
         )
 
@@ -5875,7 +5875,7 @@ class TestTask55AutoFired(TempDirCase):
     """Task 55(b): auto_fired 在 _validate() 之前置位 → 校验失败即缴械整点自动开抢。
 
     改后：_validate() 通过之后才置位；失败时保持 False，允许下个 _tick 重试。
-    （2026-10-13 重构：表单从 launcher.LauncherApp 迁到 gui.GrabTaskForm。）
+    （2026-10-13 重构：表单从 grabber.LauncherApp 迁到 gui.GrabTaskForm。）
     """
 
     def _make_app(self, lc):
@@ -5914,7 +5914,7 @@ class TestTask55AutoFired(TempDirCase):
     def test_auto_validate_ok_sets_auto_fired_and_starts(self):
         # 回归 pin：校验通过 → 置位 + 正常启动
         app, logs = self._make_app(self._valid_lc())
-        with mock.patch.object(launcher, "Grabber") as MG:
+        with mock.patch.object(grabber, "Grabber") as MG:
             ret = app.start_grab(auto=True)
         self.assertTrue(ret)
         self.assertTrue(app.auto_fired)
@@ -5924,14 +5924,14 @@ class TestTask55AutoFired(TempDirCase):
     def test_manual_start_grab_does_not_touch_auto_fired(self):
         # 回归 pin：手动路径不碰 auto_fired
         app, logs = self._make_app(self._valid_lc())
-        with mock.patch.object(launcher, "Grabber"):
+        with mock.patch.object(grabber, "Grabber"):
             app.start_grab(auto=False)
         self.assertFalse(app.auto_fired)
 
     def test_auto_grabber_start_failure_rolls_back_auto_fired(self):
         # _validate 通过但线程启动失败 → 回滚置位，允许下个 _tick 重试
         app, logs = self._make_app(self._valid_lc())
-        with mock.patch.object(launcher, "Grabber",
+        with mock.patch.object(grabber, "Grabber",
                                side_effect=RuntimeError("no threads")):
             ret = app.start_grab(auto=True)
         self.assertFalse(ret)
@@ -6021,7 +6021,7 @@ class TestFileLockTimeout(TempDirCase):
         task = {"name": "t-timeout", "from": "长葛", "to": "确山"}
         with self._timeout_lock():
             with self.assertRaises(TimeoutError) as cm:
-                launcher.append_monitor_task(task)
+                grabber.append_monitor_task(task)
         self.assertIn("文件被占用", str(cm.exception))
 
     def test_monitor_save_config_timeout_no_crash(self):
@@ -7247,11 +7247,11 @@ class TestTask65InteractionLoginChain(TempDirCase):
     # ---- (i) 软失败不计入 fail_streak ----
 
     def test_is_soft_fail(self):
-        self.assertTrue(launcher._is_soft_fail("系统繁忙，请稍后再试"))
-        self.assertTrue(launcher._is_soft_fail("网络异常"))
-        self.assertTrue(launcher._is_soft_fail("当前排队人数较多，请等待"))
-        self.assertFalse(launcher._is_soft_fail("余票不足"))
-        self.assertFalse(launcher._is_soft_fail(""))
+        self.assertTrue(grabber._is_soft_fail("系统繁忙，请稍后再试"))
+        self.assertTrue(grabber._is_soft_fail("网络异常"))
+        self.assertTrue(grabber._is_soft_fail("当前排队人数较多，请等待"))
+        self.assertFalse(grabber._is_soft_fail("余票不足"))
+        self.assertFalse(grabber._is_soft_fail(""))
 
 
 class TestTask66SmtpPasswordEncryption(TempDirCase):
@@ -8461,56 +8461,56 @@ class TestTask83MonitorMenuRobustness(TempDirCase):
 class TestTask74Launcher(TempDirCase):
     """Task 74: launcher P2/P3 bundle（a–h）。无 Tk 真机，全部 mock/桩测试。
 
-    2026-10-13 界面重构：抢票界面（原 launcher.LauncherApp）已并入
+    2026-10-13 界面重构：抢票界面（原 grabber.LauncherApp）已并入
     gui.GrabTaskForm / gui.GrabTab；本类断言口径不变，目标类随之平移。
     """
 
     # ---- (b) kind_rank 大小写 ----
 
     def test_search_stations_kind_rank_case_insensitive(self):
-        snapshot = dict(launcher._station_kinds)
-        old_path = launcher.STATION_KIND_PATH
-        launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
-        self.addCleanup(setattr, launcher, "STATION_KIND_PATH", old_path)
+        snapshot = dict(grabber._station_kinds)
+        old_path = grabber.STATION_KIND_PATH
+        grabber.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
+        self.addCleanup(setattr, grabber, "STATION_KIND_PATH", old_path)
 
         def _restore():
-            launcher._station_kinds.clear()
-            launcher._station_kinds.update(snapshot)
+            grabber._station_kinds.clear()
+            grabber._station_kinds.update(snapshot)
         self.addCleanup(_restore)
-        with open(launcher.STATION_KIND_PATH, "w", encoding="utf-8") as f:
+        with open(grabber.STATION_KIND_PATH, "w", encoding="utf-8") as f:
             json.dump({"BJB": "普速", "VNP": "高铁"}, f)
-        launcher._station_kinds.clear()
+        grabber._station_kinds.clear()
         stations = [
             {"name": "北京北站X", "spy": "bjb", "py": "beijingbei", "code": "BJB"},
             {"name": "北京南", "spy": "bjn", "py": "beijingnan", "code": "VNP"},
         ]
-        with mock.patch.object(launcher, "get_station_index", return_value=stations):
-            out = launcher.search_stations("bj")
+        with mock.patch.object(grabber, "get_station_index", return_value=stations):
+            out = grabber.search_stations("bj")
         # 同分下普速站应排在高铁站前面（旧代码 kind 全 miss → 按站名长度排错）
         self.assertEqual(out[0]["name"], "北京北站X")
 
     # ---- (c) synced_trains 保留 ----
 
     def test_load_launcher_config_preserves_synced_trains(self):
-        old = launcher.LAUNCHER_CFG_PATH
+        old = grabber.LAUNCHER_CFG_PATH
         p = os.path.join(self.tmp, "launcher_config.json")
-        launcher.LAUNCHER_CFG_PATH = p
-        self.addCleanup(setattr, launcher, "LAUNCHER_CFG_PATH", old)
+        grabber.LAUNCHER_CFG_PATH = p
+        self.addCleanup(setattr, grabber, "LAUNCHER_CFG_PATH", old)
         with open(p, "w", encoding="utf-8") as f:
             json.dump({"trains": ["G1"], "synced_trains": ["G2", "G3"],
                        "from": "北京"}, f)
-        lc = launcher.load_launcher_config()
+        lc = grabber.load_launcher_config()
         self.assertEqual(lc["synced_trains"], ["G2", "G3"])
         self.assertEqual(lc["trains"], ["G1"])
 
     # ---- (g) 历史记录非 dict 跳过 ----
 
     def test_history_item_text_skips_non_dict(self):
-        with self.assertLogs(launcher.LOG, level="WARNING"):
-            self.assertIsNone(launcher._history_item_text("not-a-dict"))
-        self.assertIsNone(launcher._history_item_text(None))
+        with self.assertLogs(grabber.LOG, level="WARNING"):
+            self.assertIsNone(grabber._history_item_text("not-a-dict"))
+        self.assertIsNone(grabber._history_item_text(None))
         self.assertEqual(
-            launcher._history_item_text({"from": "北京", "to": "上海",
+            grabber._history_item_text({"from": "北京", "to": "上海",
                                          "date": "2026-10-10"}),
             "北京 → 上海    2026-10-10")
 
@@ -8534,7 +8534,7 @@ class TestTask74Launcher(TempDirCase):
         panel._put_log = mock.Mock()
         with mock.patch.object(gui.messagebox, "askyesno",
                                return_value=True), \
-             mock.patch.object(launcher, "save_grab_tasks") as m_save:
+             mock.patch.object(grabber, "save_grab_tasks") as m_save:
             panel._delete_task("t1")
         form.close.assert_called_once_with(stop_thread=True)
         self.assertEqual(panel.tasks, [])
@@ -9277,9 +9277,9 @@ class TestTask82StationDbRebuildRefusesZero(TempDirCase):
     def _run_rebuild_empty_index(self, **kwargs):
         """空索引下跑 rebuild：返回 (ret, stdout)。"""
         import io
-        with mock.patch.object(launcher, "get_station_index",
+        with mock.patch.object(grabber, "get_station_index",
                                return_value=[]), \
-             mock.patch.object(launcher, "load_station_kinds",
+             mock.patch.object(grabber, "load_station_kinds",
                                return_value={}):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -9322,9 +9322,9 @@ class TestTask82StationDbRebuildRefusesZero(TempDirCase):
         import io
         idx = [{"name": "北京", "code": "BJP", "py": "beijing", "spy": "bj"},
                {"name": "上海", "code": "SHH", "py": "shanghai", "spy": "sh"}]
-        with mock.patch.object(launcher, "get_station_index",
+        with mock.patch.object(grabber, "get_station_index",
                                return_value=idx), \
-             mock.patch.object(launcher, "load_station_kinds",
+             mock.patch.object(grabber, "load_station_kinds",
                                return_value={"BJP": "高铁"}):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -9409,39 +9409,39 @@ class TestTask84LauncherP3(TempDirCase):
 
     def test_normalize_trains_string_single_with_warning(self):
         warned = []
-        got = launcher._normalize_trains("G101", warned.append)
+        got = grabber._normalize_trains("G101", warned.append)
         self.assertEqual(got, ["G101"])
         self.assertEqual(len(warned), 1, "字符串 trains 必须记一次警告")
 
     def test_normalize_trains_list_unchanged(self):
         warned = []
-        got = launcher._normalize_trains([" g101 ", "K2"], warned.append)
+        got = grabber._normalize_trains([" g101 ", "K2"], warned.append)
         self.assertEqual(got, ["G101", "K2"])
         self.assertEqual(warned, [])
 
     def test_normalize_trains_non_string_items_skipped(self):
         warned = []
-        got = launcher._normalize_trains(["G101", 123, None], warned.append)
+        got = grabber._normalize_trains(["G101", 123, None], warned.append)
         self.assertEqual(got, ["G101"])
 
     def test_normalize_trains_illegal_shape_ignored_with_warning(self):
         warned = []
-        got = launcher._normalize_trains(123, warned.append)
+        got = grabber._normalize_trains(123, warned.append)
         self.assertEqual(got, [])
         self.assertEqual(len(warned), 1)
 
     def test_grabber_run_wires_normalize_trains(self):
         import queue as _queue
-        th = object.__new__(launcher.Grabber)
+        th = object.__new__(grabber.Grabber)
         th.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
                  "trains": "G101", "seat_types": [], "seat_priority": "",
                  "passenger_names": []}
         th.logq = _queue.Queue()
         th.stop_event = threading.Event()
         th.result = None
-        with mock.patch.object(launcher, "HERE", self.tmp), \
-             mock.patch.object(launcher, "_normalize_trains",
-                               wraps=launcher._normalize_trains) as sp:
+        with mock.patch.object(grabber, "HERE", self.tmp), \
+             mock.patch.object(grabber, "_normalize_trains",
+                               wraps=grabber._normalize_trains) as sp:
             th._run()
         self.assertEqual(th.result, (False, "请至少勾选一种席别"))
         sp.assert_called_once()
@@ -9453,9 +9453,9 @@ class TestTask84LauncherP3(TempDirCase):
             json.dump({"tasks": [{"trains": "G101"}]}, f, ensure_ascii=False)
         lc = {"trains": []}
         logged = []
-        with mock.patch.object(launcher, "HERE", self.tmp), \
-             mock.patch.object(launcher, "log", logged.append):
-            ret = launcher.merge_trains_from_monitor(lc, saver=lambda c: None)
+        with mock.patch.object(grabber, "HERE", self.tmp), \
+             mock.patch.object(grabber, "log", logged.append):
+            ret = grabber.merge_trains_from_monitor(lc, saver=lambda c: None)
         self.assertTrue(ret)
         self.assertEqual(lc["trains"], ["G101"])
 
@@ -9483,15 +9483,15 @@ class TestTask84LauncherP3(TempDirCase):
     # ---- (c) log 路径 PII 脱敏 ----
 
     def test_mask_pii_text_masks_order_no(self):
-        masked = launcher._mask_pii_text(
+        masked = grabber._mask_pii_text(
             "订单已提交成功（未支付）：订单号 E123456789，下单时间 2026-10-08，请尽快去 12306 支付")
         self.assertNotIn("E123456789", masked)
         self.assertIn("订单号", masked)
         plain = "已提交订单（未支付）：https://kyfw.12306.cn/otn/payOrder/init"
-        self.assertEqual(launcher._mask_pii_text(plain), plain)
+        self.assertEqual(grabber._mask_pii_text(plain), plain)
 
     def test_mask_names(self):
-        self.assertEqual(launcher._mask_names(["张三丰", "李"]), "张**、*")
+        self.assertEqual(grabber._mask_names(["张三丰", "李"]), "张**、*")
 
     def test_ensure_passengers_log_masks_names(self):
         cfg = os.path.join(self.tmp, "config.json")
@@ -9499,13 +9499,13 @@ class TestTask84LauncherP3(TempDirCase):
             json.dump({"tasks": [{"passenger_names": ["张三丰"]}]},
                       f, ensure_ascii=False)
         logged = []
-        with mock.patch.object(launcher, "HERE", self.tmp), \
-             mock.patch.object(launcher.appcommon, "data_path",
+        with mock.patch.object(grabber, "HERE", self.tmp), \
+             mock.patch.object(grabber.appcommon, "data_path",
                                side_effect=lambda n: os.path.join(self.tmp, n)), \
-             mock.patch.object(launcher, "log", logged.append), \
-             mock.patch.object(launcher.passengers_mod, "save_passengers",
+             mock.patch.object(grabber, "log", logged.append), \
+             mock.patch.object(grabber.passengers_mod, "save_passengers",
                                return_value=True) as m_save:
-            launcher.ensure_passengers()
+            grabber.ensure_passengers()
         m_save.assert_called_once()
         text = "".join(logged)
         self.assertNotIn("张三丰", text)
@@ -9519,13 +9519,13 @@ class TestTask84LauncherP3(TempDirCase):
             json.dump({"tasks": [{"passenger_names": ["张三"]}]},
                       f, ensure_ascii=False)
         logged = []
-        with mock.patch.object(launcher, "HERE", self.tmp), \
-             mock.patch.object(launcher.appcommon, "data_path",
+        with mock.patch.object(grabber, "HERE", self.tmp), \
+             mock.patch.object(grabber.appcommon, "data_path",
                                side_effect=lambda n: os.path.join(self.tmp, n)), \
-             mock.patch.object(launcher, "log", logged.append), \
-             mock.patch.object(launcher.passengers_mod, "save_passengers",
+             mock.patch.object(grabber, "log", logged.append), \
+             mock.patch.object(grabber.passengers_mod, "save_passengers",
                                return_value=False):
-            launcher.ensure_passengers()
+            grabber.ensure_passengers()
         text = "".join(logged)
         self.assertNotIn("已从监控任务导入乘车人", text)
         self.assertIn("错误", text)
@@ -9909,21 +9909,21 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
     def test_display_trains_string_not_char_split(self):
         # (b) 旧代码无此 helper（AttributeError）；各展示点对 "G101"
         # 会 join 成 "G,1,0,1" 逐字符拆。
-        import grabber as launcher_mod
-        self.assertEqual(launcher_mod._display_trains("G101"), ["G101"])
-        self.assertEqual(",".join(launcher_mod._display_trains("G101")), "G101")
-        self.assertEqual(launcher_mod._display_trains(["g1 ", ""]), ["G1"])
-        self.assertEqual(launcher_mod._display_trains(123), [])
-        self.assertEqual(launcher_mod._display_trains(None), [])
+        import grabber as grabber_mod
+        self.assertEqual(grabber_mod._display_trains("G101"), ["G101"])
+        self.assertEqual(",".join(grabber_mod._display_trains("G101")), "G101")
+        self.assertEqual(grabber_mod._display_trains(["g1 ", ""]), ["G1"])
+        self.assertEqual(grabber_mod._display_trains(123), [])
+        self.assertEqual(grabber_mod._display_trains(None), [])
 
     def test_mask_one_name(self):
         # (c) 旧代码无此 helper（AttributeError）；_ptxt 记全名。
-        import grabber as launcher_mod
-        self.assertEqual(launcher_mod._mask_one_name("张三丰"), "张**")
-        self.assertEqual(launcher_mod._mask_one_name("李"), "*")
-        self.assertEqual(launcher_mod._mask_one_name(""), "")
+        import grabber as grabber_mod
+        self.assertEqual(grabber_mod._mask_one_name("张三丰"), "张**")
+        self.assertEqual(grabber_mod._mask_one_name("李"), "*")
+        self.assertEqual(grabber_mod._mask_one_name(""), "")
         # _mask_names 复用同一口径（单源）
-        self.assertEqual(launcher_mod._mask_names(["张三", "李四"]), "张*、李*")
+        self.assertEqual(grabber_mod._mask_names(["张三", "李四"]), "张*、李*")
 
     def _patch_pax(self, pm):
         p = os.path.join(self.tmp, "passengers.json")
@@ -10330,8 +10330,8 @@ class TestTask108BomSelfHeal(TempDirCase):
         task = {"name": "BOM任务", "from": "长葛", "to": "确山",
                 "date": "2026-10-16", "trains": ["K225"],
                 "seat_types": ["硬座"], "passenger_names": ["张三"]}
-        with mock.patch.object(launcher, "HERE", self.tmp):
-            name = launcher.append_monitor_task(task)
+        with mock.patch.object(grabber, "HERE", self.tmp):
+            name = grabber.append_monitor_task(task)
         self.assertEqual(name, "BOM任务")
         # 写回自愈：无 BOM 前缀、合法 JSON、含新任务
         with open(p, "rb") as f:
@@ -11380,17 +11380,17 @@ class TestTask100NotifyPassengersP3(TempDirCase):
 
     def test_c_ensure_passengers_passes_expect_stamp_none(self):
         # RED on old code: 裸调 save_passengers 不传指纹，首跑双进程可静默覆写
-        import grabber as launcher
+        import grabber
         cfg = os.path.join(self.tmp, "config.json")
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"tasks": [{"passenger_names": ["张三"]}]}, f)
-        with mock.patch.object(launcher, "HERE", self.tmp), \
-             mock.patch.object(launcher.appcommon, "data_path",
+        with mock.patch.object(grabber, "HERE", self.tmp), \
+             mock.patch.object(grabber.appcommon, "data_path",
                                side_effect=lambda n: os.path.join(self.tmp, n)), \
-             mock.patch.object(launcher, "log"), \
-             mock.patch.object(launcher.passengers_mod, "save_passengers",
+             mock.patch.object(grabber, "log"), \
+             mock.patch.object(grabber.passengers_mod, "save_passengers",
                                return_value=True) as m_save:
-            launcher.ensure_passengers()
+            grabber.ensure_passengers()
         m_save.assert_called_once()
         self.assertIn("expect_stamp", m_save.call_args.kwargs)
         self.assertIsNone(m_save.call_args.kwargs["expect_stamp"])
@@ -11451,17 +11451,17 @@ class TestTask101CrossModuleP3(TempDirCase):
 
     # ---- (a) save_station_kinds 并发写：tmp 文件名必须带线程后缀 ----
     def test_a_tmp_unique_per_thread(self):
-        import grabber as launcher
-        real_path = launcher.STATION_KIND_PATH
-        real_kinds = launcher._station_kinds
-        launcher.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
-        launcher._station_kinds = {"AAA": "高铁"}
-        self.addCleanup(setattr, launcher, "STATION_KIND_PATH", real_path)
-        self.addCleanup(setattr, launcher, "_station_kinds", real_kinds)
+        import grabber
+        real_path = grabber.STATION_KIND_PATH
+        real_kinds = grabber._station_kinds
+        grabber.STATION_KIND_PATH = os.path.join(self.tmp, "station_kind.json")
+        grabber._station_kinds = {"AAA": "高铁"}
+        self.addCleanup(setattr, grabber, "STATION_KIND_PATH", real_path)
+        self.addCleanup(setattr, grabber, "_station_kinds", real_kinds)
         srcs = []
         with mock.patch("os.replace") as m_replace:
             m_replace.side_effect = lambda s, d: srcs.append(s)
-            ts = [threading.Thread(target=launcher.save_station_kinds)
+            ts = [threading.Thread(target=grabber.save_station_kinds)
                   for _ in range(2)]
             for t in ts:
                 t.start()
@@ -11474,29 +11474,29 @@ class TestTask101CrossModuleP3(TempDirCase):
 
     # ---- (b) get_station_index：加载失败不永久缓存，下次重试；日志文案属实 ----
     def test_b_failed_load_not_cached(self):
-        import grabber as launcher
-        launcher._STATION_INDEX = None
-        self.addCleanup(setattr, launcher, "_STATION_INDEX", None)
+        import grabber
+        grabber._STATION_INDEX = None
+        self.addCleanup(setattr, grabber, "_STATION_INDEX", None)
         with mock.patch.object(ticket, "load_station_index",
                                side_effect=RuntimeError("net down")) as m_load:
-            with mock.patch.object(launcher, "log") as m_log:
-                self.assertEqual(launcher.get_station_index(), [])
-                self.assertEqual(launcher.get_station_index(), [])
+            with mock.patch.object(grabber, "log") as m_log:
+                self.assertEqual(grabber.get_station_index(), [])
+                self.assertEqual(grabber.get_station_index(), [])
         self.assertEqual(m_load.call_count, 2, "加载失败被永久缓存，网络恢复后仍无结果")
-        self.assertIsNone(launcher._STATION_INDEX)
+        self.assertIsNone(grabber._STATION_INDEX)
         logged = " ".join(str(c) for c in m_log.call_args_list)
         self.assertNotIn("只按站名匹配", logged, "失败时索引为空，'只按站名匹配'不属实")
 
     def test_b_success_still_cached(self):
-        import grabber as launcher
-        launcher._STATION_INDEX = None
-        self.addCleanup(setattr, launcher, "_STATION_INDEX", None)
+        import grabber
+        grabber._STATION_INDEX = None
+        self.addCleanup(setattr, grabber, "_STATION_INDEX", None)
         st = [{"name": "北京", "code": "BJP", "py": "beijing", "spy": "bj"}]
         with mock.patch.object(ticket, "load_station_index",
                                return_value=st) as m_load:
-            with mock.patch.object(launcher, "log"):
-                self.assertEqual(launcher.get_station_index(), st)
-                self.assertEqual(launcher.get_station_index(), st)
+            with mock.patch.object(grabber, "log"):
+                self.assertEqual(grabber.get_station_index(), st)
+                self.assertEqual(grabber.get_station_index(), st)
         self.assertEqual(m_load.call_count, 1)
 
     # ---- (d) 未知席别码 warn-once 去重 ----
@@ -11680,10 +11680,10 @@ class TestTask103LauncherGuiP3(TempDirCase):
 
     def test_b_display_seat_types_unit(self):
         # 裸字符串按单个席别，不逐字符拆；非法形状视为空。
-        self.assertEqual(launcher._display_seat_types("二等座"), ["二等座"])
-        self.assertEqual(launcher._display_seat_types(["一等座"]), ["一等座"])
-        self.assertEqual(launcher._display_seat_types(None), [])
-        self.assertEqual(launcher._display_seat_types(123), [])
+        self.assertEqual(grabber._display_seat_types("二等座"), ["二等座"])
+        self.assertEqual(grabber._display_seat_types(["一等座"]), ["一等座"])
+        self.assertEqual(grabber._display_seat_types(None), [])
+        self.assertEqual(grabber._display_seat_types(123), [])
 
     # ---- (c) gui 任务对话框席别预选成员检查（P3） ----
 
@@ -11756,9 +11756,9 @@ class TestTask104LoadSanitize(TempDirCase):
         # 改前：load_grab_tasks 原样返回脏条目，后续 t.get(...) 全崩。
         path = self._write("grab_tasks.json", {"tasks": [
             {"id": "a", "name": "A"}, "junk", 123, None, {"id": "b"}]})
-        with mock.patch.object(launcher, "GRAB_TASKS_PATH", path), \
-             mock.patch.object(launcher, "log") as mlog:
-            tasks = launcher.load_grab_tasks()
+        with mock.patch.object(grabber, "GRAB_TASKS_PATH", path), \
+             mock.patch.object(grabber, "log") as mlog:
+            tasks = grabber.load_grab_tasks()
         self.assertEqual([t.get("id") for t in tasks], ["a", "b"])
         warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
         self.assertTrue(warns, "应记 warning")
@@ -11770,9 +11770,9 @@ class TestTask104LoadSanitize(TempDirCase):
         # 删除路径调 p.get(...) 抛 AttributeError（Task 96d 只修了展示侧）。
         cfg = self._write("launcher_config.json",
                           {"presets": [{"name": "p1"}, "junk", 42, None]})
-        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
-             mock.patch.object(launcher, "log") as mlog:
-            lc = launcher.load_launcher_config()
+        with mock.patch.object(grabber, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(grabber, "log") as mlog:
+            lc = grabber.load_launcher_config()
         self.assertEqual(lc["presets"], [{"name": "p1"}])
         warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
         self.assertTrue(warns, "应记 warning")
@@ -11781,9 +11781,9 @@ class TestTask104LoadSanitize(TempDirCase):
         # presets 本体非 list（如手改成字符串）：_save_preset 的推导式
         # 同样会 p.get 崩；入口统一按空处理。
         cfg = self._write("launcher_config.json", {"presets": "oops"})
-        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
-             mock.patch.object(launcher, "log") as mlog:
-            lc = launcher.load_launcher_config()
+        with mock.patch.object(grabber, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(grabber, "log") as mlog:
+            lc = grabber.load_launcher_config()
         self.assertEqual(lc["presets"], [])
         warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
         self.assertTrue(warns, "应记 warning")
@@ -11792,9 +11792,9 @@ class TestTask104LoadSanitize(TempDirCase):
         # 改前：_save_preset 的去重推导式在 "junk".get 处抛 AttributeError。
         cfg = self._write("launcher_config.json",
                           {"presets": [{"name": "p1"}, "junk", 42]})
-        with mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
-             mock.patch.object(launcher, "log"):
-            lc = launcher.load_launcher_config()
+        with mock.patch.object(grabber, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(grabber, "log"):
+            lc = grabber.load_launcher_config()
         app = object.__new__(gui.GrabTaskForm)
         app.lc = lc
         app._ui_to_lc = mock.Mock()
@@ -11817,11 +11817,11 @@ class TestTask104LoadSanitize(TempDirCase):
                          {"tasks": [{"id": "a", "name": "A"}]})
         cfg = self._write("launcher_config.json",
                           {"presets": [{"name": "p1"}]})
-        with mock.patch.object(launcher, "GRAB_TASKS_PATH", gt), \
-             mock.patch.object(launcher, "LAUNCHER_CFG_PATH", cfg), \
-             mock.patch.object(launcher, "log") as mlog:
-            tasks = launcher.load_grab_tasks()
-            lc = launcher.load_launcher_config()
+        with mock.patch.object(grabber, "GRAB_TASKS_PATH", gt), \
+             mock.patch.object(grabber, "LAUNCHER_CFG_PATH", cfg), \
+             mock.patch.object(grabber, "log") as mlog:
+            tasks = grabber.load_grab_tasks()
+            lc = grabber.load_launcher_config()
         self.assertEqual(tasks, [{"id": "a", "name": "A"}])
         self.assertEqual(lc["presets"], [{"name": "p1"}])
         warns = [c for c in mlog.call_args_list if "[警告]" in str(c)]
@@ -11850,30 +11850,30 @@ class TestTask106BareStringHardening(TempDirCase):
         # 全部无法下单 → (False, "勾选的席别都无法自动下单")。
         # 改后按单个席别处理，通过席别检查，继续走到车站校验
         # （此处 mock 断网，直接返回车站加载失败）。
-        grabber = object.__new__(launcher.Grabber)
-        grabber.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+        g = object.__new__(grabber.Grabber)
+        g.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
                       "trains": ["G101"], "seat_types": "二等座",
                       "seat_priority": "", "passenger_names": ["张三"]}
-        grabber._log = mock.Mock()
-        grabber.result = None
-        with mock.patch.object(launcher.ticket, "load_station_map",
+        g._log = mock.Mock()
+        g.result = None
+        with mock.patch.object(grabber.ticket, "load_station_map",
                                side_effect=Exception("offline")):
-            grabber._run()
-        self.assertEqual(grabber.result,
+            g._run()
+        self.assertEqual(g.result,
                          (False, "车站数据加载失败（网络异常），请联网后重试"))
 
     def test_grabber_run_clean_seat_types_unchanged(self):
         # 正向对照：干净 list 形状行为不变（同样走到车站校验）。
-        grabber = object.__new__(launcher.Grabber)
-        grabber.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+        g = object.__new__(grabber.Grabber)
+        g.lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
                       "trains": ["G101"], "seat_types": ["二等座"],
                       "seat_priority": "", "passenger_names": ["张三"]}
-        grabber._log = mock.Mock()
-        grabber.result = None
-        with mock.patch.object(launcher.ticket, "load_station_map",
+        g._log = mock.Mock()
+        g.result = None
+        with mock.patch.object(grabber.ticket, "load_station_map",
                                side_effect=Exception("offline")):
-            grabber._run()
-        self.assertEqual(grabber.result,
+            g._run()
+        self.assertEqual(g.result,
                          (False, "车站数据加载失败（网络异常），请联网后重试"))
 
     # ---- (1) gui.py:2892 调用点契约（dialog 内联，沿 Task 103c 口径） ----
@@ -11897,10 +11897,10 @@ class TestTask106BareStringHardening(TempDirCase):
         # 2892/576 调用点依赖的契约：_display_seat_types 用于 passenger_names
         # 时，裸字符串按单个姓名处理（中文名不 strip/upper，与席别同口径）。
         self.assertEqual(appcommon.display_seat_types("张三"), ["张三"])
-        self.assertEqual(launcher._display_seat_types("张三"), ["张三"])
-        self.assertEqual(launcher._display_seat_types(["张三", "李四"]),
+        self.assertEqual(grabber._display_seat_types("张三"), ["张三"])
+        self.assertEqual(grabber._display_seat_types(["张三", "李四"]),
                          ["张三", "李四"])
-        self.assertEqual(launcher._display_seat_types(None), [])
+        self.assertEqual(grabber._display_seat_types(None), [])
 
 
 
@@ -12394,7 +12394,7 @@ class TestAutoStartEngine(TempDirCase):
             seen.update(state)
 
         with mock.patch.object(api, "update_state_locked", _fake), \
-             mock.patch.object(api.launcher, "log"):
+             mock.patch.object(api.grabber, "log"):
             n = api._resume_stopped_tasks()
         self.assertEqual(n, 1)
         self.assertEqual(seen["tasks"]["被动暂停"]["status"], "monitoring")
@@ -12410,7 +12410,7 @@ class TestAutoStartEngine(TempDirCase):
         # tasks 不是 dict：不能抛，返回 0
         with mock.patch.object(api, "update_state_locked",
                                lambda fn: fn({"tasks": None})), \
-             mock.patch.object(api.launcher, "log"):
+             mock.patch.object(api.grabber, "log"):
             self.assertEqual(api._resume_stopped_tasks(), 0)
 
     def test_auto_start_engine_resumes_then_starts(self):
@@ -12431,7 +12431,7 @@ class TestAutoStartEngine(TempDirCase):
                                return_value={"auto_start_engine": False}), \
              mock.patch.object(api, "_resume_stopped_tasks") as m_res, \
              mock.patch.object(api, "start_engine") as m_st, \
-             mock.patch.object(api.launcher, "log"):
+             mock.patch.object(api.grabber, "log"):
             self.assertFalse(api._auto_start_engine())
         self.assertFalse(m_res.called)
         self.assertFalse(m_st.called)
@@ -12679,11 +12679,11 @@ class TestApiRpcContract(TempDirCase):
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({}, f)
         self._patch(self.api, "CONFIG_PATH", cfg)
-        self._patch(self.api.launcher, "LAUNCHER_CFG_PATH",
+        self._patch(self.api.grabber, "LAUNCHER_CFG_PATH",
                     os.path.join(self.tmp, "launcher_config.json"))
-        self._patch(self.api.launcher, "_monitor_cfg_path",
+        self._patch(self.api.grabber, "_monitor_cfg_path",
                     lambda: os.path.join(self.tmp, "monitor_config.json"))
-        self._patch(self.api.launcher, "GRAB_TASKS_PATH",
+        self._patch(self.api.grabber, "GRAB_TASKS_PATH",
                     os.path.join(self.tmp, "grab_tasks.json"))
         self._patch(self.api.passengers_mod, "DEFAULT_PATH",
                     os.path.join(self.tmp, "passengers.json"))
@@ -12698,7 +12698,7 @@ class TestApiRpcContract(TempDirCase):
         self._patch(self.api.browser_order, "check_session",
                     lambda *a, **k: (False, "契约测试"))
         self._patch(self.api.notify_mod, "send_email", lambda *a, **k: (True, ""))
-        self._patch(self.api.launcher, "Grabber", mock.Mock())
+        self._patch(self.api.grabber, "Grabber", mock.Mock())
 
         # 网络禁卫：任何漏网的真实连接都失败（handler 会把它转成 error 响应）
         def _blocked(*_a, **_k):
@@ -12886,7 +12886,7 @@ class TestMonitorTaskEdit(unittest.TestCase):
     def test_create_task_rejects_empty_dates(self):
         api_mod = self._api()
         with mock.patch.object(api_mod, "push"), \
-                mock.patch.object(api_mod.launcher, "append_monitor_task") as m_app:
+                mock.patch.object(api_mod.grabber, "append_monitor_task") as m_app:
             r = api_mod.rpc_create_task({
                 "from": "郑州", "to": "上海", "dates": [], "date_range": [],
                 "trains": ["K1970"], "seat_types": ["硬座"],
@@ -13023,7 +13023,7 @@ class TestApiSaveGuards(TempDirCase):
                 mock.patch.object(
                     api_mod, "_req_on",
                     side_effect=lambda pp, k: bool(pp.get(k, False))), \
-                mock.patch.object(api_mod.launcher, "append_monitor_task",
+                mock.patch.object(api_mod.grabber, "append_monitor_task",
                                   side_effect=lambda t: captured.update(t)):
             r = api_mod.rpc_create_task({
                 "from": "郑州", "to": "上海", "dates": ["2026-10-20"],
@@ -13036,7 +13036,7 @@ class TestApiSaveGuards(TempDirCase):
     def test_save_grab_task_rejects_bad_number_and_missing_id(self):
         api_mod = self._api()
         self.assertFalse(api_mod.rpc_save_grab_task({"name": "x"}).get("ok"))
-        with mock.patch.object(api_mod.launcher, "load_grab_tasks",
+        with mock.patch.object(api_mod.grabber, "load_grab_tasks",
                                return_value=[]):
             r = api_mod.rpc_save_grab_task({"id": "a",
                                             "poll_seconds": "abc"})

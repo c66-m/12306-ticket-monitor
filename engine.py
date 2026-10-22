@@ -532,7 +532,7 @@ class MonitorEngine(object):
                             return self.state
                     # 原子写入：先写临时文件再替换，避免两线程同时写坏 state.json
                     # 临时名/重试/直写兜底语义由 appcommon 参数化保留；
-                    # 跨进程锁与 launcher.append_monitor_task 的 state 段互斥
+                    # 跨进程锁与 grabber.append_monitor_task 的 state 段互斥
                     try:
                         # 不用 fallback_direct：replace 重试耗尽时宁丢本轮落盘，
                         # 绝不直写——直写被强杀/打断会撕裂 state.json（单字符截断），

@@ -2,8 +2,8 @@
 """12306 抢票业务模块 —— 抢票引擎 / 任务库 / 车站搜索 / 与监控系统联动。
 
 2026-10-18 改名：launcher.py → grabber.py。原名暗示「启动器」，实际是核心抢票
-业务模块（Tkinter 启动器界面早已删除），名字与职责不符。调用方统一用
-`import grabber as launcher` 别名，避免数百处 `launcher.xxx` 调用点被迫改写。
+业务模块（Tkinter 启动器界面早已删除），名字与职责不符。调用方曾以
+launcher 为本模块别名；P4-B A-4 已清除别名，调用点统一写作 `grabber.xxx`。
 
 2026-10-13 界面重构：原「抢票启动器」独立界面已推翻，全部界面收敛进
 Tkinter 单窗口面板（朴素 ttk，无主题/无图片/无动画；该界面现已是
@@ -16,7 +16,7 @@ legacy/gui.py）。本模块只保留不依赖 tkinter 的业务能力：
     5. 联动：append_monitor_task（写入监控系统任务表）、merge_trains_from_monitor
     6. 其他：更新检查、日期区间解析、乘车人首跑导入
 
-调用约定：界面侧所有对本模块的调用都走 `launcher.xxx` 限定名（别名），
+调用约定：界面侧所有对本模块的调用都走 `grabber.xxx` 限定名，
 测试 patch 模块属性即可生效（与旧口径一致）。
 
 （历史上本文件兼有 tkinter 界面，重构后界面全部删除；旧版备份在
@@ -55,7 +55,7 @@ except ImportError:
 import passengers as passengers_mod
 import ticket
 
-import grabber_utils as launcher_utils
+import grabber_utils
 from grabber_utils import (
     SEAT_OPTIONS, SEAT_ORDER, MONITOR_SEAT_CHOICES,
     FONT, _DEFAULT_LC, PURPOSE_LABELS, LABEL_TO_PURPOSE,

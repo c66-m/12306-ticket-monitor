@@ -16,8 +16,8 @@ import traceback
 
 from rpc.common import (_warn, push)
 
-import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
-import grabber_utils as launcher_utils
+import grabber
+import grabber_utils
 import ticket
 import appcommon
 
@@ -37,7 +37,7 @@ def rpc_save_grab_task(p):
                 p[k] = float(p[k])
             except (TypeError, ValueError):
                 return {"ok": False, "error": "参数 %s 必须是数字" % k}
-    tasks = launcher.load_grab_tasks()
+    tasks = grabber.load_grab_tasks()
     found = False
     for i, t in enumerate(tasks):
         if t.get("id") == tid:
@@ -46,7 +46,7 @@ def rpc_save_grab_task(p):
             break
     if not found:
         tasks.append(p)
-    launcher.save_grab_tasks(tasks)
+    grabber.save_grab_tasks(tasks)
     return {"ok": True}
 
 def rpc_rename_grab_task(p):
@@ -55,11 +55,11 @@ def rpc_rename_grab_task(p):
     name = (p.get("name") or "").strip()
     if not name:
         return {"ok": False, "error": "名称不能为空"}
-    tasks = launcher.load_grab_tasks()
+    tasks = grabber.load_grab_tasks()
     for t in tasks:
         if t.get("id") == tid:
             t["name"] = name
-            launcher.save_grab_tasks(tasks)
+            grabber.save_grab_tasks(tasks)
             return {"ok": True, "name": name}
     return {"ok": False, "error": "抢票任务不存在"}
 
@@ -68,8 +68,8 @@ def rpc_delete_grab_task(p):
     if not tid:
         # 空 id 会命中「所有无 id 任务」，一次误调用清空老任务
         return {"ok": False, "error": "缺少任务 id"}
-    tasks = [t for t in launcher.load_grab_tasks() if t.get("id") != tid]
-    launcher.save_grab_tasks(tasks)
+    tasks = [t for t in grabber.load_grab_tasks() if t.get("id") != tid]
+    grabber.save_grab_tasks(tasks)
     return {"ok": True}
 
 # ---------------- 抢票引擎 ----------------
@@ -78,14 +78,14 @@ _grabbers = {}  # id -> Grabber
 
 def rpc_start_grab(p):
     tid = p.get("id")
-    tasks = launcher.load_grab_tasks()
+    tasks = grabber.load_grab_tasks()
     task = next((t for t in tasks if t.get("id") == tid), None)
     if not task:
         return {"ok": False, "error": "抢票任务不存在"}
     g = _grabbers.get(tid)
     if g and g.is_alive():
         return {"ok": False, "error": "任务已在抢票中"}
-    g = launcher.Grabber(dict(task))
+    g = grabber.Grabber(dict(task))
     g.start()
     _grabbers[tid] = g
     return {"ok": True}
@@ -103,7 +103,7 @@ def rpc_grab_ticker(_p):
     import datetime as _dt
     now = _dt.datetime.now()
     out = []
-    for t in launcher.load_grab_tasks():
+    for t in grabber.load_grab_tasks():
         tid = t.get("id")
         g = _grabbers.get(tid)
         # 编辑弹窗回填依赖 from/to/fromCode/date/start_time 等全量字段，
@@ -130,15 +130,15 @@ def rpc_grab_ticker(_p):
             t["result_msg"] = msg or ""
             t["result_at"] = item["result_at"]
             try:
-                tasks = launcher.load_grab_tasks()
+                tasks = grabber.load_grab_tasks()
                 for i, x in enumerate(tasks):
                     if x.get("id") == tid:
                         tasks[i] = t
                         break
-                launcher.save_grab_tasks(tasks)
+                grabber.save_grab_tasks(tasks)
             except Exception as e:
                 _warn("抢票结果回写任务库", e)
-        st = launcher_utils.parse_dt(str(t.get("start_time") or ""))
+        st = grabber_utils.parse_dt(str(t.get("start_time") or ""))
         armed = bool(st and st > now)
         item["armed"] = armed
         if st:
@@ -147,7 +147,7 @@ def rpc_grab_ticker(_p):
                 lead = max(0, int(t.get("warm_minutes") or 10)) * 60
             except (TypeError, ValueError):
                 lead = 0
-            cd = launcher_utils.fmt_countdown(abs(diff))
+            cd = grabber_utils.fmt_countdown(abs(diff))
             if diff > lead:
                 item["countdown"] = ("距开抢 " + cd) + (" (自动开抢)" if armed else "")
             elif diff > 0:
@@ -263,17 +263,17 @@ def _armed_loop():
         time.sleep(2)
         try:
             now = _dt.datetime.now()
-            for t in launcher.load_grab_tasks():
+            for t in grabber.load_grab_tasks():
                 tid = t.get("id")
                 if tid in _armed_fired:
                     continue
-                st = launcher_utils.parse_dt(str(t.get("start_time") or ""))
+                st = grabber_utils.parse_dt(str(t.get("start_time") or ""))
                 if not st:
                     continue
                 lead = _armed_prepare_lead(t)
                 if (st - now).total_seconds() > lead:
                     # 提前 max(3min, warm_minutes) 启动：Grabber 起来后先登录+预热，
-                    # 由 launcher 预热段等到开抢点再下单
+                    # 由 grabber 预热段等到开抢点再下单
                     continue
                 if (now - st).total_seconds() > max(90, lead):
                     _armed_fired.add(tid)  # 窗口已过，缴械
@@ -290,35 +290,35 @@ def _armed_loop():
             _warn("自动开抢轮询", e)
 
 def rpc_search_station(p):
-    """p = {q} → 本地模糊搜索车站（launcher.search_stations：拼音/简拼/电报码）。"""
+    """p = {q} → 本地模糊搜索车站（grabber.search_stations：拼音/简拼/电报码）。"""
     q = (p.get("q") or "").strip()
     if not q:
         return {"stations": []}
-    hits = launcher.search_stations(q, limit=8)
+    hits = grabber.search_stations(q, limit=8)
     # kind：该站探测到的车次类型（"高铁"/"普速"/组合），没探测过是空串，仅作展示
     return {"stations": [{"name": h["name"], "code": h["code"],
-                          "kind": launcher.station_kind(h["code"])} for h in hits]}
+                          "kind": grabber.station_kind(h["code"])} for h in hits]}
 
 def rpc_list_presets(_p):
-    cfg = launcher.load_launcher_config()
+    cfg = grabber.load_launcher_config()
     return {"presets": cfg.get("presets") or [],
             "station_history": cfg.get("station_history") or [],
             "query_history": cfg.get("query_history") or []}
 
 def rpc_delete_preset(p):
     """p = {name}：删除常用行程预设。"""
-    cfg = launcher.load_launcher_config()
+    cfg = grabber.load_launcher_config()
     name = p.get("name")
     before = cfg.get("presets") or []
     cfg["presets"] = [x for x in before if not (isinstance(x, dict) and x.get("name") == name)]
     if len(cfg["presets"]) == len(before):
         return {"ok": False, "error": "预设不存在：" + str(name)}
-    appcommon.atomic_write_json(launcher.LAUNCHER_CFG_PATH, cfg)
+    appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
     return {"ok": True}
 
 def rpc_save_preset(p):
     """p = {name, from, to, ...}"""
-    cfg = launcher.load_launcher_config()
+    cfg = grabber.load_launcher_config()
     presets = cfg.setdefault("presets", [])
     name = p.get("name") or ("预设 %d" % (len(presets) + 1))
     p["name"] = name
@@ -328,5 +328,5 @@ def rpc_save_preset(p):
             break
     else:
         presets.append(p)
-    appcommon.atomic_write_json(launcher.LAUNCHER_CFG_PATH, cfg)
+    appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
     return {"ok": True}

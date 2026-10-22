@@ -15,7 +15,7 @@ import traceback
 
 from rpc.session import current_session
 
-import grabber_utils as launcher_utils
+import grabber_utils
 import passengers as passengers_mod
 import order as order_mod
 
@@ -25,8 +25,8 @@ def rpc_list_passengers(_p):
     """列表接口：证件号 / 手机号一律脱敏，明文只在 passengerDetail 按需取。"""
     pax = passengers_mod.load_passengers()
     stamp = passengers_mod.passengers_stamp()
-    safe = [dict(x, id_no=launcher_utils.mask_id(x.get("id_no")),
-                 mobile=launcher_utils.mask_mobile(x.get("mobile"))) for x in pax]
+    safe = [dict(x, id_no=grabber_utils.mask_id(x.get("id_no")),
+                 mobile=grabber_utils.mask_mobile(x.get("mobile"))) for x in pax]
     return {"passengers": safe, "stamp": stamp}
 
 def rpc_passenger_detail(p):

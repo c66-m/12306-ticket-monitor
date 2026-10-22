@@ -15,7 +15,7 @@ import traceback
 
 from rpc.common import (_task_defaults, _warn, delete_task_everywhere, engine_running, get_engine, load_config, load_state, push, start_engine, stop_engine, update_state_locked)
 
-import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
+import grabber
 import ticket
 import engine as engine_mod
 import appcommon
@@ -53,7 +53,7 @@ def rpc_list_monitor_tasks(_p):
             "trains": t.get("trains") or [],
             "seat_types": t.get("seat_types") or [],
             "seat_priority": t.get("seat_priority") or "",
-            # 落盘字段名是 purpose_code / passenger_names（见 launcher_utils.build_monitor_task）；
+            # 落盘字段名是 purpose_code / passenger_names（见 grabber_utils.build_monitor_task）；
             # 早先这里读 t["purpose"] / t["passengers"] 恒为空 → 编辑弹窗回填不出票种和乘车人，
             # 用户保存一次就把乘车人清空了
             "purpose": t.get("purpose_code") or "ADULT",
@@ -161,7 +161,7 @@ def rpc_create_task(p):
         # 在创建时就拦下，前端能直接看到原因（前端 dateSpan 对倒置区间返回 []）。
         return {"ok": False,
                 "error": "监控日期为空：结束日期不能早于开始日期，请重新选择"}
-    task = launcher.build_monitor_task(
+    task = grabber.build_monitor_task(
         str(p.get("from") or ""), str(p.get("to") or ""),
         dates, date_range,
         trains, seats, pax_names,
@@ -177,7 +177,7 @@ def rpc_create_task(p):
                 push("log", {"line": "[提醒] 首选席别：%s" % warn, "tag": "warn"})
         except Exception as e:
             _warn("首选席别解析", e)
-    launcher.append_monitor_task(task)
+    grabber.append_monitor_task(task)
     if _req_on(p, "start_now"):
         start_engine()
         get_engine().set_task_status(task, "monitoring", "新建任务立即启动", force=True)

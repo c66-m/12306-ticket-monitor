@@ -691,7 +691,7 @@ def _clear_task_state(name):
 
 # ----------------------------- 菜单 4：乘车人管理 -----------------------------
 
-# 口径单源在 appcommon.mask_id_partial（与 launcher_utils.mask_id 是两种口径，
+# 口径单源在 appcommon.mask_id_partial（与 grabber_utils.mask_id 是两种口径，
 # 勿混用）；别名保留，调用点不变。
 _mask_id = appcommon.mask_id_partial
 

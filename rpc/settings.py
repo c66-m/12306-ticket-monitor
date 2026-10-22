@@ -16,22 +16,22 @@ import traceback
 
 from rpc.common import (TASK_DEFAULTS_DEF, _STAMP_UNSET, _config_stamp, _task_defaults, _warn, load_config, normalize_email_settings, update_config_locked)
 
-import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
-import grabber_utils as launcher_utils
+import grabber
+import grabber_utils
 import notify as notify_mod
 
 def rpc_ip_locate(_p):
     """本机 IP 归属地（百度公开接口）。"""
-    return {"text": launcher_utils.ip_locate()}
+    return {"text": grabber_utils.ip_locate()}
 
 def rpc_check_update(_p):
     """检查更新（读 launcher_config.json 的 update_url；未配置时 has_new=False）。"""
-    lc = launcher.load_launcher_config()
-    has_new, ver, notes, download = launcher.check_update(lc)
+    lc = grabber.load_launcher_config()
+    has_new, ver, notes, download = grabber.check_update(lc)
     return {"has_new": bool(has_new), "version": ver or "",
             "notes": notes or "", "download": download or "",
             "configured": bool((lc.get("update_url") or "").strip()),
-            "current": getattr(launcher, "__version__", "")}
+            "current": getattr(grabber, "__version__", "")}
 
 # ---------------- 设置（SMTP + 会话 + order_mode） ----------------
 
@@ -60,7 +60,7 @@ def rpc_get_settings(_p):
 def rpc_save_settings(p):
     """p = {email?, order_mode?, poll_interval_seconds?, task_defaults?, expect_stamp?}。
 
-    expect_stamp 为 getSettings 下发的 stamp 时做乐观并发检查：抢票进程（launcher/
+    expect_stamp 为 getSettings 下发的 stamp 时做乐观并发检查：抢票进程（grabber/
     monitor）与设置页并发写 config.json 时，后写方不再静默覆盖前写方。
     """
     try:

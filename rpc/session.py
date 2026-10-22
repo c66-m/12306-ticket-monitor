@@ -15,7 +15,7 @@ import traceback
 
 from rpc.common import (_warn, engine_running, get_engine, load_config, push)
 
-import grabber_utils as launcher_utils
+import grabber_utils
 import order as order_mod
 import browser_order
 
@@ -177,7 +177,7 @@ def rpc_relogin(p):
                 res = {}
             if res.get("ok"):
                 try:
-                    who = launcher_utils.mask_mobile(res.get("name") or "") or "已登录"
+                    who = grabber_utils.mask_mobile(res.get("name") or "") or "已登录"
                 except Exception:
                     who = res.get("name") or "已登录"
                 push("log", {"line": "[会话] 会话仍然有效（%s），无需重新登录" % who, "tag": "ok"})
@@ -232,7 +232,7 @@ def rpc_get_account(_p):
         name = res.get("name") or ""
         if name:
             try:
-                name = launcher_utils.mask_mobile(name)
+                name = grabber_utils.mask_mobile(name)
             except Exception as e:
                 _warn("手机号掩码", e)
         return {"name": name or "已登录", "logged_in": True}

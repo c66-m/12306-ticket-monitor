@@ -18,8 +18,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import grabber as launcher          # 2026-10-18 改名：launcher.py → grabber.py（别名保持调用点不变）
-import grabber_utils as launcher_utils
+import grabber
+import grabber_utils
 import ticket
 import engine as engine_mod
 import passengers as passengers_mod
@@ -238,7 +238,7 @@ def start_engine():
         t.start()
         _engine_thread = t
         _engine_stop = stop_evt
-    launcher.log("[启动] 监控引擎已启动")
+    grabber.log("[启动] 监控引擎已启动")
     return True
 
 
@@ -265,7 +265,7 @@ def stop_engine():
     # stop_event，下一轮头即返回），或主循环本身还没轮到 break。前者之外
     # 的「仍在收尾」不等于任务会跑完一整轮（旧文案「在途任务未结束」会
     # 让人以为日志还要刷很久）。
-    launcher.log("[停止] 监控引擎%s" % ("仍在收尾（在途任务跑完当轮即停）" if alive else "已停止"))
+    grabber.log("[停止] 监控引擎%s" % ("仍在收尾（在途任务跑完当轮即停）" if alive else "已停止"))
     return not alive
 
 
@@ -300,9 +300,9 @@ def _mark_running_tasks_paused():
     try:
         update_state_locked(_set)
         if changed[0]:
-            launcher.log("[停止] %d 个任务已标记暂停（引擎已停止）" % changed[0])
+            grabber.log("[停止] %d 个任务已标记暂停（引擎已停止）" % changed[0])
     except Exception as e:
-        launcher.log("[停止] 标记任务暂停失败：%s" % e)
+        grabber.log("[停止] 标记任务暂停失败：%s" % e)
     return changed[0]
 
 
@@ -329,9 +329,9 @@ def _resume_stopped_tasks():
     try:
         update_state_locked(_set)
         if changed[0]:
-            launcher.log("[启动] %d 个任务自动恢复监控" % changed[0])
+            grabber.log("[启动] %d 个任务自动恢复监控" % changed[0])
     except Exception as e:
-        launcher.log("[启动] 任务自动恢复失败：%s" % e)
+        grabber.log("[启动] 任务自动恢复失败：%s" % e)
     return changed[0]
 
 
@@ -342,7 +342,7 @@ def _auto_start_engine():
     顺序反了引擎读到的是旧的 paused。
     """
     if not load_config().get("auto_start_engine", True):
-        launcher.log("[启动] auto_start_engine=false，跳过自动启动引擎")
+        grabber.log("[启动] auto_start_engine=false，跳过自动启动引擎")
         return False
     _resume_stopped_tasks()
     return start_engine()
@@ -363,21 +363,21 @@ def _log_tag(record):
 
 
 def log_pump():
-    """把 launcher.LOGQ 的日志成批推给前端（150ms 一窗）。
+    """把 grabber.LOGQ 的日志成批推给前端（150ms 一窗）。
 
     逐行推送时每条日志都是一次 IPC + 前端一次同步 reflow，日志密集时会
     一起卡；攒批后一次 DOM 插入只滚一次（2026-10-19 审查）。
     """
     while True:
         try:
-            first = launcher.LOGQ.get(timeout=0.3)
+            first = grabber.LOGQ.get(timeout=0.3)
         except queue.Empty:
             continue
         batch = [first]
         deadline = time.time() + 0.15
         while time.time() < deadline:
             try:
-                batch.append(launcher.LOGQ.get_nowait())
+                batch.append(grabber.LOGQ.get_nowait())
             except queue.Empty:
                 time.sleep(0.02)
         items = [{"line": r, "tag": _log_tag(r)} for r in batch]

@@ -88,7 +88,7 @@ EMU_SEAT_ALIAS = {"WZ": "O"}
 
 
 def is_emu_code(train_code):
-    """车次号首字母判动车组（与 launcher.is_emu 同口径）。"""
+    """车次号首字母判动车组（与 grabber.is_emu 同口径）。"""
     return str(train_code or "")[:1].upper() in ("G", "D", "C")
 
 
