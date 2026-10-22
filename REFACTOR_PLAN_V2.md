@@ -10,7 +10,7 @@
 | 项 | 实测 |
 |---|---|
 | ui/app.js | 108,807 字节（≈106KB），ui/ 下仅此一个 JS |
-| api.py | 72,153 字节，METHODS 表 37 个 RPC 方法，命名空间已就位 |
+| api.py | 72,153 字节，METHODS 表 39 个 RPC 方法（实测，计划初稿的 37 与单测 docstring 的 41 均已过时），命名空间已就位 |
 | electron/preload.js | 1,290 字节 |
 | tests/test_all.py | 855 个用例；tests/unit、tests/contract、tests/integration 已部分分层且全绿 |
 | tools/ | check.py、shadow_report.py、verify_dualwrite.py 均已存在 |
@@ -42,7 +42,7 @@
 - **push 推送通道本期不做**。原因：api.py 为 HTTP 请求-响应，push 的传输（SSE/WebSocket）、事件序号、断线重连后全量快照三件事未定案；本地单用户场景现有轮询够用。待三件事写成设计并评审后再排期，不阻塞 A 线其余项。
 
 ### A-3a api.py 按域拆分（行为不变）
-- 内容：37 方法按域落 7 个文件（tasks/grab/orders/passengers/settings/history/session），`api.py` 变启动壳 + 门面：**re-export 全部旧符号**，外部 import 路径零变化。
+- 内容：39 方法按域落 7 个文件（tasks/grab/orders/passengers/settings/history/session），`api.py` 变启动壳 + 门面：**re-export 全部旧符号**，外部 import 路径零变化。
 - 验收：`tests/unit/test_rpc_namespace.py` 等 52 个相关 unit 测试**零改动**全过；全量回归失败集不扩大。若拆分被迫改测试，先停下来修耦合，不硬拆。
 
 ### A-3b 统一错误协议（与 A-3a 分开提交、分开上线）
