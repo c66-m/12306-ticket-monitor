@@ -50,6 +50,7 @@
 ### A-3b 统一错误协议（与 A-3a 分开提交、分开上线）
 - 内容：RPC 错误统一为 `{code, message, evidence}`；api 侧与前端（含 A-1 拆分后的各 page 模块）、preload 同批适配。
 - 约束：协议变更是行为变更，单独提交；上线前前端所有调用点的错误处理逐个核对，不留旧形状假设。
+- evidence 口径（施工定案，rpc/common.py 的 reply() docstring 为准）：白名单仅三类——方法名 `method`、异常类名 `exc_type`、原因类别常量 `reason`（如 `invalid_json`/`not_object`）；**禁止**放入请求 params 的任何内容（乘车人等 PII），message 文案与旧版逐字不变。
 
 ### A-4 测试四层迁移 + legacy 清理
 - 前置：先全仓 grep 生成**真实引用清单**（谁 import legacy、共几处、每处测什么），以清单为准估工作量与排期（此前口头数字 49 用例/198 行与仓库实测对不上，不作依据）。
@@ -83,3 +84,13 @@
 - 每项完成后跑：`python tools/check.py` + 分层测试 + test_all，失败集与 §0 基线比对并留记录。
 - B 线任一门槛未达，不提前施工、不口头放行；A 线做完即停下评估，B 线按证据另行启动。
 - 施工中发现与本计划书冲突的事实，先更新计划书再继续，不默默偏离。
+
+## 5. 执行状态（2026-10-23 本轮收尾，分支 refactor/p4b-a）
+
+- A-1 ✅（d350d0a）：ui 拆 16 个 ES Module，符号零丢失、import 图无环，Electron 33.4.11 无头冒烟过；**最终验收待用户 Windows 真机**（五页逐个点开＋一次真实 RPC 往返）。
+- A-2 ✅（a9b7e33）：preload 映射 39 对（实测数，非初稿 37）；push 仍按计划暂缓。
+- A-3a ✅（5f23741）：api.py 1719 行→门面 278 行＋rpc/ 八文件，AST 逐字对账 0 差异（别名提交后的限定名差异除外）；门面 `__setattr__` 传播垫片经独立评审实跑验证。
+- A-3b ✅（8bbff0a）：信封 `{code,message,evidence}` 四场景落地，前端零感知（main.js 转 Error(message)），11 个协议用例更新。
+- A-4 ◐（8edd23f／6a82e89／ed92649）：gui 引用三遍处置完成——re-point 23 例、删纯死 UI 74 例（855→781）、launcher 别名清除（仓外 `api.launcher` 随之消失，有意不兼容）。**未完两件**：① 钉住 5 个现行语义缺口的 19 例 HOLD 保留（清单见 A4_GUI_CLASSIFICATION.md 风险清单 #8/#13/#14/#15/#16），等用户裁决（修生产代码恢复旧语义，或接受新语义后删 pin）；legacy/gui.py 因此**尚未删除**，删 legacy 的前置动作清单在分类文件文末。② test_all 其余用例逐类迁四层属长尾，本轮只处理了 gui 耦合部分，后续增量推进。
+- 独立评审（598250e..ed92649，六个面）：**GO-with-notes**，零 Critical/Important，3 条 Minor 均为文档口径对齐（已随本节回填）。
+- B 线：门控未开，本轮未施工；`_classify_session` 存量 bug 仍按 B-1 前置修复登记在案（A-3a 原样保留）。

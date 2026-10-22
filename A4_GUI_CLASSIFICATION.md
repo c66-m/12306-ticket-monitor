@@ -351,3 +351,13 @@
 1. **TestTask75Gui**（`test_load_config_corrupt_warns_once`、`test_update_state_locked_non_dict_state`）：机械结果在 rpc/appcommon 层有等价物，断言却落在 legacy 独有的 LOG 警告通道上。本文按"断言对象即被测语义"判删；若产品意图是 rpc 侧也应有同等可见的警告（如给 `rpc.common.load_config` 补 `non_dict` 钩子、给 `update_state_locked` 补 `on_non_dict`），则应先补生产代码再判迁。这取决于对 rpc 警告通道的产品要求，我无法从代码单独判定。
 2. **TestTask84LauncherP3 的 (b) 例与 TestTask103LauncherGuiP3 的 (d) 例**：损坏/非 dict 拒写的核心断言（RuntimeError＋mutator 不执行＋不覆写）在 rpc 侧全部成立，只有 `messagebox.showerror` 一条断言不成立。本文按"弹窗为共同主断言"判删；若接受去掉弹窗断言，两例可改判迁（改 patch 目标到 `rpc.common.CONFIG_PATH`）。这是口径选择题。
 3. **TestLockedRMW 的 `test_gui_save_config_still_writes_standalone`**：本文判删（rpc 无 save_config）。另一选项是改指 `monitor.load_config/save_config` 对，但被测对象就从 gui 变成 monitor、且 monitor 版带指纹守卫语义，属"换被测对象"而非 re-point；是否接受取决于对这条回归 pin 的定位。
+
+---
+
+## 执行注记（2026-10-23，执行结果与上文裁决的出入对齐）
+
+上文裁决为盘点时口径，实际执行有两处更保守的调整，提交信息已逐条交代，此处对齐文档：
+
+1. **判「删」中的 19 例改为 HOLD 保留**：凡钉住现行产品真实语义缺口的用例（风险清单 #8 seats_by_date 编辑丢失、#13 auto fail-open、#14 _armed_loop 置位时机、#15 删任务不停线程、#16 存预设不归一化）一律扣下未删——TestValidateAutoNoModal 7、TestTask55AutoFired 5、TestTask74Launcher::test_delete_task_stops_grabber_thread、TestTask75Gui 的 2 个 test_build_edited_task_*、TestTask103 (a) 组 3、TestTask104::test_save_preset_safe_after_sanitized_load。等用户裁决（修生产代码或接受新语义）后再处置；legacy/gui.py 的删除随之顺延。
+2. **「拿不准」#2 的 2 例改判迁**：TestTask84 (b) 与 TestTask103 (d) 改指 rpc_common.update_config_locked，仅删去 messagebox.showerror 一条弹窗断言，拒写核心断言（RuntimeError＋mutator 不执行＋不覆写）全保留。
+3. 实际执行数：re-point 23 例、删除 74 例（855→781），与独立评审的 AST 差集复核精确一致。
