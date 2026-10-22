@@ -25,7 +25,7 @@
 - **下单结果判定不回读页面文本/URL，只看官方订单接口**：`order.py` 的 `classify_order_status`（三元组）+ `classify_with_time`（四元组，多一个 `recent`=下单时间落在本次提交窗口内的订单）。engine 与 launcher 的 dup/ambiguous 分支统一走 `classify_with_time(..., not_before_ts=attempt_ts)`。
 - ambiguous（提交后结果未知，如关网页丢了成功信号）三态：①官方 unpaid 且 recent 非空 → **本次提交成功**（dedup=SUBMITTED，下单时间入账/通知）；②官方 none/cancelled → 确认无订单，**安全重试**（launcher 最多 3 次后停，engine 直接 continue 下轮）；③其余（error/unknown/blocked/更早旧单）→ 保守停任务交人工，防重复下单。
 - dup（页面判重）三态：先排除「行程冲突」（`dup_kind=="行程冲突"` 永不判成功）；其余回读 —— paid=已支付、unpaid+recent=本次提交成功、unpaid 无 recent=账号更早遗留订单（ACCOUNT_DUP，请核对支付）、none/cancelled=清除本地记录继续抢。
-- 归因窗口 `find_recent_order(..., window_sec=180)`：订单 `order_ts` ≥ 本次发起时刻 - 180 秒才算「本次生成」；`_normalize_order_item` 解析 `order_date`（下单时刻）出 `order_time`/`order_ts`，解析失败 `order_ts=None` 走保守分支（绝不判本次成功）。
+- 归因窗口 `find_recent_order(..., window_sec=30)`（2026-10-19 由 180 收紧）：订单 `order_ts` ≥ 本次发起时刻 - 30 秒才算「本次生成」；`_normalize_order_item` 解析 `order_date`（下单时刻）出 `order_time`/`order_ts`，解析失败 `order_ts=None` 走保守分支（绝不判本次成功）。
 - `engine.py` 启动恢复复核 orders.json（约 840 行）仍用三元组 `classify_order_status`，不参与时间归因（别改成四元组）。
 - **queryMyOrder 新参数（2026-10-07 实测，旧参数静默失效）**：必须带 `pageIndex=0&pageSize=8&query_where=G|H&sequeue_train_name=`，数据在 `data.OrderDTODataList`（不是 orderDBList）。窗口语义：H（历史）按**乘车日期**过滤且 EndDate 必须 ≤ 昨天（含今天整体空 body）；G（未出行）按**下单日期**过滤（窗口 [60 天前, 今天] 才能捞到全部未出行票）。未支付单走独立接口 queryMyOrderNoComplete（data.orderDBList）。
 - 真实字段结构（order.py `_normalize_order_item` 已适配）：`order_date`="2026-09-28 19:06:16" 精确下单时刻；`from_station_name_page`/`to_station_name_page` 是数组；乘客在 `array_passser_name_page`（官方拼写，passengerDTOList=null）；票状态只看 `tickets[].ticket_status_name`（已出站/已退票(业务流水号:...)/已支付），顶层 return_flag/resign_flag/pay_flag 恒同不可用。退票订单仍留在 G 列表，classify 归 cancelled（可重购）。

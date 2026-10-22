@@ -31,8 +31,15 @@ data/passengers.json
 data/grab_tasks.json
 data/session_cookies.json
 data/.browser_state.json
+# 问题台账（界面「问题日志」页数据源，含本机报错现场，不入库）
+data/problem_log.jsonl
+data/problem_log.jsonl.trim
 # data/ 下的一次性迁移备份（含全部隐私数据）
 data_migration_backup/
+# SQLite 双写镜像库（P0 起，data/app.db + WAL 日志，可再生产物不入库）
+data/app.db
+data/app.db-wal
+data/app.db-shm
 
 # ===== 开发调试产物（含个人测试数据，不上传）=====
 _*

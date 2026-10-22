@@ -18,6 +18,11 @@ import sys
 import threading
 import time
 
+# 时钟单源（infra 层）：beijing_tz 转发，既有调用点零改动
+from infra.clock import beijing_tz, now_ts as clock_now_ts, now_tz as clock_now_tz  # noqa: F401
+# 双写镜像（P0：JSON 为主、SQLite 为副；镜像失败只告警不阻断；仅正规数据路径）
+from adapters.store import dualwrite  # noqa: F401
+
 LOG = logging.getLogger("monitor")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -109,20 +114,9 @@ def mask_id_partial(id_no):
 
 
 # ----------------------------- 北京时间 -----------------------------
-
-def beijing_tz():
-    """北京时间时区：ZoneInfo("Asia/Shanghai")，Windows 无 tzdata 时退化固定 +8。
-
-    北京无夏令时，固定 +8 恒等于 Asia/Shanghai，退化后同样正确。收敛自
-    order._beijing_tz / logutil._beijing_tz（logutil 原先为避免反向依赖业务
-    模块而复制一份，appcommon 只依赖标准库 + filelock，无此顾虑）。
-    """
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo("Asia/Shanghai")
-    except Exception:
-        return datetime.timezone(datetime.timedelta(hours=8),
-                                 name="Asia/Shanghai")
+# 单源在 infra/clock.beijing_tz（模块顶部已转发导入）。坐标说明：
+# order._beijing_tz / logutil._beijing_tz 原先各自复制实现，均已转发到
+# appcommon.beijing_tz 再向前转发，链路末端统一落在 infra/clock。
 
 
 # ----------------------------- 展示归一化 -----------------------------
@@ -254,6 +248,11 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
         os.chmod(tmp, mode)
     replace_with_retry(tmp, path, tries=replace_tries, delay=replace_delay,
                        fallback_direct=fallback_direct)
+    # 双写镜像（P0）统一锚在最底层：任何写者（write_state / update_state_locked /
+    # engine 直写 state / append_history / upsert_order）都经过这里，保证不漏
+    # （2026-10-20 实测：engine _save_state 的直写路径曾绕过 write_state 挂点，
+    # 新增任务未进镜像库）。dualwrite 内部已兜底，镜像失败只告警。
+    dualwrite.mirror_written(path, obj)
     # 写后兜底清：进程在"写 tmp → replace"之间崩溃会留下残留 tmp 文件，
     # 下次成功写完顺手清理本路径的过期残留（只删旧文件，不碰它进程正在写的）。
     try:
@@ -423,7 +422,7 @@ def _read_orders_db(path):
 
 
 def write_state(path, state, *, tmp_kind="tmp", fallback_direct=False):
-    """原子写 state.json（见 atomic_write_json）。"""
+    """原子写 state.json（见 atomic_write_json，镜像钩子在最底层统一挂）。"""
     atomic_write_json(path, state, tmp_kind=tmp_kind,
                       fallback_direct=fallback_direct)
 
@@ -486,6 +485,7 @@ def append_history(path, record, keep=500):
                             return
             history.append(record)
             atomic_write_json(path, history[-keep:])
+            # 镜像钩子在 atomic_write_json 最底层（dualwrite.mirror_written）
     except TimeoutError as e:
         LOG.warning("[数据] order_history.json 锁争用超时，"
                     "本条历史记录跳过: %s", e)
@@ -506,6 +506,11 @@ def _load_orders_impl(path):
     try:
         with open(path, encoding="utf-8-sig") as f:
             db = json.load(f)
+    except OSError as e:
+        # 瞬时占用（另一进程正在写/杀软扫描）不是坏档：放弃本次读取，
+        # 绝不隔离——否则健康订单库会被挪走，防重记录全丢（2026-10-19 审查）。
+        LOG.warning("[数据] orders.json 被占用，本次跳过读取：%s", e)
+        return {"orders": {}}, False
     except Exception as e:
         decision, bad = _quarantine_decision(path, stat_fingerprint(path))
         if decision == "quarantined":
@@ -571,6 +576,7 @@ def upsert_order(path, key, rec):
                 rec["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 db["orders"][key] = rec
                 atomic_write_json(path, db)
+                # 镜像钩子在 atomic_write_json 最底层（dualwrite.mirror_written）
     except TimeoutError as e:
         LOG.warning("[数据] orders.json 锁争用超时，本条订单记录跳过: %s", e)
         return
@@ -742,6 +748,41 @@ def update_config_locked(path, mutator, *, expect_fingerprint=_STAMP_UNSET,
         return result if return_result else True
 
 
+def drop_dedup_state(state):
+    """丢弃旧 state 的防重数据（功能已下线，数据不再参与任何判断）。
+
+    旧版有两种落盘形态：早期把「区间|日期|车次|席别」平铺在顶层，后期收进
+    dedup 节。两种都在这里一次清掉，避免死数据被反复写回、越积越多。
+    engine 的读路径与 grabber 的写路径共用本函数（单点口径）。
+    """
+    if not isinstance(state, dict):
+        return state
+    state.pop("dedup", None)
+    for k in [k for k in state if isinstance(k, str) and "|" in k]:
+        del state[k]
+    return state
+
+
+def remove_task_from_config(config, task):
+    """从配置删除一个任务：有 uid 按 uid 删；无 uid 只删第一个同名。
+
+    单点口径（api / legacy/gui 共用）：编辑任务 = 先建后删，任务名不含
+    日期，改日期后新旧同名——按名字删全部会把刚建的新任务一起删掉。
+    """
+    uid = task.get("uid")
+    name = task.get("name")
+    tasks = list(config.get("tasks") or [])
+    if uid and any(t.get("uid") == uid for t in tasks):
+        config["tasks"] = [t for t in tasks if t.get("uid") != uid]
+        return config
+    for idx, t in enumerate(tasks):
+        if t.get("name") == name:
+            tasks.pop(idx)
+            break
+    config["tasks"] = tasks
+    return config
+
+
 def update_state_locked(path, mutator, *, read_state, tmp_kind="tmp",
                         on_non_dict=None):
     """锁内读-改-写 state.json。
@@ -753,6 +794,18 @@ def update_state_locked(path, mutator, *, read_state, tmp_kind="tmp",
     """
     with filelock.file_lock(path + ".lock"):
         state = read_state(path)
+        if not isinstance(state, dict) or state == {}:
+            # 注入的读实现（engine.load_state_file）会把读失败吞成 {}，与
+            # "文件本来就是空对象" 无法区分。文件存在时复核一次原始 JSON：
+            # 解析失败就拒写，避免 mutator 作用在空状态上整份覆写，把其它
+            # 任务的 status/retry 清空（2026-10-19 审查）。
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8-sig") as f:
+                        json.load(f)
+                except Exception as e:
+                    raise RuntimeError(
+                        "state.json 读取失败，本次写入已取消：%s" % e)
         if not isinstance(state, dict):
             if on_non_dict is not None:
                 on_non_dict(state)
@@ -776,7 +829,11 @@ def normalize_email_settings(email):
         from_addr = user
     email["username"] = user
     email["from"] = from_addr
-    to_list = [x.strip() for x in (email.get("to") or []) if x.strip()]
+    raw_to = email.get("to") or []
+    if isinstance(raw_to, str):
+        # 单字符串曾被逐字符迭代，报出「a、@、b…」这种误导性错误
+        raw_to = re.split(r"[,，;；\s]+", raw_to)
+    to_list = [str(x).strip() for x in raw_to if str(x).strip()]
     bad = [x for x in to_list if not EMAIL_RE.match(x)]
     if bad:
         raise ValueError("收件人格式不正确：%s" % "、".join(bad))

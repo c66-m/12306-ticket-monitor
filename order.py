@@ -229,11 +229,12 @@ def parse_bj_wall(s):
     return dt.replace(tzinfo=_BJ_TZ).timestamp()
 
 
-def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, window_sec=180):
+def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, window_sec=30):
     """时间戳归因：在订单列表里找「本行程 + 下单时间落在本次提交窗口内」的订单。
 
     not_before_ts 是软件本次发起下单动作的时刻（epoch 秒）。订单的 order_ts 若
-    大于 not_before_ts - window_sec（允许少量时钟/接口延迟），即可判定该订单是
+    大于 not_before_ts - window_sec（只容忍少量时钟偏差；旧值 180s 会把上一轮
+    失败的旧单判成本次成功，2026-10-19 审查收紧到 30s），即可判定该订单是
     本次提交生成的；更早的就是遗留旧订单。
 
     上界：order_ts 大于 not_before_ts + 600 的订单一律跳过——"未来"的订单不
@@ -900,7 +901,7 @@ def _dash_date(s):
     return s
 
 
-def order_ticket(config, task, ticket, seat_name):
+def order_ticket(config, task, ticket, seat_name, should_stop=None):
     """
     完整下单入口。成功返回 (True, 描述, 额外信息)，失败返回 (False, 错误, None)。
     描述中带订单号（尽力获取）。state 写入由调用方负责。
@@ -908,13 +909,15 @@ def order_ticket(config, task, ticket, seat_name):
     config["order_mode"] == "browser" 时转交 browser_order，用真实 Edge 下单：
     纯 HTTP 的 confirmSingleForQueue 会被易盾设备指纹 / 阿里云验证拦住
     （服务端伪装成「余票不足 / 系统繁忙」），浏览器才不会。
+    should_stop 一路透传，让浏览器链的滑块等待/付款页驻留可被停止事件打断。
     """
     if (config.get("order_mode") or "http") == "browser":
         try:
             import browser_order
         except ImportError:
             return False, "已配置 order_mode=browser，但缺少 browser_order 模块", None
-        return browser_order.order_ticket_via_browser(config, task, ticket, seat_name)
+        return browser_order.order_ticket_via_browser(
+            config, task, ticket, seat_name, should_stop=should_stop)
 
     sess = load_session(config.get("session_cookies_file", "session_cookies.json"))
     ok, who = check_login(sess)

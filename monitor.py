@@ -662,10 +662,9 @@ def menu_task_ops():
             eng.set_task_status(task, "cancelled", "用户手动取消")
             print("  已取消（任务保留在列表中，可删除）。")
     elif op == "4":
-        if ask_yes_no("  确认重置「%s」状态并清除其防重下单记录？" % task["name"], "n"):
-            eng.empty_task_dedup(task)
+        if ask_yes_no("  确认重置「%s」状态为监控中？" % task["name"], "n"):
             eng.set_task_status(task, "monitoring", "已重置")
-            print("  已重置为监控中，防重记录已清除。")
+            print("  已重置为监控中。")
     elif op == "5":
         if ask_yes_no("  确认从配置中删除任务「%s」？" % task["name"], "n"):
             del config["tasks"][idx]

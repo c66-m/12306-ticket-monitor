@@ -372,20 +372,8 @@ def _build_edited_task(task, *, from_name, to_name, dates, date_range, trains,
 
 
 def remove_task_from_config(config, task):
-    """从配置中删除一个任务：有 uid 按 uid 删除；无 uid 的旧任务只删第一个
-    同名任务——避免重名时误删全部。"""
-    uid = task.get("uid")
-    name = task.get("name")
-    tasks = list(config.get("tasks") or [])
-    if uid and any(t.get("uid") == uid for t in tasks):
-        config["tasks"] = [t for t in tasks if t.get("uid") != uid]
-    else:
-        for idx, t in enumerate(tasks):
-            if t.get("name") == name:
-                tasks.pop(idx)
-                break
-        config["tasks"] = tasks
-    return config
+    """删除任务（单源在 appcommon：有 uid 按 uid 删，无 uid 只删第一个同名）。"""
+    return appcommon.remove_task_from_config(config, task)
 
 
 def delete_task_everywhere(app, task):
@@ -782,8 +770,7 @@ class TaskPage(ttk.Frame):
                 if messagebox.askyesno("确认", "确定取消任务「%s」？取消后不再监控。" % name, parent=self):
                     eng.set_task_status(task, "cancelled", "手动取消")
             elif action == "reset":
-                if messagebox.askyesno("确认", "确定重置「%s」并清除其防重下单记录？" % name, parent=self):
-                    eng.empty_task_dedup(task)
+                if messagebox.askyesno("确认", "确定重置「%s」为监控中？" % name, parent=self):
                     eng.set_task_status(task, "monitoring", "手动重置", force=True)
             elif action == "delete":
                 if messagebox.askyesno("确认", "确定从配置中删除任务「%s」？" % name, parent=self):

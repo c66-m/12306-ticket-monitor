@@ -56,9 +56,9 @@ NO_DATES_FALLBACK_INTERVAL = 300
 
 # 例行字段（last_poll/message/fail_streak）合并冲刷间隔（秒）：这些字段每轮
 # 必写但价值低（纯展示/计数），高频轮询下逐次落盘会造成多余的文件锁争用与
-# IO。改为打脏标，由主循环在此间隔内合并写一次；dedup/retry/status 等重要
+# IO。改为打脏标，由主循环在此间隔内合并写一次；retry/status 等重要
 # 事件仍立即 _save_state()，不参与节流（正确性不变）。
-_STATE_FLUSH_INTERVAL = 2.0
+_STATE_FLUSH_INTERVAL = 5.0
 
 # 任务并发执行上限：_run_task 平铺到 ThreadPoolExecutor，一个任务在下单/
 # 长查询阻塞时不再让其它任务排队等它。浏览器下单走 browser_order.exclusive()
@@ -78,15 +78,6 @@ STATUS_LABELS = {
 STATUS_COLORS = {}  # 预留；控制台不引入颜色库
 
 ACTIVE_STATUSES = ("monitoring", "retrying")
-
-DEDUPE_VALUES = {
-    "SUBMITTED": "已提交订单(未支付)",
-    "ACCOUNT_DUP": "账号已有订单(防重跳过)",
-    "NO_ORDER": "已记录(不自动下单)",
-    "MANUAL": "人工确认",
-    # 网页端下单页不下发该席别（如普速车的「无座」）：重试无用，永久跳过
-    "SEAT_UNAVAILABLE": "网页端不提供该席别(已跳过)",
-}
 
 LOG = logging.getLogger("monitor")
 
@@ -288,10 +279,19 @@ def future_dates(task, today=None):
 
 
 def dedup_key(task, date, train_code, seat_name, passenger_names):
-    """防重复唯一键：区间|日期|车次|席别|乘车人组合（排序后拼接）。"""
+    """下单目标唯一键：区间|日期|车次|席别|乘车人组合（排序后拼接）。
+
+    防重（dedup）已下线，本函数仍被 retry 冷却表、dup_streak 连击计数与日志
+    归因复用——这三个场景需要的是"同一个下单目标"，与是否重复下单无关。
+    名字沿用旧称，避免调用点与测试大范围改名。"""
     names = "|".join(sorted(passenger_names)) if passenger_names else "*"
     return "{0}|{1}|{2}|{3}|{4}|{5}".format(
         task["from"], task["to"], date, train_code, seat_name, names)
+
+
+def _drop_dedup(state):
+    """丢弃旧 state 的防重数据（单点实现已下沉到 appcommon.drop_dedup_state）。"""
+    return appcommon.drop_dedup_state(state)
 
 
 class MonitorEngine(object):
@@ -347,10 +347,14 @@ class MonitorEngine(object):
         # 例行字段写盘节流：_mark_state_dirty 置脏（last_poll/message 等低频高
         # 频写入点），主循环 _flush_state_if_dirty 在 _STATE_FLUSH_INTERVAL 内
         # 合并写。任何 _save_state() 都可能在过程中被 _run_task 的业务分支直接
-        # 调用（dedup/状态变更），因此该机制不改变"重要状态立即落盘"的语义。
+        # 调用（冷却/状态变更），因此该机制不改变"重要状态立即落盘"的语义。
         self._state_dirty = False
         self._last_state_flush = 0.0
         self.state = self._load_state()
+        # 外部写入基线：内存上次见到的磁盘 status/message。合并落盘时磁盘
+        # 与基线不同 ⇒ 其它进程（GUI/launcher）改过，磁盘优先，避免引擎把
+        # 用户刚点的暂停/取消整条覆盖（2026-10-19 审查）。
+        self._status_seen = _task_status_map(self.state)
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
         except OSError:
@@ -398,8 +402,14 @@ class MonitorEngine(object):
         LOG.setLevel(logging.INFO)
         for h in list(LOG.handlers):
             LOG.removeHandler(h)
+            try:
+                h.close()      # removeHandler 不关流：不 close 会泄漏日志文件句柄
+            except Exception:
+                pass
         LOG.addHandler(fh)
         LOG.addHandler(sh)
+        # 问题台账：WARNING 及以上落 data/problem_log.jsonl，供界面「问题日志」页
+        LOG.addHandler(logutil.ProblemLogHandler())
         LOG.propagate = False
 
     # ----------------------------- 状态持久化 -----------------------------
@@ -431,15 +441,15 @@ class MonitorEngine(object):
             if isinstance(err, OSError):
                 # 瞬时占用（另一进程正在写 state.json，读句柄撞车）：本次跳过
                 # 加载，不挪档、不重建、不落盘；_sync_state 会在文件变化后重载。
-                # 绝不能把健康文件当坏档隔离（旧行为丢防重记录）。
+                # 绝不能把健康文件当坏档隔离（旧行为会把任务状态一起丢掉）。
                 LOG.warning("state.json 被占用，本次跳过加载，稍后重试: %s", err)
                 old = getattr(self, "state", None)
                 state = old if isinstance(old, dict) else {}
             else:
                 LOG.warning("state.json 读取失败: %s", err)
                 # 读不出来 ≠ 空状态：挪档留证（时间戳名，见 appcommon.quarantine_corrupt），
-                # 再从空状态重建。丢 state 就是丢防重（dedup）记录，理论上会
-                # 重复下单——必须醒目提示去核对在途行程。
+                # 再从空状态重建。丢 state 会丢掉任务运行状态与冷却计数，
+                # 在途订单仍可能已生成——必须醒目提示去核对在途行程。
                 # 传入读失败瞬间（持锁内，由 read_state_or_none 在读取结束时抓取）
                 # 的指纹：若另一进程在此期间已写入健康文件，quarantine 会放弃
                 # 隔离，避免误伤（Task 33 TOCTOU 守卫；Task 72 修复"释放锁后现
@@ -455,16 +465,9 @@ class MonitorEngine(object):
                         "防重记录都在坏档里——请尽快到 12306「未支付订单」"
                         "核对在途行程，避免重复下单", bad)
                 state = {}
-        # 兼容旧版：把平铺的 "区间|日期|车次|席别" 键迁到 dedup 下
-        if "dedup" not in state:
-            dedup, tasks = {}, {}
-            for k, v in state.items():
-                if isinstance(k, str) and "|" in k:
-                    dedup[k] = v
-                else:
-                    tasks[k] = v
-            state = {"dedup": dedup, "tasks": tasks}
-        state.setdefault("dedup", {})
+        # 防重（dedup）已下线：旧 state 的 dedup 节与平铺防重键在加载时丢弃，
+        # 不再参与判断，也不再写回（见 _drop_dedup）。
+        _drop_dedup(state)
         state.setdefault("tasks", {})
         state.setdefault("retry", {})
         state = self._sanitize_state_tasks(state)
@@ -512,7 +515,8 @@ class MonitorEngine(object):
                                 getattr(self, "_deleted_names", None) or ())
                             snapshot = copy.deepcopy(
                                 _merge_state_for_save(
-                                    disk_state, state, tombstoned))
+                                    disk_state, state, tombstoned,
+                                    getattr(self, "_status_seen", None)))
                             break
                         except RuntimeError:  # 字典/集合并发修改导致的迭代异常
                             time.sleep(0.02)
@@ -552,6 +556,8 @@ class MonitorEngine(object):
                 LOG.warning("state.json 锁争用超时，本次跳过落盘，稍后重试: %s",
                             e)
                 return self.state
+        self._status_seen = _task_status_map(snapshot)
+        self._apply_merged_status(snapshot)
         try:
             self._state_mtime = os.path.getmtime(self.state_path)
         except OSError:
@@ -562,12 +568,28 @@ class MonitorEngine(object):
         self._last_state_flush = time.time()
         return self.state
 
+    def _apply_merged_status(self, snapshot):
+        """把合并结果的 status/message 同步回内存条目（就地改，保引用）。
+
+        外部写入（用户暂停/取消）已写盘：若内存不同步，下一轮 _save_state
+        会拿旧内存值再覆盖回去，暂停变成「闪一下又跑」。
+        """
+        snap_tasks = snapshot.get("tasks") if isinstance(snapshot, dict) else None
+        live_tasks = self.state.get("tasks") if isinstance(self.state, dict) else None
+        if not isinstance(snap_tasks, dict) or not isinstance(live_tasks, dict):
+            return
+        for name, snap in list(snap_tasks.items()):
+            live = live_tasks.get(name)
+            if isinstance(live, dict) and isinstance(snap, dict):
+                live["status"] = snap.get("status", live.get("status"))
+                live["message"] = snap.get("message", live.get("message"))
+
     def _mark_state_dirty(self):
         """例行字段（last_poll/message 等）变更：只置脏标，不立即落盘。
 
         与直接 _save_state() 的区别仅在于"写盘时机"：交由主循环在
         _STATE_FLUSH_INTERVAL 内合并写一次。调用点必须确认这些字段属于
-        "每轮必写、丢了也无关正确性"的例行信息；凡涉及 dedup/retry/任务
+        "每轮必写、丢了也无关正确性"的例行信息；凡涉及 retry/任务
         状态转移等落盘后才安全的语义，仍直接调 _save_state()。"""
         self._state_dirty = True  # 兼容绕过 __init__ 的测试实例
 
@@ -588,17 +610,17 @@ class MonitorEngine(object):
         """仅重新读取 state.json（供运行中的引擎同步外部修改，不触发写入）。
 
         锁争用超时返回 None：调用方保留旧状态、稍后重试；绝不能回退成 {}
-        覆盖内存里的防重记录。
+        覆盖内存里的任务运行状态。
         内容损坏同样返回 None（Task 72）：先挪档留证 + 醒目告警（与 _load_state
         同级），绝不静默吞成 {}——否则 _sync_state 会用空状态覆盖内存态，
-        随后 _save_state 经合并把空 dedup 写回磁盘，永久丢失防重记录。"""
+        随后 _save_state 经合并把空状态写回磁盘，丢任务状态与冷却计数。"""
         if not os.path.exists(self.state_path):
             state = {}
         else:
             try:
                 # 与 _load_state 同理：读与写侧持同一把 file_lock，
                 # 避免撞上 _save_state fallback_direct 直写的撕裂文件
-                # → json 误判损坏 → self.state = {} → 空状态被落盘丢防重。
+                # → json 误判损坏 → self.state = {} → 空状态被落盘。
                 with filelock.file_lock(self.state_path + ".lock"):
                     state, err, read_fp = appcommon.read_state_or_none(
                         self.state_path)
@@ -618,14 +640,14 @@ class MonitorEngine(object):
                 # 传入读失败瞬间（持锁内）的指纹，避免误伤健康文件。
                 bad = appcommon.quarantine_corrupt(self.state_path, read_fp)
                 if bad is None:
-                    LOG.warning("坏档挪移失败（文件被占用？），保留旧内存态以保防重记录")
+                    LOG.warning("坏档挪移失败（文件被占用？），保留旧内存态")
                 else:
                     LOG.warning(
                         "坏档已挪为 %s，保留旧内存态。其它任务的运行状态与"
-                        "防重记录都在坏档里——请尽快到 12306「未支付订单」"
-                        "核对在途行程，避免重复下单", bad)
+                        "冷却/连击记录都在坏档里——请到 12306「未支付订单」"
+                        "核对在途行程", bad)
                 return None
-        state.setdefault("dedup", {})
+        _drop_dedup(state)
         state.setdefault("tasks", {})
         state.setdefault("retry", {})
         state = self._sanitize_state_tasks(state)
@@ -662,6 +684,7 @@ class MonitorEngine(object):
                 return
             self._adopt_state(new_state)
             self._state_mtime = m
+            self._status_seen = _task_status_map(self.state)
 
     def _sync_config(self):
         """检测 config.json 是否被修改（GUI 增删任务）：有则热更新任务列表。
@@ -797,14 +820,6 @@ class MonitorEngine(object):
             entry["message"] = message
         self._save_state()
         LOG.info("[状态] 任务 %s -> %s %s", name, STATUS_LABELS.get(status, status), message)
-
-    def empty_task_dedup(self, task):
-        """清空某任务的本地防重记录（状态重置后重新抢同一张票时用）。"""
-        prefix = "{0}|{1}|".format(task["from"], task["to"])
-        for k in list(self.state["dedup"].keys()):
-            if k.startswith(prefix):
-                del self.state["dedup"][k]
-        self._save_state()
 
     def note_task_deleted(self, name):
         """GUI 删除任务时调用：立即从内存状态中清除该任务条目并落盘。
@@ -980,18 +995,13 @@ class MonitorEngine(object):
                     LOG.info("[有票] 任务「%s」%s %s %s->%s %s 有余票(码%s)",
                              name, date, train_code, info["from_name"], info["to_name"],
                              seat_name, avail.get(seat_name))
-                    # 先不查乘车人，直接用任务配置的乘车人组合做历史查重键
+                    # 先不查乘车人，直接用任务配置的乘车人组合做冷却/连击归因键
                     p_names = sorted(task.get("passenger_names") or []) or ["(账号默认)"]
                     key = dedup_key(task, date, train_code, seat_name,
                                     task.get("passenger_names") or [])
-                    if key in self.state["dedup"]:
-                        LOG.info("[跳过] 任务「%s」已有记录：%s", name,
-                                 DEDUPE_VALUES.get(self.state["dedup"][key], self.state["dedup"][key]))
-                        continue
                     if not auto_order:
                         # 未开启自动下单：只报警不下单，供人工在 App/网页快速购买
-                        self.state["dedup"][key] = "NO_ORDER"
-                        self._save_state()
+                        # （防重已下线：同一趟车每次轮询命中余票都会再提醒一次）
                         subject = "[有票] {0} {1} {2}->{3} {4}".format(
                             train_code, date, info["from_name"], info["to_name"], seat_name)
                         body = (
@@ -1041,7 +1051,6 @@ class MonitorEngine(object):
                     if result_msg == "ok":
                         retry_map.pop(key, None)
                         self.state.setdefault("dup_streak", {}).pop(key, None)
-                        self.state["dedup"][key] = "SUBMITTED"
                         self._save_state()
                         self._record_success(task, info, date, seat_name, extra)
                         if stop_after:
@@ -1069,6 +1078,14 @@ class MonitorEngine(object):
                                     "blocked": "存在其它行程未支付订单挡路:请到 12306「未完成订单」支付或取消后恢复任务",
                                     "unknown": "官方状态不明确:保留本地记录,下轮再核",
                                     "error": "官方查询失败:保留本地记录,下轮再核"}[cls]
+                        # P1 影子比对：新判定内核与现网 dup 决策对比（不改变现网行为）
+                        _legacy_dup = {"paid": "block_paid",
+                                       "unpaid": "success" if recent else "halt_manual",
+                                       "cancelled": "retry_safe", "none": "retry_safe",
+                                       "blocked": "block_conflict",
+                                       "unknown": "halt_manual", "error": "halt_manual"}[cls]
+                        self._shadow_compare(date, train_code, p_names, attempt_ts,
+                                             "dup", _legacy_dup)
                         appcommon.upsert_order(
                             self.orders_path, okey,
                             {"order_no": ono, "train": train_code, "date": date,
@@ -1089,7 +1106,7 @@ class MonitorEngine(object):
                             # 官方能看到单（或查询失败）：连击态中断，下次从零计
                             self.state.setdefault("dup_streak", {}).pop(key, None)
                         if cls == "paid":
-                            self.state["dedup"][key] = "SUBMITTED"
+                            # 上行可能刚弹出 dup_streak：落盘保留该变更
                             self._save_state()
                             if stop_after:
                                 self.set_task_status(task, "success",
@@ -1102,8 +1119,6 @@ class MonitorEngine(object):
                         if cls == "unpaid":
                             if recent:
                                 # 下单时间落在本次提交窗口内 → 本次已提交成功
-                                self.state["dedup"][key] = "SUBMITTED"
-                                self._save_state()
                                 if bool(task.get("stop_after_order", True)):
                                     self.set_task_status(task, "success",
                                         "本次已提交订单（未支付），下单时间 %s——请尽快支付"
@@ -1111,8 +1126,6 @@ class MonitorEngine(object):
                                     return True, False
                             else:
                                 # 有该行程未支付订单但下单时间更早 → 更早遗留订单
-                                self.state["dedup"][key] = "ACCOUNT_DUP"
-                                self._save_state()
                                 if bool(task.get("stop_after_order", True)):
                                     self.set_task_status(task, "success",
                                         "账号存在该行程更早的未支付订单 %s——请核对后尽快支付"
@@ -1136,8 +1149,6 @@ class MonitorEngine(object):
                                 LOG.error("[警告] 任务「%s」%s 连续 %d 次 dup 且官方无单，"
                                           "停止自动重试", name, date, streak)
                                 return True, False
-                            self.state["dedup"].pop(key, None)
-                            self._save_state()
                             continue
                         if cls == "blocked":
                             self.set_task_status(task, "failed", "%s——处理后恢复本任务" % raw)
@@ -1153,9 +1164,16 @@ class MonitorEngine(object):
                                 date, train_code, task.get("passenger_names") or [],
                                 not_before_ts=attempt_ts,
                                 session=self._classify_session())
+                            # P1 影子比对：新判定内核与现网 ambiguous 决策对比
+                            _legacy_amb = ("success"
+                                           if (cls == "unpaid" and recent)
+                                           else ("retry_safe"
+                                                 if cls in ("none", "cancelled")
+                                                 else "halt_manual"))
+                            self._shadow_compare(date, train_code, p_names,
+                                                 attempt_ts, "ambiguous",
+                                                 _legacy_amb)
                             if cls == "unpaid" and recent:
-                                self.state["dedup"][key] = "SUBMITTED"
-                                self._save_state()
                                 self._record_success(
                                     task, info, date, seat_name,
                                     {"passengers": "、".join(p_names), "order_no": ono})
@@ -1189,10 +1207,8 @@ class MonitorEngine(object):
                             })
                             return True, False
                         if (extra or {}).get("reason") == "seat_unavailable":
-                            # 确认页可售席别由 12306 服务端下发（普速车常常没有「无座」），
-                            # 换时间点重试也不会有：记入 dedup 永久跳过，别无限重试刷日志
-                            self.state["dedup"][key] = "SEAT_UNAVAILABLE"
-                            self._save_state()
+                            # 确认页可售席别由 12306 服务端下发（普速车常常没有「无座」）：
+                            # 本席别本次跳过。防重已下线，下一轮仍会重试（不再永久跳过）
                             appcommon.append_history(self.history_path, {
                                 "time": self._now(), "task": name, "result": "seat_unavailable",
                                 "train": train_code, "date": date, "from": info["from_name"],
@@ -1251,8 +1267,6 @@ class MonitorEngine(object):
                             if cls == "unpaid" and recent:
                                 # 窗口虽然死了，官方接口显示本次已生成未支付订单：
                                 # 如实捞回来报成功，防用户以为没下成又去重复下单
-                                self.state["dedup"][key] = "SUBMITTED"
-                                self._save_state()
                                 self._record_success(
                                     task, info, date, seat_name,
                                     {"passengers": "、".join(p_names), "order_no": ono})
@@ -1344,14 +1358,19 @@ class MonitorEngine(object):
             entry["fail_streak"] = 0
             entry["message"] = "上次查询 {0}：无余票".format(time.strftime("%H:%M:%S"))
             # 与开头 last_poll 同理：例行字段脏标合并写；真正落盘由主循环
-            # 冲刷兜底（业务分支里的 dedup/status 变更仍走立即 _save_state）
+            # 冲刷兜底（业务分支里的 status 变更仍走立即 _save_state）
             self._mark_state_dirty()
         return False, False
 
     def _order_once(self, task, info, date, seat_name):
         """调用 order_ticket，把返回统一成 (结果标识, extra)。"""
         try:
-            ok, msg, extra = order_mod.order_ticket(self.config, task, info, seat_name)
+            ev = getattr(self, "_stop_event", None)
+            ok, msg, extra = order_mod.order_ticket(
+                self.config, task, info, seat_name,
+                # 传可调用对象：Event 本身不可调用（曾把 Event 直接当回调，
+                # 下单链启动即 TypeError: 'Event' object is not callable）
+                should_stop=ev.is_set if ev is not None else None)
         except Exception as e:
             return "fail", {"msg": "下单异常: {0}".format(e)}
         if ok:
@@ -1363,6 +1382,39 @@ class MonitorEngine(object):
         packed = dict(extra) if isinstance(extra, dict) else {}
         packed["msg"] = msg
         return "fail", packed
+
+    # ------------------------- P1 影子比对（判定内核验证期，只记不改） -------------------------
+    def _shadow_compare(self, date, train_code, passenger_names,
+                        not_before_ts, phase, legacy_decision):
+        """新判定内核（core/verdict）与现网旧分支的结果比对（影子模式）。
+
+        只写结构化日志（[影子比对]），不改任何现有决策路径——验证期内系统
+        行为与现状完全一致。结论一致率由 tools/shadow_report.py 聚合，
+        连续 7 天零分歧后（P3）才切换为真决策。
+        """
+        try:
+            from adapters.railway.snapshot import SnapshotProvider
+            from core.domain.tripkey import TripKey
+            from core.verdict import engine as vcore_engine
+            from core.verdict import snapshot_view as vsv
+            prov = SnapshotProvider(self._classify_session())
+            orders = prov.fetch(date)
+            trip = TripKey.from_task(date, train_code, passenger_names)
+            v = vcore_engine.postconfirm(
+                trip, orders, passenger_names, not_before_ts)
+            agree = legacy_decision == v.decision.value
+            LOG.info("[影子比对] %s %s %s 旧=%s 新=%s 一致=%s 快照=%s",
+                     phase, date, train_code, legacy_decision,
+                     v.decision.value, agree, vsv.summarize(orders))
+            if not agree:
+                LOG.warning("[影子比对·分歧] %s %s %s 旧=%s 新=%s 新理由=%s",
+                            phase, date, train_code, legacy_decision,
+                            v.decision.value, v.reason)
+            return v
+        except Exception as e:  # noqa: BLE001 影子比对绝不影响现网决策
+            LOG.warning("[影子比对] %s %s %s 异常(不阻断现网决策): %s",
+                        phase, date, train_code, e)
+            return None
 
     def _record_success(self, task, info, date, seat_name, extra):
         name = task["name"]
@@ -1532,25 +1584,6 @@ class MonitorEngine(object):
             self._last_session_check = now - 900
             LOG.warning("[会话] 登录校验临时失败（非登录失效）：%s；监控继续，5 分钟后自动重试" % who)
 
-    @staticmethod
-    def _cancelled_dedup_keys(rec, dedup_keys):
-        """已取消订单清本地防重：按 dedup 键的日期/车次字段精确匹配。
-
-        键格式为 from|to|date|train|seat|names（见 dedup_key）：取第 3、4 字段
-        与 rec 的 date/train 精确相等比较。Task 72 修复旧的子串匹配——车次
-        "G1" 会误清同日 "G101" 等其它车次的防重记录。
-        rec 缺 date/train 时返回 []（调用方记 warning 跳过该条），绝不抛
-        TypeError 中止整个启动恢复。"""
-        date, train = rec.get("date"), rec.get("train")
-        if not date or not train:
-            return []
-        out = []
-        for k in dedup_keys:
-            parts = k.split("|")
-            if len(parts) >= 4 and parts[2] == date and parts[3] == train:
-                out.append(k)
-        return out
-
     # ----------------------------- 主循环 -----------------------------
 
     def run(self, stop_event=None):
@@ -1578,17 +1611,8 @@ class MonitorEngine(object):
                 appcommon.upsert_order(op, okey, rec)
                 LOG.info("[订单恢复] %s 官方状态=%s(%s)", okey, cls, raw)
                 if cls == "cancelled":
-                    # Task 72：精确键匹配清本地防重（旧子串匹配会误清 "G101"）；
-                    # rec 缺 date/train 时记 warning 跳过该条，不中止整体恢复。
-                    if not rec.get("date") or not rec.get("train"):
-                        LOG.warning("[订单恢复] %s 缺少 date/train，跳过本地防重清理",
-                                    okey)
-                    else:
-                        for dk in self._cancelled_dedup_keys(
-                                rec, self.state.get("dedup", {})):
-                            self.state["dedup"].pop(dk, None)
-                        self._save_state()
-                        LOG.info("[订单恢复] 官方已取消,已清除 %s 的本地防重记录", okey)
+                    # 防重已下线：取消订单无需再清本地记录（本来也没有），留日志备查
+                    LOG.info("[订单恢复] %s 官方已取消，可重新抢票", okey)
         except Exception as e:
             LOG.warning("[订单恢复] 未完成订单上下文恢复失败(不影响监控): %s", e)
         active_tasks = [t for t in self.tasks
@@ -1615,7 +1639,7 @@ class MonitorEngine(object):
         # 不再串行排队。线程池 worker 数上限 MAX_TASK_WORKERS。
         # 调度键用任务名而非列表索引：_sync_config 热更新会重建 self.tasks
         # （替换对象），索引会错位，任务名在任务生命周期内稳定。
-        # 并发正确性：不同任务写 state 的不同 entry / dedup key 由 GIL 保证
+        # 并发正确性：不同任务写 state 的不同 entry / retry key 由 GIL 保证
         # dict 操作原子；同一 key 的并发下单（重复任务/交叉任务）被浏览器侧
         # exclusive 文件锁（browser_order）与 12306 服务端行程冲突挡路兜底，
         # order.py 归因会判 dup/blocked 并停止任务，不会真的下成两单。
@@ -1732,13 +1756,24 @@ def load_state_file(path):
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8-sig") as f:
-                return json.load(f)
+                # 防重已下线：GUI/launcher 这条读路径也一并丢弃旧 dedup 节，
+                # 否则它们在引擎未运行时写回会把死数据又带进文件。
+                return _drop_dedup(json.load(f))
         except Exception:
             return {}
     return {}
 
 
-def _merge_state_for_save(disk_state, mem_state, tombstoned):
+def _task_status_map(state):
+    """{任务名: (status, message)}：识别外部写入用的基线快照。"""
+    tasks = state.get("tasks") if isinstance(state, dict) else None
+    if not isinstance(tasks, dict):
+        return {}
+    return {n: (t.get("status"), t.get("message"))
+            for n, t in tasks.items() if isinstance(t, dict)}
+
+
+def _merge_state_for_save(disk_state, mem_state, tombstoned, status_seen=None):
     """Task 57 锁内合并：磁盘为底、内存覆盖、墓碑剔除。返回新 dict。
 
     背景：_save_state 旧代码在拿 file_lock 之前已从内存 deepcopy 出快照，
@@ -1748,8 +1783,8 @@ def _merge_state_for_save(disk_state, mem_state, tombstoned):
     - tasks：并发写方只增删任务条目 → 取并集；同一任务两边不一致时
       内存（引擎最新一轮的调度结果）获胜；tombstoned 中的名字一律剔除
       （内存已删，磁盘残留不得复活——Task 53 墓碑语义）。
-    - dedup/retry：只有引擎写这两节 → 内存为准（empty_task_dedup 的
-      显式清空必须被尊重，不能用磁盘旧值复活）。
+    - retry/dup_streak：只有引擎写这两节 → 内存为准，不能用磁盘旧值复活。
+    - dedup：功能已下线，本函数不再输出该节；磁盘上的旧数据随之自然消失。
 
     返回的是新 dict，但 tasks 条目值仍引用 mem/disk 的 live 对象——
     调用方必须 deepcopy 后再序列化（见 _save_state 的重试循环）。
@@ -1765,13 +1800,29 @@ def _merge_state_for_save(disk_state, mem_state, tombstoned):
         mem_tasks = {}
     merged_tasks = dict(disk_tasks)
     merged_tasks.update(mem_tasks)
+    # 外部写入优先：磁盘 status/message 与「上次见到的基线」不同，说明有
+    # 其它进程在引擎内存之外改过（GUI 暂停/取消、launcher 写入）。这两个
+    # 字段保留磁盘值，其余字段仍按内存合并（2026-10-19 审查）。
+    if status_seen:
+        for name, disk_task in disk_tasks.items():
+            if not isinstance(disk_task, dict):
+                continue
+            seen = status_seen.get(name)
+            if seen is None or seen == (disk_task.get("status"),
+                                        disk_task.get("message")):
+                continue
+            mem_task = merged_tasks.get(name)
+            if not isinstance(mem_task, dict):
+                continue
+            fixed = dict(mem_task)
+            fixed["status"] = disk_task.get("status", fixed.get("status"))
+            fixed["message"] = disk_task.get("message", fixed.get("message"))
+            merged_tasks[name] = fixed
     for name in tombstoned:
         merged_tasks.pop(name, None)
-    mem_dedup = mem_state.get("dedup")
     mem_retry = mem_state.get("retry")
     mem_dup = mem_state.get("dup_streak")
     return {
-        "dedup": dict(mem_dedup) if isinstance(mem_dedup, dict) else {},
         "retry": dict(mem_retry) if isinstance(mem_retry, dict) else {},
         # dup_streak 必须落盘：它是跨轮累加的「网页连续判 dup 而官方查无此单」
         # 计数，攒到 3 就判定账号被限流并停手。不落盘这个阈值永远攒不满，

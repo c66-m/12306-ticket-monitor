@@ -120,12 +120,16 @@ def check():
                 print("    %s %s" % (n, c))
     stations = data["stations_db.json"].get("stations", [])
     kinds = data["station_kind.json"]
-    stale = [s for s in stations
-             if s.get("kind") == "待识别" and kinds.get(s["code"])]
+    if not isinstance(stations, list) or not isinstance(kinds, dict):
+        # 形状被手改坏时返回「不一致」，而不是 KeyError/AttributeError 带崩 CLI
+        print("不一致：stations_db.json / station_kind.json 结构异常")
+        return 1
+    stale = [s for s in stations if isinstance(s, dict)
+             and s.get("kind") == "待识别" and kinds.get(s.get("code"))]
     if stale:
         print("提示：stations_db.json 有 %d 站仍标「待识别」而 station_kind.json "
               "已有答案（rebuild 后收编）：%s"
-              % (len(stale), "、".join("%s=%s" % (s["name"], kinds[s["code"]])
+              % (len(stale), "、".join("%s=%s" % (s.get("name"), kinds[s.get("code")])
                                        for s in stale[:5])))
     if drift:
         print("name↔code 漂移 %d 处：迁移消费者或删除车站文件前必须先对齐。" % drift)

@@ -23,6 +23,7 @@ import atexit
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,12 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
+
+# 问题台账重定向到临时文件：引擎与接口的 WARNING 在测试里同样会写台账，
+# 不重定向会把假日志写进用户真实的 data/problem_log.jsonl。
+_TEST_PROBLEM_LOG = os.path.join(tempfile.gettempdir(), "t12306_test_problem_log.jsonl")
+os.environ["T12306_PROBLEM_LOG"] = _TEST_PROBLEM_LOG
+atexit.register(lambda: os.path.exists(_TEST_PROBLEM_LOG) and os.remove(_TEST_PROBLEM_LOG))
 
 import engine as engine_mod          # noqa: E402
 import ticket                        # noqa: E402
@@ -140,7 +147,8 @@ def make_engine(tmp):
     e.tasks = []
     e.base_interval, e.min_interval = 45, 30
     e._config_mtime = None
-    e.state = {"dedup": {}, "tasks": {}, "retry": {}}
+    # 防重已下线：引擎内存态不再有 dedup 节
+    e.state = {"tasks": {}, "retry": {}}
     e._save_lock = threading.Lock()
     e._history_lock = threading.Lock()
     return e
@@ -181,6 +189,12 @@ class TempDirCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="t12306_")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # mock 下单的耗时记录写到临时文件：旧行为会写进真实
+        # logs/order_timing.jsonl，把 G101 之类的假记录混进真数据。
+        _p = mock.patch.object(browser_order, "TIMING_PATH",
+                               os.path.join(self.tmp, "order_timing.jsonl"))
+        _p.start()
+        self.addCleanup(_p.stop)
         self._real_before = _real_snapshot()
         self.addCleanup(self._assert_real_untouched)
 
@@ -315,6 +329,29 @@ class TestTicket(TempDirCase):
         n2c, c2n = ticket.load_station_map(cache)
         self.assertEqual(n2c["北京"], "BJP")
         self.assertEqual(c2n["BJP"], "北京")
+
+
+class TestTicketCache(TempDirCase):
+    """缓存 JSON 记忆化：按 (mtime, size) 失效（2026-10-19 审查 P1）。"""
+
+    def test_json_cache_memoizes_and_invalidates(self):
+        import ticket
+        p = os.path.join(self.tmp, "cache.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"v": 1}, f)
+        ticket._JSON_CACHE.clear()
+        first = ticket._read_json_cache(p)
+        self.assertEqual(first, {"v": 1})
+        self.assertIs(ticket._read_json_cache(p), first, "未变化时不应重复解析")
+        st = os.stat(p)
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        self.assertEqual(ticket._read_json_cache(p), {"v": 1})
+        # 与生产一致的原子替换写：原地覆盖在 Windows 下 mtime 可能被隧道恢复
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"v": 2}, f)
+        os.replace(tmp, p)
+        self.assertEqual(ticket._read_json_cache(p), {"v": 2}, "文件变化必须失效")
 
 
 class TestEngineUnit(TempDirCase):
@@ -1262,7 +1299,7 @@ class TestGuiUnit(TempDirCase):
 class TestEngineFlow(TempDirCase):
     """端到端（mock）：查询命中 → 下单 → 状态/防重/历史 的完整状态机。"""
 
-    def _run(self, order_ret, expect_status, expect_dedup=None, notify_calls=None,
+    def _run(self, order_ret, expect_status, notify_calls=None,
              expect_history=True, **task_over):
         e = make_engine(self.tmp)
         t = task_of(**task_over)
@@ -1277,9 +1314,8 @@ class TestEngineFlow(TempDirCase):
             broke, _rec = e._run_task(t)
         st = e.state["tasks"][t["name"]]["status"]
         self.assertEqual(st, expect_status, e.state["tasks"][t["name"]].get("message"))
-        if expect_dedup:
-            self.assertTrue(any(v == expect_dedup for v in e.state["dedup"].values()),
-                            e.state["dedup"])
+        # 防重已下线：状态里不应再出现 dedup 节
+        self.assertNotIn("dedup", e.state)
         if notify_calls is not None:
             self.assertEqual(m_notify.call_count, notify_calls)
         self.assertEqual(os.path.exists(e.history_path), expect_history)
@@ -1287,23 +1323,23 @@ class TestEngineFlow(TempDirCase):
 
     def test_e2e_success_and_stop(self):
         self._run((True, "ok 订单号: E123", {"order_no": "E123", "passengers": "张三"}),
-                  expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
+                  expect_status="success", notify_calls=1)
 
     def test_dup_unpaid_stops(self):
-        # 官方核验=待支付且非本次提交(更早旧单):记 ACCOUNT_DUP 并按 stop_after_order 停止
+        # 官方核验=待支付且非本次提交(更早旧单):按 stop_after_order 停止
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
                                return_value=("unpaid", "E9", "未支付", None)) as mq:
             e = self._run((False, "已有订单", {"reason": "dup"}),
-                          expect_status="success", expect_dedup="ACCOUNT_DUP")
+                          expect_status="success")
         self.assertEqual(mq.call_count, 1)
 
-    def test_dup_cancelled_clears_and_keeps_monitoring(self):
-        # 官方核验=已取消:清除本地防重记录,允许重新下单,任务继续监控
+    def test_dup_cancelled_keeps_monitoring(self):
+        # 官方核验=已取消:允许重新下单,任务继续监控
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
                                return_value=("cancelled", "E9", "已取消", None)):
             e = self._run((False, "已有订单", {"reason": "dup"}),
                           expect_status="monitoring")
-        self.assertNotIn("ACCOUNT_DUP", set(e.state["dedup"].values()))
+        self.assertNotIn("dedup", e.state)
 
     def test_dup_none_streak_stops_after_3(self):
         # 网页端反复判 dup 但官方查无此单（如「取消次数过多」当日封禁）：
@@ -1358,7 +1394,7 @@ class TestEngineFlow(TempDirCase):
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
                                return_value=("paid", "E9", "已支付", None)):
             self._run((False, "已有订单", {"reason": "dup"}),
-                      expect_status="success", expect_dedup="SUBMITTED")
+                      expect_status="success")
 
     def test_dup_paid_keeps_monitoring_when_not_stop_after(self):
         # stop_after_order=False：dup→官方回读 paid（已支付旧单）
@@ -1366,12 +1402,12 @@ class TestEngineFlow(TempDirCase):
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
                                return_value=("paid", "E9", "已支付", None)):
             self._run((False, "已有订单", {"reason": "dup"}),
-                      expect_status="monitoring", expect_dedup="SUBMITTED",
+                      expect_status="monitoring",
                       stop_after_order=False)
 
     def test_seat_unavailable_permanent_skip(self):
         self._run((False, "网页端不提供席别 硬座", {"reason": "seat_unavailable"}),
-                  expect_status="monitoring", expect_dedup="SEAT_UNAVAILABLE")
+                  expect_status="monitoring")
 
     def test_busy_enters_cooldown(self):
         # 系统忙走冷却退避、不写历史（设计如此，避免刷日志）
@@ -1394,7 +1430,7 @@ class TestEngineFlow(TempDirCase):
                                return_value=("unpaid", "E9", "未支付",
                                              {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
             e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
-                          expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
+                          expect_status="success", notify_calls=1)
         hist = json.load(open(e.history_path, encoding="utf-8"))
         self.assertEqual(hist[-1]["result"], "success")
 
@@ -1405,7 +1441,7 @@ class TestEngineFlow(TempDirCase):
                                return_value=("unpaid", "E9", "未支付",
                                              {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
             e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
-                          expect_status="monitoring", expect_dedup="SUBMITTED",
+                          expect_status="monitoring",
                           notify_calls=1, stop_after_order=False)
         hist = json.load(open(e.history_path, encoding="utf-8"))
         self.assertEqual(hist[-1]["result"], "success")
@@ -1423,23 +1459,26 @@ class TestEngineFlow(TempDirCase):
                                return_value=("unpaid", "E9", "未支付",
                                              {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
             self._run((False, "已有订单", {"reason": "dup"}),
-                      expect_status="success", expect_dedup="SUBMITTED")
+                      expect_status="success")
 
-    def test_dedup_prevents_reorder(self):
-        """防重第二层：已 SUBMITTED 的组合再次命中直接跳过，不再调下单。"""
+    def test_no_dedup_gate_reorder_attempted(self):
+        """防重已下线：同一目标再次命中仍会发起下单，不再被本地记录拦住。
+
+        这是删除防重的既定代价——重复提交只能靠 12306 官方订单核验兜底。
+        """
         e = make_engine(self.tmp)
         t = task_of()
         e.tasks = [t]
         e.state["tasks"][t["name"]] = {"status": "monitoring"}
-        from engine import dedup_key
-        key = dedup_key(t, engine_mod.future_dates(t)[0][0], "K225", "硬座", ["张三"])
-        e.state["dedup"][key] = "SUBMITTED"
         with mock.patch.object(e, "_query_with_retry",
-                               return_value=[synthetic_row()]) as q, \
-             mock.patch.object(engine_mod.order_mod, "order_ticket") as m_order:
-            broke, _ = e._run_task(t)
-        m_order.assert_not_called()
-        self.assertEqual(e.state["tasks"][t["name"]]["status"], "monitoring")
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123",
+                                              "passengers": "张三"})) as m_order:
+            e._run_task(t)
+        self.assertGreaterEqual(m_order.call_count, 1)
+        self.assertNotIn("dedup", e.state)
 
     def test_query_failure_backoff(self):
         e = make_engine(self.tmp)
@@ -1471,7 +1510,7 @@ class TestEngineFlow(TempDirCase):
                                              {"order_no": "E9", "order_time": "2026-10-07 12:00:00"})):
             e = self._run((False, "浏览器窗口异常关闭: TargetClosedError: Target closed",
                            {"reason": "browser_dead"}),
-                          expect_status="success", expect_dedup="SUBMITTED", notify_calls=1)
+                          expect_status="success", notify_calls=1)
         hist = json.load(open(e.history_path, encoding="utf-8"))
         self.assertEqual(hist[-1]["result"], "success")
 
@@ -1880,6 +1919,102 @@ class TestStateStore(TempDirCase):
         with mock.patch.object(ac.os, "replace", side_effect=OSError("busy")):
             self.assertIsNone(ac.quarantine_corrupt(p))
         self.assertEqual(open(p, encoding="utf-8").read(), "{corrupt2")
+
+    def test_update_state_locked_refuses_corrupt_state(self):
+        # 注入的读实现会把读失败吞成 {}：绝不能据此整份覆写
+        # （否则其它任务的 status/retry 全部清空，2026-10-19 审查 P0）
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        open(p, "w", encoding="utf-8").write("{corrupt")
+        with self.assertRaises(RuntimeError):
+            appcommon.update_state_locked(
+                p, lambda st: st.setdefault("tasks", {}).update({"x": 1}),
+                read_state=lambda _p: {})
+        self.assertEqual(open(p, encoding="utf-8").read(), "{corrupt")
+
+    def test_update_state_locked_allows_legit_empty_object(self):
+        # 文件确实是合法空对象 {}：照常允许写入（不能把正常空档也拒掉）
+        import appcommon
+        p = os.path.join(self.tmp, "state.json")
+        open(p, "w", encoding="utf-8").write("{}")
+        appcommon.update_state_locked(
+            p, lambda st: st.setdefault("tasks", {}).update({"x": 1}),
+            read_state=lambda _p: {})
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["tasks"], {"x": 1})
+
+    def test_order_once_passes_callable_stop(self):
+        # 回归：引擎曾把 threading.Event 直接当 should_stop 传给下单链，
+        # 启动即 TypeError: 'Event' object is not callable（2026-10-19 实测）
+        import engine as engine_mod
+        e = make_engine(self.tmp)
+        ev = threading.Event()
+        e._stop_event = ev
+        captured = {}
+
+        def fake_order(*_a, **k):
+            captured.update(k)
+            return True, "ok", {}
+
+        with mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               side_effect=fake_order):
+            got = e._order_once({"train_code": "G1"}, {"train_code": "G1"},
+                                "2026-10-20", "硬座")
+        self.assertEqual(got[0], "ok")
+        cb = captured.get("should_stop")
+        self.assertTrue(callable(cb), "Event 不能直接当回调传")
+        self.assertFalse(cb())
+        ev.set()
+        self.assertTrue(cb())
+
+    def test_drop_dedup_state_clears_section_and_flat_keys(self):
+        # 防重数据两种历史形态（dedup 节 + 平铺「|」键）都要清掉，
+        # 且引擎读路径与 grabber 写路径共用同一实现（2026-10-19）
+        import appcommon
+        st = {"dedup": {"k": 1},
+              "郑州|上海|2026-10-20|K558|硬座|张三": "SUBMITTED",
+              "retry": {}, "tasks": {}}
+        appcommon.drop_dedup_state(st)
+        self.assertEqual(st, {"retry": {}, "tasks": {}})
+        self.assertEqual(appcommon.drop_dedup_state(None), None)
+
+    def test_save_state_keeps_external_paused(self):
+        # 外部（GUI/launcher）把任务改成 paused：引擎落盘时不能整条覆盖回去
+        e = make_engine(self.tmp)
+        e.state["tasks"]["t1"] = {"status": "monitoring", "message": "轮询中"}
+        e._status_seen = {"t1": ("monitoring", "轮询中")}
+        with open(e.state_path, "w", encoding="utf-8") as f:
+            json.dump({"tasks": {"t1": {"status": "paused",
+                                        "message": "用户暂停"}},
+                       "retry": {}}, f)
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(disk["tasks"]["t1"]["status"], "paused")
+        self.assertEqual(disk["tasks"]["t1"]["message"], "用户暂停")
+        self.assertEqual(e.state["tasks"]["t1"]["status"], "paused",
+                         "内存必须同步，否则下一轮又覆盖回 monitoring")
+
+    def test_orders_transient_oserror_not_quarantined(self):
+        # 瞬时占用不是坏档：健康 orders.json 必须原地保留（2026-10-19 审查）
+        import appcommon
+        p = os.path.join(self.tmp, "orders.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"orders": {"k": 1}}, f)
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            if os.path.abspath(path) == os.path.abspath(p):
+                raise PermissionError("busy")
+            return real_open(path, *a, **k)
+
+        with mock.patch.object(appcommon, "open", fake_open, create=True):
+            db, write_ok = appcommon._load_orders_impl(p)
+        self.assertEqual(db, {"orders": {}})
+        self.assertFalse(write_ok, "读失败必须告诉写方不得覆写")
+        self.assertTrue(os.path.exists(p), "健康订单库不能被挪档")
+        with real_open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["orders"], {"k": 1})
 
     def test_three_writers_concurrent(self):
         """三写方(engine/gui/launcher 形态)并发写:全部落盘且文件始终可解析。"""
@@ -2970,6 +3105,14 @@ class TestOrderTimestamp(TempDirCase):
         self.assertIsNotNone(got)
         self.assertEqual(got["order_no"], "E100")
 
+    def test_find_recent_order_rejects_previous_round(self):
+        # 2 分钟前的上一轮旧单不能判成本次成功（旧窗口 180s 会误中）
+        now = time.time()
+        orders = [{"train": "G101", "date": "2026-10-08", "passengers": ["张三"],
+                   "order_no": "EOLD", "order_ts": now - 120}]
+        self.assertIsNone(order_mod.find_recent_order(
+            orders, "2026-10-08", "G101", ["张三"], now))
+
 
 class TestTrainCodeCase(TempDirCase):
     """Task 38 (P2): 车次大小写三处统一 —— 小写配置必须命中大写的 train_code，
@@ -3282,6 +3425,23 @@ class TestTask101ReloginPrecheck(unittest.TestCase):
         res, calls, _ = self._run({}, {"ok": False, "unknown": False, "message": "已跳转登录门户"})
         self.assertEqual(calls["login"], 1)
         self.assertFalse(res.get("already"))
+
+    def test_login_success_wakes_engine_session_check(self):
+        # 登录成功后立刻清零引擎的体检节流，让失败任务自动恢复；
+        # 否则要等最长 20 分钟，用户只能手动点恢复且会再次失败。
+        import api
+        eng = mock.Mock()
+        eng._last_session_check = 12345.0
+        with mock.patch.object(api, "probe_session", return_value={}), \
+             mock.patch.object(api.browser_order, "login", return_value=True), \
+             mock.patch.object(api, "engine_running", return_value=True), \
+             mock.patch.object(api, "get_engine", return_value=eng), \
+             mock.patch.object(api, "push"):
+            api.rpc_relogin({"force": True})
+            deadline = time.time() + 2.0
+            while api._LOGIN_GUARD.locked() and time.time() < deadline:
+                time.sleep(0.02)
+        self.assertEqual(eng._last_session_check, 0)
 
 class TestReloginSingleFlight(unittest.TestCase):
     """relogin 单飞：登录窗口已开着时再点任意入口，只回提示，不开第二支浏览器。
@@ -3858,9 +4018,9 @@ class TestLoadStateErrorSplit(TempDirCase):
         return e, sp
 
     def test_permission_error_no_quarantine_keeps_old_state(self):
-        # 旧代码：PermissionError 也被当坏档隔离 → 健康文件被挪走、防重丢失
+        # 旧代码：PermissionError 也被当坏档隔离 → 健康文件被挪走、状态丢失
         import appcommon
-        old = {"dedup": {"k": 1}, "tasks": {}, "retry": {}}
+        old = {"tasks": {"T": {"status": "monitoring"}}, "retry": {"k": 1}}
         e, sp = self._engine_with_state(old)
         with mock.patch.object(appcommon, "read_state_or_none",
                                return_value=(None, PermissionError("被占用"),
@@ -3876,7 +4036,7 @@ class TestLoadStateErrorSplit(TempDirCase):
     def test_generic_oserror_no_quarantine(self):
         # 非 PermissionError 的 OSError（如文件竞态消失）同样不得隔离
         import appcommon
-        old = {"dedup": {"k": 2}, "tasks": {}, "retry": {}}
+        old = {"tasks": {"T": {"status": "paused"}}, "retry": {"k": 2}}
         e, sp = self._engine_with_state(old)
         with mock.patch.object(appcommon, "read_state_or_none",
                                return_value=(None, OSError("I/O error"),
@@ -3898,7 +4058,7 @@ class TestLoadStateErrorSplit(TempDirCase):
                                return_value=sp + ".bad-1") as m_q:
             got = e._load_state()
         m_q.assert_called_once()
-        self.assertEqual(got["dedup"], {})
+        self.assertNotIn("dedup", got)
 
 
 class TestHistoryAppendConcurrency(TempDirCase):
@@ -5513,15 +5673,41 @@ class TestTask52SliderAmbiguous(TempDirCase):
                          "clicked=True 时滑块重现必须标 ambiguous")
 
     def test_result_slide_timeout_no_ambiguous_when_not_clicked(self):
-        # 确认按钮从未点出（clicked=False）：确实没提交，不标 ambiguous，
-        # 保持旧的 need_captcha 语义
+        # 确认按钮从未点出（clicked=False）：订单根本没提交，直接按
+        # not_submitted 收尾——不进结果等待、不标 ambiguous。
+        # （2026-10-19 审查：旧代码仍返回 ok=True，上层会误以为已提交并重下）
         ok, msg, extra, page = self._run(qr_enable=False, result_slides=1,
                                          slide_result=False)
         self.assertFalse(page.qr_submit_clicked, "前置条件：确认按钮不应被点击")
         self.assertFalse(ok)
-        self.assertTrue((extra or {}).get("need_captcha"))
+        self.assertEqual((extra or {}).get("reason"), "not_submitted")
+        self.assertIn("未提交", msg)
         self.assertNotEqual((extra or {}).get("reason"), "ambiguous",
                             "clicked=False 时不应标 ambiguous（无提交，无需回读）")
+
+    def test_book_button_missing_reports_page_evidence(self):
+        # 网页有「预订」但脚本点不到时，失败文案必须带页面取证，
+        # 否则只剩一句「可能已无票」，无法定位（2026-10-19 实测）
+        class _NoBook(self._Page):
+            def evaluate(self, js, arg=None):
+                if "queryLeftTable" in js:
+                    return {"ok": False, "why": "no_book", "rows": 3,
+                            "codeRows": 1,
+                            "url": "https://kyfw.12306.cn/otn/leftTicket/init"}
+                return super().evaluate(js, arg)
+
+        clock = self._Clock()
+        page = _NoBook(clock)
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page))
+        self.assertFalse(ok)
+        self.assertIn("页面取证", msg)
+        self.assertIn("no_book", msg)
 
 
 class TestTask52BusyProbe(TempDirCase):
@@ -5946,13 +6132,18 @@ class TestFileLockTimeout(TempDirCase):
         # 写一份健康的 state.json：超时绝不能把它当坏档隔离
         with open(e.state_path, "w", encoding="utf-8") as f:
             json.dump(old_state, f)
+        with open(e.state_path, encoding="utf-8") as f:
+            on_disk = json.load(f)      # 磁盘快照：与内存对象解耦
         with self._timeout_lock(), \
                 mock.patch.object(appcommon, "quarantine_corrupt") as q:
             got = e._load_state()
         q.assert_not_called()
         self.assertIs(got, old_state)
+        # 防重已下线：加载路径会丢弃旧 dedup 节（内存对象随之清理），
+        # 但磁盘文件必须原样保留 —— 锁超时绝不允许落盘/隔离。
+        self.assertNotIn("dedup", got)
         with open(e.state_path, encoding="utf-8") as f:
-            self.assertEqual(json.load(f), old_state)
+            self.assertEqual(json.load(f), on_disk)
 
     def test_engine_save_state_timeout_skips_write(self):
         e = make_engine(self.tmp)
@@ -6085,21 +6276,19 @@ class TestSaveStateInLockRMW(TempDirCase):
             final = json.load(f)
         self.assertNotIn("A", final.get("tasks", {}))
 
-    def test_empty_dedup_not_resurrected(self):
-        # dedup/retry 内存为准：显式清空不得被磁盘旧值复活。
+    def test_dedup_dropped_on_save(self):
+        # 防重已下线：内存里残留的 dedup 节不会再被写入磁盘
         e = make_engine(self.tmp)
         e.state = {"dedup": {"K1|K2|2026-01-01|G1|硬座|p": "SUBMITTED"},
                    "tasks": {}, "retry": {}}
         e._save_state()
-        e.empty_task_dedup({"from": "K1", "to": "K2"})
-        # empty_task_dedup 内部已 _save_state；再显式 save 一次也应保持
-        e._save_state()
         with open(e.state_path, encoding="utf-8") as f:
             final = json.load(f)
-        self.assertEqual(final.get("dedup"), {})
+        self.assertNotIn("dedup", final)
 
-    def test_memory_wins_task_conflict(self):
-        # 同一任务两边不一致 → 内存（引擎最新一轮结果）获胜。
+    def test_external_status_change_wins_over_memory(self):
+        # 磁盘 status 在上次落盘后被外部改过（GUI 暂停/取消）→ 磁盘优先。
+        # 旧行为「内存永远获胜」会把用户刚点的暂停覆盖回 monitoring。
         e = make_engine(self.tmp)
         e.state = {"dedup": {}, "tasks": {"A": {"status": "monitoring"}},
                    "retry": {}}
@@ -6107,13 +6296,13 @@ class TestSaveStateInLockRMW(TempDirCase):
         with filelock.file_lock(e.state_path + ".lock"):
             with open(e.state_path, encoding="utf-8") as f:
                 disk = json.load(f)
-            disk["tasks"]["A"]["status"] = "paused"  # 过时的并发写
+            disk["tasks"]["A"]["status"] = "paused"  # 外部进程（GUI）写入
             appcommon.atomic_write_json(e.state_path, disk,
                                         fallback_direct=True)
         e._save_state()
         with open(e.state_path, encoding="utf-8") as f:
             final = json.load(f)
-        self.assertEqual(final["tasks"]["A"]["status"], "monitoring")
+        self.assertEqual(final["tasks"]["A"]["status"], "paused")
 
 
 class TestStationCacheRefresh(TempDirCase):
@@ -8157,33 +8346,12 @@ class TestTask72EngineState(TempDirCase):
         e._sync_config()
         self.assertLessEqual(len(e._deleted_names), 500)
 
-    # ---- (f) 启动恢复精确键匹配 ----
-
-    def test_cancelled_dedup_keys_exact_match(self):
-        keys = ["BJ|SH|2026-10-10|G1|硬座|*",
-                "BJ|SH|2026-10-10|G101|硬座|*",
-                "BJ|SH|2026-10-11|G1|硬座|*"]
-        got = engine_mod.MonitorEngine._cancelled_dedup_keys(
-            {"date": "2026-10-10", "train": "G1"}, keys)
-        # "G1" 绝不能误清同日 "G101"
-        self.assertEqual(got, ["BJ|SH|2026-10-10|G1|硬座|*"])
-
-    def test_cancelled_dedup_keys_missing_fields(self):
-        keys = ["BJ|SH|2026-10-10|G1|硬座|*"]
-        # 缺 date/train → 返回 [] 而不是 TypeError 中止整体恢复
-        self.assertEqual(
-            engine_mod.MonitorEngine._cancelled_dedup_keys(
-                {"date": None, "train": "G1"}, keys), [])
-        self.assertEqual(
-            engine_mod.MonitorEngine._cancelled_dedup_keys({}, keys), [])
-
-
 class TestMergeStateForSave(unittest.TestCase):
     """_merge_state_for_save 直接参数化单测：磁盘为底、内存覆盖、墓碑剔除。
 
-    旧覆盖仅通过 _save_state 端到端间接验证（test_pruned_orphan_stays_dead_on_disk），
-    合并规则本身的边界（非 dict 输入、dedup/retry 内存为准、墓碑剔除、
-    内存空 dedup 不被磁盘复活）无直接断言。"""
+    旧覆盖仅通过 _save_state 端到端间接验证（test_pruned_orphan_stays_dead_on_disk）。
+    防重（dedup）已下线：本函数不再输出该节，磁盘旧值一律不复活（见
+    test_dedup_not_emitted）。"""
 
     def test_basic_union_disk_plus_mem(self):
         disk = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
@@ -8212,18 +8380,18 @@ class TestMergeStateForSave(unittest.TestCase):
         got = engine_mod._merge_state_for_save(disk, mem, {"ghost"})
         self.assertNotIn("ghost", got["tasks"])
 
-    def test_dedup_retry_from_mem_only(self):
+    def test_retry_from_mem_only(self):
         disk = {"tasks": {}, "dedup": {"k1": True}, "retry": {"k2": True}}
         mem = {"tasks": {}, "dedup": {"k3": True}, "retry": {"k4": True}}
         got = engine_mod._merge_state_for_save(disk, mem, set())
-        self.assertEqual(got["dedup"], {"k3": True})
         self.assertEqual(got["retry"], {"k4": True})
 
-    def test_mem_empty_dedup_not_revived_from_disk(self):
+    def test_dedup_not_emitted(self):
+        # 防重已下线：无论磁盘/内存是否还有 dedup 节，输出里都不该再出现
         disk = {"tasks": {}, "dedup": {"k1": True}, "retry": {}}
-        mem = {"tasks": {}, "dedup": {}, "retry": {}}
+        mem = {"tasks": {}, "dedup": {"k3": True}, "retry": {}}
         got = engine_mod._merge_state_for_save(disk, mem, set())
-        self.assertEqual(got["dedup"], {})
+        self.assertNotIn("dedup", got)
 
     def test_non_dict_disk_state_graceful(self):
         mem = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
@@ -8234,7 +8402,7 @@ class TestMergeStateForSave(unittest.TestCase):
         disk = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
         got = engine_mod._merge_state_for_save(disk, None, set())
         self.assertEqual(got["tasks"], {"A": {"status": "ok"}})
-        self.assertEqual(got["dedup"], {})
+        self.assertNotIn("dedup", got)
         self.assertEqual(got["retry"], {})
 
     def test_tasks_not_dict_graceful(self):
@@ -8243,11 +8411,32 @@ class TestMergeStateForSave(unittest.TestCase):
         got = engine_mod._merge_state_for_save(disk, mem, set())
         self.assertEqual(got["tasks"], {})
 
-    def test_dedup_retry_not_dict_graceful(self):
+    def test_retry_not_dict_graceful(self):
         mem = {"tasks": {}, "dedup": "bad", "retry": 42}
         got = engine_mod._merge_state_for_save({}, mem, set())
-        self.assertEqual(got["dedup"], {})
+        self.assertNotIn("dedup", got)
         self.assertEqual(got["retry"], {})
+
+    def test_external_status_change_wins_over_memory(self):
+        # 磁盘 status 与「上次见到的基线」不同 ⇒ GUI/launcher 改过，磁盘优先
+        disk = {"tasks": {"A": {"status": "paused", "message": "用户暂停"}},
+                "retry": {}}
+        mem = {"tasks": {"A": {"status": "monitoring", "message": "轮询中"}},
+               "retry": {}}
+        seen = {"A": ("monitoring", "轮询中")}
+        got = engine_mod._merge_state_for_save(disk, mem, set(), seen)
+        self.assertEqual(got["tasks"]["A"]["status"], "paused")
+        self.assertEqual(got["tasks"]["A"]["message"], "用户暂停")
+
+    def test_engine_status_change_wins_when_disk_matches_baseline(self):
+        # 磁盘没变（==基线）⇒ 内存是引擎自己的最新调度结果，内存优先
+        disk = {"tasks": {"A": {"status": "monitoring", "message": "x"}},
+                "retry": {}}
+        mem = {"tasks": {"A": {"status": "failed", "message": "boom"}},
+               "retry": {}}
+        seen = {"A": ("monitoring", "x")}
+        got = engine_mod._merge_state_for_save(disk, mem, set(), seen)
+        self.assertEqual(got["tasks"]["A"]["status"], "failed")
 
     def test_tombstoned_none_graceful(self):
         disk = {"tasks": {"A": {"status": "ok"}}, "dedup": {}, "retry": {}}
@@ -8261,12 +8450,12 @@ class TestMergeStateForSave(unittest.TestCase):
         got = engine_mod._merge_state_for_save(disk, mem, set())
         self.assertEqual(got["tasks"], {})
 
-    def test_returned_dedup_is_copy(self):
-        mem_dedup = {"k1": True}
-        mem = {"tasks": {}, "dedup": mem_dedup, "retry": {}}
+    def test_returned_retry_is_copy(self):
+        mem_retry = {"k1": True}
+        mem = {"tasks": {}, "retry": mem_retry}
         got = engine_mod._merge_state_for_save({}, mem, set())
-        got["dedup"]["k2"] = True
-        self.assertNotIn("k2", mem_dedup)
+        got["retry"]["k2"] = True
+        self.assertNotIn("k2", mem_retry)
 
 
 class TestTask73MonitorCreateCancel(TempDirCase):
@@ -11239,7 +11428,8 @@ class TestTask93EngineP2(TempDirCase):
         # 降级为空任务集后，_resume_or_init_status 正常补上 T1 的默认条目
         self.assertIsInstance(eng.state["tasks"], dict)
         self.assertEqual(eng.state["tasks"]["T1"]["status"], "paused")
-        self.assertEqual(eng.state["dedup"], {"k": "v"})  # 其它节不受影响
+        # 防重已下线：旧 dedup 节在加载时被丢弃，其它节不受影响
+        self.assertNotIn("dedup", eng.state)
 
     def test_reload_state_tasks_list_does_not_kill_thread(self):
         # 运行中外部把 tasks 节写坏：旧代码 _sync_state 重载后
@@ -13101,6 +13291,21 @@ class TestOrderflowDispatch(TempDirCase):
         rfo.assert_not_called()
         rov.assert_called_once()
 
+    def test_run_orderflow_accepts_event_object(self):
+        # 兼容边界：调用方传 threading.Event 时下沉为 is_set，避免不可调用
+        import orderflow
+        ev = threading.Event()
+        with mock.patch.object(orderflow, "_run_orderflow_locked",
+                               return_value=(True, "ok", {})) as m:
+            orderflow.run_orderflow({"train_code": "G1"}, "二等座", "O",
+                                    ["张三"], "2026-10-20", warm=None,
+                                    should_stop=ev)
+        cb = m.call_args.kwargs["should_stop"]
+        self.assertTrue(callable(cb))
+        self.assertFalse(cb())
+        ev.set()
+        self.assertTrue(cb())
+
     def test_run_orderflow_contract_shape(self):
         # 返回值契约与旧链一致 (ok, msg, extra)：launcher/engine 下游不区分链。
         import orderflow
@@ -13181,7 +13386,7 @@ class TestOrderflowE2EMock(TempDirCase):
 
     def _core(self, page, should_stop=None, flow_cfg=None, slides=None,
               slide_wait_result=None, reopen_entry=None, judge_result=None,
-              fill_stop=None):
+              fill_stop=None, no_reopen=False):
         import orderflow
         clock = self._Clock()
         warm = self._Warm(page)
@@ -13200,7 +13405,7 @@ class TestOrderflowE2EMock(TempDirCase):
             mock.patch.object(orderflow, "time", clock),
             mock.patch.object(orderflow, "launch", side_effect=AssertionError("冷启动不应发生")),
             mock.patch.object(orderflow, "session_ok", return_value=(True, "user")),
-            mock.patch.object(orderflow, "_goto_and_query", return_value=None),
+            mock.patch.object(orderflow, "_goto_and_query", return_value=True),
             mock.patch.object(orderflow, "_run_fill_submit_confirm", side_effect=fake_fill),
             mock.patch.object(orderflow, "fetch_unpaid_order_no", return_value="E123"),
             mock.patch.object(orderflow, "session_from_browser_state", return_value=object()),
@@ -13211,6 +13416,11 @@ class TestOrderflowE2EMock(TempDirCase):
         if reopen_entry is not None:
             patches.append(mock.patch.object(
                 orderflow, "_reopen_and_order", return_value=reopen_entry))
+        elif no_reopen:
+            # 断言「绝不下第二单」：一旦被调用直接炸测试
+            patches.append(mock.patch.object(
+                orderflow, "_reopen_and_order",
+                side_effect=AssertionError("不应新开页重下")))
         if judge_result is not None:
             patches.append(mock.patch.object(
                 orderflow, "_judge_official", return_value=judge_result))
@@ -13292,9 +13502,9 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertIn("JUDGE", stages)
 
     def test_e2e_reopen_retry_new_page_success(self):
-        # 首读未获 → 官方回读无 dup → 新开页重下 → 新页读到付款页成功
+        # 首读未获 → 官方回读明确「无单」→ 新开页重下 → 新页读到付款页成功
         judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous"})
+                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
         new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
         clock = self._Clock()
         reopen_entry = {"page": new_page, "t_submit": clock.now,
@@ -13309,6 +13519,122 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertTrue(ok, msg)
         self.assertEqual(extra["page_kind"], "payOrder")
         self.assertEqual(extra["order_no"], "E123")
+
+    def test_e2e_judge_error_never_reopens(self):
+        # 官方回读失败/不可判定（error/unknown/blocked）不是「无单」：
+        # 允许重下会撞出第二张单（2026-10-19 审查 P0）
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous", "flow_judge": {"cls": "error"}})
+        page = self._HoldPage(self.INIT_URL, "")
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, judge_result=judge, no_reopen=True,
+            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                      "retry_open_times": 1})
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("JUDGE", stages)
+
+    def test_e2e_lock_page_stabilizes_before_success(self):
+        # 2026-10-19 用户口径：进入锁定座位页后必须静置 1–2s 再判成功，
+        # 防止半渲染/瞬时信号被当成最终结果后立刻关页。
+        class _Counting(self._HoldPage):
+            def __init__(self, url, body):
+                super().__init__(url, body)
+                self.reads = 0
+            def evaluate(self, js, arg=None):
+                if "document.body" in js:
+                    self.reads += 1
+                return super().evaluate(js, arg)
+        page = _Counting(self.PAY_URL, self.pay_body_default())
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                            "retry_open_times": 0, "lock_confirm_seconds": 2})
+        self.assertTrue(ok, msg)
+        # 0.5s 一轮 × 2s 确认窗 = 至少 5 次正文读（首读 + 4 轮）
+        self.assertGreaterEqual(page.reads, 5, "锁定页未静置确认就返回成功")
+
+    def test_e2e_pending_prompt_blocks_early_reopen(self):
+        # 2026-10-19 实测 bug：点确认后页面显示「订单已经提交，系统正在
+        # 处理中」期间，官方回读必然 ambiguous；旧逻辑据此立刻新开页重下，
+        # 下出第二单被 12306 判「出票失败/未完成订单」——处理中必须先等。
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous"})
+        new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
+        reopen_entry = {"page": new_page, "t_submit": 1_700_000_000.0,
+                        "picked": ["张三"], "dlg_seat": "二等座"}
+        page = self._HoldPage(self.INIT_URL,
+                              "【提示框】订单已经提交，系统正在处理中，请稍候。")
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, judge_result=judge, reopen_entry=reopen_entry,
+            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                      "retry_open_times": 1})
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous", "处理中页面被提前重下")
+
+    def test_e2e_lock_page_never_reopens_second_order(self):
+        # 已进入锁定页但还没刷出「席位已锁定」：只等，绝不下第二单；
+        # 观察窗到期交官方回读（ambiguous），由上层保守处理。
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous"})
+        new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
+        reopen_entry = {"page": new_page, "t_submit": 1_700_000_000.0,
+                        "picked": ["张三"], "dlg_seat": "二等座"}
+        page = self._HoldPage(self.PAY_URL, "页面加载中")
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, judge_result=judge, reopen_entry=reopen_entry,
+            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                      "retry_open_times": 1})
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+
+    def test_e2e_transient_dup_on_lock_page_ignored(self):
+        # 刚进锁定页 1–2s 内正文残留「未完成订单」链接噪声：不能判 dup
+        # 关页重下，必须继续等锁定词（确认窗内一律 wait）。
+        class _Seq(self._HoldPage):
+            def __init__(self, url, bodies):
+                super().__init__(url, bodies[0])
+                self._bodies = list(bodies)
+            def evaluate(self, js, arg=None):
+                if "document.body" in js:
+                    self._body = (self._bodies.pop(0) if len(self._bodies) > 1
+                                  else self._bodies[0])
+                return super().evaluate(js, arg)
+        page = _Seq(self.PAY_URL, ["您有未完成订单，请先处理",
+                                   "您有未完成订单，请先处理",
+                                   self.pay_body_default()])
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
+                            "retry_open_times": 0, "lock_confirm_seconds": 1.5})
+        self.assertTrue(ok, msg)
+
+    def test_e2e_video_timeline_pending_then_lock_success(self):
+        # 复刻用户录屏 2 的时间线：确认后「正在处理」约 6 秒才出锁定页。
+        # 全程不得新开页重下，锁定页静置确认后按成功收尾。
+        success_body = self.pay_body_default()
+        class _Timeline(self._HoldPage):
+            def __init__(self):
+                super().__init__(TestOrderflowE2EMock.INIT_URL, "")
+                self.n = 0
+            @property
+            def url(self):
+                return (TestOrderflowE2EMock.INIT_URL if self.n < 12
+                        else TestOrderflowE2EMock.PAY_URL)
+            def evaluate(self, js, arg=None):
+                if "document.body" in js:
+                    self.n += 1
+                    self._body = (
+                        "【提示框】订单已经提交，系统正在处理中，请稍候。"
+                        if self.n <= 12 else success_body)
+                return super().evaluate(js, arg)
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous"})
+        page = _Timeline()
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, judge_result=judge, no_reopen=True,
+            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 12,
+                      "retry_open_times": 1})
+        self.assertTrue(ok, msg)
+        self.assertEqual(extra["page_kind"], "payOrder")
 
 
 def _multi(patches):
@@ -13702,7 +14028,7 @@ class TestApiRpcContract(TempDirCase):
     # ---- 1. 注册完整性 ----
 
     def test_methods_registry_complete(self):
-        self.assertEqual(len(self.api.METHODS), 37,
+        self.assertEqual(len(self.api.METHODS), 39,
                          "方法数变化必须同步契约测试：%s" % sorted(self.api.METHODS))
         for name, fn in self.api.METHODS.items():
             self.assertTrue(callable(fn), "%s 不可调用" % name)
@@ -13749,10 +14075,35 @@ class TestApiRpcContract(TempDirCase):
         self.assertIn("ValueError", resp["error"]["message"])
         self.assertIn("handler 炸了", resp["error"]["message"])
 
+    def test_threaded_dispatch_does_not_block_slow_method(self):
+        # 慢方法（查票/会话）不能堵住 stdin 分发线程（2026-10-19 审查 P1）
+        gate = threading.Event()
+
+        def slow(_p):
+            gate.wait(2)
+            return {"ok": True}
+
+        with mock.patch.object(self.api, "_SLOW_METHODS",
+                               frozenset({"__slow"})), \
+                mock.patch.dict(self.api.METHODS, {"__slow": slow}):
+            t0 = time.time()
+            self.api.rpc_dispatch(
+                json.dumps({"jsonrpc": "2.0", "id": 9,
+                            "method": "__slow", "params": {}}),
+                threaded=True)
+            self.assertLess(time.time() - t0, 0.05,
+                            "慢方法不应阻塞分发线程")
+            self.assertNotIn('"id": 9', self._out.getvalue())
+            gate.set()
+            deadline = time.time() + 2
+            while time.time() < deadline and '"id": 9' not in self._out.getvalue():
+                time.sleep(0.01)
+        self.assertIn('"id": 9', self._out.getvalue())
+
     def test_empty_params_never_raise(self):
         """漏参数是最常见的协议层故障：只允许返回 error，不允许把异常抛给主循环。"""
         must_have_params = ("createTask", "deleteTask", "setTaskStatus",
-                            "resetTask", "saveGrabTask", "renameGrabTask",
+                            "saveGrabTask", "renameGrabTask",
                             "deleteGrabTask", "passengerDetail", "deletePreset")
         for method in must_have_params:
             with self.subTest(method=method):
@@ -13817,6 +14168,213 @@ class TestMonitorTaskEdit(unittest.TestCase):
         self.assertTrue(r.get("ok"))
         self.assertEqual(deleted, ["u2"], "同名任务必须按 uid 精确删除，不能删到第一条")
 
+    def test_remove_task_by_uid_keeps_same_name_sibling(self):
+        # 2026-10-19 用户反馈：编辑日期后任务直接消失。编辑=先建后删，新旧
+        # 同名；按名字删全部同名会把刚建的新任务一起删掉。
+        api_mod = self._api()
+        cfg = {"tasks": [{"uid": "old", "name": "郑州-上海 K558 硬座"},
+                         {"uid": "new", "name": "郑州-上海 K558 硬座"}]}
+        api_mod.remove_task_from_config(
+            cfg, {"uid": "old", "name": "郑州-上海 K558 硬座"})
+        self.assertEqual([t["uid"] for t in cfg["tasks"]], ["new"],
+                         "按 uid 删除时不得删掉同名的新任务")
+
+    def test_remove_task_without_uid_only_drops_first_name_match(self):
+        # 老任务没有 uid（uid 字段是后加的）。编辑时旧任务在前、新任务追加在
+        # 末尾，删第一条才正好是旧任务；删光等于「改完日期任务没了」。
+        api_mod = self._api()
+        cfg = {"tasks": [{"name": "同名任务", "dates": ["2026-10-19"]},
+                         {"uid": "new", "name": "同名任务",
+                          "dates": ["2026-10-20"]}]}
+        api_mod.remove_task_from_config(cfg, {"name": "同名任务"})
+        self.assertEqual([t.get("uid") for t in cfg["tasks"]], ["new"],
+                         "无 uid 只能删一条同名任务，不能把新任务一起删掉")
+
+    def test_rpc_delete_task_keeps_new_same_name_task(self):
+        # 走真实 delete_task_everywhere（只 patch state 写）：编辑后列表必须
+        # 留下新建的那条，而不是两条一起消失。
+        api_mod = self._api()
+        api_mod.CONFIG_PATH = self._tmp_cfg([
+            {"name": "同名任务", "dates": ["2026-10-19"]},
+            {"uid": "new", "name": "同名任务", "dates": ["2026-10-20"]},
+        ])
+        with mock.patch.object(api_mod, "update_state_locked"):
+            r = api_mod.rpc_delete_task({"name": "同名任务"})
+        self.assertTrue(r.get("ok"))
+        with open(api_mod.CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.assertEqual([t.get("uid") for t in cfg["tasks"]], ["new"])
+
+
+class TestApiSaveGuards(TempDirCase):
+    """api 保存链路的返回值/密码/指纹守卫（2026-10-19 审查 P0）。"""
+
+    def _api(self):
+        import api as api_mod
+        old = api_mod.CONFIG_PATH
+        self.addCleanup(setattr, api_mod, "CONFIG_PATH", old)
+        return api_mod
+
+    def _cfg(self, data):
+        p = os.path.join(self.tmp, "config.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return p
+
+    def test_first_smtp_password_is_kept(self):
+        # 旧配置没有 password：新填授权码不能被「按旧值判空」的逻辑删掉
+        api_mod = self._api()
+        api_mod.CONFIG_PATH = self._cfg({"notify": {"email": {
+            "enabled": True, "smtp_host": "smtp.qq.com", "smtp_port": 465,
+            "username": "a@qq.com", "from": "a@qq.com", "to": ["a@qq.com"]}}})
+        with mock.patch.object(api_mod.notify_mod, "protect_secret",
+                               side_effect=lambda s: "ENC:" + s):
+            r = api_mod.rpc_save_settings({"email": {
+                "enabled": True, "smtp_host": "smtp.qq.com", "smtp_port": 465,
+                "username": "a@qq.com", "password": "auth-code",
+                "from": "a@qq.com", "to": ["a@qq.com"]}})
+        self.assertTrue(r.get("ok"), r)
+        with open(api_mod.CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["notify"]["email"]["password"], "ENC:auth-code")
+
+    def test_save_passengers_propagates_failure(self):
+        # save_passengers 返回 False（stamp 冲突/占用/不可解密）不能回 ok:True
+        api_mod = self._api()
+        with mock.patch.object(api_mod.passengers_mod, "load_passengers",
+                               return_value=[]), \
+             mock.patch.object(api_mod.passengers_mod, "save_passengers",
+                               return_value=False) as m_save:
+            r = api_mod.rpc_save_passengers({"passengers": []})
+        self.assertFalse(r.get("ok"))
+        self.assertIn("保存失败", r.get("error") or "")
+        self.assertIs(m_save.call_args.kwargs["expect_stamp"],
+                      api_mod.passengers_mod._STAMP_UNSET)
+
+    def test_save_passengers_null_stamp_means_no_check(self):
+        # 前端 stamp 未就绪（JSON null）≠「文件必须不存在」
+        api_mod = self._api()
+        with mock.patch.object(api_mod.passengers_mod, "load_passengers",
+                               return_value=[]), \
+             mock.patch.object(api_mod.passengers_mod, "save_passengers",
+                               return_value=True) as m_save, \
+             mock.patch.object(api_mod.passengers_mod, "passengers_stamp",
+                               return_value="S1"):
+            r = api_mod.rpc_save_passengers({"passengers": [],
+                                             "expect_stamp": None})
+        self.assertTrue(r.get("ok"), r)
+        self.assertIs(m_save.call_args.kwargs["expect_stamp"],
+                      api_mod.passengers_mod._STAMP_UNSET)
+
+    def test_split_date_input_rejects_non_iso_list(self):
+        # 列表形态同样必须是 ISO：非 ISO 落盘后会被引擎静默丢弃
+        api_mod = self._api()
+        with mock.patch.object(api_mod, "push"):
+            dates, rng = api_mod._split_date_input(
+                {"dates": ["2026-10-19"],
+                 "date_range": ["2026/10/19", "2026-10-21"]})
+        self.assertEqual(dates, ["2026-10-19"])
+        self.assertEqual(rng, [])
+
+    def test_create_task_string_seats_not_split_per_char(self):
+        # 裸字符串不能被逐字符拆成「二/等/座」
+        api_mod = self._api()
+        captured = {}
+        with mock.patch.object(api_mod, "push"), \
+                mock.patch.object(
+                    api_mod, "_req_on",
+                    side_effect=lambda pp, k: bool(pp.get(k, False))), \
+                mock.patch.object(api_mod.launcher, "append_monitor_task",
+                                  side_effect=lambda t: captured.update(t)):
+            r = api_mod.rpc_create_task({
+                "from": "郑州", "to": "上海", "dates": ["2026-10-20"],
+                "trains": "K1970", "seat_types": "硬座,无座",
+                "passengers": "张三", "auto_order": False})
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(captured["seat_types"], ["硬座", "无座"])
+        self.assertEqual(captured["passenger_names"], ["张三"])
+
+    def test_save_grab_task_rejects_bad_number_and_missing_id(self):
+        api_mod = self._api()
+        self.assertFalse(api_mod.rpc_save_grab_task({"name": "x"}).get("ok"))
+        with mock.patch.object(api_mod.launcher, "load_grab_tasks",
+                               return_value=[]):
+            r = api_mod.rpc_save_grab_task({"id": "a",
+                                            "poll_seconds": "abc"})
+        self.assertFalse(r.get("ok"))
+        self.assertIn("数字", r.get("error") or "")
+
+    def test_delete_grab_task_requires_id(self):
+        api_mod = self._api()
+        r = api_mod.rpc_delete_grab_task({})
+        self.assertFalse(r.get("ok"))
+        self.assertIn("id", r.get("error") or "")
+
+    def test_set_task_status_rejects_unknown_status(self):
+        api_mod = self._api()
+        r = api_mod.rpc_set_task_status({"name": "t", "status": "success "})
+        self.assertFalse(r.get("ok"))
+        with mock.patch.object(api_mod, "load_config",
+                               return_value={"tasks": []}):
+            r2 = api_mod.rpc_set_task_status({"name": "t", "status": "paused"})
+        self.assertFalse(r2.get("ok"))
+        self.assertIn("不存在", r2.get("error") or "")
+
+    def test_query_tickets_validates_station_and_date(self):
+        api_mod = self._api()
+        bad_code = api_mod.rpc_query_tickets(
+            {"fromCode": "北京", "toCode": "SHH", "date": "2026-10-20"})
+        self.assertIn("车站代码", bad_code.get("error") or "")
+        bad_date = api_mod.rpc_query_tickets(
+            {"fromCode": "BJP", "toCode": "SHH", "date": "2026/10/20"})
+        self.assertIn("日期", bad_date.get("error") or "")
+
+    def test_list_history_limit_clamped(self):
+        api_mod = self._api()
+        with mock.patch.object(api_mod, "read_history_records",
+                               return_value=[]) as m:
+            api_mod.rpc_list_history({"limit": "abc"})
+            api_mod.rpc_list_history({"limit": -5})
+        self.assertEqual([c.args[0] for c in m.call_args_list], [200, 1])
+
+
+class TestP2InputGuards(TempDirCase):
+    """P2：共享构造函数与文件的形状守卫（2026-10-19 审查）。"""
+
+    def test_build_monitor_task_normalizes_inputs(self):
+        import grabber_utils
+        t = grabber_utils.build_monitor_task(
+            "北京", "上海", "2026-10-20", "not-a-range", ["G101"], None,
+            "张三", "ADULT", "false", "0", "abc")
+        self.assertEqual(t["seat_types"], [], "seats=None 不能 TypeError")
+        self.assertEqual(t["passenger_names"], ["张三"], "字符串不能逐字符拆")
+        self.assertFalse(t["auto_order"], 'bool("false") 不能变 True')
+        self.assertFalse(t["stop_after_order"])
+        self.assertEqual(t["priority"], 5)
+        self.assertEqual(t["dates"], ["2026-10-20"])
+        self.assertEqual(t["date_range"], [])
+
+    def test_email_recipients_string_is_split(self):
+        import appcommon
+        email = appcommon.normalize_email_settings(
+            {"username": "a@x.com", "to": "b@x.com, c@x.com"})
+        self.assertEqual(email["to"], ["b@x.com", "c@x.com"])
+
+    def test_station_db_kind_shape_returns_1(self):
+        import station_db
+        files = {
+            "station_name.json": {"name2code": {"北京": "BJP"}},
+            "station_index.json": {"stations": [{"name": "北京", "code": "BJP"}]},
+            "stations_db.json": {"stations": [{"name": "北京", "code": "BJP",
+                                               "kind": "待识别"}]},
+            "station_kind.json": ["not-a-dict"],
+        }
+        for name, obj in files.items():
+            with open(os.path.join(self.tmp, name), "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False)
+        with mock.patch.object(station_db, "HERE", self.tmp):
+            self.assertEqual(station_db.check(), 1)
+
 
 class TestKeepPayPage(unittest.TestCase):
     """下单成功后把「席位已锁定」付款页留给用户核对/支付（2026-10-18 需求）。
@@ -13871,6 +14429,88 @@ class TestKeepPayPage(unittest.TestCase):
 
         with mock.patch.object(bo, "_log"):
             bo._hold_pay_page(_P(), 60, lambda: True)
+
+
+class TestProblemLog(TempDirCase):
+    """问题台账（界面「问题日志」页数据源）：写入 / 读取 / 清空 / 裁剪 / Handler。"""
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.tmp, "problem_log.jsonl")
+
+    def test_append_and_read_newest_first(self):
+        import logutil
+        logutil.append_problem("ERROR", "engine:1", "第一条", path=self.path)
+        logutil.append_problem("WARNING", "engine:2", "第二条", path=self.path)
+        got = logutil.read_problem_log(path=self.path, limit=10)
+        self.assertEqual([r["message"] for r in got], ["第二条", "第一条"])
+        self.assertEqual(got[0]["level"], "WARNING")
+        self.assertEqual(got[1]["source"], "engine:1")
+
+    def test_read_limit_and_missing_file(self):
+        import logutil
+        for i in range(5):
+            logutil.append_problem("ERROR", "s", "msg%d" % i, path=self.path)
+        self.assertEqual(len(logutil.read_problem_log(path=self.path, limit=2)), 2)
+        self.assertEqual(logutil.read_problem_log(path=self.path, limit=2)[0]["message"], "msg4")
+        self.assertEqual(logutil.read_problem_log(path=os.path.join(self.tmp, "none")), [])
+
+    def test_bad_lines_skipped(self):
+        import logutil
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{not json\n\n")
+        logutil.append_problem("ERROR", "s", "好的一条", path=self.path)
+        got = logutil.read_problem_log(path=self.path)
+        self.assertEqual([r["message"] for r in got], ["好的一条"])
+
+    def test_clear(self):
+        import logutil
+        logutil.append_problem("ERROR", "s", "x", path=self.path)
+        self.assertTrue(logutil.clear_problem_log(path=self.path))
+        self.assertEqual(logutil.read_problem_log(path=self.path), [])
+
+    def test_handler_captures_warning_and_error_only(self):
+        import logutil
+        h = logutil.ProblemLogHandler(path=self.path)
+        logger = logging.getLogger("t12306_test_problem")
+        logger.handlers = [h]
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.info("不要这条")
+        logger.warning("要这条 %s", "警告")
+        try:
+            raise ValueError("炸了")
+        except ValueError:
+            logger.exception("异常也要")
+        recs = logutil.read_problem_log(path=self.path)
+        msgs = [r["message"] for r in recs]
+        self.assertIn("要这条 警告", msgs)
+        self.assertIn("异常也要", msgs)
+        self.assertNotIn("不要这条", msgs)
+        self.assertIn("ValueError: 炸了", recs[0]["trace"])
+
+    def test_trim_keeps_recent_entries(self):
+        import logutil
+        with mock.patch.object(logutil, "PROBLEM_LOG_MAX_BYTES", 200), \
+             mock.patch.object(logutil, "PROBLEM_LOG_KEEP", 5):
+            for i in range(20):
+                logutil.append_problem("ERROR", "s", "line-%02d" % i, path=self.path)
+            got = logutil.read_problem_log(path=self.path, limit=100)
+        self.assertLessEqual(len(got), 5)
+        self.assertEqual(got[0]["message"], "line-19")
+
+    def test_rpc_list_and_clear_requires_confirm(self):
+        import logutil
+        import api
+        logutil.append_problem("ERROR", "s", "rpc 可见", path=self.path)
+        with mock.patch.object(logutil, "problem_log_path", return_value=self.path):
+            self.assertEqual(api.rpc_list_problem_logs({"limit": 5})["records"][0]["message"],
+                             "rpc 可见")
+            denied = api.rpc_clear_problem_logs({})
+            self.assertFalse(denied["ok"], "无 confirm 不得清空")
+            self.assertTrue(api.rpc_list_problem_logs({})["records"], "拒绝后记录仍在")
+            self.assertTrue(api.rpc_clear_problem_logs({"confirm": True})["ok"])
+            self.assertEqual(api.rpc_list_problem_logs({})["records"], [])
 
 
 if __name__ == "__main__":

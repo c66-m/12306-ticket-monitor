@@ -9,6 +9,7 @@
 业务层全部复用 launcher / ticket / engine / passengers / order / notify，
 本文件只做：JSON-RPC 分发 + LOGQ 日志泵 + 引擎线程管理。零业务逻辑。
 """
+import datetime
 import json
 import os
 import queue
@@ -29,9 +30,11 @@ import engine as engine_mod
 import passengers as passengers_mod
 import appcommon
 import filelock
+import logutil
 import order as order_mod
 import browser_order
 import notify as notify_mod
+from app.scheduler import Scheduler  # P2：散养线程统一收编
 
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
@@ -125,21 +128,14 @@ def load_config():
     return appcommon.read_config_or_empty(CONFIG_PATH, broken=_broken)
 
 
-def save_config(config):
-    appcommon.write_config_locked(CONFIG_PATH, config)
-
-
 def load_state():
     return engine_mod.load_state_file(
         appcommon.state_path_of(load_config(), HERE))
 
 
 def remove_task_from_config(config, task):
-    tasks = config.get("tasks")
-    if isinstance(tasks, list):
-        key = task.get("name")
-        config["tasks"] = [t for t in tasks if t.get("name") != key]
-    return config
+    """删除任务（单源在 appcommon：有 uid 按 uid 删，无 uid 只删第一个同名）。"""
+    return appcommon.remove_task_from_config(config, task)
 
 
 def update_config_locked(fn, expect_stamp=_STAMP_UNSET):
@@ -199,6 +195,7 @@ def read_history_records(limit=200):
 
 _engine = None
 _engine_lock = threading.Lock()
+_engine_start_lock = threading.Lock()  # 启动幂等：判定+建线程+赋值必须原子
 _engine_thread = None
 _engine_stop = None  # 当前引擎线程的 stop_event，stop_engine() 用它请求优雅退出
 
@@ -221,16 +218,22 @@ def engine_running():
 
 
 def start_engine():
-    """启动监控引擎线程（幂等）。"""
+    """启动监控引擎线程（幂等）。
+
+    判定+建线程+赋值在同一把锁内：否则自启与 RPC 并发时会在
+    t.start() 与 _engine_thread 赋值之间各起一个循环，同一任务双路下单
+    （2026-10-19 审查）。
+    """
     global _engine_thread, _engine_stop
-    if engine_running():
-        return True
-    eng = get_engine()
-    stop_evt = threading.Event()
-    t = threading.Thread(target=eng.run, args=(stop_evt,), daemon=True)
-    t.start()
-    _engine_thread = t
-    _engine_stop = stop_evt
+    with _engine_start_lock:
+        if _engine_thread is not None and _engine_thread.is_alive():
+            return True
+        eng = get_engine()
+        stop_evt = threading.Event()
+        t = threading.Thread(target=eng.run, args=(stop_evt,), daemon=True)
+        t.start()
+        _engine_thread = t
+        _engine_stop = stop_evt
     launcher.log("[启动] 监控引擎已启动")
     return True
 
@@ -260,6 +263,19 @@ def stop_engine():
     # 让人以为日志还要刷很久）。
     launcher.log("[停止] 监控引擎%s" % ("仍在收尾（在途任务跑完当轮即停）" if alive else "已停止"))
     return not alive
+
+
+def rpc_shutdown(_p):
+    """Electron 退出前的优雅收尾：停引擎（状态落盘）后返回，由主进程 kill。
+
+    直接强杀会跳过 finally：引擎节流的 state 丢失，Playwright 起的浏览器
+    子进程变孤儿并占住 .browser_profile（2026-10-19 审查）。
+    """
+    try:
+        stop_engine()
+    except Exception as e:
+        _warn("退出前停止引擎", e)
+    return {"ok": True}
 
 
 def _mark_running_tasks_paused():
@@ -330,23 +346,43 @@ def _auto_start_engine():
 
 # ---------------- 日志泵 ----------------
 
+def _log_tag(record):
+    """日志分级（与前端颜色映射一致）。"""
+    if "[有票]" in record or "[抢到]" in record or "[成功]" in record:
+        return "ok"
+    if "[错误]" in record or "[失败]" in record:
+        return "err"
+    if ("[提醒]" in record or "[重试]" in record or "[暂停]" in record
+            or "[会话]" in record):
+        return "warn"
+    return "info"
+
+
 def log_pump():
-    """把 launcher.LOGQ 的日志推给前端。"""
+    """把 launcher.LOGQ 的日志成批推给前端（150ms 一窗）。
+
+    逐行推送时每条日志都是一次 IPC + 前端一次同步 reflow，日志密集时会
+    一起卡；攒批后一次 DOM 插入只滚一次（2026-10-19 审查）。
+    """
     while True:
         try:
-            record = launcher.LOGQ.get(timeout=0.3)
+            first = launcher.LOGQ.get(timeout=0.3)
         except queue.Empty:
             continue
-        tag = "info"
-        if "[有票]" in record or "[抢到]" in record or "[成功]" in record:
-            tag = "ok"
-        elif "[错误]" in record or "[失败]" in record:
-            tag = "err"
-        elif "[提醒]" in record or "[重试]" in record or "[暂停]" in record:
-            tag = "warn"
-        elif "[会话]" in record:
-            tag = "warn"
-        push("log", {"line": record, "tag": tag})
+        batch = [first]
+        deadline = time.time() + 0.15
+        while time.time() < deadline:
+            try:
+                batch.append(launcher.LOGQ.get_nowait())
+            except queue.Empty:
+                time.sleep(0.02)
+        items = [{"line": r, "tag": _log_tag(r)} for r in batch]
+        # 单条保持旧形状（line/tag），多条用 lines 数组，前端两态都认。
+        # 前端断开（stdout 关闭）时日志泵不能跟着死，否则后续日志全丢。
+        try:
+            push("log", {"lines": items} if len(items) > 1 else items[0])
+        except Exception:
+            pass
 
 
 # ---------------- RPC 方法 ----------------
@@ -422,7 +458,13 @@ def _split_date_input(p):
     raw = p.get("date_range")
     if isinstance(raw, (list, tuple)) and len(raw) == 2:
         a, b = str(raw[0]), str(raw[1])
-        if a and b and a > b:
+        try:
+            # 列表形态同样必须是 ISO 日期：非 ISO 落盘后会被引擎静默丢弃
+            datetime.date.fromisoformat(a)
+            datetime.date.fromisoformat(b)
+        except (TypeError, ValueError):
+            return dates, []
+        if a > b:
             # 开始晚于结束：ISO 串可直接比较。不交换的话引擎展开不出任何日期，
             # 任务会被判「监控日期已全部过期」直接失败（2026-10-18 实测）。
             a, b = b, a
@@ -446,7 +488,10 @@ def _req_on(p, key):
     弹窗移除，改到设置页「任务默认值」；编辑旧任务时前端会显式回传任务原值，
     免得编辑一次就把「本来关着自动下单」的任务悄悄打开。"""
     if p.get(key) is not None:
-        return bool(p[key])
+        v = p[key]
+        if isinstance(v, str):   # bool("false") 是 True：字符串按字面值解释
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
     return _task_defaults(load_config())[key]
 
 
@@ -466,7 +511,17 @@ def rpc_create_task(p):
     # 前端传的是数组；早先 str(list) 落成 "['K225']" 这种字符串，被当成单个车次码
     trains = [t.strip().upper() for t in (raw_trains or [])
               if isinstance(t, str) and t.strip()]
-    seats = [str(s) for s in (p.get("seat_types") or [])]
+    raw_seats = p.get("seat_types")
+    if isinstance(raw_seats, str):
+        # 裸字符串不能被逐字符拆成「二/等/座」
+        raw_seats = re.split(r"[,，\s]+", raw_seats)
+    seats = [str(s).strip() for s in (raw_seats or []) if str(s).strip()]
+    raw_pax = p.get("passengers")
+    if isinstance(raw_pax, str):
+        raw_pax = re.split(r"[,，\s]+", raw_pax)
+    pax_names = [str(n).strip() for n in (raw_pax or []) if str(n).strip()]
+    raw_purpose_map = p.get("pax_purpose")
+    pax_purpose = raw_purpose_map if isinstance(raw_purpose_map, dict) else {}
     auto_order = _req_on(p, "auto_order")
     if auto_order and seats:
         # 与 gui 同规则：自动下单剔除不支持下单的席别
@@ -483,10 +538,10 @@ def rpc_create_task(p):
     task = launcher.build_monitor_task(
         str(p.get("from") or ""), str(p.get("to") or ""),
         dates, date_range,
-        trains, seats, list(p.get("passengers") or []),
+        trains, seats, pax_names,
         p.get("purpose") or "ADULT", auto_order,
         _req_on(p, "stop_after_order"), prio,
-        pax_purpose=dict(p.get("pax_purpose") or {}),
+        pax_purpose=pax_purpose,
         seat_priority=pri_raw)
     task["notify_channels"] = ["email"] if _req_on(p, "notify") else []
     if pri_raw:
@@ -503,10 +558,16 @@ def rpc_create_task(p):
     return {"ok": True, "name": task.get("name")}
 
 
+_TASK_STATUSES = ("monitoring", "paused", "failed", "cancelled", "success")
+
+
 def rpc_set_task_status(p):
     """p = {name, status, message?}"""
     name = p.get("name")
     status = p.get("status")
+    if status not in _TASK_STATUSES:
+        # 任意状态落盘会让界面显示 "?"，伪造 success 还会污染历史
+        return {"ok": False, "error": "非法任务状态：%s" % status}
     cfg = load_config()
     task = next((t for t in cfg.get("tasks") or [] if t.get("name") == name), None)
     if not task:
@@ -514,9 +575,12 @@ def rpc_set_task_status(p):
     if engine_running():
         get_engine().set_task_status(task, status, p.get("message") or "", force=True)
     else:
-        # 引擎未运行：直接写 state
+        # 引擎未运行：直接写 state（tasks 被手改成非 dict 时按空表重建）
         def _set(state):
-            tasks = state.setdefault("tasks", {})
+            tasks = state.get("tasks")
+            if not isinstance(tasks, dict):
+                tasks = {}
+                state["tasks"] = tasks
             rec = tasks.setdefault(name, {})
             rec["status"] = status
             rec["message"] = p.get("message") or ""
@@ -524,26 +588,25 @@ def rpc_set_task_status(p):
     return {"ok": True}
 
 
-def rpc_reset_task(p):
-    """p = {name}：清该任务本地防重记录并恢复监控（GUI「重置防重」等价）。"""
-    name = p.get("name")
-    cfg = load_config()
-    task = next((t for t in cfg.get("tasks") or [] if t.get("name") == name), None)
-    if not task:
-        return {"ok": False, "error": "任务不存在：" + str(name)}
+def rpc_list_problem_logs(p):
+    """p = {limit}：问题台账（WARNING 及以上），最新在前。"""
     try:
-        get_engine().empty_task_dedup(task)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    if engine_running():
-        get_engine().set_task_status(task, "monitoring", "手动重置", force=True)
-    else:
-        def _set(state):
-            rec = state.setdefault("tasks", {}).setdefault(name, {})
-            rec["status"] = "monitoring"
-            rec["message"] = "手动重置"
-        update_state_locked(_set)
-    return {"ok": True}
+        limit = int(p.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 1000))
+    return {"records": logutil.read_problem_log(limit=limit)}
+
+
+def rpc_clear_problem_logs(p):
+    """清空问题台账（界面「问题日志」页的「清空」）。
+
+    必须显式 confirm=true：RPC 冒烟测试会带空参数逐个调用方法，不加这道门
+    会在跑测试时把用户真实台账清掉。
+    """
+    if not p.get("confirm"):
+        return {"ok": False, "error": "需要 confirm=true 才清空问题日志"}
+    return {"ok": logutil.clear_problem_log()}
 
 
 def rpc_resume_all(_p):
@@ -582,8 +645,16 @@ def rpc_delete_task(p):
 
 def rpc_save_grab_task(p):
     """p = 完整任务 dict（含 id/name/status）。"""
-    tasks = launcher.load_grab_tasks()
     tid = p.get("id")
+    if not tid:
+        return {"ok": False, "error": "缺少任务 id"}
+    for k in ("poll_seconds", "warm_minutes", "remind_minutes"):
+        if p.get(k) not in (None, ""):
+            try:
+                p[k] = float(p[k])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "参数 %s 必须是数字" % k}
+    tasks = launcher.load_grab_tasks()
     found = False
     for i, t in enumerate(tasks):
         if t.get("id") == tid:
@@ -613,6 +684,9 @@ def rpc_rename_grab_task(p):
 
 def rpc_delete_grab_task(p):
     tid = p.get("id")
+    if not tid:
+        # 空 id 会命中「所有无 id 任务」，一次误调用清空老任务
+        return {"ok": False, "error": "缺少任务 id"}
     tasks = [t for t in launcher.load_grab_tasks() if t.get("id") != tid]
     launcher.save_grab_tasks(tasks)
     return {"ok": True}
@@ -723,12 +797,21 @@ def rpc_grab_result(p):
 
 def rpc_query_tickets(p):
     """真实查票（免登录）：query_tickets + parse_row → 前端渲染友好的结构。"""
-    from_code = p.get("fromCode") or ""
-    to_code = p.get("toCode") or ""
-    date = p.get("date") or ""
+    from_code = str(p.get("fromCode") or "").strip().upper()
+    to_code = str(p.get("toCode") or "").strip().upper()
+    date = str(p.get("date") or "").strip()
     purpose = p.get("purpose") or "ADULT"
     if not (from_code and to_code and date):
         return {"error": "缺少 fromCode/toCode/date"}
+    if not (re.fullmatch(r"[A-Z]{3}", from_code)
+            and re.fullmatch(r"[A-Z]{3}", to_code)):
+        return {"error": "车站代码格式不正确（应为 3 位大写字母）"}
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        return {"error": "日期格式必须是 YYYY-MM-DD"}
+    if purpose not in ("ADULT", "0X00"):
+        purpose = "ADULT"
     if date < time.strftime("%Y-%m-%d"):
         # 12306 对过期日期返回非 JSON，直接给出可读原因（查询历史里的旧日期会走到这里）
         return {"error": "该日期已过期，12306 不再提供余票查询"}
@@ -791,6 +874,34 @@ def rpc_seat_priority_feedback(p):
 
 
 _armed_fired = set()  # 已自动触发的抢票任务 id（防重）
+_SCHED = None  # P2 统一调度器（main() 初始化）
+
+
+def _reconcile_update(key, rec):
+    """对账写台账（显式传入 ReconcileRunner，走 appcommon 落 JSON+镜像）。"""
+    try:
+        appcommon.upsert_order(appcommon.data_path("orders.json"), key, rec)
+    except Exception as e:
+        _warn("对账写台账", e)
+
+
+def _reconcile_tick():
+    """后台对账守护（P3）：每 5 分钟扫台账未决记录，用官方快照改判。
+
+    会话可用才跑；会话异常/查询失败只做审计不中断。首跑延迟 300s
+    （immediate=False），启动瞬间不立即改写台账。
+    """
+    try:
+        from adapters.railway.snapshot import SnapshotProvider
+        from app.reconcile_service import ReconcileRunner
+        prov = SnapshotProvider(_classify_session())
+        runner = ReconcileRunner(prov, updater=_reconcile_update)
+        rep = runner.reconcile_once()
+        push("log", {"line": "[对账] 台账对账完成 %s" % rep.summary(),
+                     "tag": "info"})
+    except Exception as e:
+        push("log", {"line": "[对账] 本轮跳过：%s：%s"
+                     % (type(e).__name__, e), "tag": "warn"})
 
 
 def _armed_prepare_lead(t):
@@ -952,7 +1063,14 @@ def rpc_save_passengers(p):
                 if isinstance(v, str) and "*" in v:
                     x[k] = prev.get(k, "")
             rows.append(x)
-        passengers_mod.save_passengers(rows, expect_stamp=p.get("expect_stamp"))
+        stamp = p.get("expect_stamp", passengers_mod._STAMP_UNSET)
+        if stamp is None:
+            # JSON null（前端尚未拿到 stamp）按「不检查」处理：旧代码把它当成
+            # 「文件必须不存在」，文件已存在时每次保存都被静默拒绝。
+            stamp = passengers_mod._STAMP_UNSET
+        if not passengers_mod.save_passengers(rows, expect_stamp=stamp):
+            return {"ok": False,
+                    "error": "保存失败：文件被其它程序修改或占用，请刷新后重试"}
         return {"ok": True, "stamp": passengers_mod.passengers_stamp()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1042,21 +1160,24 @@ def probe_session(force=False):
     unknown=True 表示这一轮没验成（浏览器忙 / 风控 / 网络），前端据此保留上一次
     结论，而不是把有效会话显示成「未登录」。force=True 走真实浏览器校验。
     """
-    if (load_config().get("order_mode") or "http") != "browser":
-        try:
-            ok, msg, permanent = order_mod.verify_session(order_mod.load_session())
-        except Exception as e:
-            return {"ok": False, "unknown": False, "permanent": True,
-                    "message": str(e), "name": ""}
-        return {"ok": bool(ok), "unknown": not ok and not permanent,
-                "permanent": bool(permanent), "message": str(msg or ""),
-                "name": str(msg or "") if ok else ""}
     now = time.time()
     if (not force and _SESSION_CACHE["res"] is not None
             and now - _SESSION_CACHE["at"] < _SESSION_TTL):
         return _SESSION_CACHE["res"]
-    res = _probe_browser_session()
-    _SESSION_CACHE["at"] = now
+    if (load_config().get("order_mode") or "http") != "browser":
+        try:
+            ok, msg, permanent = order_mod.verify_session(order_mod.load_session())
+        except Exception as e:
+            res = {"ok": False, "unknown": False, "permanent": True,
+                   "message": str(e), "name": ""}
+        else:
+            res = {"ok": bool(ok), "unknown": not ok and not permanent,
+                   "permanent": bool(permanent), "message": str(msg or ""),
+                   "name": str(msg or "") if ok else ""}
+    else:
+        res = _probe_browser_session()
+    # 两种模式共用缓存：http 的 3×15s 校验不能被前端与看门狗每 60s 各打一遍
+    _SESSION_CACHE["at"] = time.time()
     _SESSION_CACHE["res"] = res
     return res
 
@@ -1157,6 +1278,15 @@ def rpc_relogin(p):
                     push("log", {"line": "[错误] 重新登录失败：%s" % e, "tag": "err"})
                 reset_session_cache()          # 下一次探测重新验，不用等缓存过期
                 push("session", {"ok": ok})
+                if ok:
+                    try:
+                        if engine_running():
+                            # 立刻触发引擎的会话体检（主循环 1s 内会读到）：
+                            # 正常节流 20 分钟，不触发的话用户登录完仍看到「已失败」，
+                            # 只能手动点恢复——再点又因会话刚恢复而重复失败（实测）。
+                            get_engine()._last_session_check = 0
+                    except Exception as e:
+                        _warn("登录成功后触发会话恢复", e)
             finally:
                 _LOGIN_GUARD.release()         # 必须复位，否则再也登不上
 
@@ -1194,7 +1324,11 @@ def rpc_get_account(_p):
 # ---------------- 历史 ----------------
 
 def rpc_list_history(p):
-    limit = int(p.get("limit") or 200)
+    try:
+        limit = int(p.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 1000))   # 负数会让 history[-(-5):] 返回最旧一段
     return {"records": read_history_records(limit)}
 
 
@@ -1339,12 +1473,15 @@ def rpc_save_settings(p):
             if p.get("email") is not None:
                 email = dict(p["email"])
                 # 掩码占位不动原密码；明文才加密回写
+                old_pw = (cfg.get("notify") or {}).get("email", {}).get("password", "")
                 pw = email.get("password") or ""
                 if pw == "******":
-                    email["password"] = (cfg.get("notify") or {}).get("email", {}).get("password", "")
+                    email["password"] = old_pw
                 elif pw:
                     email["password"] = notify_mod.protect_secret(pw)
-                if not (cfg.get("notify") or {}).get("email", {}).get("password"):
+                elif old_pw:
+                    email["password"] = old_pw     # 未提交密码：沿用旧值
+                if not email.get("password"):
                     email.pop("password", None)
                 email = normalize_email_settings(email)
                 cfg.setdefault("notify", {})["email"] = email
@@ -1380,13 +1517,22 @@ def rpc_test_email(_p):
         return {"ok": False, "error": str(e)}
 
 
+def rpc_start_engine(_p=None):
+    return {"ok": start_engine()}
+
+
+def rpc_stop_engine(_p=None):
+    return {"ok": stop_engine()}
+
+
 # ---------------- RPC 分发表 ----------------
 
 METHODS = {
     "listMonitorTasks": rpc_list_monitor_tasks,
     "createTask": rpc_create_task,
     "setTaskStatus": rpc_set_task_status,
-    "resetTask": rpc_reset_task,
+    "listProblemLogs": rpc_list_problem_logs,
+    "clearProblemLogs": rpc_clear_problem_logs,
     "pauseAll": rpc_pause_all,
     "resumeAll": rpc_resume_all,
     "deleteTask": rpc_delete_task,
@@ -1418,16 +1564,88 @@ METHODS = {
     "getSettings": rpc_get_settings,
     "saveSettings": rpc_save_settings,
     "testEmail": rpc_test_email,
-    "startEngine": lambda _p: {"ok": start_engine()},
-    "stopEngine": lambda _p: {"ok": stop_engine()},
+    "shutdown": rpc_shutdown,
+    "startEngine": rpc_start_engine,
+    "stopEngine": rpc_stop_engine,
 }
 
 
-def rpc_dispatch(line):
+# P4-B：RPC 命名空间化（C4）。METHODS 为平台旧名（前端当前调用点，不变式）；
+# _NS_METHODS 提供「域.动作」风格入口（tasks.list / grab.start / settings.save…），
+# 为后续 api.py 按域拆分（rpc/server/）落好契约。别名关系记录在 _NS_TO_OLD。
+_NS_TO_OLD = {
+    "tasks.list": "listMonitorTasks",
+    "tasks.create": "createTask",
+    "tasks.set_status": "setTaskStatus",
+    "tasks.delete": "deleteTask",
+    "tasks.pause_all": "pauseAll",
+    "tasks.resume_all": "resumeAll",
+    "problems.list": "listProblemLogs",
+    "problems.clear": "clearProblemLogs",
+    "grab.save": "saveGrabTask",
+    "grab.delete": "deleteGrabTask",
+    "grab.rename": "renameGrabTask",
+    "grab.start": "startGrab",
+    "grab.stop": "stopGrab",
+    "grab.result": "grabResult",
+    "grab.ticker": "grabTicker",
+    "tickets.query": "queryTickets",
+    "seats.priority_feedback": "seatPriorityFeedback",
+    "stations.search": "searchStation",
+    "presets.list": "listPresets",
+    "presets.save": "savePreset",
+    "presets.delete": "deletePreset",
+    "history.push_query": "pushQueryHistory",
+    "history.list": "listHistory",
+    "history.reconcile": "reconcileHistory",
+    "network.ip_loc": "ipLocate",
+    "update.check": "checkUpdate",
+    "passengers.list": "listPassengers",
+    "passengers.save": "savePassengers",
+    "passengers.detail": "passengerDetail",
+    "passengers.sync_12306": "sync12306Passengers",
+    "session.check": "checkSession",
+    "session.relogin": "relogin",
+    "session.account": "getAccount",
+    "settings.get": "getSettings",
+    "settings.save": "saveSettings",
+    "settings.test_email": "testEmail",
+    "engines.start": "startEngine",
+    "engines.stop": "stopEngine",
+    "system.shutdown": "shutdown",
+}
+_NS_METHODS = {ns: METHODS[old] for ns, old in _NS_TO_OLD.items()}
+
+
+# 慢方法（网络/浏览器/大文件）：移出 stdin 分发线程，否则 1s/2s 的前端轮询
+# 会排在 3×15s 的会话检查后面（2026-10-19 审查）。threaded=True 时才异步。
+_SLOW_METHODS = frozenset({
+    "queryTickets", "checkSession", "relogin", "sync12306Passengers",
+    "reconcileHistory", "testEmail", "ipLocate", "getAccount",
+})
+_RPC_SLOTS = threading.BoundedSemaphore(6)
+
+
+def _rpc_handle(id_, method, fn, params):
+    """执行一个 RPC 方法并回包（分发线程与慢方法线程共用）。"""
+    try:
+        result = fn(params)
+        reply(id_, result=result)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        # 界面「问题日志」页的数据源：RPC 方法异常也记一条台账（含堆栈）
+        logutil.append_problem("ERROR", "api.%s" % method,
+                               "%s: %s" % (type(e).__name__, e),
+                               traceback.format_exc())
+        reply(id_, error="%s: %s" % (type(e).__name__, e))
+
+
+def rpc_dispatch(line, threaded=False):
     """处理一行 JSON-RPC 请求并回包。
 
-    从 main() 的循环体抽出（逻辑一字未改），让协议层可以脱离真管道被测试。
-    副作用只有 reply()（写 stdout）与方法异常时 traceback 到 stderr。
+    从 main() 的循环体抽出，让协议层可以脱离真管道被测试。
+    threaded=True（仅 main 的真管道）时，慢方法交给短线程执行，避免堵住
+    stdin 队列；并发慢请求超过 6 个则退化为同步（背压，不丢请求）。
     """
     line = line.strip()
     if not line:
@@ -1445,25 +1663,44 @@ def rpc_dispatch(line):
     id_ = msg.get("id")
     method = msg.get("method") or ""
     params = msg.get("params") or {}
-    fn = METHODS.get(method)
+    # 旧名直连（前端现状）或命名空间入口（tasks.list 风格，P4-B 新增契约）
+    fn = METHODS.get(method) or _NS_METHODS.get(method)
     if fn is None:
         reply(id_, error="未知方法：" + method)
         return
-    try:
-        result = fn(params)
-        reply(id_, result=result)
-    except Exception as e:
-        traceback.print_exc(file=sys.stderr)
-        reply(id_, error="%s: %s" % (type(e).__name__, e))
+    # 命名空间入口同样映射到慢方法集合（旧名集合判断两者皆可）
+    is_slow = (method in _SLOW_METHODS
+               or _NS_TO_OLD.get(method) in _SLOW_METHODS)
+    if threaded and is_slow:
+        if _RPC_SLOTS.acquire(blocking=False):
+            def _run():
+                try:
+                    _rpc_handle(id_, method, fn, params)
+                finally:
+                    _RPC_SLOTS.release()
+            t = threading.Thread(target=_run, daemon=True,
+                                 name="rpc-" + method)
+            try:
+                t.start()
+            except Exception:
+                _RPC_SLOTS.release()   # 线程没起来必须归还名额
+                raise
+        else:
+            _rpc_handle(id_, method, fn, params)
+        return
+    _rpc_handle(id_, method, fn, params)
 
 
 def main():
-    # 日志泵线程
-    threading.Thread(target=log_pump, daemon=True).start()
-    # 抢票任务到点自动开抢调度（原 gui._tick）
-    threading.Thread(target=_armed_loop, daemon=True).start()
-    # 会话看门狗：登录失效弹窗提醒（不靠引擎体检才发现）
-    threading.Thread(target=_session_watch_loop, daemon=True).start()
+    # P2：三个杂项守护线程统一登记进 Scheduler（daemon 类型，原函数语义零改动）
+    global _SCHED
+    _SCHED = Scheduler()
+    _SCHED.add_daemon("log_pump", log_pump)                # 日志泵线程
+    _SCHED.add_daemon("armed_scan", _armed_loop)           # 到点自动开抢调度
+    _SCHED.add_daemon("session_watch", _session_watch_loop)  # 会话看门狗
+    _SCHED.add_periodic("reconcile_guard", 300,
+                        _reconcile_tick, immediate=False)  # 对账守护（P3）
+    _SCHED.start()
     # 启动软件即启动监控引擎（config.json: auto_start_engine=false 可关）。
     # 必须接住异常：get_engine() 里会 load_station_map()（首次要联网）、读 config，
     # 任何一处抛出去就是「后端起不来 → main.js 立刻重启 → 无限崩溃循环」，
@@ -1476,7 +1713,7 @@ def main():
                      "tag": "err"})
     push("ready", {"pid": os.getpid()})
     for line in sys.stdin:
-        rpc_dispatch(line)
+        rpc_dispatch(line, threaded=True)
 
 
 if __name__ == "__main__":

@@ -414,15 +414,29 @@ def _sibling_cache_path(path, name):
     return os.path.join(d, name) if d else _abs_cache_path(name)
 
 
+_JSON_CACHE = {}   # path -> ((mtime_ns, size), data)
+
+
 def _read_json_cache(path):
+    """读缓存 JSON，按 (mtime, size) 记忆化。
+
+    station_name.json 有 3300+ 站点，界面每 2s 的 listMonitorTasks 都会
+    调 load_station_map；每次 open+json.load 是常态化的无谓磁盘 IO。
+    返回的内存对象按只读使用（站名/码表），文件一变指纹即失效重读。
+    """
     import os
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                return json.load(f)
-        except Exception:
-            pass  # 损坏：走重新下载
-    return None
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime_ns, st.st_size)
+        hit = _JSON_CACHE.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        _JSON_CACHE[path] = (key, data)
+        return data
+    except Exception:
+        return None  # 不存在/损坏：走重新下载
 
 
 def _cache_fresh(path):

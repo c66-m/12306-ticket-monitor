@@ -253,10 +253,35 @@ def ip_locate(timeout=6):
 
 # ----------------------------- 监控任务组装 -----------------------------
 
+def _as_bool(value):
+    """字符串布尔归一：bool("false") 为 True，会让开关语义反转。"""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
                        passengers, purpose_code, auto_order, stop_after_order,
                        priority, pax_purpose=None, seat_priority=None):
-    """按监控系统的任务结构组装任务字典（与 gui.py 新建监控任务一致）。"""
+    """按监控系统的任务结构组装任务字典（与 gui.py 新建监控任务一致）。
+
+    入口做形状归一：seats/trains=None 不再 TypeError，裸字符串不会被
+    逐字符拆开，布尔字符串按字面值解释（2026-10-19 审查）。
+    """
+    trains = [str(t).strip() for t in (trains or []) if str(t).strip()]
+    seats = [str(s).strip() for s in (seats or []) if str(s).strip()]
+    if isinstance(passengers, str):
+        passengers = [passengers]
+    passengers = [str(n) for n in (passengers or [])]
+    if isinstance(dates, str):
+        dates = [dates]
+    dates = [str(d) for d in (dates or [])]
+    if not isinstance(date_range, (list, tuple)):
+        date_range = []
+    try:
+        priority = int(priority)
+    except (TypeError, ValueError):
+        priority = 5
     name = "%s-%s %s %s" % (
         from_name, to_name, "/".join(trains) if trains else "全部车次",
         "/".join(seats))
@@ -266,17 +291,17 @@ def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
         "from": from_name,
         "to": to_name,
         "dates": dates,
-        "date_range": date_range,
+        "date_range": list(date_range),
         "trains": trains,
         "seat_types": seats,
         "seat_priority": (str(seat_priority).strip()
                           if isinstance(seat_priority, str) else list(seat_priority or [])),
-        "auto_order": bool(auto_order),
-        "stop_after_order": bool(stop_after_order),
+        "auto_order": _as_bool(auto_order),
+        "stop_after_order": _as_bool(stop_after_order),
         "passenger_names": passengers,
-        "priority": int(priority),
+        "priority": priority,
         "purpose_code": purpose_code,
-        "pax_purpose": dict(pax_purpose or {}),
+        "pax_purpose": dict(pax_purpose) if isinstance(pax_purpose, dict) else {},
         "notify_channels": ["email"],
     }
 

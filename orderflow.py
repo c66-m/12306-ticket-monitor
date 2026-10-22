@@ -67,7 +67,12 @@ _PAY_LOCK_KEY = "席位已锁定"
 _SEAT_SCAN = ("无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座")
 
 _FLOW_DEFAULTS = {"read_poll_seconds": 0.5, "page_wait_seconds": 10.0,
-                  "retry_open_times": 1}
+                  "retry_open_times": 1, "lock_confirm_seconds": 1.5}
+# 锁定座位页静置确认窗（秒）：进入 payOrder 后先在原页静置 1–2s 再下结论。
+# 12306 点确认后要 2–8 秒才渲染出「席位已锁定」，期间正文可能还是旧页或
+# 过程提示；窗内不重下、不关页、不判 dup/fail（2026-10-19 用户口径）。
+_LOCK_CONFIRM_MIN = 1.0
+_LOCK_CONFIRM_MAX = 2.0
 
 
 def classify_snapshot(url, body):
@@ -168,10 +173,16 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
         warn += "（核对窗曾显示席别 %s，请以订单详情为准）" % entry["dlg_seat"]
     ono = None
     try:
+        # 用户可能刚在页面上重新登录过：先落盘会话，再回读，避免读到旧 cookie
+        try:
+            save_state(entry["page"].context)
+        except Exception:
+            pass
         ono = fetch_unpaid_order_no(session_from_browser_state(), date, train,
                                     passenger_names, entry["t_submit"])
-    except Exception:
-        ono = None
+    except Exception as e:
+        _emit(logger, "[流程] JUDGE：订单号回读失败（%s），不影响本次成功判定"
+                      "（可到 12306「未完成订单」核对）" % str(e)[:120])
     if ono:
         _emit(logger, "[流程] JUDGE：官方回读到本次订单号 %s" % ono)
     extra = {"passengers": "、".join(entry["picked"]), "seat_on_page": seat_on_page,
@@ -243,6 +254,11 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
     poll = max(float(cfg["read_poll_seconds"]), 0.1)
     page_wait = max(float(cfg["page_wait_seconds"]), 1.0)
     retry_left = max(int(cfg["retry_open_times"]), 0)
+    try:
+        lock_confirm = float(cfg["lock_confirm_seconds"])
+    except (TypeError, ValueError):
+        lock_confirm = _FLOW_DEFAULTS["lock_confirm_seconds"]
+    lock_confirm = max(_LOCK_CONFIRM_MIN, min(lock_confirm, _LOCK_CONFIRM_MAX))
     train = (info or {}).get("train_code")
 
     def _stopped():
@@ -258,6 +274,12 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
         _usable = getattr(warm, "usable", None)
         if reuse and _usable is not None and not _usable():
             _emit(logger, "[流程] 复用的浏览器页面已失效，改为冷启动")
+            # 只回收浏览器资源、不释放 profile/线程锁（锁属外层 finally）；
+            # 不关就重开同一 profile 会双实例抢锁（2026-10-19 审查）。
+            try:
+                warm.close(release_locks=False)
+            except Exception:
+                pass
             reuse = False
         own_ctx = not reuse
         if reuse:
@@ -274,7 +296,21 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
             ok, who = session_ok(ctx, page=page)
             if not ok:
                 return False, "浏览器会话不可用（%s）。请先运行：python browser_order.py login" % who, None
-            _goto_and_query(page, info, date, should_stop=should_stop)
+            hit = _goto_and_query(page, info, date, should_stop=should_stop)
+            if not hit:
+                # 查询命中判定没等到「预订」：后续 FILL 在无按钮的页面上点，
+                # 只会把「页面没起来/无票」误报成同一句话（2026-10-19 实测）。
+                if _stopped():
+                    return False, "手动停止：车票页查询阶段用户已停止", {
+                        "reason": "user_stopped"}
+                try:
+                    closed = page.is_closed()
+                except Exception:
+                    closed = False
+                if closed:
+                    return False, "浏览器窗口异常关闭", {"reason": "browser_dead"}
+                return False, ("车票页未就绪或 %s 当前不可预订（未等到「预订」按钮）；"
+                               "下一轮重试" % train), {"reason": "not_ready"}
         else:
             warm.refresh(info)
         mark("goto")
@@ -291,7 +327,9 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
         _emit(logger, "[流程] HOLD：驻留观察网页变化（每 %.1fs 读 url+正文，"
                       "每页 %.0fs 无果退出）" % (poll, page_wait))
         pages = [{"page": page, "t_submit": t_submit, "picked": res["picked"],
-                  "dlg_seat": res["dlg_seat"], "deadline": time.time() + page_wait}]
+                  "dlg_seat": res["dlg_seat"], "deadline": time.time() + page_wait,
+                  "last_url": "", "pending": False, "lock_seen_at": None,
+                  "success_since": None}]
         first_round = True
         tick = 0
         while pages:
@@ -308,21 +346,53 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                         continue
                     url, body = "", ""
                 snap = classify_snapshot(url, body)
+                e["last_url"] = url
+                e["pending"] = any(k in body for k in _PENDING_KEYS)
+                on_lock = "payOrder" in url
+                if on_lock and e["lock_seen_at"] is None:
+                    e["lock_seen_at"] = time.time()
+                    # 确认窗内不关页、不重下：静置窗口顺延该页观察倒计时
+                    e["deadline"] = max(e["deadline"],
+                                        e["lock_seen_at"] + lock_confirm + poll)
+                    _emit(logger, "[流程] HOLD：进入锁定座位页，静置确认 %.1fs"
+                                  "（期间不重下、不关页）" % lock_confirm)
+                # 锁座确认窗：刚进入 payOrder 的 1–2s 内正文可能还是旧页/半渲染，
+                # 只等「席位已锁定」或显式失败，绝不判 dup/fail、更不重下。
+                in_confirm = (on_lock and e["lock_seen_at"] is not None
+                              and time.time() - e["lock_seen_at"] < lock_confirm)
                 if snap == "success":
-                    _emit(logger, "[流程] HOLD：读到「席位已锁定」界面（%.1fs）"
-                          % (time.time() - e["t_submit"]))
-                    return _finish_success(e, url, body, date, train,
-                                           passenger_names, seat_name, logger,
-                                           headless=headless, stop=_stopped)
-                if snap == "ambiguous":
-                    _emit(logger, "[流程] HOLD：落在旧单列表/订单初始化页，走官方回读")
-                    return _judge_official(date, train, passenger_names,
-                                           e["t_submit"], logger)
-                if snap == "dup":
-                    return _finish_dup(url, body, logger)
-                if snap == "fail":
-                    _emit(logger, "[流程] JUDGE：网页判定下单失败")
-                    return False, body, None
+                    if e["success_since"] is None:
+                        e["success_since"] = time.time()
+                        e["deadline"] = max(e["deadline"],
+                                            e["success_since"] + lock_confirm + poll)
+                        _emit(logger, "[流程] HOLD：读到「席位已锁定」，静置 %.1fs"
+                                      "确认订单状态保持不变" % lock_confirm)
+                    elif time.time() - e["success_since"] >= lock_confirm:
+                        _emit(logger, "[流程] HOLD：锁定界面稳定 %.1fs（提交后 %.1fs）"
+                              % (lock_confirm, time.time() - e["t_submit"]))
+                        return _finish_success(e, url, body, date, train,
+                                               passenger_names, seat_name, logger,
+                                               headless=headless, stop=_stopped)
+                    # 窗内：继续读同一页确认，不动订单状态
+                else:
+                    # 锁定信号消失（跳走/半渲染）：重新计时，避免瞬时误判
+                    e["success_since"] = None
+                    if in_confirm:
+                        pass          # 确认窗内一律 wait，交给下一轮
+                    elif snap == "ambiguous":
+                        _emit(logger, "[流程] HOLD：落在旧单列表/订单初始化页，走官方回读")
+                        return _judge_official(date, train, passenger_names,
+                                               e["t_submit"], logger)
+                    elif snap == "dup":
+                        if on_lock:
+                            # 锁定页里的「未完成订单」多是过程提示的链接文字，
+                            # 不能据此关页重下：继续等锁定词或显式失败
+                            pass
+                        else:
+                            return _finish_dup(url, body, logger)
+                    elif snap == "fail":
+                        _emit(logger, "[流程] JUDGE：网页判定下单失败")
+                        return False, body, None
                 # 滑块出现即停交人工（坑 7）：脚本不绕过，等待不计入该页
                 # 观察倒计时（顺延 deadline，与旧链结果循环同口径）；
                 # tick%4==1 降频查询，与旧链 250ms 结果循环的滑块查询频率对齐
@@ -342,15 +412,23 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
             if not pages:
                 break
             tick += 1
-            if first_round:
-                # 首读未获：先官方回读防 dup（已生成未完成新订单=成功关全部），
-                # 仍无则新开页面重下，新旧页并存各自 0.5s 读、各自 10s 退出
+            # 首读未获：先官方回读防 dup（已生成未完成新订单=成功关全部），
+            # 仍无则新开页面重下，新旧页并存各自 0.5s 读、各自 10s 退出。
+            # 但页面还在「正在处理，请稍候」或已进入锁定座位页时必须先等：
+            # 2026-10-19 实测确认后 2–8 秒才渲染锁定页，提前重下等于下第二单，
+            # 12306 直接「出票失败/未完成订单」——即用户看到的「锁座成功后
+            # 闪退并重新购票」。状态明确前 first_round 保持 True，不消费。
+            waiting_lock = any(e["pending"] or "payOrder" in (e["last_url"] or "")
+                               for e in pages)
+            if first_round and not waiting_lock:
                 first_round = False
                 # 提交 → 12306 落库有 1-3 秒延迟。提交后立刻回读必然判「结果未知」，
                 # 上层据此重开页面从 DETECT 重新下一单 —— 等于每次下单提交两单，
                 # 占两次座、各计一次取消，直接喂大「取消次数过多」封禁。
-                # 首轮回读前先补足最短落库等待（上限 3s，不放大用户体感）。
-                left = (t_submit or 0) + min(3.0, float(page_wait)) - time.time()
+                # 首轮回读前先补足最短落库等待。12306 从点确认到订单落库/锁定
+                # 页渲染要 2–8s，3s 太早会判「无单」触发重下（2026-10-19 审查）；
+                # 取 8s 与 page_wait 的较小值，短观察窗配置不被放大。
+                left = (t_submit or 0) + min(8.0, float(page_wait)) - time.time()
                 if left > 0:
                     if _stopped():
                         return False, ("手动停止：确认已提交但结果未知，"
@@ -369,7 +447,10 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                                                  t_submit, logger)
                 if ok:
                     return ok, msg, extra
-                if retry_left > 0:
+                # 只有官方明确「无单/已取消」才允许重下；error/unknown/blocked/
+                # paid/更早旧单都属于不可判定，重下会撞出第二张单（2026-10-19 审查）。
+                cls = ((extra or {}).get("flow_judge") or {}).get("cls")
+                if retry_left > 0 and cls in ("none", "cancelled"):
                     if _stopped():
                         # 已提交、官方回读未确认：结果未知交上层，绝不带病重下
                         return False, ("手动停止：确认已提交但结果未知，"
@@ -381,7 +462,12 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     if not isinstance(rep, dict):
                         return rep
                     rep["deadline"] = time.time() + page_wait
+                    rep.update({"last_url": "", "pending": False,
+                                "lock_seen_at": None, "success_since": None})
                     pages.append(rep)
+                elif retry_left > 0:
+                    _emit(logger, "[流程] JUDGE：官方回读不可判定（cls=%s），"
+                                  "放弃自动重下，交上层处理" % cls)
             time.sleep(poll)
         # 所有观察页超时退出：JUDGE 兜底（坑 8：交官方回读闭环，上层还会再判）
         stage("JUDGE")
@@ -394,7 +480,8 @@ def run_orderflow(info, seat_name, seat_code, passenger_names, date,
     """阶段化下单入口。返回 (ok, msg, extra)，契约与 order_via_browser 一致。
 
     flow_cfg: config.json 的 order_flow 段（read_poll_seconds /
-        page_wait_seconds / retry_open_times），缺省见 _FLOW_DEFAULTS。
+        page_wait_seconds / retry_open_times / lock_confirm_seconds），
+        缺省见 _FLOW_DEFAULTS。
     logger: [流程] 阶段日志的落点。engine 传 monitor LOG、launcher 传
         launcher LOG（各自日志文件 + GUI 全局日志区）；None 时兜底 print。
 
@@ -402,6 +489,9 @@ def run_orderflow(info, seat_name, seat_code, passenger_names, date,
     @_exclusive 之外处理，否则重入分支的 finally 会把 depth 恢复成
     「本线程仍持有锁」的假象。
     """
+    # 兼容传 Event 的调用方：统一下沉为可调用（is_set）。契约仍以回调为准。
+    if should_stop is not None and not callable(should_stop):
+        should_stop = getattr(should_stop, "is_set", None)
     try:
         if warm is not None and not warm.usable():
             try:
@@ -475,4 +565,4 @@ def _run_orderflow_locked(info, seat_name, seat_code, passenger_names, date,
     _emit(logger, "[流程] LOG：本次下单结论 ok=%s %s" % (ok, (msg or "")[:400]))
     _record_timing(tm, time.perf_counter() - t0, ok, msg, info, seat_name, warm)
     return ok, msg, extra
-
+

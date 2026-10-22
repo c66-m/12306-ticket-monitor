@@ -203,38 +203,45 @@ def check_station_db(detail: list[str]) -> list[str]:
 
 
 def check_tests(detail: list[str]) -> list[str]:
-    """全量测试必须全绿（解析 unittest 的汇总行）。"""
+    """全量测试（test_all.py）必须全绿；tests/{unit,contract,integration,e2e}
+    目录若存在也须全绿（P4 四层逐步填充，先占位后充实）。"""
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    suites = [("test_all", [sys.executable,
+                            os.path.join("tests", "test_all.py")])]
+    for d in ("unit", "contract", "integration", "e2e"):
+        if os.path.isdir(os.path.join(ROOT, "tests", d)):
+            suites.append((d, [sys.executable, "-m", "unittest", "discover",
+                               "-s", os.path.join("tests", d),
+                               "-p", "test_*.py"]))
     started = time.time()
-    try:
-        proc = subprocess.run(
-            [sys.executable, os.path.join("tests", "test_all.py")],
-            cwd=ROOT, env=env, capture_output=True,
-            encoding="utf-8", errors="replace", timeout=900,
-        )
-    except subprocess.TimeoutExpired:
-        return ["测试超时（>900s）"]
-    except OSError as exc:
-        return ["测试进程无法启动：%s" % exc]
-
+    ok_counts, failures = [], []
+    for name, cmd in suites:
+        try:
+            proc = subprocess.run(
+                cmd, cwd=ROOT, env=env, capture_output=True,
+                encoding="utf-8", errors="replace", timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append("%s 测试超时（>900s）" % name)
+            continue
+        except OSError as exc:
+            failures.append("%s 测试进程无法启动：%s" % (name, exc))
+            continue
+        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        ran = re.search(r"^Ran (\d+) tests? in ", out, re.M)
+        ok = (proc.returncode == 0
+              and re.search(r"^OK(?: \(.*\))?$", out, re.M) is not None)
+        if ok:
+            ok_counts.append("%s:%s" % (name, ran.group(1) if ran else "?"))
+        else:
+            failures.append("%s 未通过（退出码 %d%s）"
+                            % (name, proc.returncode,
+                               ("，%s" % ran.group(1)) if ran else ""))
     elapsed = time.time() - started
-    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    ran = re.search(r"^Ran (\d+) tests? in ", out, re.M)
-    failed = "FAILED (" in out
-    ok = re.search(r"^OK(?: \(.*\))?$", out, re.M) is not None
-
-    if proc.returncode == 0 and ok and not failed:
-        detail.append("%s tests, %.1fs" % (ran.group(1) if ran else "?", elapsed))
+    if not failures:
+        detail.append(" ".join(ok_counts) + " %.1fs" % elapsed)
         return []
-
-    detail = ["测试未通过（退出码 %d，%.1fs）" % (proc.returncode, elapsed)]
-    if ran:
-        detail.append("共 %s 个用例" % ran.group(1))
-    summary = re.search(r"^FAILED \(.*\)$", out, re.M)
-    if summary:
-        detail.append(summary.group(0))
-    failures = re.findall(r"^(?:FAIL|ERROR): (\S+)", out, re.M)
-    detail.extend(failures[:20])
+    detail.append("测试未通过（%.1fs）：%s" % (elapsed, "; ".join(failures)))
     return detail
 
 

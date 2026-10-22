@@ -688,3 +688,228 @@ xx 秒内完成支付」），让人亲眼确认下单成功并直接支付。
 **验证**：`TestOrderflowClassifySnapshot` 更新为「泛化词 → wait、锁定词 →
 success」；新增 `test_pay_url_without_locked_page_is_ambiguous`（URL 到 payOrder
 但正文为空 → ambiguous）；全量 813+ tests。
+
+## 22. 2026-10-19 锁定座位页静置确认：不再「锁座成功后闪退重购」
+
+**需求**：进入「席位已锁定」页后先稳定停留 1–2 秒确认，期间订单状态不变；
+只有拿到明确的锁座成功/失败结果才继续，禁止跳回重新购票流程。
+
+**实测根因**（用户录屏两段 + 全局日志 21:38:12–14）：
+- 点确认后页面先显示「订单已经提交，系统正在处理中，请稍候。」，12306 要
+  2–8 秒才渲染 payOrder 锁定页（视频 2：24s 起提示，34s 才出锁定页）。
+- HOLD 首读只等 3 秒就官方回读；提交结果未落库 → ambiguous → 立刻
+  `_reopen_and_order` 新开页再下一单（日志同一秒出现「新开页面重下已提交」）。
+- 第二单被 12306 拒绝「出票失败/未完成订单」，页面判定 dup，流程收尾关页——
+  用户看到的就是「锁座成功后立即闪退并重新购票」。
+
+**改动**（orderflow.py）：
+- `order_flow.lock_confirm_seconds`（默认 1.5s，钳制 1–2s）：进入 payOrder 后
+  静置确认，期间不重下、不关页、不判 dup/fail；锁定词稳定 ≥ 确认窗才
+  `_finish_success`（同时顺延该页 deadline，避免确认中被超时打断）。
+- `first_round` 重下闸门：任一页仍显示过程提示（`_PENDING_KEYS`）或在
+  payOrder 上时，官方回读 + 新开页重下整体顺延（保持 first_round=True），
+  状态明确后才允许走老逻辑。
+- 锁定页上的 dup 词（多为过程提示里的「未完成订单」链接）不再关页。
+- 成功判定仍是「URL 到 payOrder + 正文出现席位已锁定」，不放松。
+
+**验证**：新增 4 项回归（锁定页至少静置 5 次轮询才成功 / 处理中禁止重下 /
+锁定页永不重下 / 锁定页瞬态 dup 噪声忽略）；orderflow 相关 21 项全绿；
+全量 823 项 1 失败为既有未提交改动（engine 去 dedup 与
+`test_engine_load_state_timeout_skips_not_quarantine` 断言冲突），与本改动无关。
+
+## 23. 2026-10-19 编辑任务改日期后任务消失：按名删全部同名
+
+**需求/现象**：老任务在编辑弹窗里改日期保存后，任务从列表里直接消失。
+
+**根因**：编辑 = 前端「先 `createTask` 再 `deleteTask(旧 uid)`」（无原地编辑
+接口）。任务名由「线路+车次+席别」生成、**不含日期**，改日期后新旧同名。
+`api.remove_task_from_config` 旧实现按名字删掉**全部同名任务**，刚建的新任务
+一起被删 → 列表归零。`legacy/gui.remove_task_from_config` 早已是按 uid / 只删
+第一条的语义，api 这份是漂移出来的重复实现。
+
+**改动**（api.py）：
+- `remove_task_from_config`：有 uid 且命中 → 按 uid 精确删除；无 uid 的旧任务
+  → 只删第一个同名条目（append 追加的新任务在末尾，第一条正好是旧任务）。
+- 批量删除按名字仍可用：多次调用逐条删，不会误删新建任务。
+
+**验证**：新增 3 项回归（按 uid 删同名兄弟保留新任务 / 无 uid 只删第一条 /
+`rpc_delete_task` 真实链路保留新建任务）；`TestMonitorTaskEdit` 6 项全绿；
+全量 827 项 1 失败仍为既有 engine 去 dedup 断言冲突，与本改动无关。
+
+## 24. 2026-10-19 代码审查 P0 整改 + 去重精简
+
+**触发**：全项目审查（并发/下单/校验/性能四线）后按 P0 顺序整改，同时合并
+api 与 legacy/gui 重复的删任务逻辑。
+
+**P0 修复**：
+- `appcommon.update_state_locked`：读实现吞异常返回 `{}` 时复核原始 JSON，
+  解析失败即拒写（旧行为会把空状态整份覆写，丢全部任务 status/retry）。
+- `orderflow`：官方回读只有 `cls ∈ {none, cancelled}` 才允许新开页重下；
+  `error/unknown/blocked` 一律放弃自动重下（旧逻辑会把已成功订单再提交一次）。
+- `browser_order._run_fill_submit_confirm`：确认按钮始终未启用（clicked=False）
+  改为返回 `not_submitted`，不再 `ok=True` 诱使 HOLD 空等后重下。
+- `api.rpc_save_settings`：新增授权码按 `email` 自身判断，不再被旧配置判空删掉；
+  未提交密码时沿用旧值。
+- `api.rpc_save_passengers`：检查 `save_passengers` 返回值；`expect_stamp`
+  缺省/None 归一为哨兵（旧行为把它当「文件必须不存在」，文件已存在时静默拒绝）。
+- `api.start_engine`：新增 `_engine_start_lock`，判定+建线程+赋值原子化。
+- `api.rpc_shutdown` + `electron/main.js`：退出先 RPC 收尾（停引擎落盘）再 kill，
+  超时 5s 兜底；避免状态丢失与 Playwright 孤儿进程占 profile 锁。
+- `orderflow`：warm 锁内失效时 `warm.close(release_locks=False)`，避免同
+  profile 双上下文。
+- `order.order_ticket` / `browser_order.order_ticket_via_browser` 透传
+  `should_stop`，引擎 `_order_once` 传入 `_stop_event`（滑块/付款页驻留可中断）。
+
+**精简**：`remove_task_from_config` 收敛到 appcommon 单源，api 与 legacy/gui
+改为委托（删除两处 20+ 行重复实现）；密码/指纹判断合并为单次取值。
+
+**验证**：新增 6 项回归（损坏 state 拒写 / 合法空对象放行 / 回读不可判定不重下 /
+首次 SMTP 授权码保留 / 乘车人保存失败上报 / null stamp 按不检查）；全量
+833 项 1 失败仍为既有 engine 去 dedup 断言冲突。`TestTask52SliderAmbiguous`
+的「未点确认」用例已同步为新语义（not_submitted）。
+
+## 25. 2026-10-19 代码审查 P1 批次：异常路径、输入校验与缓存
+
+**修复**：
+- orders.json 瞬时 `OSError`（占用/扫描）不再当坏档隔离——返回空库且
+  `write_ok=False`，写方跳过覆写；只有 JSON 损坏才挪档。
+- HOLD 首轮官方回读最短等待 3s → 8s（12306 落库/渲染 2–8s，提前判无单会重下）。
+- 成功收尾先 `save_state(page.context)` 再回读订单号；回读失败记日志，不再静默。
+- 归因窗口 `window_sec` 180s → 30s：2 分钟前的上一轮旧单不再被判本次成功；
+  RULES.md 同步。
+- `saveGrabTask`：必填 `id`，数值参数校验（`poll_seconds="abc"` 不再让抢票
+  线程 `float()` 猝死）；`deleteGrabTask` 缺 id 直接拒绝（防清空无 id 老任务）。
+- `createTask`：`seat_types`/`passengers` 字符串归一（不再逐字符拆成「二/等/座」），
+  `pax_purpose` 非 dict 归空。
+- `date_range` 列表形态补 ISO 校验（非 ISO 不再落盘后被引擎静默丢弃）。
+- `setTaskStatus`：状态白名单 + `tasks` 非 dict 安全重建；grabber 轮询间隔
+  `float()` 包 try。
+- `engine._setup_logging` 摘除 handler 时 `close()`（文件句柄泄漏）。
+- `probe_session` 缓存对 http 模式生效（前端与看门狗不再各打一轮 3×15s）。
+- `ticket._read_json_cache` 按 `(mtime, size)` 记忆化（3300 站不再每 2s 重解析）。
+
+**验证**：新增 10 项回归（瞬时占用不隔离 / 非 ISO 区间拒绝 / 字符串席别不拆字 /
+抢票任务非法数值拒绝 / 缺 id 拒绝删除 / 非法状态拒绝 / 缓存命中与失效 /
+上一轮旧单不归因）；全量 841 项 1 失败仍为既有 engine 去 dedup 断言冲突。
+
+## 26. 2026-10-19 审查 P1 性能批：慢 RPC 分流、日志攒批、抢票页增量刷新
+
+- `api.rpc_dispatch(line, threaded=False)`：main 的真管道传 `threaded=True`，
+  `_SLOW_METHODS`（queryTickets / checkSession / relogin / sync12306Passengers /
+  reconcileHistory / testEmail / ipLocate / getAccount）交给 daemon 短线程执行，
+  `BoundedSemaphore(6)` 满则退化为同步（背压不丢请求）；测试/协议层默认同步，
+  行为与返回顺序不变。
+- `log_pump`：150ms 攒批推送——单条仍是 `{line,tag}`，多条用 `{lines:[...]}`；
+  前端 `pushLogBatch` 用 DocumentFragment 一次插入、只滚一次，会话失效正则仍
+  对整批文本生效。
+- `refreshGrab`：新增 `grabSig`（除倒计时外的展示字段）；签名不变时只原地更新
+  `.g-count`，不再每秒 `innerHTML` 重建整页。
+- `logutil._trim_problem_log`：超过上限 1.2 倍才裁剪，避免贴着上限时每条日志
+  都全量读+重写。
+- 验证：新增「慢方法不阻塞分发线程」；全量 842 项 1 失败仍为既有 engine 去
+  dedup 断言冲突；`node --check` 通过。
+
+## 27. 2026-10-19 审查 P2 批：边界收口与测试基线转绿
+
+- `grabber.append_monitor_task` 临时文件名改为 `<kind><pid>-<tid>`，纳入
+  `appcommon.sweep_stale_tmp` 清理（旧名 `.launcher<tid>` 永远清不掉）。
+- `electron/main.js`：`pyCall` 计时器存入 pending，响应/启动失败/进程退出
+  统一 `clearTimeout`；`DSH_DEBUG` 对 savePassengers/passengerDetail/
+  saveSettings 只打参数键名，不再输出证件号/手机号/授权码明文。
+- `api.rpc_query_tickets`：站码必须 3 位大写字母、日期过 `fromisoformat`、
+  purpose 限定 ADULT/0X00（非法回落 ADULT）。
+- `api.rpc_list_history`：limit 强转保护 + [1,1000] 钳制（负数不再取最旧段）。
+- `station_db.check`：stations/kinds 形状守卫，异常形状返回 1 而非抛栈。
+- `appcommon.normalize_email_settings`：`to` 为字符串时按分隔符拆分，不再
+  逐字符校验报「a、@、b…」。
+- `grabber_utils.build_monitor_task`：seats/trains=None、字符串布尔、
+  字符串乘车人/日期、非 dict pax_purpose、非法 priority 全部归一；
+  `api._req_on` 同步字符串布尔语义（"false" 不再变 True）。
+- 测试：新增 `TestP2InputGuards` 4 项 + query/list 校验 2 项；
+  `test_engine_load_state_timeout_skips_not_quarantine` 对齐「去 dedup」
+  （磁盘字节原样、内存丢弃 dedup）。全量 **847 OK (skipped=15)**，基线转绿。
+
+## 28. 2026-10-19 状态合并外部写入优先 + 落盘节流放宽
+
+- `engine._status_seen`：记录「上次见到的磁盘 status/message」基线。`_save_state`
+  合并时，磁盘值与基线不同 ⇒ 外部进程（GUI/launcher）改过，status/message
+  保留磁盘值；磁盘未变 ⇒ 内存（引擎最新调度结果）优先。修复「用户暂停被引擎
+  内存旧状态覆盖回 monitoring」。
+- `_apply_merged_status`：外部值写盘后同步回内存条目（就地改、保引用），
+  否则下一轮 `_save_state` 又会拿旧内存覆盖回去。
+- `_sync_state` 重载后重置基线；`_save_state` 成功后更新基线。
+- `_STATE_FLUSH_INTERVAL` 2s → 5s：例行字段（last_poll/message）落盘频率减半，
+  重要状态变更仍立即落盘。
+- 测试：新增 3 项（外部暂停优先 / 磁盘未变时内存优先 / `_save_state` 端到端
+  保留外部 paused）；原 `test_memory_wins_task_conflict` 按新语义改名并调整。
+  全量 **850 OK (skipped=15)**。
+
+## 29. 2026-10-19 收尾：去重单源、死代码与隐藏窗口轮询
+
+- `appcommon.drop_dedup_state`：防重清理下沉为单点实现（dedup 节 + 早期平铺
+  「|」键）。`engine._drop_dedup` 改为委托；`grabber.append_monitor_task` 的
+  state 写路径改用它——旧代码只 pop `dedup` 节，早期平铺键会被原样写回。
+- 删除 `api.save_config` 死函数（无调用点，且绕过指纹/坏档守卫）。
+- `log_pump`：push 包 try——前端断开时日志泵不再静默死亡。
+- `rpc_dispatch`：慢方法线程启动失败时归还信号量名额，避免名额泄漏。
+- `ui/app.js`：窗口隐藏（迷你小窗/最小化）时跳过 1s/2s 定时轮询，
+  `visibilitychange` 回到前台立即 `refreshAll()` 对齐数据。
+- 测试：新增 `test_drop_dedup_state_clears_section_and_flat_keys`；
+  全量 **851 OK (skipped=15)**。
+
+## 31. 2026-10-19 网页有「预订」脚本却报没有
+
+**现象**（截图）：12306 网页 K558 无座=有、显示「预订」；客户端 22:53:37
+DETECT → FILL → 22:53:38 报「页面上没有 K558 的『预订』按钮」。
+
+**根因（两处）**：
+1. 同车次在 `#queryLeftTable` 里可能有多行（主行/展开行）。旧点击逻辑找到
+   第一条 `<strong>K558</strong>` 就 break，那一行没有 `<a>预订` 便直接判失败；
+   而查询命中判定 `_QUERY_HIT_JS` 用的是 `.some()`（任意一行有预订即可）→
+   命中通过、点击失败，1 秒内出现自相矛盾的结果。
+2. 失败文案没有页面取证，无法区分「无票/候补」「DOM 结构变了（a→button）」
+   「页面根本没起来」。
+
+**改动**：
+- 点击改为遍历所有 K558 行，取第一条**真有**「预订」的 `<a>`；找不到再走
+  词界兜底，与命中判定同口径。
+- 失败返回页面取证：`url/title`、行数、同车次行数、首行正文片段。
+- 冷启动 `_goto_and_query` 未命中不再硬跑 FILL：返回 `not_ready` /
+  `user_stopped` / `browser_dead`，不再把「页面没起来」误报成「没按钮」。
+- 测试：新增取证回归；全量 **853 OK (skipped=15)**。
+
+**补充（同日 23:0x）**：用户日志仍显示旧文案，核对进程启动时间 22:53:34
+早于本次改动 22:56:46——跑的是旧后端。另加两层硬化：
+- 「预订」识别同时认 `<a>` 与 `<button>`（12306 前端灰度可能换标签）。
+- 失败现场落盘 `logs/booking_fail_<车次>_<时间>.json/.png`：URL、标题、
+  表格 id、前 40 行文本与链接文本、`#queryLeftTable` 的 HTML 片段（20KB）
+  与截图；测试替身无 `screenshot` 属性时跳过，不污染 logs/。
+
+## 32. 2026-10-19 回归修复：Event 被当成回调传
+
+**现象**：23:09 恢复任务后立刻报
+`浏览器下单异常: TypeError: 'Event' object is not callable`。
+
+**根因**：上一批把 `should_stop` 贯穿到引擎下单链时，`engine._order_once`
+传的是 `threading.Event` 对象本身；下游按回调调用 `should_stop()` → TypeError。
+
+**改动**：
+- `engine._order_once` 改传 `ev.is_set`（可调用）；
+- `orderflow.run_orderflow` 入口做兼容归一：非 callable 时取 `.is_set`，
+  防止其它调用方再犯；
+- 新增 2 项回归（引擎传参必须是可调用 / run_orderflow 接受 Event）；
+  全量 **855 OK (skipped=15)**。
+
+## 33. 2026-10-20 安全整改：授权码加密、会话文件 ACL、耗时记录噪声
+
+- `config.json` 的 `notify.email.password` 已用 DPAPI 加密为 `dpapi1:`
+  （379 字符），`notify.secret_of` 往返校验通过；设置页仍显示 `******`，
+  保存设置不会覆盖已加密值。全量 git 历史扫描该串 **0 命中**（从未提交）。
+- ACL 收紧：`data/` 与 `.browser_profile/`（706 个文件）去掉继承，仅保留
+  当前用户 / Administrators / SYSTEM；原有 `BUILTIN\Users:(RX)` 与
+  `Authenticated Users:(M)` 已移除。目录 ACE 带 `(OI)(CI)`，后续原子写的
+  新文件自动继承同一权限。
+- `order_timing.jsonl`：新增 `browser_order.TIMING_PATH`；`TempDirCase`
+  统一 patch 到临时文件，mock 下单不再污染真实记录。历史 1473 条中
+  1287 条 G101 mock 已归档为 `.bak-20261020` 并清理，剩 186 条真实车次。
+- 全量 **855 OK (skipped=15)**。

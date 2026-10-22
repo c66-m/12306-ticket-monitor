@@ -20,19 +20,28 @@ function broadcast(channel, payload) {
 }
 
 // ---------- JSON-RPC 桥 ----------
-const pending = new Map();   // id -> {resolve, reject}
+const pending = new Map();   // id -> {resolve, reject, timer}
 let rpcId = 0;
+
+// 调试日志脱敏：这几个方法的参数含证件号/手机号/授权码，只打键名
+const _SENSITIVE_RPC = new Set(["savePassengers", "passengerDetail", "saveSettings"]);
 
 function pyCall(method, params) {
   return new Promise((resolve, reject) => {
     if (!py || !py.stdin.writable) return reject(new Error("Python 后端正在重启，请稍后重试"));
-    if (process.env.DSH_DEBUG) console.log("[rpc]", method, "->", JSON.stringify(params || {}).slice(0, 120));
+    if (process.env.DSH_DEBUG) {
+      const brief = _SENSITIVE_RPC.has(method)
+        ? "params[" + Object.keys(params || {}).join(",") + "]"
+        : JSON.stringify(params || {}).slice(0, 120);
+      console.log("[rpc]", method, "->", brief);
+    }
     const id = ++rpcId;
-    pending.set(id, { resolve, reject });
+    const entry = { resolve, reject, timer: null };
+    pending.set(id, entry);
     try { py.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"); }
     catch (e) { pending.delete(id); return reject(new Error("Python 后端已退出（" + (e && e.message) + "）")); }
-    // 60s 超时兜底（查票/会话检查可能慢）
-    setTimeout(() => {
+    // 60s 超时兜底（查票/会话检查可能慢）；响应到达时必须 clearTimeout
+    entry.timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
         reject(new Error(method + " 超时"));
@@ -73,7 +82,10 @@ function startPython() {
     const msg = (err && err.message) || String(err);
     console.error("[py] spawn failed:", msg);
     broadcast("py-push", { method: "log", params: { line: "[系统] Python 后端启动失败：" + msg, tag: "err" } });
-    for (const [, p] of pending) p.reject(new Error("Python 后端启动失败：" + msg));
+    for (const [, p] of pending) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(new Error("Python 后端启动失败：" + msg));
+    }
     pending.clear();
     py = null;
     scheduleRestart();
@@ -90,6 +102,7 @@ function startPython() {
       const p = pending.get(msg.id);
       if (p) {
         pending.delete(msg.id);
+        if (p.timer) clearTimeout(p.timer);
         if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
         else p.resolve(msg.result);
       }
@@ -111,7 +124,10 @@ function startPython() {
     if (code) console.error("[py] exited", code);
     py = null;
     // 崩溃前未回包的在途 RPC 全部立刻失败，前端不会干等 60 秒超时
-    for (const [, p] of pending) p.reject(new Error("Python 后端已退出（code " + code + "）"));
+    for (const [, p] of pending) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(new Error("Python 后端已退出（code " + code + "）"));
+    }
     pending.clear();
     broadcast("py-push", { method: "backendDead", params: { code } });
     // 自动重启：应用退出（window-all-closed 收尾）时不再拉起
@@ -244,8 +260,28 @@ app.whenReady().then(() => {
   });
 });
 
-app.on("window-all-closed", () => {
+// 退出前先让后端优雅收尾（停引擎落盘状态），再到点强杀。
+// 直接 kill 会跳过 Python finally：state 节流缓冲丢失、Playwright 浏览器
+// 变孤儿并占住 .browser_profile，下次启动起不来（2026-10-19 审查）。
+let shuttingDown = false;
+function shutdownBackend() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   quitting = true;
-  if (py) { try { py.kill(); } catch {} }
-  app.quit();
+  const done = () => {
+    if (py) { try { py.kill(); } catch { /* 已退出 */ } }
+    app.quit();
+  };
+  if (!py) return done();
+  const timer = setTimeout(done, 5000);   // 引擎收尾上限 10s，这里给 5s 体感上限
+  pyCall("shutdown", {}).then(
+    () => { clearTimeout(timer); done(); },
+    () => { clearTimeout(timer); done(); });
+}
+
+app.on("window-all-closed", shutdownBackend);
+app.on("before-quit", (e) => {
+  if (shuttingDown || !py) return;
+  e.preventDefault();
+  shutdownBackend();
 });

@@ -763,6 +763,11 @@ def _hold_pay_page(page, seconds, should_stop=None):
          % seconds)
 
 
+# 耗时记录落点：测试在 TempDirCase 里 patch 成临时文件，避免 mock 下单
+# 把 G101 之类的假记录写进真实 logs/order_timing.jsonl 淹没真实数据。
+TIMING_PATH = os.path.join(HERE, "logs", "order_timing.jsonl")
+
+
 def _record_timing(tm, total, ok, msg, info, seat_name, warm):
     """把一次下单的各阶段耗时追加到 logs/order_timing.jsonl。
 
@@ -770,8 +775,7 @@ def _record_timing(tm, total, ok, msg, info, seat_name, warm):
     预热、各车次各席别的阶段耗时，找出真正拖后腿的那一步。纯旁路，
     写不进去也绝不影响下单本身。"""
     try:
-        d = os.path.join(HERE, "logs")
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(os.path.dirname(TIMING_PATH) or ".", exist_ok=True)
         rec = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "train": (info or {}).get("train_code"),
@@ -782,7 +786,7 @@ def _record_timing(tm, total, ok, msg, info, seat_name, warm):
             "msg": (msg or "")[:140],
             "phases": tm,
         }
-        with open(os.path.join(d, "order_timing.jsonl"), "a", encoding="utf-8") as f:
+        with open(TIMING_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
@@ -817,13 +821,13 @@ _QUERY_HIT_JS = r"""(code) => {
     for (const tr of rows) {
         const s = tr.querySelector('strong');
         if (!(s && s.textContent.trim() === code)) continue;
-        if (Array.from(tr.querySelectorAll('a')).some(
+        if (Array.from(tr.querySelectorAll('a,button')).some(
                 a => (a.innerText || '').indexOf('预订') >= 0)) return true;
     }
     const re = new RegExp('(^|[^A-Za-z0-9])' +
         code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
     return rows.some(tr => re.test(tr.innerText || '')
-        && Array.from(tr.querySelectorAll('a')).some(
+        && Array.from(tr.querySelectorAll('a,button')).some(
             a => (a.innerText || '').indexOf('预订') >= 0));
 }"""
 
@@ -866,6 +870,50 @@ def _goto_and_query(page, info, date, want_hit=True, timeout=20000, wait_code=No
                     return False
     except Exception:
         return False
+
+
+def _dump_booking_failure(page, info, diag):
+    """把「找不到预订按钮」的现场落盘（JSON + 截图），供离线定位。
+
+    只在真实 Playwright 页面生效：测试替身没有 screenshot，直接跳过，
+    不会往项目 logs/ 里写垃圾。任何异常都吞掉——取证不能反过来打断失败上报。
+    """
+    if not hasattr(page, "screenshot"):
+        return ""
+    try:
+        d = os.path.join(HERE, "logs")
+        os.makedirs(d, exist_ok=True)
+        base = os.path.join(d, "booking_fail_%s_%s" % (
+            info.get("train_code") or "x", time.strftime("%Y%m%d-%H%M%S")))
+        snap = {"train": info.get("train_code"),
+                "from": info.get("from_name"), "to": info.get("to_name"),
+                "url": getattr(page, "url", ""), "diag": diag}
+        try:
+            snap["table"] = page.evaluate(r"""() => {
+                const tb = document.querySelector('#queryLeftTable');
+                const out = {url: location.href, title: document.title,
+                             tables: Array.from(document.querySelectorAll('table'))
+                                       .map(t => t.id || t.className || '').slice(0, 10)};
+                if (!tb) return out;
+                out.rows = Array.from(tb.querySelectorAll('tr')).slice(0, 40).map(tr => ({
+                    text: (tr.innerText || '').replace(/\s+/g, ' ').slice(0, 160),
+                    links: Array.from(tr.querySelectorAll('a,button'))
+                              .map(e => (e.innerText || '').trim()).slice(0, 8)}));
+                out.html = tb.outerHTML.slice(0, 20000);
+                return out;
+            }""")
+        except Exception:
+            pass
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+        try:
+            page.screenshot(path=base + ".png", full_page=False)
+        except Exception:
+            pass
+        _log("  [浏览器] 预订按钮失败现场已存：%s.json/.png" % base)
+        return base
+    except Exception:
+        return ""
 
 
 def _cls_has(cls_text, name):
@@ -1028,32 +1076,49 @@ def _run_fill_submit_confirm(ctx, page, info, date, seat_name, seat_code,
     try:
         # 3) 点该车次的「预订」——精确匹配车次行。:has-text() 是子串匹配，
         #    查 G1 曾可能点中排在前面的 G11/G100 的「预订」，把订单下给别的车次
-        book_ok = page.evaluate(
+        book = page.evaluate(
             r"""(code) => {
                 const tb = document.querySelector('#queryLeftTable');
-                if (!tb) return false;
+                if (!tb) return {ok: false, why: 'no_table', url: location.href};
                 const rows = Array.from(tb.querySelectorAll('tr'));
-                let row = null;
+                const re = new RegExp('(^|[^A-Za-z0-9])' +
+                    code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
+                // a / button 都认：12306 前端灰度可能把「预订」从链接换成按钮
+                const bookOf = (tr) => Array.from(tr.querySelectorAll('a,button')).find(
+                    a => (a.innerText || '').indexOf('预订') >= 0);
+                // 同车次可能有多行（主行/展开行）：取第一条「真有预订」的。
+                // 旧代码找到第一条 strong 命中就 break，那一行没有预订就直接判失败
+                // （2026-10-19 实测：网页明明有预订，脚本报没有）。
                 for (const tr of rows) {
                     const s = tr.querySelector('strong');
-                    if (s && s.textContent.trim() === code) { row = tr; break; }
-                }
-                if (!row) {
-                    const re = new RegExp('(^|[^A-Za-z0-9])' +
-                        code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^0-9])');
-                    for (const tr of rows) {
-                        if (re.test(tr.innerText || '')) { row = tr; break; }
+                    if (s && s.textContent.trim() === code) {
+                        const a = bookOf(tr);
+                        if (a) { a.click(); return {ok: true}; }
                     }
                 }
-                if (!row) return false;
-                const a = Array.from(row.querySelectorAll('a')).find(
-                    a => (a.innerText || '').indexOf('预订') >= 0);
-                if (!a) return false;
-                a.click();
-                return true;
+                for (const tr of rows) {
+                    if (!re.test(tr.innerText || '')) continue;
+                    const a = bookOf(tr);
+                    if (a) { a.click(); return {ok: true}; }
+                }
+                const same = rows.filter(tr => {
+                    const s = tr.querySelector('strong');
+                    return s && s.textContent.trim() === code;
+                });
+                return {ok: false, why: 'no_book', url: location.href,
+                        title: document.title, rows: rows.length,
+                        codeRows: same.length,
+                        sample: (same[0] ? same[0].innerText : '').slice(0, 120)};
             }""", info["train_code"])
+        # 兼容旧测试替身：它们对这段 JS 直接返回 True/False
+        book_ok = book.get("ok") if isinstance(book, dict) else bool(book)
         if not book_ok:
-            return _fail("页面上没有 %s 的『预订』按钮（可能已无票或不可预订）" % info["train_code"], None)
+            detail = json.dumps(book, ensure_ascii=False)[:400] if isinstance(
+                book, dict) else str(book)
+            base = _dump_booking_failure(page, info, book)
+            tip = ("；失败现场已存 %s.json/.png" % base) if base else ""
+            return _fail("页面上没有 %s 的『预订』按钮（可能已无票或不可预订）；"
+                         "页面取证：%s%s" % (info["train_code"], detail, tip), None)
         _log("  [浏览器] 已点 %s 的『预订』" % info["train_code"])
         mark("book")
 
@@ -1459,6 +1524,12 @@ def _run_fill_submit_confirm(ctx, page, info, date, seat_name, seat_code,
                     _log("  [浏览器] 已点确认框：%s" % b["txt"])
                     clicked = True
                     break
+        if not clicked:
+            # 确认按钮始终未启用、回退控件也没有：订单根本没提交。旧代码仍
+            # 返回 ok=True（HOLD 空等 → 首轮无单 → 重下），现在如实上报，
+            # 上层按普通失败处理（2026-10-19 审查）。
+            return _fail("未点成确认（确认按钮始终未启用），本次未提交订单",
+                         {"reason": "not_submitted"})
         mark("submit")
         t_submit = time.time()
         if stage_cb is not None:
@@ -2006,10 +2077,12 @@ def warm_up(info, date, headless=False, timeout=120, wait_code=None, stop_event=
                        wait_code=wait_code, stop_event=stop_event)
 
 
-def order_ticket_via_browser(config, task, ticket, seat_name):
+def order_ticket_via_browser(config, task, ticket, seat_name, should_stop=None):
     """order_ticket 的浏览器实现，签名与 order.py 的 HTTP 版一致。
 
     供 order.py 在 config["order_mode"] == "browser" 时直接转发调用。
+    should_stop: 引擎/启动器的停止事件，贯穿下单链（滑块与付款页驻留
+    期间也据此尽快收手，2026-10-19 审查）。
     """
     alias_name = None
     try:
@@ -2046,6 +2119,7 @@ def order_ticket_via_browser(config, task, ticket, seat_name):
                 ticket, seat_name, seat_code, names, date,
                 headless=bool(config.get("browser_headless", False)),
                 alias_name=alias_name, purpose=purpose, purpose_map=purpose_map,
+                should_stop=should_stop,
                 flow_cfg=config.get("order_flow") or {},
                 logger=logging.getLogger("monitor"))
             if ok:
@@ -2068,7 +2142,7 @@ def show_timing_report():
     「记录速度最快的路径和方法」的落地入口：按 预热/冷启动 两条路径分别汇总
     每次下单的总耗时与各阶段耗时，直接给出哪条路最快、最慢的一步在哪。"""
     import statistics
-    p = os.path.join(HERE, "logs", "order_timing.jsonl")
+    p = TIMING_PATH
     if not os.path.exists(p):
         print("还没有下单耗时记录（logs/order_timing.jsonl）")
         return 1

@@ -11,6 +11,7 @@ DayFileHandler：按天滚动的文件日志，文件名保持 logs/<prefix>_YYY
 
 import datetime
 import hashlib
+import json
 import logging
 import os
 import re
@@ -173,3 +174,129 @@ class DayFileHandler(logging.Handler):
         finally:
             self.release()
         super().close()
+
+
+# ----------------------------- 问题台账（界面「问题日志」页数据源） -----------------------------
+# 与 DayFileHandler 的分工：那边是按天滚动的全文日志（给人 tail），这边是跨天
+# 保留的问题台账（给界面按条展示）。只收 WARNING 及以上，JSONL 一行一条，
+# 按文件大小裁剪，绝不参与按天清理——否则用户想看的历史问题会被 30 天规则删掉。
+
+PROBLEM_LOG_MAX_BYTES = 512 * 1024
+PROBLEM_LOG_KEEP = 800
+
+
+def problem_log_path():
+    """问题台账路径（data/problem_log.jsonl）：读写单一口径。
+
+    T12306_PROBLEM_LOG 可整体重定向——测试用它把台账落到临时目录，
+    避免跑测试时把用户真实的问题记录写满假日志。
+    """
+    override = os.environ.get("T12306_PROBLEM_LOG")
+    if override:
+        return override
+    return appcommon.data_path("problem_log.jsonl")
+
+
+def _trim_problem_log(path):
+    """超过上限时保留最近 PROBLEM_LOG_KEEP 条（best-effort，失败不影响写入）。"""
+    try:
+        # 放宽到 1.2 倍再裁：裁剪后仍贴着上限时，每条日志都全量重写一次
+        # （带堆栈的记录很大），会形成写风暴（2026-10-19 审查）。
+        if os.path.getsize(path) <= PROBLEM_LOG_MAX_BYTES * 1.2:
+            return
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()[-PROBLEM_LOG_KEEP:]
+        tmp = path + ".trim"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def append_problem(level, source, message, trace="", path=None):
+    """追加一条问题记录（跨进程安全）。写失败静默——台账不能影响业务。
+
+    level: ERROR / WARNING；source: "engine:1234"（模块:行号）或 "api.xxx"；
+    trace: 异常堆栈原文，可为空；path: 测试注入用，默认 problem_log_path()。
+    """
+    path = path or problem_log_path()
+    rec = {
+        "ts": datetime.datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "level": level,
+        "source": source,
+        "message": message,
+        "trace": trace or "",
+    }
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with file_lock(_lock_path_for(path), timeout=2):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.flush()
+            _trim_problem_log(path)
+    except Exception:
+        pass
+
+
+def read_problem_log(path=None, limit=200):
+    """读最近 limit 条问题记录，最新在前。文件缺失/坏行一律跳过，绝不抛。"""
+    try:
+        limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit = 200
+    try:
+        with open(path or problem_log_path(), encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out = []
+    for ln in reversed(lines[-limit:]):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def clear_problem_log(path=None):
+    """清空台账，返回是否成功。"""
+    path = path or problem_log_path()
+    try:
+        with file_lock(_lock_path_for(path), timeout=2):
+            with open(path, "w", encoding="utf-8"):
+                pass
+        return True
+    except OSError:
+        return False
+
+
+class ProblemLogHandler(logging.Handler):
+    """把 WARNING 及以上记录写入问题台账，供界面「问题日志」页读取。"""
+
+    def __init__(self, path=None, level=logging.WARNING):
+        super().__init__(level)
+        self._path = path
+
+    def emit(self, record):
+        try:
+            trace = ""
+            if record.exc_info:
+                # Handler 没有 formatException（那是 Formatter 的方法）
+                trace = logging.Formatter().formatException(record.exc_info)
+            append_problem(
+                record.levelname,
+                "%s:%s" % (record.module, record.lineno),
+                record.getMessage(),
+                trace,
+                self._path,
+            )
+        except Exception:
+            self.handleError(record)

@@ -395,7 +395,11 @@ class Grabber(threading.Thread):
                 return
 
         # 3) 抢票主循环
-        poll = max(1.0, float(lc.get("poll_seconds") or 3))
+        try:
+            poll = max(1.0, float(lc.get("poll_seconds") or 3))
+        except (TypeError, ValueError):
+            # 手改 grab_tasks.json 写坏轮询间隔：不能让它终结抢票线程
+            poll = 3.0
         n = 0
         last_target = None   # (车次, 席别)：同一目标连续失败计数用
         fail_streak = 0
@@ -783,9 +787,11 @@ def append_monitor_task(task, start_now=True):
     处于「监控中」状态的新任务会被自动捡起来，无需重启监控软件。"""
     with _CFG_WRITE_LOCK:  # 同进程多窗口并发串行化
         cfg_path = _monitor_cfg_path()
-        # 临时名带线程标识：同进程多窗口并发追加时共用一个名字会互相踩
-        # （Windows 下 os.replace 撞上别人打开的句柄直接 PermissionError）
-        tmp = cfg_path + ".launcher%s" % threading.get_ident()
+        # 临时名带 pid+线程标识：同进程多窗口并发追加时共用一个名字会互相踩；
+        # 同时必须匹配 appcommon.sweep_stale_tmp 的 `<kind><pid>-<tid>` 形态，
+        # 否则崩溃残留永远清不掉（2026-10-19 审查）。
+        tmp = "%s.launcher%d-%d" % (cfg_path, os.getpid(),
+                                    threading.get_ident())
         # 读-改-写必须串行化：监控系统 GUI 是独立进程，也在改同一个 config.json。
         # 只比 mtime 是 TOCTOU——实测 3 个线程并发追加任务，最后只剩 1 条。
         # 锁文件用 filelock（进程被强杀时由系统释放）；mtime 比对留作第二道，
@@ -828,6 +834,8 @@ def append_monitor_task(task, start_now=True):
                     try:
                         with open(state_path, "r", encoding="utf-8-sig") as f:
                             state = json.load(f)
+                        # 防重已下线：节与早期平铺键一并清掉（单源在 appcommon）
+                        appcommon.drop_dedup_state(state)
                     except Exception as e:
                         # state.json 损坏：挪档留证（带时间戳，反复损坏不互相覆盖），再按
                         # 只含本任务的新状态重建——保住「立即启动」语义，不让它静默降级成
