@@ -12021,7 +12021,10 @@ class TestTask100NotifyPassengersP3(TempDirCase):
         import passengers as pax_mod
         with self.assertRaises(pax_mod.SecretDecryptError) as cm:
             pax_mod.unprotect_secret(12345)
-        self.assertIn("12345", str(cm.exception))
+        # R1-15 翻转：旧断言 assertIn("12345") 钉住的正是原值回显泄漏；
+        # 修复后只报类型名，消息不得含原值。
+        self.assertNotIn("12345", str(cm.exception))
+        self.assertIn("int", str(cm.exception))
 
     def test_e_unprotect_legacy_paths_unchanged(self):
         # 回归 pin：字符串/空/None 路径行为不变（旧代码即通过）
@@ -12029,6 +12032,127 @@ class TestTask100NotifyPassengersP3(TempDirCase):
         self.assertEqual(pax_mod.unprotect_secret("legacy"), "legacy")
         self.assertEqual(pax_mod.unprotect_secret(""), "")
         self.assertEqual(pax_mod.unprotect_secret(None), "")
+
+
+class TestR1SupportHardening(TempDirCase):
+    """R1 修复（FULL_REVIEW_20261023 第 15/16/17 条）：
+    (15) 凭证值不进消息面——非字符串 password/敏感串只报类型名不报原值；
+    (16) SMTP 的 SMTP_SSL/starttls 必须传校验证书的 SSL context；
+    (17) atomic_write_json 写 tmp 后 fsync 文件、replace 后尽力 fsync 父目录，
+         fsync 失败不得影响写入成功语义。"""
+
+    def _email_cfg(self, **over):
+        cfg = {"enabled": True, "smtp_host": "smtp.example.com",
+               "smtp_port": 465, "username": "u", "password": "p",
+               "from": "u@example.com", "to": ["u@example.com"]}
+        cfg.update(over)
+        return cfg
+
+    # ---- (15) 凭证值不进消息面 ----
+
+    def test_send_email_nonstring_password_hides_value(self):
+        # 旧代码消息含 {0!r} 原值：手改配置把授权码写成数字 123456 →
+        # 失败消息经 rpc/CLI/日志把授权码明文带出消息面
+        with mock.patch("notify.smtplib.SMTP_SSL") as m_ssl:
+            ok, msg = notify_mod.send_email(
+                self._email_cfg(password=123456), "s", "b")
+        self.assertFalse(ok)
+        self.assertNotIn("123456", msg)
+        self.assertIn("int", msg)  # 只报类型名
+        m_ssl.assert_not_called()
+
+    def test_unprotect_nonstring_hides_value(self):
+        # 旧代码 SecretDecryptError 消息含 %r 原值，同型泄漏
+        with self.assertRaises(pax_mod.SecretDecryptError) as cm:
+            pax_mod.unprotect_secret(987654)
+        self.assertNotIn("987654", str(cm.exception))
+        self.assertIn("int", str(cm.exception))
+
+    # ---- (16) SMTP TLS 校验证书 ----
+
+    def test_smtp_ssl_passes_verifying_context(self):
+        import ssl as ssl_mod
+        seen = {}
+
+        class FakeSSL(object):
+            def __init__(self, host, port, timeout=None, context=None):
+                seen["context"] = context
+
+            def login(self, u, p):
+                pass
+
+            def sendmail(self, a, b, c):
+                pass
+
+            def quit(self):
+                pass
+
+        with mock.patch("notify.smtplib.SMTP_SSL", FakeSSL):
+            ok, msg = notify_mod.send_email(self._email_cfg(), "s", "b")
+        self.assertTrue(ok, msg)
+        ctx = seen.get("context")
+        self.assertIsNotNone(ctx)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl_mod.CERT_REQUIRED)
+
+    def test_smtp_starttls_passes_verifying_context(self):
+        import ssl as ssl_mod
+        seen = {}
+
+        class FakeSMTP(object):
+            def __init__(self, host, port, timeout=None):
+                pass
+
+            def starttls(self, context=None):
+                seen["context"] = context
+
+            def login(self, u, p):
+                pass
+
+            def sendmail(self, a, b, c):
+                pass
+
+            def quit(self):
+                pass
+
+        with mock.patch("notify.smtplib.SMTP", FakeSMTP):
+            ok, msg = notify_mod.send_email(
+                self._email_cfg(smtp_port=587), "s", "b")
+        self.assertTrue(ok, msg)
+        ctx = seen.get("context")
+        self.assertIsNotNone(ctx)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl_mod.CERT_REQUIRED)
+
+    # ---- (17) atomic_write_json fsync ----
+
+    def test_atomic_write_fsyncs_tmp_file(self):
+        import appcommon
+        calls = []
+        real_fsync = os.fsync
+
+        def spy(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        path = os.path.join(self.tmp, "durable.json")
+        with mock.patch.object(appcommon.os, "fsync", spy):
+            appcommon.atomic_write_json(path, {"k": "v"})
+        self.assertGreaterEqual(len(calls), 1)  # 至少 tmp 文件被 fsync
+        self.assertEqual(json.load(open(path, encoding="utf-8")), {"k": "v"})
+
+    def test_atomic_write_fsync_failure_still_succeeds(self):
+        # fsync 尽力而为：抛 OSError（目录 fsync 在 Windows/特殊文件系统
+        # 不可用）绝不能让写入失败——本用例改前即通过，是语义 pin
+        import appcommon
+
+        def boom(fd):
+            raise OSError("fsync unsupported")
+
+        path = os.path.join(self.tmp, "durable2.json")
+        with mock.patch.object(appcommon.os, "fsync", boom):
+            appcommon.atomic_write_json(path, {"k": 2})
+        self.assertEqual(json.load(open(path, encoding="utf-8")), {"k": 2})
 
 
 class TestTask101CrossModuleP3(TempDirCase):
@@ -14143,6 +14267,479 @@ class TestProblemLog(TempDirCase):
             self.assertTrue(api.rpc_list_problem_logs({})["records"], "拒绝后记录仍在")
             self.assertTrue(api.rpc_clear_problem_logs({"confirm": True})["ok"])
             self.assertEqual(api.rpc_list_problem_logs({})["records"], [])
+
+
+class TestR1RpcHardening(TempDirCase):
+    """R1 修复（2026-10-23 全仓深审 RPC 层第 4/5/6 条）：
+
+    ① rpc_dispatch 对非字符串 method 回 bad_request 信封而不是抛 TypeError
+       冒泡出 stdin 主循环、带崩整个后端进程；
+    ② config/state 子结构被手改坏形状（state.tasks=list、tasks 混入字符串
+       条目、task_defaults=list）时，核心 RPC 降级返回而不是恒崩；
+    ③ _grabbers 注册表加锁：同 tid 并发 start 只准构造一个 Grabber；
+       ticker 消费结果删除注册前校验实例同一性，不误删新注册的实例。
+    """
+
+    # ---------- ① method 类型 ----------
+
+    @contextlib.contextmanager
+    def _pipe(self):
+        import api
+        buf = io.StringIO()
+        with mock.patch.object(api, "WRITE", buf.write), \
+                mock.patch.object(api, "FLUSH", lambda: None):
+            yield buf
+
+    def _feed(self, *lines):
+        import api
+        with self._pipe() as buf:
+            for line in lines:
+                api.rpc_dispatch(line)
+        return [json.loads(s) for s in buf.getvalue().splitlines() if s.strip()]
+
+    def test_non_string_method_returns_bad_request(self):
+        cases = [('{"id": 1, "method": 123}', 1),
+                 ('{"id": 2, "method": {"x": 1}}', 2),
+                 ('{"id": 3, "method": ["startGrab"]}', 3)]
+        for payload, want_id in cases:
+            # 旧代码：数字在 "未知方法：" + method 处 TypeError、dict/list
+            # 在 METHODS.get 处 unhashable TypeError，都冒泡杀进程
+            (m,) = self._feed(payload)
+            self.assertEqual(m["id"], want_id)
+            self.assertNotIn("result", m)
+            self.assertEqual(m["error"]["code"], "bad_request")
+            # evidence 只放原因类别，绝不回显 method 原值
+            self.assertEqual(m["error"]["evidence"],
+                             {"reason": "bad_method_type"})
+
+    # ---------- ② 子结构形状 ----------
+
+    @staticmethod
+    def _task(name="任务A"):
+        return {"name": name, "from": "长葛", "to": "郑州",
+                "trains": ["K262"], "seat_types": ["硬座"]}
+
+    def test_list_monitor_tasks_tolerates_state_tasks_list(self):
+        import api
+        cfg = {"tasks": [self._task()]}
+        with mock.patch.object(api, "load_config", return_value=cfg), \
+             mock.patch.object(api, "load_state",
+                               return_value={"tasks": ["坏形状"]}):
+            out = api.rpc_list_monitor_tasks({})
+        self.assertEqual([t["name"] for t in out["tasks"]], ["任务A"])
+        # state 读不到该任务记录时按任务自身状态（缺省 paused）展示
+        self.assertEqual(out["tasks"][0]["status"], "paused")
+
+    def test_list_monitor_tasks_skips_non_dict_entries(self):
+        import api
+        import rpc.tasks as tasks_rpc
+        tasks_rpc._SHAPE_WARNED.clear()
+        cfg = {"tasks": ["坏条目", 42, self._task()]}
+        with mock.patch.object(api, "load_config", return_value=cfg), \
+             mock.patch.object(api, "load_state", return_value={}), \
+             mock.patch.object(tasks_rpc, "_warn") as m_warn:
+            out = api.rpc_list_monitor_tasks({})
+        self.assertEqual([t["name"] for t in out["tasks"]], ["任务A"])
+        self.assertTrue(m_warn.called, "跳过坏条目必须留一次性告警")
+
+    def test_task_defaults_tolerates_non_dict_raw(self):
+        self.assertEqual(rpc_common._task_defaults({"task_defaults": [1, 2]}),
+                         rpc_common.TASK_DEFAULTS_DEF)
+        self.assertEqual(rpc_common._task_defaults({"task_defaults": "坏"}),
+                         rpc_common.TASK_DEFAULTS_DEF)
+
+    def test_set_and_delete_task_skip_non_dict_entries(self):
+        import api
+        cfg = {"tasks": ["坏条目", self._task()]}
+        with mock.patch.object(api, "load_config", return_value=cfg), \
+             mock.patch.object(api, "engine_running", return_value=False), \
+             mock.patch.object(api, "update_state_locked",
+                               side_effect=lambda fn: fn({})), \
+             mock.patch.object(api, "delete_task_everywhere") as m_del:
+            r = api.rpc_set_task_status({"name": "任务A", "status": "paused"})
+            self.assertTrue(r["ok"], r)
+            r2 = api.rpc_delete_task({"name": "任务A"})
+            self.assertTrue(r2["ok"], r2)
+        m_del.assert_called_once()
+
+    # ---------- ③ _grabbers 注册表锁 ----------
+
+    def test_concurrent_start_grab_constructs_single_grabber(self):
+        import rpc.grab as grab_rpc
+        made = []
+
+        class FakeGrabber(object):
+            def __init__(self, task):
+                # 放大竞态窗口：无锁时两线程都会在对方注册前走完构造
+                time.sleep(0.05)
+                made.append(self)
+                self._alive = False
+
+            def start(self):
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+        task = {"id": "t-race", "name": "竞态任务"}
+        results = []
+        with mock.patch.object(grabber, "load_grab_tasks", return_value=[task]), \
+             mock.patch.object(grabber, "Grabber", FakeGrabber), \
+             mock.patch.dict(grab_rpc._grabbers, {}, clear=True):
+            def _call():
+                results.append(grab_rpc.rpc_start_grab({"id": "t-race"}))
+            threads = [threading.Thread(target=_call) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(len(made), 1)
+            self.assertEqual(sorted(bool(r.get("ok")) for r in results),
+                             [False, True])
+            self.assertIs(grab_rpc._grabbers["t-race"], made[0])
+
+    def test_grab_ticker_does_not_delete_replaced_grabber(self):
+        import rpc.grab as grab_rpc
+        task = {"id": "t-swap", "name": "换实例任务", "status": "idle",
+                "from": "北京", "to": "上海", "date": "2026-10-10",
+                "start_time": ""}
+        old = mock.Mock()
+        new = mock.Mock()
+        new.is_alive.return_value = True
+        calls = {"n": 0}
+
+        def _alive():
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                # 第二次查活时，用户已手动重开抢：注册表换成新实例
+                grab_rpc._grabbers["t-swap"] = new
+                return False
+            return True
+
+        old.is_alive.side_effect = _alive
+        old.result = (True, "旧一轮结果")
+        old.result_reason = None
+        saved = []
+        with mock.patch.object(grabber, "load_grab_tasks",
+                               return_value=[dict(task)]), \
+             mock.patch.object(grabber, "save_grab_tasks",
+                               side_effect=lambda ts: saved.extend(ts)), \
+             mock.patch.dict(grab_rpc._grabbers, {"t-swap": old}):
+            grab_rpc.rpc_grab_ticker({})
+            # 注册表里的新实例不得被旧结果消费误删；旧结果也不得回写
+            self.assertIs(grab_rpc._grabbers["t-swap"], new)
+            self.assertEqual(saved, [])
+
+
+class TestR1GrabberDupClassify(TempDirCase):
+    """R1-3（全仓深审 2026-10-23）：grabber dup 兜底假成功。
+
+    旧代码：浏览器判 dup 后回读官方核验，只有 paid/unpaid 两档被单独
+    处理，其余（none/cancelled/error/unknown/blocked）全落 else 置
+    result=(True,「检测到该行程已有订单」)，且无条件 _notify_success——
+    旧单刚被取消（cancelled）或官方查询失败（error）时，用户收到
+    「抢票成功」邮件、任务终止，实际无单可付。
+    新口径（与 engine 同名分支对齐）：
+      none/cancelled → 未成单：安全重试（多次仍查无单才失败收尾），
+        绝不置成功、绝不发成功通知、历史不记 success/dup；
+      error/unknown/blocked → B2 待核对结局（result_reason="ambiguous"），
+        停抢不重试；
+      paid / unpaid → 保持现状（成功 + 通知 + 历史）。
+    """
+
+    def _drive(self, classify_ret):
+        import queue
+        lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+              "trains": ["G101"], "seat_types": ["二等座"],
+              "seat_priority": "", "passenger_names": ["张三"]}
+        g = grabber.Grabber(lc, logq=queue.Queue())
+        g._log = g.logq.put  # 不写真实日志文件
+        waits = []
+        g.stop_event = mock.Mock()
+        g.stop_event.is_set.return_value = False
+
+        def fake_wait(s):
+            waits.append(s)
+            return len(waits) >= 10  # 兜底停转，防测试无限循环
+        g.stop_event.wait.side_effect = fake_wait
+        g._notify_success = mock.Mock()
+        history = []
+        attempts = []
+
+        def fake_order(*a, **k):
+            attempts.append(1)
+            return (False, "您有未完成订单，请先处理", {"reason": "dup"})
+
+        train = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                 "start_time": "08:00", "available_seats": {"二等座": "有"}}
+        with contextlib.ExitStack() as stack:
+            p = stack.enter_context
+            p(mock.patch.object(ticket, "load_station_map",
+                                return_value=({"北京": "BJP", "上海": "SHH"},
+                                              {"BJP": "北京", "SHH": "上海"})))
+            p(mock.patch.object(grabber.browser_order, "busy",
+                                return_value=False))
+            p(mock.patch.object(grabber.browser_order, "check_session",
+                                return_value=(True, "user")))
+            p(mock.patch.object(ticket, "query_tickets",
+                                return_value=[{"row": 1}]))
+            p(mock.patch.object(ticket, "parse_row", return_value=train))
+            p(mock.patch.object(ticket, "seat_candidates_for",
+                                return_value=["二等座"]))
+            p(mock.patch.object(grabber.browser_order, "order_via_browser",
+                                side_effect=fake_order))
+            p(mock.patch.object(grabber.orderflow, "run_orderflow",
+                                side_effect=fake_order))
+            p(mock.patch.object(grabber.order_mod, "classify_with_time",
+                                return_value=classify_ret))
+            p(mock.patch.object(grabber.appcommon, "append_history",
+                                side_effect=lambda path, rec: history.append(rec)))
+            g._run()
+        return g, history, attempts
+
+    def test_dup_none_cancelled_not_success(self):
+        for cls in ("none", "cancelled"):
+            with self.subTest(cls=cls):
+                g, history, attempts = self._drive(
+                    (cls, "", "官方核验:%s" % cls, None))
+                self.assertIsNotNone(g.result)
+                ok, msg = g.result
+                self.assertFalse(ok, "官方核验 %s 不得报成功" % cls)
+                g._notify_success.assert_not_called()
+                self.assertFalse(
+                    [h for h in history if h.get("result") in ("success", "dup")],
+                    "历史不得记 success/dup：%r" % (history,))
+                self.assertIsNone(g.result_reason,
+                                  "查无单是未成单结局，不得落待核对")
+                self.assertGreater(len(attempts), 1,
+                                   "官方确认无单应安全重试，而非一次定案")
+
+    def test_dup_unconfirmed_is_ambiguous(self):
+        for cls in ("error", "unknown", "blocked"):
+            with self.subTest(cls=cls):
+                g, history, attempts = self._drive(
+                    (cls, "", "官方核验:%s" % cls, None))
+                self.assertIsNotNone(g.result)
+                ok, msg = g.result
+                self.assertFalse(ok, "官方核验 %s 不得报成功" % cls)
+                self.assertEqual(g.result_reason, "ambiguous")
+                self.assertIn("待核对", msg)
+                g._notify_success.assert_not_called()
+                self.assertFalse(
+                    [h for h in history if h.get("result") in ("success", "dup")],
+                    "历史不得记 success/dup：%r" % (history,))
+                self.assertEqual(len(attempts), 1, "待核对绝不自动重试下单")
+
+    def test_dup_paid_still_success(self):
+        g, history, attempts = self._drive(("paid", "E123", "已支付", None))
+        ok, msg = g.result
+        self.assertTrue(ok)
+        g._notify_success.assert_called_once()
+        self.assertEqual([h.get("result") for h in history], ["dup"])
+
+    def test_dup_unpaid_recent_still_success(self):
+        recent = {"order_no": "E123", "order_time": "2026-10-10 08:01:00"}
+        g, history, attempts = self._drive(("unpaid", "E123", "未支付", recent))
+        ok, msg = g.result
+        self.assertTrue(ok)
+        g._notify_success.assert_called_once()
+        self.assertEqual([h.get("result") for h in history], ["success"])
+
+    def test_dup_unpaid_earlier_still_success(self):
+        g, history, attempts = self._drive(("unpaid", "E9", "未支付", None))
+        ok, msg = g.result
+        self.assertTrue(ok)
+        g._notify_success.assert_called_once()
+        self.assertEqual([h.get("result") for h in history], ["dup"])
+
+
+class TestR1MonitorTaskOpsForce(TempDirCase):
+    """R1-12（全仓深审 2026-10-23）：CLI 菜单[3] 显式操作必须传 force。
+
+    旧代码：恢复(2)/重置(4) 不带 force，被 set_task_status 的防覆盖
+    守卫（paused/cancelled 不许被例行写入改回 monitoring）静默拒绝、
+    只记 INFO，CLI 却照打「已恢复监控」——用户以为在监控实际漏抢。
+    与创建路径（monitor.py:492）及 rpc/tasks 口径对齐：菜单 1–4 项
+    显式用户操作统一 force=True（操作 5 删除走 save_config，不在此列）。
+    """
+
+    def _run_op(self, op):
+        import monitor as m
+        task = {"name": "t1", "from": "北京", "to": "上海", "dates": [],
+                "trains": [], "seat_types": [], "priority": 5,
+                "passenger_names": []}
+        eng = mock.MagicMock()
+        eng.task_status.return_value = "paused"
+        eng.state = {"tasks": {}}
+        eng.base_interval = 45
+        reads = iter(["1", op])  # 先选任务序号 1，再选操作项
+        with mock.patch.object(m, "load_config",
+                               return_value={"tasks": [task]}), \
+             mock.patch.object(m, "_config_stamp", return_value="stamp"), \
+             mock.patch.object(m, "menu_task_list", return_value=None), \
+             mock.patch.object(m, "fresh_engine", return_value=eng), \
+             mock.patch.object(m, "read",
+                               side_effect=lambda prompt="", default="": next(reads)), \
+             mock.patch.object(m, "ask_yes_no", return_value=True), \
+             mock.patch("builtins.print"):
+            m.menu_task_ops()
+        return eng
+
+    def _assert_forced(self, eng, status):
+        self.assertEqual(eng.set_task_status.call_count, 1)
+        args, kwargs = eng.set_task_status.call_args
+        self.assertEqual(args[1], status)
+        forced = kwargs.get("force") or (len(args) > 3 and args[3])
+        self.assertTrue(forced,
+                        "显式用户操作必须 force=True：args=%r kwargs=%r"
+                        % (args, kwargs))
+
+    def test_pause_passes_force(self):
+        self._assert_forced(self._run_op("1"), "paused")
+
+    def test_resume_passes_force(self):
+        self._assert_forced(self._run_op("2"), "monitoring")
+
+    def test_cancel_passes_force(self):
+        self._assert_forced(self._run_op("3"), "cancelled")
+
+    def test_reset_passes_force(self):
+        self._assert_forced(self._run_op("4"), "monitoring")
+
+
+class TestR1DeleteStopsInflightOrder(TempDirCase):
+    """R1-13（全仓深审 2026-10-23）：删除监控任务要中止在途下单。
+
+    旧代码：_order_once 传给下单链的 should_stop 只绑引擎 stop_event，
+    不感知删除；_record_success 写历史 + 发通知前无墓碑复检——任务在
+    下单途中被删，订单照样提交成功、成功邮件照发，与删除意图相反。
+    """
+
+    def test_should_stop_observes_deletion(self):
+        e = make_engine(self.tmp)
+        e._stop_event = threading.Event()
+        t = task_of()
+        seen = []
+
+        def fake_order(config, task, info, seat_name, should_stop=None):
+            seen.append(bool(should_stop and should_stop()))  # 删除前
+            e.note_task_deleted(t["name"])                    # 下单途中删除
+            seen.append(bool(should_stop and should_stop()))  # 删除后
+            return False, "已停止", {"msg": "已停止"}
+
+        with mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               side_effect=fake_order):
+            e._order_once(t, {"train_code": "K225"}, "2026-10-20", "硬座")
+        self.assertEqual(seen, [False, True],
+                         "下单链的 should_stop 必须感知任务删除")
+
+    def test_record_success_skips_history_and_notify_after_delete(self):
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.note_task_deleted(t["name"])
+        info = {"train_code": "K225", "from_name": "长葛", "to_name": "确山",
+                "start_time": "08:00", "arrive_time": "12:00"}
+        with mock.patch.object(e, "_notify", return_value={}) as m_notify, \
+             mock.patch.object(engine_mod.appcommon, "append_history") as m_hist:
+            e._record_success(t, info, "2026-10-20", "硬座",
+                              {"passengers": "张三", "order_no": "E123"})
+        m_notify.assert_not_called()
+        m_hist.assert_not_called()
+
+    def test_record_success_normal_path_unchanged(self):
+        # 对照 pin：未删除任务的成功收尾照常写历史 + 发通知（防过修）
+        e = make_engine(self.tmp)
+        t = task_of()
+        info = {"train_code": "K225", "from_name": "长葛", "to_name": "确山",
+                "start_time": "08:00", "arrive_time": "12:00"}
+        with mock.patch.object(e, "_notify", return_value={}) as m_notify, \
+             mock.patch.object(engine_mod.appcommon, "append_history") as m_hist:
+            e._record_success(t, info, "2026-10-20", "硬座",
+                              {"passengers": "张三", "order_no": "E123"})
+        m_notify.assert_called_once()
+        m_hist.assert_called_once()
+
+
+class TestR1DuplicateTaskNames(TempDirCase):
+    """R1-14（全仓深审 2026-10-23）：同名监控任务互相遮蔽。
+
+    引擎调度/状态全按任务名为键：同名任务只有一个能被调度、状态还
+    串扰，旧代码既不去重也不告警，另一日期静默永不监控。
+    新行为：引擎在启动（__init__）与每次 _sync_config 后检测重名，
+    LOG.error 明确列出（同一批重名只报一次，不随每轮同步刷屏）；
+    grabber_utils.build_monitor_task 的任务名并入首个日期，降低碰撞。
+    """
+
+    def _collect_errors(self, fn):
+        records = []
+
+        class _H(logging.Handler):
+            def emit(self, r):
+                records.append(r)
+
+        h = _H(level=logging.ERROR)
+        engine_mod.LOG.addHandler(h)
+        try:
+            fn()
+        finally:
+            engine_mod.LOG.removeHandler(h)
+        return [r for r in records if r.levelno >= logging.ERROR]
+
+    def test_duplicate_check_warns_once(self):
+        e = make_engine(self.tmp)
+        e.tasks = [task_of("同名"), task_of("同名"), task_of("独名")]
+        first = self._collect_errors(e._check_duplicate_task_names)
+        second = self._collect_errors(e._check_duplicate_task_names)
+        hits = [r for r in first if "遮蔽" in r.getMessage()]
+        self.assertEqual(len(hits), 1, "重名必须明确告警一次：%r"
+                         % ([r.getMessage() for r in first],))
+        self.assertIn("同名", hits[0].getMessage())
+        self.assertEqual([r for r in second if "遮蔽" in r.getMessage()], [],
+                         "同一批重名不得每轮重复刷屏")
+
+    def test_sync_config_warns_on_duplicate_names(self):
+        e = make_engine(self.tmp)
+        cfg = {"tasks": [task_of("同名"), task_of("同名")],
+               "state_file": "state.json",
+               "history_file": "order_history.json"}
+        with open(e.config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        e._config_mtime = None  # 强制触发同步
+        records = self._collect_errors(lambda: e._sync_config())
+        self.assertTrue([r for r in records if "遮蔽" in r.getMessage()],
+                        "_sync_config 后必须检测重名")
+
+    def test_engine_init_warns_on_duplicate_names(self):
+        cfg = os.path.join(self.tmp, "config.json")
+        st = os.path.join(self.tmp, "state.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": "甲任务", "uid": "u1"},
+                                 {"name": "甲任务", "uid": "u2"}],
+                       "state_file": st}, f)
+        records = self._collect_errors(
+            lambda: engine_mod.MonitorEngine(config_path=cfg,
+                                             setup_logging=False))
+        hits = [r for r in records if "遮蔽" in r.getMessage()]
+        self.assertTrue(hits, "引擎启动时未对重名任务告警")
+        self.assertIn("甲任务", hits[0].getMessage())
+
+    def test_build_monitor_task_name_includes_first_date(self):
+        import grabber_utils
+        t1 = grabber_utils.build_monitor_task(
+            "北京", "上海", ["2026-10-25"], [], ["G101"], ["二等座"],
+            ["张三"], "ADULT", True, True, 5)
+        t2 = grabber_utils.build_monitor_task(
+            "北京", "上海", ["2026-10-26"], [], ["G101"], ["二等座"],
+            ["张三"], "ADULT", True, True, 5)
+        self.assertNotEqual(t1["name"], t2["name"],
+                            "仅日期不同的任务不得同名")
+        self.assertIn("10-25", t1["name"])
+        self.assertIn("10-26", t2["name"])
+        # 只有 date_range 时同样并入起始日期
+        t3 = grabber_utils.build_monitor_task(
+            "北京", "上海", [], ["2026-10-25", "2026-10-27"], ["G101"],
+            ["二等座"], ["张三"], "ADULT", True, True, 5)
+        self.assertIn("10-25", t3["name"])
 
 
 if __name__ == "__main__":
