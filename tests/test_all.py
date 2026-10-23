@@ -10526,12 +10526,14 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
         stamp = pm.passengers_stamp()
         # 用户思考期间：另一进程（GUI/Launcher）写入 passengers.json
         pm.save_passengers([{"name": "EXT"}])
-        with mock.patch("builtins.print") as mprint:
+        # R3 起放弃告警改走 LOG.warning（print 在 GUI 下不可见）：
+        # 原断言查 print 输出，现改查 monitor 日志，同口径验证「有可见告警」。
+        with self.assertLogs("monitor", level="WARNING") as cm:
             ok = pm.save_passengers([{"name": "A2"}], expect_stamp=stamp)
         self.assertFalse(ok)
         names = [x["name"] for x in pm.load_passengers()]
         self.assertEqual(names, ["EXT"])  # 外部数据保留，未被覆写
-        self.assertIn("已放弃", self._printed(mprint))
+        self.assertTrue(any("已放弃" in line for line in cm.output))
 
     def test_passengers_stamp_match_writes(self):
         # 回归 pin：无外部写入时正常落盘。
@@ -10591,12 +10593,16 @@ class TestTask88ConvergenceLeftovers(TempDirCase):
             return default
 
         with mock.patch.object(monitor_mod, "read", side_effect=fake_read), \
-             mock.patch("builtins.print") as mprint:
+             mock.patch("builtins.print") as mprint, \
+             self.assertLogs("monitor", level="WARNING") as cm:
             monitor_mod.menu_passengers()
         names = [x["name"] for x in pm.load_passengers()]
         self.assertEqual(names, ["EXT"])  # 外部数据保留，未被 A+B 覆写
         printed = self._printed(mprint)
-        self.assertIn("已放弃", printed)
+        # R3 起 passengers 放弃告警改走 LOG（print 在 GUI 下不可见）：
+        # 原断言在 printed 里查「已放弃」，现改查日志；菜单自身的
+        # 「重新载入」提示仍走 print，两边各验一处。
+        self.assertTrue(any("已放弃" in line for line in cm.output))
         self.assertIn("重新载入", printed)
         self.assertNotIn("已添加并加密保存", printed)
 
@@ -14740,6 +14746,631 @@ class TestR1DuplicateTaskNames(TempDirCase):
             "北京", "上海", [], ["2026-10-25", "2026-10-27"], ["G101"],
             ["二等座"], ["张三"], "ADULT", True, True, 5)
         self.assertIn("10-25", t3["name"])
+
+
+class TestR3RpcCluster(TempDirCase):
+    """R3 修复（全仓深审 2026-10-23 RPC 簇 P3 三条 + R1 评审 note N3）：
+
+    ① rpc_reconcile_history 的 limit 解析与同文件 rpc_list_history 同款
+       兜底：非法值（"abc"/列表）回落 50，不再让 ValueError/TypeError
+       逃出 handler 变成 handler_error + 一条 ERROR 级台账噪声；
+    ② startEngine/stopEngine/shutdown 纳入 _SLOW_METHODS：启停引擎要建
+       引擎（首次联网加载车站表）/ 在分发线程 join 引擎线程最长 10s，
+       同步跑会冻结全量 RPC，必须走慢线程分发；
+    ③ stdin 主循环单行长度上限（api._iter_request_lines，约 1MB）：超限
+       行整行丢弃并回 bad_request，绝不整行读进内存做 json 解析，后续
+       正常行照常被处理；
+    ④ N3：_warn_shape_once 的 detail 不再用 %r 回显 config 坏条目原文，
+       只报类型名（与 R1 第 15 条「只报类型不报值」口径对齐）。
+    """
+
+    # ---------- ① reconcileHistory limit 兜底 ----------
+
+    def _reconcile_with_limit(self, limit):
+        """空历史下调一次 reconcileHistory：只需它不抛、正常返回。"""
+        import api
+        path = os.path.join(self.tmp, "order_history.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        with mock.patch.object(api, "load_config",
+                               lambda: {"history_file": path}), \
+                mock.patch.object(api, "WRITE", lambda _s: None):
+            return api.rpc_reconcile_history({"limit": limit})
+
+    def test_reconcile_history_bad_limit_falls_back_to_50(self):
+        for bad in ("abc", {}, ["x"]):
+            with self.subTest(limit=repr(bad)):
+                r = self._reconcile_with_limit(bad)
+                self.assertTrue(r["ok"], r)
+                self.assertEqual(r["checked"], 0)
+
+    def test_reconcile_history_valid_limit_still_works(self):
+        r = self._reconcile_with_limit(50)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["checked"], 0)
+
+    # ---------- ② 引擎启停走慢方法 ----------
+
+    def test_engine_control_methods_are_slow(self):
+        import api
+        for name in ("startEngine", "stopEngine", "shutdown"):
+            self.assertIn(name, api.METHODS)   # 集合里的名字必须真实存在
+            self.assertIn(name, api._SLOW_METHODS)
+        # 命名空间入口同样命中慢判定（分发层经 _NS_TO_OLD 映射回旧名）
+        for ns in ("engines.start", "engines.stop", "system.shutdown"):
+            self.assertIn(api._NS_TO_OLD[ns], api._SLOW_METHODS)
+
+    def test_slow_engine_method_dispatches_off_stdin_thread(self):
+        import api
+        seen = {}
+        done = threading.Event()
+
+        def _fake_start(_p):
+            seen["thread"] = threading.current_thread().name
+            done.set()
+            return {"ok": True}
+
+        buf = io.StringIO()
+        with mock.patch.dict(api.METHODS, {"startEngine": _fake_start}), \
+                mock.patch.object(api, "WRITE", buf.write), \
+                mock.patch.object(api, "FLUSH", lambda: None):
+            api.rpc_dispatch('{"id": 7, "method": "startEngine", "params": {}}',
+                             threaded=True)
+            self.assertTrue(done.wait(5), "慢方法线程未在超时内执行")
+            for _ in range(100):
+                if buf.getvalue().strip():
+                    break
+                time.sleep(0.05)
+        # 同步分发时执行线程是调用方线程（名字不带 rpc- 前缀）
+        self.assertTrue(seen["thread"].startswith("rpc-"), seen)
+        replies = [json.loads(s) for s in buf.getvalue().splitlines() if s.strip()]
+        self.assertEqual(replies[0]["id"], 7)
+        self.assertEqual(replies[0]["result"], {"ok": True})
+
+    # ---------- ③ stdin 单行长度上限 ----------
+
+    def _collect_replies(self):
+        import api
+        replies = []
+        orig = api.reply
+        api.reply = lambda id_, result=None, error=None, code=None, \
+            evidence=None: replies.append(
+                {"id": id_, "result": result, "error": error,
+                 "code": code, "evidence": evidence})
+        self.addCleanup(setattr, api, "reply", orig)
+        return replies
+
+    def test_overlong_line_dropped_and_next_line_processed(self):
+        import api
+        replies = self._collect_replies()
+        overlong = "x" * 5000
+        valid = '{"id": 9, "method": "nopeMissing", "params": {}}'
+        with mock.patch.object(api, "_MAX_LINE_BYTES", 64):
+            lines = list(api._iter_request_lines(
+                io.StringIO(overlong + "\n" + valid + "\n")))
+            for line in lines:
+                api.rpc_dispatch(line)
+        # 超限行整行丢弃（不进 json 解析），只留一条 bad_request 回包
+        self.assertEqual(lines, [valid + "\n"])
+        self.assertEqual(len(replies), 2)
+        self.assertIsNone(replies[0]["id"])
+        self.assertEqual(replies[0]["code"], "bad_request")
+        self.assertEqual(replies[0]["evidence"], {"reason": "line_too_long"})
+        # 后续正常行照常被分发（未知方法回包证明走通了分发路径）
+        self.assertEqual(replies[1]["id"], 9)
+        self.assertEqual(replies[1]["code"], "unknown_method")
+
+    def test_overlong_line_at_eof_without_newline_terminates(self):
+        import api
+        replies = self._collect_replies()
+        with mock.patch.object(api, "_MAX_LINE_BYTES", 64):
+            lines = list(api._iter_request_lines(io.StringIO("y" * 5000)))
+        self.assertEqual(lines, [])
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["evidence"], {"reason": "line_too_long"})
+
+    def test_normal_lines_pass_through_unchanged(self):
+        import api
+        src = io.StringIO('{"id": 1}\n{"id": 2}\n')
+        self.assertEqual(list(api._iter_request_lines(src)),
+                         ['{"id": 1}\n', '{"id": 2}\n'])
+
+    # ---------- ④ N3 形状告警不回显坏条目原文 ----------
+
+    def test_shape_warning_reports_type_not_raw_entry(self):
+        import rpc.tasks as tasks_rpc
+        secretish = "PASSWORD-LIKE-SECRET-1234567890"
+        tasks_rpc._SHAPE_WARNED.clear()
+        self.addCleanup(tasks_rpc._SHAPE_WARNED.clear)
+        with mock.patch.object(tasks_rpc, "_warn") as m_warn:
+            out = tasks_rpc._task_dicts({"tasks": [secretish, 42]})
+        self.assertEqual(out, [])
+        self.assertTrue(m_warn.called, "跳过坏条目必须留一次性告警")
+        detail = " ".join(str(a) for a in m_warn.call_args[0])
+        self.assertNotIn(secretish, detail)
+        self.assertIn("str", detail)
+
+
+class TestR3EngineDupUnpaidPerTrain(TempDirCase):
+    """R3 引擎-1（全仓深审 2026-10-23）：dup 判 unpaid 且 stop_after_order=False
+    时，不得在同车次内逐席别重复走完整浏览器下单。
+
+    旧代码：unpaid 分支在 stop_after=False 时直接 continue 到同车次下一
+    席别——同轮已确认该行程有未支付订单，剩余席别逐个再走一遍下单、各
+    被判一次 dup、每次写一条 dup 历史，靠 12306 服务端防重兜底。
+    新口径：比照 paid 分支结束「本车次本轮」处理（break 出席别循环），
+    其它日期仍可继续处理。
+    """
+
+    def _row3(self):
+        # 在 synthetic_row 基础上再点亮软卧（字段 23），凑满 3 个有票席别
+        f = synthetic_row().split("|")
+        f[23] = "有"
+        return "|".join(f)
+
+    def test_unpaid_no_stop_after_orders_once_per_train_per_date(self):
+        e = make_engine(self.tmp)
+        today = datetime.date.today()
+        d1 = (today + datetime.timedelta(days=1)).isoformat()
+        d2 = (today + datetime.timedelta(days=2)).isoformat()
+        t = task_of(dates=[d1, d2], seat_types=["硬座", "硬卧", "软卧"],
+                    stop_after_order=False)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[self._row3()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(False, "已有订单",
+                                             {"reason": "dup"})) as m_order, \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付", None)), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            e._run_task(t)
+        # 每日期恰 1 次下单（首个席别判 unpaid 即收尾本车次），两日期都被处理
+        self.assertEqual(m_order.call_count, 2,
+                         "unpaid 后不得同车次逐席别重走下单：calls=%d"
+                         % m_order.call_count)
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "monitoring")
+
+
+class TestR3SyncConfigSchedule(TempDirCase):
+    """R3 引擎-2：config 变更不再无条件重置全部活动任务的 next_due。
+
+    旧代码：_sync_config 只要解析成功就返回 True，主循环随即把所有活动
+    任务的 next_due 重置为当前时刻——改个通知设置/存个预设（任务没变）
+    也会让全部任务当场各补一轮查询，结算出的失败退避一并作废。
+    新口径：_sync_config 仍返回「已同步」（既有契约不变），另以
+    _tasks_changed 标记任务集合（名+内容指纹）是否实际变化；主循环
+    仅在 _tasks_changed 时重建调度表，否则保留各任务原 next_due。
+    """
+
+    def _write_cfg(self, e, tasks, **extra):
+        cfg = {"poll_interval_seconds": 45, "min_interval_seconds": 30,
+               "tasks": tasks}
+        cfg.update(extra)
+        with open(e.config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        st = os.stat(e.config_path)
+        os.utime(e.config_path, (st.st_mtime + 5, st.st_mtime + 5))
+
+    def test_settings_only_change_does_not_mark_tasks_changed(self):
+        e = make_engine(self.tmp)
+        e.tasks = [task_of("t1")]
+        self._write_cfg(e, [task_of("t1")],
+                        notify={"email": {"enabled": False}},
+                        presets=[{"name": "预设一"}])
+        e._config_mtime = None  # 强制触发同步
+        self.assertTrue(e._sync_config())  # 同步本身照常发生
+        self.assertFalse(getattr(e, "_tasks_changed", True),
+                         "仅设置类变更不得标记任务集合变化")
+
+    def test_task_content_change_marks_tasks_changed(self):
+        e = make_engine(self.tmp)
+        e.tasks = [task_of("t1")]
+        changed = task_of("t1", trains=["G999"])
+        self._write_cfg(e, [changed])
+        e._config_mtime = None
+        self.assertTrue(e._sync_config())
+        self.assertTrue(e._tasks_changed, "任务内容变化必须标记变化")
+
+    def test_task_added_marks_tasks_changed(self):
+        e = make_engine(self.tmp)
+        e.tasks = [task_of("t1")]
+        self._write_cfg(e, [task_of("t1"), task_of("t2")])
+        e._config_mtime = None
+        self.assertTrue(e._sync_config())
+        self.assertTrue(e._tasks_changed, "任务新增必须标记变化")
+
+    def test_run_loop_preserves_next_due_on_settings_only_change(self):
+        # 主循环级：设置类变更后活动任务不得被立即重投（next_due 保留，
+        # 含失败退避语义）；任务内容变更后应被重投（调度重置）。
+        e = make_engine(self.tmp)
+        t = task_of("t1")
+        self._write_cfg(e, [t])
+        e.tasks = [task_of("t1")]
+        e.state["tasks"]["t1"] = {"status": "monitoring", "fail_streak": 0}
+        e._config_mtime = os.path.getmtime(e.config_path)
+        e._state_mtime = None
+        e._status_seen = {}
+        e.check_session_if_needed = lambda: None
+        calls = []
+
+        def fake_run_task(task):
+            calls.append(task["name"])
+            return False, False
+        e._run_task = fake_run_task
+
+        class FastEvent(threading.Event):
+            def wait(self, timeout=None):
+                return super().wait(0.01)
+
+        stop = FastEvent()
+        th = threading.Thread(target=e.run, kwargs={"stop_event": stop},
+                              daemon=True)
+        th.start()
+        try:
+            deadline = time.time() + 5
+            while not calls and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(calls, ["t1"], "启动后活动任务应先跑一轮")
+            time.sleep(0.3)
+            self.assertEqual(len(calls), 1)
+            # 只改非任务配置项 → 不得重置 next_due（旧代码会立即重投）
+            self._write_cfg(e, [task_of("t1")],
+                            notify={"email": {"enabled": False}})
+            time.sleep(0.6)
+            self.assertEqual(len(calls), 1,
+                             "仅设置变更后任务被立即重投：next_due 被无条件重置")
+            # 改任务内容 → 调度重置，该任务应被重投
+            self._write_cfg(e, [task_of("t1", trains=["G999"])])
+            deadline = time.time() + 5
+            while len(calls) < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(len(calls), 2,
+                             "任务内容变更后应重置调度并重投该任务")
+        finally:
+            stop.set()
+            th.join(timeout=5)
+
+
+class TestR3SeatsByDateShape(TempDirCase):
+    """R3 引擎-3：seats_by_date 形状消毒。
+
+    旧代码：trains/seat_types/dates 都有形状消毒（Task 68/93），唯独
+    seats_by_date 没有——手改成 list/str 时 seats_by_date.get(date)
+    抛 AttributeError 穿出 _run_task，被结算层当「内部异常」退避，
+    每轮原样重演、任务永不恢复。
+    新口径：取用前 isinstance dict 检查，非 dict 记警告后按 {} 处理。
+    """
+
+    def _run_with(self, sbd):
+        e = make_engine(self.tmp)
+        t = task_of(seats_by_date=sbd)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123",
+                                              "passengers": "张三"})), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            with self.assertLogs("monitor", level="WARNING") as logs:
+                broke, rec = e._run_task(t)
+        return e, t, logs.output
+
+    def test_list_seats_by_date_does_not_crash(self):
+        tomorrow = (datetime.date.today()
+                    + datetime.timedelta(days=1)).isoformat()
+        e, t, out = self._run_with([tomorrow])
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "success",
+                         "seats_by_date 为 list 时任务应正常跑完一轮")
+        self.assertTrue(any("seats_by_date" in m for m in out),
+                        "非 dict 的 seats_by_date 必须记警告：%r" % (out,))
+
+    def test_str_seats_by_date_does_not_crash(self):
+        tomorrow = (datetime.date.today()
+                    + datetime.timedelta(days=1)).isoformat()
+        e, t, out = self._run_with(tomorrow)
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "success",
+                         "seats_by_date 为 str 时任务应正常跑完一轮")
+        self.assertTrue(any("seats_by_date" in m for m in out),
+                        "非 dict 的 seats_by_date 必须记警告：%r" % (out,))
+
+
+class TestR3GrabberAmbiguousPerTarget(TempDirCase):
+    """R3 引擎-4：grabber 的 ambiguous 安全重试计数按目标（车次+席别）计。
+
+    旧代码：ambiguous_retries 是整个 Grabber 生命周期共用的单计数器，
+    只增不减、跨目标累计——长跑中相隔数小时/不同车次各出现一次
+    「提交后未知且官方查无单」也会攒满 3 次永久停抢，文案却称「连续
+    多次」。R1 的 dup 安全重试路径复用了同一计数器，两处同病。
+    新口径：按 (车次, 席别) 键控计数，ambiguous 与 dup 两条安全重试
+    路径共用同一本账；目标出现确定性结局（下单成功/定论失败）后清掉
+    该目标计数；同一目标累计 3 次才停抢。
+    """
+
+    AMB = (False, "提交后未收到明确结果", {"reason": "ambiguous"})
+    DUP = (False, "您有未完成订单，请先处理", {"reason": "dup"})
+    FAIL = (False, "下单失败：确认页提交被拒绝", {})
+    NONE = ("none", "", "未找到", None)
+
+    def _drive(self, script):
+        """script: [(train, seat, order_ret, classify_ret), ...]，按次驱动。
+
+        每轮查询只放出当前 script 条目的车次；script 耗尽后查询无票，
+        靠 stop_event.wait 兜底停转。
+        """
+        import queue
+        lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+              "trains": ["G101", "G102"], "seat_types": ["二等座", "硬座"],
+              "seat_priority": "", "passenger_names": ["张三"]}
+        g = grabber.Grabber(lc, logq=queue.Queue())
+        g._log = g.logq.put
+        waits = []
+        g.stop_event = mock.Mock()
+        g.stop_event.is_set.return_value = False
+
+        def fake_wait(s):
+            waits.append(s)
+            return len(waits) >= 30
+        g.stop_event.wait.side_effect = fake_wait
+        g._notify_success = mock.Mock()
+        state = {"idx": 0}
+        attempts = []
+
+        def cur():
+            return script[state["idx"]] if state["idx"] < len(script) else None
+
+        def fake_query(*a, **k):
+            c = cur()
+            return [{"train": c[0]}] if c else []
+
+        def fake_parse(row, code2name, date):
+            c = cur()
+            return {"train_code": c[0], "from_name": "北京", "to_name": "上海",
+                    "start_time": "08:00", "available_seats": {c[1]: "有"}}
+
+        def fake_order(*a, **k):
+            c = cur()
+            attempts.append(c[0])
+            state["idx"] += 1
+            return c[2]
+
+        def fake_classify(*a, **k):
+            return script[state["idx"] - 1][3]
+
+        with contextlib.ExitStack() as stack:
+            p = stack.enter_context
+            p(mock.patch.object(ticket, "load_station_map",
+                                return_value=({"北京": "BJP", "上海": "SHH"},
+                                              {"BJP": "北京", "SHH": "上海"})))
+            p(mock.patch.object(grabber.browser_order, "busy",
+                                return_value=False))
+            p(mock.patch.object(grabber.browser_order, "check_session",
+                                return_value=(True, "user")))
+            p(mock.patch.object(ticket, "query_tickets",
+                                side_effect=fake_query))
+            p(mock.patch.object(ticket, "parse_row", side_effect=fake_parse))
+            p(mock.patch.object(ticket, "seat_candidates_for",
+                                side_effect=lambda code, seats, pri, avail=None:
+                                [cur()[1]]))
+            p(mock.patch.object(grabber.browser_order, "order_via_browser",
+                                side_effect=fake_order))
+            p(mock.patch.object(grabber.orderflow, "run_orderflow",
+                                side_effect=fake_order))
+            p(mock.patch.object(grabber.order_mod, "classify_with_time",
+                                side_effect=fake_classify))
+            p(mock.patch.object(grabber.appcommon, "append_history",
+                                side_effect=lambda path, rec: None))
+            g._run()
+        return g, attempts
+
+    def test_different_targets_do_not_accumulate(self):
+        # 两车次各出现 2 次「未知+官方无单」：跨目标不得攒满 3 次停抢
+        script = [("G101", "二等座", self.AMB, self.NONE),
+                  ("G102", "硬座", self.AMB, self.NONE),
+                  ("G101", "二等座", self.AMB, self.NONE),
+                  ("G102", "硬座", self.AMB, self.NONE)]
+        g, attempts = self._drive(script)
+        self.assertEqual(len(attempts), 4,
+                         "不同目标各 2 次不应触发停抢：attempts=%r" % attempts)
+        self.assertIsNone(g.result,
+                          "跨目标累计停抢误报：result=%r" % (g.result,))
+
+    def test_same_target_three_stops(self):
+        # 同车次同席别累计 3 次 → 停抢（行为 pin，与旧阈值一致）
+        script = [("G101", "二等座", self.AMB, self.NONE)] * 3
+        g, attempts = self._drive(script)
+        self.assertEqual(len(attempts), 3)
+        self.assertIsNotNone(g.result)
+        ok, msg = g.result
+        self.assertFalse(ok)
+        self.assertIn("连续 3 次", msg)
+        self.assertIsNone(g.result_reason)
+
+    def test_mixed_branches_share_target_count(self):
+        # ambiguous 路径与 dup 安全重试路径共用同一本按目标账：
+        # 同目标 1 次 ambiguous-none + 2 次 dup-none = 3 → 停抢
+        script = [("G101", "二等座", self.AMB, self.NONE),
+                  ("G101", "二等座", self.DUP, self.NONE),
+                  ("G101", "二等座", self.DUP, self.NONE)]
+        g, attempts = self._drive(script)
+        self.assertEqual(len(attempts), 3)
+        self.assertIsNotNone(g.result)
+        ok, msg = g.result
+        self.assertFalse(ok)
+        self.assertIn("连续 3 次", msg)
+
+    def test_definitive_failure_clears_target_count(self):
+        # 同目标 2 次未知无单后出现一次定论失败 → 该目标计数清零；
+        # 之后再 2 次未知无单不得停抢，第 3 次才停（共 6 次尝试）
+        script = [("G101", "二等座", self.AMB, self.NONE),
+                  ("G101", "二等座", self.AMB, self.NONE),
+                  ("G101", "二等座", self.FAIL, self.NONE),
+                  ("G101", "二等座", self.AMB, self.NONE),
+                  ("G101", "二等座", self.AMB, self.NONE),
+                  ("G101", "二等座", self.AMB, self.NONE)]
+        g, attempts = self._drive(script)
+        self.assertEqual(len(attempts), 6,
+                         "定论失败应清掉该目标计数：attempts=%r result=%r"
+                         % (attempts, g.result))
+        self.assertIsNotNone(g.result)
+        ok, msg = g.result
+        self.assertFalse(ok)
+        self.assertIn("连续 3 次", msg)
+
+
+class TestR3SupportCluster(TempDirCase):
+    """R3 支撑簇（FULL_REVIEW_20261023 支撑 P3 四条 + R1 完成记录 note N4）：
+
+    (1) save_passengers 落盘传 mode=0o600（对齐 config/密钥/cookie 口径），
+        防 enc 明文降级时证件号/手机号按默认 umask 裸奔；
+    (2) 指纹守卫放弃保存改走 LOG.warning——print 在 GUI 进程里直接消失，
+        用户只看到「保存没反应」；返回 False 契约不变；
+    (3) note_station_missing 进程内冷却节流：坏站名随轮询反复未命中时，
+        不再每次都 force 全量下载 station_name.js；
+    (4) capture_session 成功/超时路径关浏览器走 _safe_close_browser：
+        Cookie 已落盘后用户手动关窗，裸 close() 抛异常不得把成功翻成
+        失败退出码（子进程调用方只看退出码）；
+    (5) N4：replace_with_retry 的 fallback_direct 直写分支补 fsync
+        （R1-17 只覆盖了 atomic 主路径的 tmp+replace）。"""
+
+    # ---- (1) 乘车人文件落盘权限 ----
+
+    def test_save_passengers_passes_mode_0600(self):
+        import passengers as pm
+        path = os.path.join(self.tmp, "passengers.json")
+        with mock.patch.object(appcommon, "atomic_write_json",
+                               wraps=appcommon.atomic_write_json) as m_write:
+            ok = pm.save_passengers([{"name": "A"}], path=path)
+        self.assertTrue(ok)
+        # RED on old code: 未传 mode（kwargs 无 mode 键）
+        self.assertEqual(m_write.call_args[1].get("mode"), 0o600)
+        if os.name == "posix":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    # ---- (2) 指纹守卫放弃保存走 LOG ----
+
+    def test_save_passengers_stamp_mismatch_warns_via_log(self):
+        import passengers as pm
+        path = os.path.join(self.tmp, "passengers.json")
+        with mock.patch.object(pm, "DEFAULT_PATH", path):
+            pm.save_passengers([{"name": "A"}])
+            stamp = pm.passengers_stamp()
+            pm.save_passengers([{"name": "EXT"}])  # 交互期间的外部写入
+            # RED on old code: 只有 print、无 LOG 记录 → assertLogs 失败
+            with self.assertLogs("monitor", level="WARNING") as cm:
+                ok = pm.save_passengers([{"name": "A2"}], expect_stamp=stamp)
+            self.assertFalse(ok)  # 返回 False 契约不变
+            self.assertTrue(any("已放弃" in line for line in cm.output))
+            self.assertEqual([x["name"] for x in pm.load_passengers()], ["EXT"])
+
+    # ---- (3) note_station_missing 节流 ----
+
+    def _patch_missing_throttle(self):
+        """隔离节流状态：注入假时钟并清零上次放行时刻，测后恢复原状。"""
+        state = {"now": 1000.0}
+        old_now = ticket._missing_now
+        old_last = ticket._missing_last_refresh[0]
+        ticket._missing_now = lambda: state["now"]
+        ticket._missing_last_refresh[0] = None
+        self.addCleanup(setattr, ticket, "_missing_now", old_now)
+        self.addCleanup(
+            lambda: ticket._missing_last_refresh.__setitem__(0, old_last))
+        return state
+
+    def test_note_station_missing_throttled_within_cooldown(self):
+        self._patch_missing_throttle()
+        with mock.patch.object(ticket, "_refresh_station_cache_async") as bg:
+            for name in ("不存在站甲", "不存在站乙", "不存在站丙"):
+                ticket.note_station_missing(name)
+        # RED on old code: 无节流 → 3 次调用 spawn 3 个下载线程
+        self.assertEqual(bg.call_count, 1)
+
+    def test_note_station_missing_resumes_after_cooldown(self):
+        state = self._patch_missing_throttle()
+        with mock.patch.object(ticket, "_refresh_station_cache_async") as bg:
+            ticket.note_station_missing("不存在站")
+            state["now"] += ticket._MISSING_REFRESH_COOLDOWN_SEC + 1
+            ticket.note_station_missing("不存在站")
+        self.assertEqual(bg.call_count, 2)  # 冷却到期后恢复放行
+
+    # ---- (4) capture_session 安全关浏览器 ----
+
+    def _run_capture_main(self, wait_status):
+        import capture_session
+        browser = mock.Mock()
+        browser.is_connected.return_value = False  # 用户已手动关窗：连接已断
+        browser.close.side_effect = RuntimeError("close on closed browser")
+        context = mock.Mock()
+        context.new_page.return_value = mock.Mock()
+        context.cookies.return_value = [
+            {"name": n, "value": "v", "domain": ".12306.cn", "path": "/"}
+            for n in ("tk", "JSESSIONID", "BIGipServerotn")]
+        browser.new_context.return_value = context
+        cookie_path = os.path.join(self.tmp, "session_cookies.json")
+        fake_pw = mock.MagicMock()  # sync_playwright() 返回支持 with 的 MagicMock
+        with mock.patch.object(capture_session, "_order_mode",
+                               return_value="http"), \
+             mock.patch.object(capture_session, "_cookie_path",
+                               return_value=cookie_path), \
+             mock.patch.object(capture_session, "_launch_browser",
+                               return_value=browser), \
+             mock.patch.object(capture_session, "_goto_login_page",
+                               return_value=True), \
+             mock.patch.object(capture_session, "_wait_for_login",
+                               return_value=wait_status), \
+             mock.patch.object(capture_session, "_final_verify",
+                               return_value=True), \
+             mock.patch.dict("sys.modules",
+                             {"playwright": mock.MagicMock(),
+                              "playwright.sync_api": fake_pw}), \
+             mock.patch("builtins.print"):
+            rc = capture_session.main()
+        return rc, browser, cookie_path
+
+    def test_capture_success_survives_close_failure(self):
+        # RED on old code: 成功落盘后裸 browser.close() 抛 RuntimeError
+        # 穿透 main()（本用例直接报错），子进程调用方按退出码误判登录失败
+        import capture_session
+        rc, browser, cookie_path = self._run_capture_main(
+            capture_session.LOGIN_OK)
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(cookie_path))  # Cookie 确已落盘
+        browser.close.assert_not_called()  # 已断开连接：根本不该调 close
+
+    def test_capture_timeout_survives_close_failure(self):
+        # RED on old code: 超时路径同样裸 close() 抛错穿透
+        import capture_session
+        rc, browser, _p = self._run_capture_main(capture_session.LOGIN_TIMEOUT)
+        self.assertEqual(rc, 1)
+        browser.close.assert_not_called()
+
+    # ---- (5) N4：fallback_direct 直写 fsync ----
+
+    def test_fallback_direct_write_fsyncs(self):
+        src = os.path.join(self.tmp, "src.json")
+        dst = os.path.join(self.tmp, "dst.json")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write('{"k": 1}')
+        fsync_calls = []
+        real_fsync = os.fsync
+
+        def spy(fd):
+            fsync_calls.append(fd)
+            return real_fsync(fd)
+
+        with mock.patch.object(appcommon.os, "replace",
+                               side_effect=OSError("busy forever")), \
+             mock.patch.object(appcommon.os, "fsync", spy):
+            appcommon.replace_with_retry(src, dst, tries=2, delay=0,
+                                         fallback_direct=True)
+        self.assertEqual(json.load(open(dst, encoding="utf-8")), {"k": 1})
+        # RED on old code: 直写分支从不 fsync → fsync_calls 为空
+        self.assertGreaterEqual(len(fsync_calls), 1)
 
 
 if __name__ == "__main__":
