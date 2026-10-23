@@ -6,6 +6,22 @@ import { openModal, confirmBox } from "../components/modal.js";
 import { showDD } from "../components/dd.js";
 
 
+// 保存乘车人的统一收口（与 settings.saveSettings 同口径）：后端按
+// expect_stamp 乐观并发拒写时返回 {ok:false,error} 而不抛异常，必须查
+// 返回值——不查就会照常关弹窗+假报「已保存」，编辑静默丢失。
+// 成功：同步后端回的新 stamp 并返回 true；失败：toast 报错返回 false，
+// 调用方不得关弹窗/报成功。RPC 本身抛错（后端未就绪）时 call() 已 toast，
+// 这里只兜底返回 false。
+async function savePaxList(passengers) {
+  let r;
+  try {
+    r = await call("savePassengers", { passengers, expect_stamp: S.paxStamp });
+  } catch (e) { return false; }
+  if (r && (r.ok === false || r.error)) { toast(r.error || "保存失败", "err"); return false; }
+  if (r && r.stamp) S.paxStamp = r.stamp;
+  return true;
+}
+
 // ================= 乘车人页 =================
 export function renderPax(root) {
   root.innerHTML =
@@ -18,8 +34,8 @@ export function renderPax(root) {
   root.querySelector("#pSync").onclick = async () => {
     const r = await call("sync12306Passengers");
     if (r.error) return toast(r.error, "err");
-    toast("已同步 " + (r.passengers || []).length + " 位");
-    await call("savePassengers", { passengers: r.passengers, expect_stamp: S.paxStamp });
+    // 落盘成功才报「已同步」；失败时 savePaxList 已 toast 报错，只刷新对齐
+    if (await savePaxList(r.passengers || [])) toast("已同步 " + (r.passengers || []).length + " 位");
     refreshPax();
   };
   root.querySelectorAll("#pList .p").forEach((el) => {
@@ -32,12 +48,12 @@ export function renderPax(root) {
         { i: 0, label: "✎ 编辑", fn: () => { openPaxForm(p); } },
         { i: 1, label: p.is_default ? "已是默认" : "☆ 设为默认", fn: async () => {
           if (p.is_default) return;
-          await call("savePassengers", { passengers: S.pax.map((x) => Object.assign({}, x, { is_default: x.name === p.name })), expect_stamp: S.paxStamp });
+          await savePaxList(S.pax.map((x) => Object.assign({}, x, { is_default: x.name === p.name })));
           refreshPax();
         } },
         { i: 2, label: "🗑 删除", danger: true, fn: async () => {
           if (await confirmBox("删除", "删除乘车人「" + p.name + "」？")) {
-            await call("savePassengers", { passengers: S.pax.filter((x) => x.name !== p.name), expect_stamp: S.paxStamp });
+            await savePaxList(S.pax.filter((x) => x.name !== p.name));
             refreshPax();
           }
         } },
@@ -106,7 +122,9 @@ export async function openPaxForm(edit) {
       is_adult: edit ? edit.is_adult : true,
     };
     const list = edit ? S.pax.map((x) => (x.name === edit.name ? rec : x)) : S.pax.concat([rec]);
-    await call("savePassengers", { passengers: list, expect_stamp: S.paxStamp });
+    // 保存失败（指纹冲突等）不关弹窗、不报已保存：错误已由 savePaxList
+    // toast，用户可改后重试或取消，表单输入不丢。
+    if (!await savePaxList(list)) return;
     close(); toast("已保存"); refreshPax();
   };
 }

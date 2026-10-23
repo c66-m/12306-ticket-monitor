@@ -542,11 +542,11 @@ export function renderTrains(el, trains, opts, ctx) {
 }
 
 // ================= 数据刷新 =================
-export async function refreshMonitor() {
+export async function refreshMonitor(opts) {
   if (S.monitorBusy) return;
   S.monitorBusy = true;
   try {
-    const r = await call("listMonitorTasks");
+    const r = await call("listMonitorTasks", undefined, opts);
     S.monitor = r.tasks || [];
     S.engineRunning = !!r.engineRunning;
     $("#badge-monitor").textContent = S.monitor.filter((t) => ["monitoring", "retrying"].includes(t.status)).length;
@@ -556,7 +556,7 @@ export async function refreshMonitor() {
     const ae = document.activeElement;
     const typing = ae && ae.tagName === "INPUT" && !/^(min|max|close|button|submit)$/i.test(ae.type || "");
     if (S.page === "monitor" && !typing) updateMonitorView(); // 局部刷新，保留搜索框与查票结果
-  } catch (e) { /* call 已提示 */ }
+  } catch (e) { /* call 已提示；定时轮询传入 quiet 时不提示、静默等下一轮 */ }
   S.monitorBusy = false;
 }
 

@@ -68,8 +68,11 @@ function feedLog(line) {
 // ---------------- 任务 / 引擎状态 ----------------
 function renderTasks(tasks) {
   const done = tasks.filter((t) => t.status === "success");
+  // 待核对与抢到票同为「需用户关注的结果」：置顶展示。只取 success+进行中
+  // 时 ambiguous 会从小窗里凭空消失，用户就不会去 12306 核对那笔订单。
+  const attn = tasks.filter((t) => t.status === "ambiguous");
   const live = tasks.filter((t) => ACTIVE.indexOf(t.status) >= 0);
-  const rows = done.concat(live);   // 抢到票是最终结果，置顶，不能从小窗里错过
+  const rows = done.concat(attn, live);   // 抢到票是最终结果，置顶，不能从小窗里错过
   const sig = JSON.stringify(rows.map((t) => [t.name, t.status, t.message || ""]));
   if (sig === lastSig) return;
   lastSig = sig;

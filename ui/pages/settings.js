@@ -54,6 +54,8 @@ export function openSettingPanel(key, bubbleEl) {
   }
   // 清掉上一次关闭动画的残留监听（否则打开动画结束会被误判成关闭完成）
   panel.onanimationend = null;
+  // 同理清掉上一次关闭的超时兜底：重开后面板不能再被旧定时器收走
+  if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
   panel.classList.remove("closing", "done");
   panel.innerHTML =
     '<div class="set-panel-head"><h3>' + panelTitle(key) + "</h3>" +
@@ -71,6 +73,7 @@ export function closeSettingPanel() {
   const panel = document.getElementById("setPanel");
   if (!panel) return;
   panel.onanimationend = null;
+  if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
   // 背景模糊遮罩同步淡出
   const bd = document.getElementById("setBackdrop");
   if (bd) bd.classList.remove("show");
@@ -81,12 +84,18 @@ export function closeSettingPanel() {
   }
   // 退出动画：缩小回气泡原点，动画结束后才真正隐藏
   panel.classList.add("closing");
-  panel.onanimationend = (e) => {
-    if (e.animationName === "setpop-out") {
-      panel.classList.remove("show", "closing", "done");
-      panel.onanimationend = null;
-    }
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
+    panel.classList.remove("show", "closing", "done");
+    panel.onanimationend = null;
   };
+  panel.onanimationend = (e) => { if (e.animationName === "setpop-out") finish(); };
+  // 关动效（data-motion="off"）时 animation 被 CSS 全禁，animationend 永不
+  // 触发，面板会永远停在屏上——450ms 超时兜底走同一收尾（幂等，只跑一次）。
+  panel._closeTimer = setTimeout(finish, 450);
 }
 
 export function panelTitle(key) {

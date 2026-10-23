@@ -38,8 +38,8 @@ export function renderHistory(root) {
   };
 }
 
-export async function refreshHistory() {
-  try { const r = await call("listHistory", { limit: 200 }); S.history = r.records || []; if (S.page === "history") renderPage(); } catch (e) { /* ignore */ }
+export async function refreshHistory(opts) {
+  try { const r = await call("listHistory", { limit: 200 }, opts); S.history = r.records || []; if (S.page === "history") renderPage(); } catch (e) { /* ignore */ }
 }
 // failed = 本轮未成功、下轮继续重试，不是「下单失败」（真失败时 12306 往往
   // 已经生成了未支付订单，拒绝重复下单的原文是「包含未付款订单」）。

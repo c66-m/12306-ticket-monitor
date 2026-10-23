@@ -345,7 +345,9 @@ export async function refreshGrab() {
   if (S.grabBusy) return;
   S.grabBusy = true;
   try {
-    const r = await call("grabTicker");
+    // grabTicker 是 1 秒定时轮询的心跳：固定走 quiet，失败只吞不提示，
+    // 免得后端重启期间错误 toast/日志刷屏（用户操作的结果提示在各按钮处）。
+    const r = await call("grabTicker", undefined, { quiet: true });
     S.grab = r.tasks || [];
     $("#badge-grab").textContent = S.grab.filter((t) => t.running).length;
     if (S.page === "grab") {

@@ -6,12 +6,17 @@ import { pushLog } from "./components/log.js";
 
 
 export const bridge = window.api;
-export async function call(method, params) {
+// opts.quiet：后台轮询专用——失败只 throw，不 toast、不写日志区。后端重启
+// 退避（最长 30s）期间 1s/2s 的轮询若每次失败都提示，会反复刷屏并把日志
+// 400 行缓冲冲掉真实记录。用户主动操作触发的调用不传 quiet，保持原样。
+export async function call(method, params, opts) {
   try { return await bridge.call(method, params); }
   catch (e) {
-    const msg = String(e && e.message || e);
-    toast(msg, "err");
-    pushLog("[RPC] " + method + " 失败：" + msg, "err");
+    if (!opts || !opts.quiet) {
+      const msg = String(e && e.message || e);
+      toast(msg, "err");
+      pushLog("[RPC] " + method + " 失败：" + msg, "err");
+    }
     throw e;
   }
 }
@@ -31,6 +36,9 @@ export const S = {
   //                        （会话恢复后由 refreshSession 复位）
   _expiredDialogOpen: false,
   _expiredDismissed: false,
+  // _expiredPending：失效事件到达时正有业务弹窗（表单/确认框）开着，弹窗先
+  // 降级提示并把消息存这里；业务弹窗关闭后由 session.js 补弹。null = 无待弹。
+  _expiredPending: null,
   history: [],
   problems: [], problemFilter: "all",
   queryHistory: [],
@@ -75,6 +83,24 @@ export function goto(page) {
   const _enterHook = _enterHooks[page]; if (_enterHook) _enterHook();
 }
 
+// animationend 兜底：关动效（html[data-motion="off"]）时 CSS 把 animation
+// 全部禁用，animationend 永不触发，依赖它的清理会永远悬空（切页时旧页堆积、
+// 重复 id）。统一走这里：动画正常结束就按动画走；450ms 没等到则由定时器
+// 执行同一清理。清理幂等，只跑一次，先到者取消后到者。
+function afterAnim(el, name, fn) {
+  let done = false;
+  const timer = setTimeout(run, 450);
+  function run() {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    el.removeEventListener("animationend", onEnd);
+    fn();
+  }
+  function onEnd(e) { if (e.animationName === name) run(); }
+  el.addEventListener("animationend", onEnd);
+}
+
 export function renderPage(animate) {
   const c = $("#content");
   const hasOld = c.firstElementChild !== null;
@@ -82,12 +108,7 @@ export function renderPage(animate) {
   if (animate && hasOld) {
     const old = c.firstElementChild;
     old.classList.add("page-out");
-    old.addEventListener("animationend", function onOut(e) {
-      if (e.animationName === "page-draw-out") {
-        old.remove();
-        old.removeEventListener("animationend", onOut);
-      }
-    });
+    afterAnim(old, "page-draw-out", () => old.remove());
   } else if (!animate) {
     c.innerHTML = ""; // 刷新重建路径：无动画直接清空
   }
@@ -96,12 +117,7 @@ export function renderPage(animate) {
   c.appendChild(el);
   if (animate) {
     // 进入动画结束移除 page-in：恢复毛玻璃（动画期间禁用 backdrop-filter 防模糊）
-    el.addEventListener("animationend", function onIn(e) {
-      if (e.animationName === "page-draw-in") {
-        el.classList.remove("page-in");
-        el.removeEventListener("animationend", onIn);
-      }
-    });
+    afterAnim(el, "page-draw-in", () => el.classList.remove("page-in"));
   }
   _renderers[S.page](el);
 }

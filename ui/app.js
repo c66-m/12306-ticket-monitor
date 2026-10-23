@@ -126,10 +126,13 @@ renderPage();
 refreshAll();
 // 窗口隐藏（打开迷你小窗/最小化）时停掉后台轮询，回到前台立刻对齐一次：
 // 隐藏期间主窗的定时器仍会跑，白白和后端争 RPC 队列（2026-10-19 审查）。
-setInterval(() => { if (!document.hidden && S.page === "monitor") refreshMonitor(); }, 2000);
+// 后台轮询一律走 quiet（失败只吞不提示）：后端重启退避期间每秒失败弹一次
+// toast + 写一行日志会刷屏并冲掉真实日志记录。refreshGrab 的 grabTicker
+// 在其内部已固定 quiet，其余三个在这里传 opts。
+setInterval(() => { if (!document.hidden && S.page === "monitor") refreshMonitor({ quiet: true }); }, 2000);
 setInterval(() => { if (!document.hidden) refreshGrab(); }, 1000);
-setInterval(() => { if (!document.hidden && S.page === "history") refreshHistory(); }, 30000);
-setInterval(() => { if (!document.hidden) refreshSession(); }, 60000);
+setInterval(() => { if (!document.hidden && S.page === "history") refreshHistory({ quiet: true }); }, 30000);
+setInterval(() => { if (!document.hidden) refreshSession({ quiet: true }); }, 60000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refreshAll();
 });
