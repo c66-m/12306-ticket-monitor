@@ -5961,6 +5961,199 @@ class TestTask52SliderAmbiguous(TempDirCase):
         self.assertIn("no_book", msg)
 
 
+class TestB1OldChainFailWord(TempDirCase):
+    """B1（下单误报·判定层）：旧链 _order_impl 结果循环的 fail 词分支。
+
+    旧行为：确认已点出后页面出现「出票失败/余票不足」等 fail 词，直接
+    (False, 原文, None) 报失败——但实跑有页面误报、订单实际已生成待付款
+    的案例，当普通失败处理会误杀已下好的单。
+    新行为：clicked=True 时标 reason=ambiguous 交上层官方回读定生死
+    （旧链既有回读机制：回读到未支付订单=成功，确认无单才安全重试）；
+    dup 词仍优先按 dup 返回，不受影响。
+    假页面 + 假时钟驱动 _order_impl 全流程（替身口径同 TestTask52）。
+    """
+
+    class _Clock:
+        def __init__(self):
+            self.now = 1_700_000_000.0
+
+        def time(self):
+            return self.now
+
+        def sleep(self, s):
+            self.now += s
+
+        def perf_counter(self):
+            return self.now
+
+        def strftime(self, fmt, t=None):
+            return time.strftime(
+                fmt, time.localtime(self.now if t is None else t))
+
+        def localtime(self, t=None):
+            return time.localtime(self.now if t is None else t)
+
+    class _Locator:
+        def __init__(self, count=0, visible=False, evaluate_result=None):
+            self._count = count
+            self._visible = visible
+            self._evaluate_result = evaluate_result
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return self._count
+
+        def is_visible(self):
+            return self._visible
+
+        def evaluate(self, js):
+            return self._evaluate_result
+
+    class _Page:
+        """确认点击后正文变成 body_after_click（模拟服务端回显结果提示）。"""
+        INIT_URL = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+
+        def __init__(self, clock, body_after_click):
+            self._clock = clock
+            self._body_after_click = body_after_click
+            self.qr_submit_clicked = False
+            self._qr_calls = 0
+
+        def set_default_timeout(self, ms):
+            pass
+
+        def wait_for_timeout(self, ms):
+            self._clock.now += ms / 1000.0
+
+        def wait_for_url(self, *a, **k):
+            pass
+
+        def wait_for_selector(self, *a, **k):
+            pass
+
+        def wait_for_function(self, *a, **k):
+            pass
+
+        def locator(self, sel):
+            if sel == "#seatType_1":
+                return TestB1OldChainFailWord._Locator(
+                    count=1, visible=True,
+                    evaluate_result=[{"v": "WZ", "t": "无座"}])
+            return TestB1OldChainFailWord._Locator()
+
+        def eval_on_selector_all(self, sel, js):
+            if sel.startswith("#normal_passenger_id"):
+                return [{"id": "p1", "text": "张三"}]
+            return []
+
+        @property
+        def url(self):
+            return self.INIT_URL
+
+        def evaluate(self, js, arg=None):
+            if "dialog_xsertcj" in js:
+                return None  # 无学生票询问弹窗
+            if "checkticketinfo_id" in js:
+                return ""  # 核对窗原文为空：跳过席别对账分支
+            if "qr_submit_id" in js:
+                if "click" in js:
+                    self.qr_submit_clicked = True
+                    return None
+                self._qr_calls += 1
+                if self._qr_calls >= 2:
+                    return {"found": True, "cls": "btn92s", "shown": True}
+                return {"found": True, "cls": "btn92", "shown": True}
+            if "queryLeftTable" in js:
+                return True  # 点中预订
+            if "slide_passcode" in js and "nc-container" in js:
+                return []  # 确认窗里无滑块
+            if "ticketType_" in js:
+                return {"before": ["1"], "after": ["1"], "map": {}}
+            if "seatType_1" in js:
+                return {}
+            if "tt: String" in js:
+                return [{"name": "张三", "tt": "1"}]
+            if "limit_tickets" in js:
+                return [{"name": "张三", "seat": "WZ", "ticket_type": "1"}]
+            if js.startswith("(id) =>"):
+                return None  # 勾选乘车人 click
+            if js.startswith("(ids) =>"):
+                return []  # 勾选回读：全部已勾上
+            if "document.body" in js:
+                # 失败提示是确认提交后服务端才回显的：点击前正文为空
+                return self._body_after_click if self.qr_submit_clicked else ""
+            if "#submitOrder_id" in js:
+                return None
+            raise AssertionError("假页面遇到未预期的 evaluate: %r" % js[:80])
+
+    class _Warm:
+        def __init__(self, page):
+            self.p = object()
+            self.ctx = object()
+            self.page = page
+
+        def usable(self):
+            return True
+
+        def refresh(self, info):
+            pass
+
+    def _stub_playwright(self):
+        import sys
+        import types as _types
+        pw = _types.ModuleType("playwright")
+        pw_sync = _types.ModuleType("playwright.sync_api")
+
+        def _no_playwright():
+            raise AssertionError("预热路径不应启动 playwright")
+
+        pw_sync.sync_playwright = _no_playwright
+        pw.sync_api = pw_sync
+        self._pw_mods = {"playwright": pw, "playwright.sync_api": pw_sync}
+        for name, mod in self._pw_mods.items():
+            sys.modules[name] = mod
+        self.addCleanup(self._unstub_playwright)
+
+    def _unstub_playwright(self):
+        import sys
+        for name in self._pw_mods:
+            sys.modules.pop(name, None)
+
+    def _run(self, body_after_click):
+        clock = self._Clock()
+        page = self._Page(clock, body_after_click)
+        self._stub_playwright()
+        info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                "from_code": "VNP", "to_code": "SHH"}
+        with mock.patch.object(browser_order, "time", clock):
+            ok, msg, extra = browser_order._order_impl(
+                info, "无座", "WZ", ["张三"], "2026-10-10",
+                warm=self._Warm(page))
+        return ok, msg, extra, page
+
+    def test_fail_word_after_click_marks_ambiguous(self):
+        # 确认已点出后页面报「出票失败」：可能是误报（订单已生成待付款），
+        # 必须标 ambiguous 交官方回读，不许直接报普通失败
+        ok, msg, extra, page = self._run("出票失败，请稍后再试")
+        self.assertTrue(page.qr_submit_clicked, "前置条件：确认按钮应已点击")
+        self.assertFalse(ok)
+        self.assertEqual((extra or {}).get("reason"), "ambiguous",
+                         "clicked=True 时 fail 词必须先交官方回读定生死")
+        self.assertIn("官方订单接口回读", msg)
+
+    def test_fail_word_with_dup_stays_dup(self):
+        # fail 词与 dup 词同现：dup 优先口径不变（账号已有未支付订单，
+        # 再重试只会得到同样的拒绝）
+        ok, msg, extra, page = self._run("出票失败！原因：您有未完成订单，请先处理")
+        self.assertTrue(page.qr_submit_clicked, "前置条件：确认按钮应已点击")
+        self.assertFalse(ok)
+        self.assertEqual((extra or {}).get("reason"), "dup")
+        self.assertEqual((extra or {}).get("dup_kind"), "未完成订单")
+
+
 class TestTask52BusyProbe(TempDirCase):
     """Task 52b: busy() 必须是真实跨进程探测。
 
@@ -12569,11 +12762,64 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertEqual(extra["dup_kind"], "未完成订单")
 
     def test_e2e_fail_body(self):
+        # B1：fail 词先走官方回读；多轮回读明确无单（none）才认网页失败，
+        # 返回与旧行为一致的 (False, 网页原文, None)
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
         page = self._HoldPage(self.INIT_URL, "余票不足")
-        (ok, msg, extra), stages, _, _ = self._core(page)
+        (ok, msg, extra), stages, _, _ = self._core(page, judge_result=judge)
         self.assertFalse(ok)
         self.assertEqual(msg, "余票不足")
         self.assertIsNone(extra)
+
+    def test_e2e_fail_word_but_official_unpaid_succeeds(self):
+        # B1：页面报「出票失败」但订单已生成待付款（12306 误报）——
+        # 官方回读到本次未支付订单时按成功返回，不再误报失败关页。
+        judge = (True, "订单已生成（未支付）：官方订单接口回读到本次订单 E123",
+                 {"flow_judge": {"cls": "unpaid", "order_no": "E123"},
+                  "order_no": "E123", "page_kind": "official"})
+        page = self._HoldPage(self.INIT_URL, "出票失败")
+        (ok, msg, extra), stages, _, _ = self._core(page, judge_result=judge)
+        self.assertTrue(ok, msg)
+        self.assertEqual(extra["order_no"], "E123")
+        self.assertEqual(extra["page_kind"], "official")
+
+    def test_e2e_fail_word_judge_error_is_ambiguous(self):
+        # B1：fail 词后回读不确定（error）→ 返回 ambiguous 形状交上层，
+        # 绝不按普通失败返回（上层据此盲重试可能撞出第二单）。
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous", "flow_judge": {"cls": "error"}})
+        page = self._HoldPage(self.INIT_URL, "系统繁忙")
+        (ok, msg, extra), stages, _, _ = self._core(page, judge_result=judge)
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertEqual(extra["flow_judge"]["cls"], "error")
+
+    def test_e2e_final_judge_saves_state_first(self):
+        # B1：最终 JUDGE 前必须先落盘会话（与首轮同口径）——回读读的是
+        # 磁盘 cookie，不落盘会拿旧 cookie 判错。事件序应为：首轮
+        # save→judge，观察超时后的最终 JUDGE 再 save→judge。
+        import orderflow
+        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
+                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
+        events = []
+
+        def fake_judge(*a, **k):
+            events.append("judge")
+            return judge
+
+        page = self._HoldPage(self.INIT_URL, "")
+        with mock.patch.object(orderflow, "save_state",
+                               side_effect=lambda ctx: events.append("save")), \
+             mock.patch.object(orderflow, "_judge_official",
+                               side_effect=fake_judge):
+            (ok, msg, extra), stages, _, _ = self._core(
+                page, flow_cfg={"read_poll_seconds": 0.5,
+                                "page_wait_seconds": 10,
+                                "retry_open_times": 0})
+        self.assertFalse(ok)
+        self.assertIn("JUDGE", stages)
+        self.assertEqual(events, ["save", "judge", "save", "judge"])
 
     def test_e2e_slide_user_stopped(self):
         # 坑 7：滑块出现即停交人工，返回 ambiguous + need_captcha
@@ -12747,6 +12993,88 @@ class TestOrderflowE2EMock(TempDirCase):
                       "retry_open_times": 1})
         self.assertTrue(ok, msg)
         self.assertEqual(extra["page_kind"], "payOrder")
+
+
+class TestB1JudgeOfficialRetry(TempDirCase):
+    """B1（下单误报·判定层）：_judge_official 回读有界重试 + 观察窗默认值。
+
+    旧行为：回读只查一次——订单还没落库（none）或查询抖动（error）就
+    直接判 ambiguous，且两种落空在 flow_judge 里无从分辨。
+    新行为：error/none 最多再查 2 轮（间隔可注入，测试传 0 不真睡），
+    查到 unpaid 立即停；多轮后 flow_judge.cls 保留最后一轮分类，
+    error 与 none 可分辨。classify_with_time 本身语义不变。
+    """
+
+    _UNPAID = ("unpaid", "E123456789", "未支付订单",
+               {"order_no": "E123456789"})
+    _NONE = ("none", "", "", None)
+    _ERROR = ("error", "", "官方订单查询失败: boom", None)
+
+    def _judge(self, side_effect, **kw):
+        import orderflow
+        kw.setdefault("retry_interval", 0)
+        with mock.patch.object(orderflow, "classify_with_time",
+                               side_effect=side_effect) as m:
+            out = orderflow._judge_official(
+                "2026-10-17", "G101", ["张三"], 1_700_000_000.0, None, **kw)
+        return out, m.call_count
+
+    def test_retry_error_then_unpaid_succeeds(self):
+        (ok, msg, extra), calls = self._judge([self._ERROR, self._UNPAID])
+        self.assertTrue(ok, msg)
+        self.assertEqual(extra["order_no"], "E123456789")
+        self.assertEqual(calls, 2)
+
+    def test_retry_none_then_unpaid_succeeds(self):
+        # 落库延迟：首查没查到，下一轮订单出现 → 成功，不再误判未知
+        (ok, msg, extra), calls = self._judge([self._NONE, self._UNPAID])
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, 2)
+
+    def test_retry_exception_counts_as_error_and_recovers(self):
+        (ok, msg, extra), calls = self._judge(
+            [RuntimeError("net down"), self._UNPAID])
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, 2)
+
+    def test_retry_none_exhausted_keeps_none(self):
+        (ok, msg, extra), calls = self._judge([self._NONE] * 3)
+        self.assertFalse(ok)
+        # 1 次首查 + 2 轮重试封顶；cls 仍是 none（确认无单），与 error 可分辨
+        self.assertEqual(calls, 3)
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertEqual(extra["flow_judge"]["cls"], "none")
+
+    def test_retry_error_exhausted_keeps_error(self):
+        (ok, msg, extra), calls = self._judge([self._ERROR] * 3)
+        self.assertFalse(ok)
+        self.assertEqual(calls, 3)
+        self.assertEqual(extra["flow_judge"]["cls"], "error")
+
+    def test_no_retry_on_conclusive_cls(self):
+        # paid/cancelled/blocked 已是定论：不重试，立即按 ambiguous 返回
+        for cls in ("paid", "cancelled", "blocked"):
+            (ok, msg, extra), calls = self._judge([(cls, "", "", None)])
+            self.assertFalse(ok)
+            self.assertEqual(calls, 1, cls)
+            self.assertEqual(extra["flow_judge"]["cls"], cls)
+
+    def test_no_retry_when_unpaid_immediately(self):
+        (ok, msg, extra), calls = self._judge([self._UNPAID])
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, 1)
+
+    def test_retry_rounds_zero_disables(self):
+        (ok, msg, extra), calls = self._judge([self._NONE], retry_rounds=0)
+        self.assertFalse(ok)
+        self.assertEqual(calls, 1)
+
+    def test_page_wait_default_30(self):
+        import orderflow
+        self.assertEqual(orderflow._FLOW_DEFAULTS["page_wait_seconds"], 30.0)
+        live = json.load(open(os.path.join(HERE, "config.example.json"),
+                              encoding="utf-8"))
+        self.assertEqual(live["order_flow"]["page_wait_seconds"], 30)
 
 
 def _multi(patches):

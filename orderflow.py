@@ -66,7 +66,7 @@ _READ_JS = ("() => { const b = document.body ? document.body.innerText : '';"
 _PAY_LOCK_KEY = "席位已锁定"
 _SEAT_SCAN = ("无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座")
 
-_FLOW_DEFAULTS = {"read_poll_seconds": 0.5, "page_wait_seconds": 10.0,
+_FLOW_DEFAULTS = {"read_poll_seconds": 0.5, "page_wait_seconds": 30.0,
                   "retry_open_times": 1, "lock_confirm_seconds": 1.5}
 # 锁定座位页静置确认窗（秒）：进入 payOrder 后先在原页静置 1–2s 再下结论。
 # 12306 点确认后要 2–8 秒才渲染出「席位已锁定」，期间正文可能还是旧页或
@@ -133,26 +133,64 @@ def _judge_text(judge):
     return "cls=%s recent=%s raw=%s" % (cls, recent, raw)
 
 
-def _judge_official(date, train, passenger_names, t_submit, logger):
+# 官方回读重试口径：首次回读落空多半不是「真没下单」——订单落库有秒级
+# 延迟、查询接口也会抖动。有界重试：error（查询失败）/ none（没查到）时
+# 最多再查 _JUDGE_RETRY_ROUNDS 轮、间隔 _JUDGE_RETRY_INTERVAL 秒
+# （默认 2 轮 × 6 秒，新增等待 ≤12 秒）；查到 unpaid 立即停，其余分类
+# （paid / cancelled / blocked 等已是定论）不重试。
+_JUDGE_RETRY_ROUNDS = 2
+_JUDGE_RETRY_INTERVAL = 6.0
+
+
+def _judge_official(date, train, passenger_names, t_submit, logger,
+                    retry_rounds=None, retry_interval=None):
     """官方订单接口回读（JUDGE）。
 
     unpaid 且下单时间落在本次提交窗口（recent）→ 本次成功（关全部页面后由
     调用方返回）；其余返回 ambiguous 交上层既有闭环（engine/launcher 的
     ambiguous 处理会再次归因，none/cancelled 走安全重试）。
+
+    回读带 _JUDGE_RETRY_* 口径的有界重试；多轮后仍落空时 flow_judge.cls
+    保留最后一轮的分类——error（查询失败）与 none（确认无单）可分辨，
+    上层据此决定是否允许重下。retry_rounds / retry_interval 可注入（测试用，
+    classify_with_time 本身语义不变）。
     """
+    if retry_rounds is None:
+        retry_rounds = _JUDGE_RETRY_ROUNDS
+    if retry_interval is None:
+        retry_interval = _JUDGE_RETRY_INTERVAL
+    attempt = 0
+    while True:
+        try:
+            cls, ono, raw, recent = classify_with_time(
+                date, train, passenger_names, not_before_ts=t_submit)
+        except Exception as e:
+            cls, ono, raw, recent = "error", "", "官方订单查询异常: %s" % e, None
+        judge = {"cls": cls, "order_no": ono, "raw": raw, "recent": bool(recent)}
+        _emit(logger, "[流程] JUDGE：官方回读 %s" % _judge_text(judge))
+        if cls == "unpaid" and recent:
+            order_no = (recent.get("order_no") or ono) if isinstance(recent, dict) else ono
+            return True, "订单已生成（未支付）：官方订单接口回读到本次订单 %s" % order_no, {
+                "flow_judge": judge, "order_no": order_no, "page_kind": "official"}
+        if cls not in ("error", "none") or attempt >= retry_rounds:
+            return False, "订单结果未知：官方订单接口回读无法确认本次下单结果", {
+                "reason": "ambiguous", "flow_judge": judge}
+        attempt += 1
+        _emit(logger, "[流程] JUDGE：回读%s，%.0fs 后重试（%d/%d）"
+                      % ("查询失败" if cls == "error" else "暂无本次订单",
+                         retry_interval, attempt, retry_rounds))
+        if retry_interval > 0:
+            time.sleep(retry_interval)
+
+
+def _save_state_for_judge(ctx, logger):
+    """官方回读前先落盘会话：回读读的是 session_from_browser_state() 落盘的
+    那份 cookie，不落盘可能读到旧 cookie（原理见 _run_orderflow_core 首轮
+    回读前的注释）。落盘失败不中断判定，只记日志（与首轮口径一致）。"""
     try:
-        cls, ono, raw, recent = classify_with_time(date, train, passenger_names,
-                                                   not_before_ts=t_submit)
-    except Exception as e:
-        cls, ono, raw, recent = "error", "", "官方订单查询异常: %s" % e, None
-    judge = {"cls": cls, "order_no": ono, "raw": raw, "recent": bool(recent)}
-    _emit(logger, "[流程] JUDGE：官方回读 %s" % _judge_text(judge))
-    if cls == "unpaid" and recent:
-        order_no = (recent.get("order_no") or ono) if isinstance(recent, dict) else ono
-        return True, "订单已生成（未支付）：官方订单接口回读到本次订单 %s" % order_no, {
-            "flow_judge": judge, "order_no": order_no, "page_kind": "official"}
-    return False, "订单结果未知：官方订单接口回读无法确认本次下单结果", {
-        "reason": "ambiguous", "flow_judge": judge}
+        save_state(ctx)
+    except Exception as exc:
+        _emit(logger, "[流程] 会话落盘失败：%s（官方回读可能读到旧 cookie）" % exc)
 
 
 def _finish_success(entry, url, body, date, train, passenger_names, seat_name, logger,
@@ -391,8 +429,23 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                         else:
                             return _finish_dup(url, body, logger)
                     elif snap == "fail":
-                        _emit(logger, "[流程] JUDGE：网页判定下单失败")
-                        return False, body, None
+                        # fail 词不直接判失败：12306 会误报（实跑：页面报
+                        # 「出票失败」但订单已生成待付款）。先走与最终 JUDGE
+                        # 相同的官方回读（含重试）定生死——回读到本次未支付
+                        # 订单按成功返回；多轮回读明确无单（none）才认网页
+                        # 失败；回读不确定则按 ambiguous 交上层闭环。
+                        _emit(logger, "[流程] JUDGE：网页报下单失败，先官方回读确认")
+                        _save_state_for_judge(ctx, logger)
+                        ok_f, msg_f, extra_f = _judge_official(
+                            date, train, passenger_names, e["t_submit"], logger)
+                        if ok_f:
+                            return ok_f, msg_f, extra_f
+                        cls_f = ((extra_f or {}).get("flow_judge") or {}).get("cls")
+                        if cls_f == "none":
+                            _emit(logger, "[流程] JUDGE：官方回读确认无单，"
+                                          "网页失败成立")
+                            return False, body, None
+                        return ok_f, msg_f, extra_f
                 # 滑块出现即停交人工（坑 7）：脚本不绕过，等待不计入该页
                 # 观察倒计时（顺延 deadline，与旧链结果循环同口径）；
                 # tick%4==1 降频查询，与旧链 250ms 结果循环的滑块查询频率对齐
@@ -413,7 +466,7 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                 break
             tick += 1
             # 首读未获：先官方回读防 dup（已生成未完成新订单=成功关全部），
-            # 仍无则新开页面重下，新旧页并存各自 0.5s 读、各自 10s 退出。
+            # 仍无则新开页面重下，新旧页并存各自 0.5s 读、各自观察 page_wait 秒退出。
             # 但页面还在「正在处理，请稍候」或已进入锁定座位页时必须先等：
             # 2026-10-19 实测确认后 2–8 秒才渲染锁定页，提前重下等于下第二单，
             # 12306 直接「出票失败/未完成订单」——即用户看到的「锁座成功后
@@ -471,6 +524,7 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
             time.sleep(poll)
         # 所有观察页超时退出：JUDGE 兜底（坑 8：交官方回读闭环，上层还会再判）
         stage("JUDGE")
+        _save_state_for_judge(ctx, logger)
         return _judge_official(date, train, passenger_names, t_submit, logger)
 
 

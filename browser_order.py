@@ -1861,6 +1861,15 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             # dup_kind 让上层区分"行程冲突"和"本行程已有订单"
                             return False, body, {"reason": "dup",
                                                  "dup_kind": next(k for k in _dup_keys if k in _body)}
+                        if clicked:
+                            # 确认已点出：网页的失败提示可能是误报（实跑：页面
+                            # 报「出票失败」但订单已生成待付款）——不当普通失败
+                            # 让上层盲重试，标 ambiguous 交上层官方回读定生死
+                            # （回读到本次未支付订单=成功，确认无单才安全重试）。
+                            return (False,
+                                    "网页提示下单失败（%s）但确认已提交——无法确认"
+                                    "本次下单结果，交官方订单接口回读" % body,
+                                    {"reason": "ambiguous"})
                         return False, body, None
             mark("result")
             if clicked:
