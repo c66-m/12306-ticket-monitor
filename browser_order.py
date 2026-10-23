@@ -183,6 +183,34 @@ class _ProfileLock:
 _PROFILE_LOCK = _ProfileLock(_LOCK_PATH)
 
 
+# profile 独占锁等待者登记（审查第 10 条）：exclusive() 在真正阻塞等锁前
+# 登记、拿到锁或放弃后注销。付款页留窗（_hold_pay_page）每轮检查这张表：
+# 有等待者说明已有下一个任务在排队等锁，留窗占着锁只会让对方等锁超时、
+# 错过放票窗口——提前结束留窗把锁让出去；无人等待时留窗时长不变。
+# 登记只覆盖本进程内的等待者（跨进程等待在对方进程的登记表里，本进程
+# 看不见，属已知边界）。
+_LOCK_WAITERS = {}
+_LOCK_WAITERS_GUARD = threading.Lock()
+
+
+def _register_lock_waiter(label=None):
+    """登记一个独占锁等待者，返回注销用的 token。"""
+    token = object()
+    with _LOCK_WAITERS_GUARD:
+        _LOCK_WAITERS[token] = label or threading.current_thread().name
+    return token
+
+
+def _unregister_lock_waiter(token):
+    with _LOCK_WAITERS_GUARD:
+        _LOCK_WAITERS.pop(token, None)
+
+
+def _lock_waiter_count():
+    with _LOCK_WAITERS_GUARD:
+        return len(_LOCK_WAITERS)
+
+
 # Task 85d：depth 记录 owner 可寻址。
 # 背景：原先用 threading.local 存 depth（本线程重入标记）；WarmSession.close()
 # 若在非创建线程被调用（Task 65h 路径），owner 线程的 depth 残留为 1——owner
@@ -342,18 +370,26 @@ def exclusive(timeout=90):
             if _get_depth():
                 _set_depth(depth)
         return
-    if not _BROWSER_LOCK.acquire(timeout=timeout):
-        raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
+    # 阻塞等锁前先登记等待者：持锁方的付款页留窗据此提前结束（见
+    # _LOCK_WAITERS 注释）。拿到两把锁或任一步失败后立即注销。
+    waiter = _register_lock_waiter()
     try:
-        if not _PROFILE_LOCK.acquire(timeout=timeout):
-            raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），请稍后重试")
-        _set_depth(1)
+        if not _BROWSER_LOCK.acquire(timeout=timeout):
+            raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
         try:
-            yield
-        finally:
-            _set_depth(0)
-            _PROFILE_LOCK.release()
+            if not _PROFILE_LOCK.acquire(timeout=timeout):
+                raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），请稍后重试")
+        except BaseException:
+            _BROWSER_LOCK.release()
+            raise
     finally:
+        _unregister_lock_waiter(waiter)
+    _set_depth(1)
+    try:
+        yield
+    finally:
+        _set_depth(0)
+        _PROFILE_LOCK.release()
         _BROWSER_LOCK.release()
 
 
@@ -795,7 +831,13 @@ def _pay_page_hold_seconds():
 
 
 def _hold_pay_page(page, seconds, should_stop=None):
-    """把「席位已锁定」付款页留在屏幕上，直到关窗 / 手动停止 / 超时。
+    """把「席位已锁定」付款页留在屏幕上，直到关窗 / 手动停止 / 超时 /
+    有其它任务在等独占锁。
+
+    留窗全程占着 profile 独占锁：若已有任务在 exclusive() 里排队等锁，
+    继续留窗只会让对方等锁超时、错过放票窗口（审查第 10 条）——每轮
+    检查等待者登记，有等待者即提前结束留窗；无人等待时保持原时长。
+    订单结论在进留窗前已经落定，提前结束不影响本次下单结果。
 
     只对真实 Playwright 页面生效：测试替身没有 is_closed，直接返回，
     避免单元测试被这段等待挂住。
@@ -815,6 +857,10 @@ def _hold_pay_page(page, seconds, should_stop=None):
                 _log("  [浏览器] 付款页已关闭，继续后续流程。")
                 return
         except Exception:
+            return
+        if _lock_waiter_count() > 0:
+            _log("  [浏览器] 已有其它任务在等待使用浏览器，提前结束付款页"
+                 "保留（订单已生成，可在「未完成订单」里继续支付）。")
             return
         if should_stop is not None and should_stop():
             _log("  [浏览器] 已手动停止，关闭付款页。")

@@ -263,7 +263,8 @@ def find_recent_order(orders, date, train_code, passenger_names, not_before_ts, 
     return best
 
 
-def classify_with_time(date, train, passenger_names, not_before_ts=None, session=None):
+def classify_with_time(date, train, passenger_names, not_before_ts=None, session=None,
+                       deadline_ts=None):
     """classify_order_status + 下单时间归因。
 
     返回 (cls, order_no, raw, recent)：前三个与 classify_order_status 完全一致，
@@ -272,13 +273,18 @@ def classify_with_time(date, train, passenger_names, not_before_ts=None, session
 
     只查一次官方订单接口：分类与归因复用同一份订单快照（旧代码查两次，
     HTTP 量翻倍且两次快照可能不一致）。
+
+    deadline_ts：回读总时限（time.time() 口径的绝对时刻），透传给
+    check_existing_orders——三段查询每段发出前、分页每页发出前都会检查，
+    超限即中止并按 error 返回，避免一次回读在 12306 变慢时拖到分钟级、
+    全程占住 profile 独占锁（审查第 9 条）。None 表示不设总时限。
     """
     try:
         sess = session or session_from_browser_state()
     except Exception as e:
         return "error", "", "官方订单查询失败: %s" % e, None
     try:
-        orders = check_existing_orders(sess, date)
+        orders = check_existing_orders(sess, date, deadline_ts=deadline_ts)
     except Exception as e:
         return "error", "", "官方订单查询异常: %s" % e, None
     cls, ono, raw = _classify_orders(date, train, passenger_names, orders)
@@ -593,7 +599,8 @@ def _normalize_order_item(item, status):
     }
 
 
-def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25):
+def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25,
+                    deadline_ts=None):
     """新版 queryMyOrder（2026-10 实测参数）。query_where: G=未出行, H=历史。
 
     旧参数集（_json_att + 缺 pageIndex/pageSize/query_where/sequeue_train_name）
@@ -604,9 +611,16 @@ def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25)
     翻页：pageIndex 从 0 起逐页拉取，直到某页不足 page_size 条（末页）；
     max_pages 是防死循环上限（25 页 x 8 条 = 200 条，远超 60 天窗口的
     实际订单量）。旧代码 pageIndex 恒 "0"，深页订单漏检。
+
+    deadline_ts（回读总时限，绝对时刻）：每页请求发出前检查，超限抛
+    RuntimeError 中止——分页预算计入总窗，不让深页把回读拖过总时限。
     """
     items = []
     for page in range(max_pages):
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            raise RuntimeError(
+                "官方订单查询超过回读总时限（query_where=%s 第 %d 页前中止）"
+                % (query_where, page))
         data = {"come_from_flag": "my_order", "pageIndex": str(page),
                 "pageSize": str(page_size), "query_where": query_where,
                 "queryStartDate": start, "queryEndDate": end,
@@ -620,7 +634,7 @@ def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25)
     return items
 
 
-def check_existing_orders(session, target_date):
+def check_existing_orders(session, target_date, deadline_ts=None):
     """查询账号订单（未完成 + 未出行 + 历史），返回统一订单列表（尽力解析）。
 
     target_date 是乘车日期。三个列表都必须查：已支付的未来票在「未出行」（G），
@@ -628,7 +642,15 @@ def check_existing_orders(session, target_date):
 
     任一查询失败记 warning 后向上传播（不再吞成空列表）：调用方按"未知"
     保守处理（如下单入口直接中止本轮），不拿空列表当"无重复"继续下单。
+
+    deadline_ts（回读总时限，绝对时刻）：三段查询每段发出前检查，超限
+    抛 RuntimeError，不再发起新查询（审查第 9 条）。
     """
+    def _check_deadline(seg):
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            raise RuntimeError(
+                "官方订单查询超过回读总时限（%s 查询前中止）" % seg)
+
     orders = []
     # 查询窗口按北京时间构造：订单时间戳已按北京时间解析（Task 36），
     # 机器本地时区非 Asia/Shanghai 时，time.strftime/time.localtime 会让
@@ -639,6 +661,7 @@ def check_existing_orders(session, target_date):
     back60 = (now_bj - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     ahead60 = (now_bj + datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     # 未完成订单（未支付）：不分日期车次，12306 规则是任一未完成订单都会挡新单
+    _check_deadline("未完成订单")
     try:
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
                          data={"_json_att": ""}, timeout=15)
@@ -664,18 +687,22 @@ def check_existing_orders(session, target_date):
     # 未出行（已支付、乘车日期在今天之后）：G 的窗口按下单日期过滤
     # （实测：G 窗口 10-07~12-06 查不到 9-28 下单的 K225，9-28~9-28 可以），
     # 故窗口取 [60 天前, 今天]；列表含退票残留，状态看票级字段。
+    _check_deadline("未出行订单")
     try:
-        for item in _query_my_order(session, "G", back60, today):
+        for item in _query_my_order(session, "G", back60, today,
+                                    deadline_ts=deadline_ts):
             orders.append(_normalize_order_item(item, "已支付(未出行)"))
     except Exception as e:
         LOG.warning("查询未出行订单失败: %s", e)
         raise RuntimeError("未出行订单查询失败: {0}".format(e))
     # 历史（乘车日期已过，含已出站/已退票）：H 窗口 EndDate 必须 <= 昨天，
     # 含今天会整体返回空 body；目标日期在过去时只查当天即可
+    _check_deadline("历史订单")
     try:
         h_end = target_date if target_date <= yesterday else yesterday
         h_start = target_date if target_date <= yesterday else back60
-        for item in _query_my_order(session, "H", h_start, h_end):
+        for item in _query_my_order(session, "H", h_start, h_end,
+                                    deadline_ts=deadline_ts):
             orders.append(_normalize_order_item(item, "历史订单"))
     except Exception as e:
         LOG.warning("查询历史订单失败: %s", e)
@@ -704,14 +731,19 @@ def _effective_seat_name(seat_name, train_code):
 def find_duplicate(orders, date, train_code, passenger_names,
                    from_station=None, to_station=None, seat_name=None):
     """
-    在账号已有订单里查重：同一日期 + 同一车次 + 区间一致 + 席别一致 +
-    全部目标乘车人命中 = 重复。
+    在账号已有订单里查重：同一日期 + 同一车次 + 区间一致 + 全部目标
+    乘车人命中 = 重复。
 
-    - 区间/席别：调用方与订单双方都有值时才比对；任一侧缺失不以此为由
+    - 区间：调用方与订单双方都有值时才比对；任一侧缺失不以此为由
       排除（向后兼容旧数据/旧调用）。
-    - 席别取自订单 tickets[] 的 seat_type_name（best-effort；取不到视为
-      未知，不收窄）；调用方席别先经同价改判换算为提交时有效席别
-      （"无座"→"二等座"/"硬座"），再与订单席别比对。
+    - 席别分两路（契约①：防重 key = 日期+车次+区间+乘车人，不含席别）：
+      未支付订单（_no_complete）席别不同**不排除**——12306 的未完成订单
+      规则本就不分席别挡单，同行程已有未支付硬座单时再下二等座必然被
+      拒，本地放行只是白耗一次提交；席别差异只记日志提示。已支付/历史
+      订单维持既有口径：席别双方都有值且不同则不判重。席别取自订单
+      tickets[] 的 seat_type_name（best-effort；取不到视为未知，不收窄）；
+      调用方席别先经同价改判换算为提交时有效席别（"无座"→"二等座"/
+      "硬座"），再与订单席别比对（已支付路径用）。
     - 订单解析不出乘车人列表：记 warning 后跳过该条，不封锁整条线路
       （旧代码保守判重，一条畸形记录永久封锁该 date+train 的一切下单）。
     - 空目标乘车人集不算命中。
@@ -731,7 +763,10 @@ def find_duplicate(orders, date, train_code, passenger_names,
         if to_station and ot and ot != to_station:
             continue
         o_seat = (o.get("seat") or "").strip()
-        if want_seat and o_seat and o_seat != want_seat:
+        seat_differs = bool(want_seat and o_seat and o_seat != want_seat)
+        # 未支付订单不以席别排除（契约①防重 key 不含席别）；已支付/历史
+        # 订单维持席别收窄的既有口径。
+        if seat_differs and not o.get("_no_complete"):
             continue
         pax = o.get("passengers") or []
         if not pax:
@@ -739,6 +774,12 @@ def find_duplicate(orders, date, train_code, passenger_names,
                         _mask_order_no(o.get("order_no") or "?"))
             continue
         if want and want <= set(pax):
+            if seat_differs:
+                LOG.warning(
+                    "未支付订单 %s 席别为 %s、目标席别为 %s：席别不同，"
+                    "但按防重复契约（日期+车次+区间+乘车人，不含席别）"
+                    "仍判重复",
+                    _mask_order_no(o.get("order_no") or "?"), o_seat, want_seat)
             return o
     return None
 

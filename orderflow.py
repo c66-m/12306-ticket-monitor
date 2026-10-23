@@ -140,10 +140,16 @@ def _judge_text(judge):
 # （paid / cancelled / blocked 等已是定论）不重试。
 _JUDGE_RETRY_ROUNDS = 2
 _JUDGE_RETRY_INTERVAL = 6.0
+# 回读总时限（秒，审查第 9 条）：一轮 classify_with_time 串行三段查询、
+# 每请求 15s、分页上限 25 页，12306 整体变慢时单次回读可达分钟级，且
+# 全程占着 profile 独占锁、其它任务等锁先超时。总时限封顶：透传给
+# classify_with_time 做段内截断，本函数在重试决策前再检查一次，超限
+# 按 error 收尾（没查完不能当「确认无单」的 none）。
+_JUDGE_DEADLINE_SECONDS = 45.0
 
 
 def _judge_official(date, train, passenger_names, t_submit, logger,
-                    retry_rounds=None, retry_interval=None):
+                    retry_rounds=None, retry_interval=None, deadline_seconds=None):
     """官方订单接口回读（JUDGE）。
 
     unpaid 且下单时间落在本次提交窗口（recent）→ 本次成功（关全部页面后由
@@ -154,16 +160,24 @@ def _judge_official(date, train, passenger_names, t_submit, logger,
     保留最后一轮的分类——error（查询失败）与 none（确认无单）可分辨，
     上层据此决定是否允许重下。retry_rounds / retry_interval 可注入（测试用，
     classify_with_time 本身语义不变）。
+
+    deadline_seconds：回读总时限（默认 _JUDGE_DEADLINE_SECONDS=45s）。
+    转成绝对时刻透传 classify_with_time（deadline_ts，三段查询内部截断），
+    本函数每轮重试前再核一次总耗时，超限按 error 收尾、不再发起新查询。
     """
     if retry_rounds is None:
         retry_rounds = _JUDGE_RETRY_ROUNDS
     if retry_interval is None:
         retry_interval = _JUDGE_RETRY_INTERVAL
+    if deadline_seconds is None:
+        deadline_seconds = _JUDGE_DEADLINE_SECONDS
+    deadline_ts = time.time() + max(0.0, float(deadline_seconds))
     attempt = 0
     while True:
         try:
             cls, ono, raw, recent = classify_with_time(
-                date, train, passenger_names, not_before_ts=t_submit)
+                date, train, passenger_names, not_before_ts=t_submit,
+                deadline_ts=deadline_ts)
         except Exception as e:
             cls, ono, raw, recent = "error", "", "官方订单查询异常: %s" % e, None
         judge = {"cls": cls, "order_no": ono, "raw": raw, "recent": bool(recent)}
@@ -175,12 +189,29 @@ def _judge_official(date, train, passenger_names, t_submit, logger,
         if cls not in ("error", "none") or attempt >= retry_rounds:
             return False, "订单结果未知：官方订单接口回读无法确认本次下单结果", {
                 "reason": "ambiguous", "flow_judge": judge}
+        if time.time() >= deadline_ts:
+            _emit(logger, "[流程] JUDGE：回读超过总时限 %.0fs，按查询失败收尾"
+                          % deadline_seconds)
+            judge = {"cls": "error", "order_no": ono,
+                     "raw": "官方回读超过总时限 %.0fs" % deadline_seconds,
+                     "recent": False}
+            return False, "订单结果未知：官方订单接口回读无法确认本次下单结果", {
+                "reason": "ambiguous", "flow_judge": judge}
         attempt += 1
         _emit(logger, "[流程] JUDGE：回读%s，%.0fs 后重试（%d/%d）"
                       % ("查询失败" if cls == "error" else "暂无本次订单",
                          retry_interval, attempt, retry_rounds))
         if retry_interval > 0:
-            time.sleep(retry_interval)
+            # 睡眠不越过总时限：到点立刻进下一轮，由轮首检查收尾
+            time.sleep(min(retry_interval,
+                           max(0.0, deadline_ts - time.time())))
+
+
+# order/init 停滞判据（审查第 8 条）：order/init 是通往 payOrder 的正常
+# 中间态，不能一读到就转回读定案。快照（url+正文）连续 _INIT_STALL_TICKS
+# 轮与上一轮完全一致，视为页面已停滞（不再自行跳转），才允许转 JUDGE；
+# 快照还在变就继续观察，本页 deadline 到期则走最终 JUDGE 兜底。
+_INIT_STALL_TICKS = 2
 
 
 def _save_state_for_judge(ctx, logger):
@@ -367,7 +398,8 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
         pages = [{"page": page, "t_submit": t_submit, "picked": res["picked"],
                   "dlg_seat": res["dlg_seat"], "deadline": time.time() + page_wait,
                   "last_url": "", "pending": False, "lock_seen_at": None,
-                  "success_since": None}]
+                  "success_since": None, "last_snap": None, "snap_same": 0,
+                  "init_wait": False}]
         first_round = True
         tick = 0
         while pages:
@@ -386,6 +418,17 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                 snap = classify_snapshot(url, body)
                 e["last_url"] = url
                 e["pending"] = any(k in body for k in _PENDING_KEYS)
+                # 快照停滞跟踪（order/init 判据，见 _INIT_STALL_TICKS）：
+                # 与上一轮完全一致记一次，变化即清零。
+                snap_sig = (url, body)
+                if e.get("last_snap") == snap_sig:
+                    e["snap_same"] = e.get("snap_same", 0) + 1
+                else:
+                    e["snap_same"] = 0
+                e["last_snap"] = snap_sig
+                init_stalled = e["snap_same"] >= _INIT_STALL_TICKS
+                e["init_wait"] = (snap == "ambiguous" and "order/init" in url
+                                  and not init_stalled)
                 on_lock = "payOrder" in url
                 if on_lock and e["lock_seen_at"] is None:
                     e["lock_seen_at"] = time.time()
@@ -418,9 +461,25 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     if in_confirm:
                         pass          # 确认窗内一律 wait，交给下一轮
                     elif snap == "ambiguous":
-                        _emit(logger, "[流程] HOLD：落在旧单列表/订单初始化页，走官方回读")
-                        return _judge_official(date, train, passenger_names,
-                                               e["t_submit"], logger)
+                        if "order/init" in url and not init_stalled:
+                            # order/init 是通往 payOrder 的正常中间态，页面
+                            # 还在变化时先等它自己跳转，不抢先回读定案：
+                            # 落库慢于回读窗时，本会自跳锁定页的成功会被
+                            # 提前定成待核对（审查第 8 条）。init_wait 已
+                            # 置位，首轮回读也不会抢跑；停滞或本页 deadline
+                            # 到期才转回读（到期走最终 JUDGE 兜底）。
+                            _emit(logger, "[流程] HOLD：订单初始化页仍在跳转，继续观察")
+                        else:
+                            if "order/init" in url:
+                                _emit(logger, "[流程] HOLD：订单初始化页已停滞，走官方回读")
+                            else:
+                                _emit(logger, "[流程] HOLD：落在旧单列表/订单初始化页，走官方回读")
+                            # 回读前先落盘会话（审查第 7 条）：与 fail 分支、
+                            # 最终 JUDGE 对齐——回读读的是磁盘 cookie，
+                            # 不落盘可能拿旧 cookie 把本可确认的订单降级。
+                            _save_state_for_judge(ctx, logger)
+                            return _judge_official(date, train, passenger_names,
+                                                   e["t_submit"], logger)
                     elif snap == "dup":
                         if on_lock:
                             # 锁定页里的「未完成订单」多是过程提示的链接文字，
@@ -472,6 +531,7 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
             # 12306 直接「出票失败/未完成订单」——即用户看到的「锁座成功后
             # 闪退并重新购票」。状态明确前 first_round 保持 True，不消费。
             waiting_lock = any(e["pending"] or "payOrder" in (e["last_url"] or "")
+                               or e.get("init_wait")
                                for e in pages)
             if first_round and not waiting_lock:
                 first_round = False
@@ -516,7 +576,9 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                         return rep
                     rep["deadline"] = time.time() + page_wait
                     rep.update({"last_url": "", "pending": False,
-                                "lock_seen_at": None, "success_since": None})
+                                "lock_seen_at": None, "success_since": None,
+                                "last_snap": None, "snap_same": 0,
+                                "init_wait": False})
                     pages.append(rep)
                 elif retry_left > 0:
                     _emit(logger, "[流程] JUDGE：官方回读不可判定（cls=%s），"
