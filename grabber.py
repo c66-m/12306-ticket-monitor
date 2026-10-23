@@ -592,6 +592,36 @@ class Grabber(threading.Thread):
                         # 本行程已有订单：回读官方接口 + 下单时间归因，确认是不是本次提交的
                         cls, ono, raw, recent = order_mod.classify_with_time(
                             date, info["train_code"], names, not_before_ts=attempt_ts)
+                        if cls in ("none", "cancelled"):
+                            # R1-3：浏览器判 dup 但官方明确查无此单/单已取消
+                            # = 未成单。旧代码落进下方兜底 else 报「成功」
+                            # 并发成功邮件（假成功：用户以为票已到手，实际
+                            # 无单可付）。与 engine 同名分支及上方 ambiguous
+                            # 分支的 none/cancelled 口径对齐：安全重试，
+                            # 多次仍查无单才失败收尾；绝不置成功、绝不发
+                            # 成功通知、历史不记 success/dup。
+                            ambiguous_retries += 1
+                            if ambiguous_retries >= 3:
+                                self.result = (False,
+                                    "网页端多次判已有订单但官方查无此单（%s），"
+                                    "请人工核对后重新开抢" % cls)
+                                log("[错误] %s" % self.result[1])
+                                return
+                            log("[提醒] 网页判已有订单，但官方核验无此订单（%s，第 %d 次），继续重试"
+                                % (cls, ambiguous_retries))
+                            if self.stop_event.wait(2):
+                                break
+                            continue
+                        if cls not in ("paid", "unpaid"):
+                            # R1-3：error/unknown/blocked 等不确定类——订单
+                            # 可能已生成待付款，误报成功让用户以为票已
+                            # 到手、误报失败又会诱导重复下单。落 B2 待核对
+                            # 结局：就此停抢、绝不自动重试、不发成功通知。
+                            self.result_reason = "ambiguous"
+                            self.result = (False, "结果未知待核对——请先到 12306 查未支付订单，"
+                                                  "勿重复下单（有单就支付或取消，确认无单后再重新开抢）")
+                            log("[待核对] %s（下单返回：%s；官方核验：%s）" % (self.result[1], msg, raw))
+                            return
                         result_kind = "dup"
                         if cls == "paid":
                             self.result = (True, "该行程订单已支付，请查收")
@@ -605,8 +635,8 @@ class Grabber(threading.Thread):
                             self.result = (True,
                                 "账号存在该行程更早的未支付订单（订单号 %s），非本次提交，请核对后尽快支付"
                                 % (ono or "未知"))
-                        else:
-                            self.result = (True, "检测到该行程已有订单，请尽快去 12306 完成支付（官方核验：%s）" % raw)
+                        # 无 else：none/cancelled 与不确定类已在上方分流，
+                        # 走到这里的 cls 只剩 paid/unpaid（R1-3）。
                         log("[提示] 下单返回：%s" % msg)
                         try:
                             appcommon.append_history(

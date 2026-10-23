@@ -651,19 +651,24 @@ def menu_task_ops():
     print("   3. 取消任务       4. 重置状态并清除防重记录（换乘车人/席别后重新开始）")
     print("   5. 删除任务")
     op = read("  选择操作（回车=返回）：", "")
+    # R1-12：1–4 项都是显式用户操作，统一传 force=True（与创建路径
+    # line 492 及 rpc/tasks 口径对齐）。旧代码不带 force：恢复/重置会被
+    # set_task_status 的防覆盖守卫（paused/cancelled 不许被例行写入改回
+    # monitoring）静默拒绝、只记 INFO，CLI 却照打「已恢复监控」，用户
+    # 以为在监控实际漏抢。
     if op == "1":
-        eng.set_task_status(task, "paused", "用户手动暂停")
+        eng.set_task_status(task, "paused", "用户手动暂停", force=True)
         print("  已暂停。")
     elif op == "2":
-        eng.set_task_status(task, "monitoring", "用户手动恢复")
+        eng.set_task_status(task, "monitoring", "用户手动恢复", force=True)
         print("  已恢复监控。启动监控（菜单 6）后即开始轮询。")
     elif op == "3":
         if ask_yes_no("  确认取消任务「%s」？取消后不再监控" % task["name"], "n"):
-            eng.set_task_status(task, "cancelled", "用户手动取消")
+            eng.set_task_status(task, "cancelled", "用户手动取消", force=True)
             print("  已取消（任务保留在列表中，可删除）。")
     elif op == "4":
         if ask_yes_no("  确认重置「%s」状态为监控中？" % task["name"], "n"):
-            eng.set_task_status(task, "monitoring", "已重置")
+            eng.set_task_status(task, "monitoring", "已重置", force=True)
             print("  已重置为监控中。")
     elif op == "5":
         if ask_yes_no("  确认从配置中删除任务「%s」？" % task["name"], "n"):

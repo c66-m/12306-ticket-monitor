@@ -373,6 +373,9 @@ class MonitorEngine(object):
         # _note_failure / 轮询后 setdefault 把已清掉的 state 条目复活。
         # _sync_config 见到同名任务重建即清除，不影响新任务。
         self._deleted_names = set()
+        # 已告警过的重名集合（R1-14）：同一批重名只报一次，不随每轮
+        # _sync_config 重复刷屏；重名消失后自动移出、再现会重新告警。
+        self._dup_warned_names = set()
 
         self.base_interval = _safe_config_int(
             self.config.get("poll_interval_seconds", 45), 45,
@@ -389,6 +392,7 @@ class MonitorEngine(object):
             self._setup_logging()
         self._ensure_task_names()
         self._resume_or_init_status()
+        self._check_duplicate_task_names()
 
     # ----------------------------- 日志 -----------------------------
 
@@ -757,6 +761,7 @@ class MonitorEngine(object):
                     list(self._deleted_names)[:500])
         self._ensure_task_names()
         self._resume_or_init_status()  # 仅补缺省状态，不覆盖已有状态
+        self._check_duplicate_task_names()
         LOG.info("[配置] 已同步任务列表，共 %d 个任务", len(self.tasks))
         return True
 
@@ -775,6 +780,29 @@ class MonitorEngine(object):
         for i, t in enumerate(self.tasks):
             if not t.get("name"):
                 t["name"] = "任务{0}".format(i + 1)
+
+    def _check_duplicate_task_names(self):
+        """R1-14：重名任务检测。调度（next_due/inflight）与状态全按任务
+        名为键，同名任务会互相遮蔽——只有一个能被调度、暂停/恢复互相
+        串扰；旧代码既不去重也不告警，另一任务静默永不监控。发现重名
+        即 LOG.error 明确列出；同一批重名只报一次（已告警集合去重，
+        重名消失后移出集合、再次出现会重新告警）。"""
+        counts = {}
+        for t in self.tasks:
+            n = t.get("name") or ""
+            if n:
+                counts[n] = counts.get(n, 0) + 1
+        dups = {n for n, c in counts.items() if c > 1}
+        warned = getattr(self, "_dup_warned_names", None)
+        if warned is None:
+            warned = self._dup_warned_names = set()
+        new_dups = dups - warned
+        if new_dups:
+            LOG.error("[配置] 检测到重名监控任务：%s——引擎按任务名调度与"
+                      "保存状态，同名任务会互相遮蔽（只有一个能被调度、"
+                      "状态互相串扰），请改名区分（并入日期/乘车人）",
+                      "、".join(sorted(new_dups)))
+        self._dup_warned_names = dups
 
     def _resume_or_init_status(self):
         """重启后：保留上次状态；新任务默认"已暂停"（未启动）。
@@ -1369,11 +1397,21 @@ class MonitorEngine(object):
         """调用 order_ticket，把返回统一成 (结果标识, extra)。"""
         try:
             ev = getattr(self, "_stop_event", None)
-            ok, msg, extra = order_mod.order_ticket(
-                self.config, task, info, seat_name,
+            task_name = task.get("name") or ""
+
+            def _should_stop():
                 # 传可调用对象：Event 本身不可调用（曾把 Event 直接当回调，
                 # 下单链启动即 TypeError: 'Event' object is not callable）
-                should_stop=ev.is_set if ev is not None else None)
+                if ev is not None and ev.is_set():
+                    return True
+                # R1-13：任务在下单途中被删除（墓碑）也视为应停——否则
+                # 删除拦不住一张正在提交的订单，与删除意图完全相反。
+                return task_name in (getattr(self, "_deleted_names", None)
+                                     or ())
+
+            ok, msg, extra = order_mod.order_ticket(
+                self.config, task, info, seat_name,
+                should_stop=_should_stop)
         except Exception as e:
             return "fail", {"msg": "下单异常: {0}".format(e)}
         if ok:
@@ -1421,6 +1459,15 @@ class MonitorEngine(object):
 
     def _record_success(self, task, info, date, seat_name, extra):
         name = task["name"]
+        if (name or "") in getattr(self, "_deleted_names", ()):
+            # R1-13：任务在下单途中被删除。订单可能已经在 12306 生成
+            # （删除无法撤销已提交的订单），但成功历史与成功通知不再
+            # 补记——否则用户删完任务还会收到「购票成功」，与删除
+            # 意图完全相反。
+            LOG.warning("[删除] 任务「%s」已在下单途中被删除：订单可能已在 "
+                        "12306 生成（无法撤销），跳过成功历史与通知记录",
+                        name)
+            return
         order_no = extra.get("order_no") or ""
         alias_seat = extra.get("alias_seat") or ""
         pay_evidence = extra.get("pay_evidence") or ""

@@ -286,6 +286,15 @@ def build_monitor_task(from_name, to_name, dates, date_range, trains, seats,
     name = "%s-%s %s %s" % (
         from_name, to_name, "/".join(trains) if trains else "全部车次",
         "/".join(seats))
+    # R1-14：任务名并入首个日期（·MM-DD，与现名空格分段风格自洽）——
+    # 引擎按任务名调度/存状态，仅日期不同的任务同名会互相遮蔽（只有
+    # 一个能被调度、状态串扰）。无 dates 时回退 date_range 的起始日。
+    first_date = dates[0] if dates else (
+        str(date_range[0]) if date_range else "")
+    if first_date:
+        short = (first_date[5:] if len(first_date) >= 10
+                 and first_date[4] == "-" else first_date)
+        name = "%s·%s" % (name, short)
     return {
         "name": name,
         "uid": uuid.uuid4().hex,
