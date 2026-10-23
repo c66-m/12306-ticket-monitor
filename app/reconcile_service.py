@@ -105,6 +105,12 @@ class ReconcileRunner:
                                      to_station=str(rec.get("to") or ""))
             cls = classifier.classify_snapshot(trip, snapshot, pax)
             decision = OLC.label(cls)
+            # 边沿触发基准（N5）：本记录落盘前的 classify。order.reconciled
+            # 只在本轮分类相对落盘值发生变化时广播——blocked 自 R2-4 纳入
+            # 待决集后每轮都会被反复确认，若未变也 fire，notify_service 在
+            # 启用 email 时会每轮发一封「blocked」对账邮件，形成周期骚扰。
+            # order.paid / order.still_unpaid 不走此门，行为不变。
+            changed = cls.value != (rec.get("classify") or "none")
             new_rec = dict(rec)
             new_rec["classify"] = cls.value
             new_rec["official_status"] = decision
@@ -123,9 +129,11 @@ class ReconcileRunner:
                 # none 计数只计官方查无（R2-4）——blocked/cancelled 等
                 # 不得混进 none 拉低口径
                 report.none += 1
-                self._fire("order.reconciled", key, cls, decision)
+                if changed:
+                    self._fire("order.reconciled", key, cls, decision)
             else:
-                self._fire("order.reconciled", key, cls, decision)
+                if changed:
+                    self._fire("order.reconciled", key, cls, decision)
         except Exception as e:
             report.errors += 1
             LOG.warning("[对账] 单条失败 key=%s: %s", key, e)

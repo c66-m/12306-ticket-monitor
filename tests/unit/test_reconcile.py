@@ -127,6 +127,72 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(rep2.paid, 1)
         self.assertEqual(store["k"]["classify"], "paid")
 
+    def test_blocked_reconciled_event_edge_triggered(self):
+        # N5：order.reconciled 边沿触发——blocked 自 R2-4 纳入待决集后每轮
+        # 都会被反复确认；classify 未变时不得重复广播，否则 notify_service
+        # 在启用 email 时每轮发一封「blocked」对账邮件，形成周期性骚扰
+        other_unpaid = _entry(train="K999", status="未完成/未支付",
+                              no_complete=True)
+        store = {"k": _rec()}  # 落盘 classify=unpaid
+
+        def updater(k, r):
+            store[k] = r
+
+        bus = _CollectBus()
+        eventbus.subscribe("order.reconciled", bus._on)
+        try:
+            runner = ReconcileRunner(FakeProvider([other_unpaid]),
+                                     loader=lambda: dict(store),
+                                     updater=updater)
+            runner.reconcile_once()  # unpaid -> blocked：真变化，fire 一次
+            self.assertEqual(store["k"]["classify"], "blocked")
+            runner.reconcile_once()  # blocked -> blocked：未变，不得再 fire
+            runner.reconcile_once()  # 再确认一轮，仍不得 fire
+        finally:
+            eventbus.unsubscribe("order.reconciled", bus._on)
+        self.assertEqual(bus.events, [("order.reconciled", "k")])
+
+    def test_blocked_to_none_fires_reconciled_event(self):
+        # N5：blocked -> none 是真变化，order.reconciled 仍应 fire——
+        # 边沿触发只压「重复确认」，不压真变化
+        store = {"k": _rec(classify="blocked")}
+
+        def updater(k, r):
+            store[k] = r
+
+        bus = _CollectBus()
+        eventbus.subscribe("order.reconciled", bus._on)
+        try:
+            runner = ReconcileRunner(FakeProvider([]),  # 官方查无 -> none
+                                     loader=lambda: dict(store),
+                                     updater=updater)
+            rep = runner.reconcile_once()
+        finally:
+            eventbus.unsubscribe("order.reconciled", bus._on)
+        self.assertEqual(rep.none, 1)
+        self.assertEqual(bus.events, [("order.reconciled", "k")])
+        self.assertEqual(store["k"]["classify"], "none")
+
+    def test_blocked_to_paid_fires_paid_event(self):
+        # N5：blocked -> paid 的变化轮事件行为保持不变，order.paid 正常广播
+        store = {"k": _rec(classify="blocked")}
+
+        def updater(k, r):
+            store[k] = r
+
+        bus = _CollectBus()
+        eventbus.subscribe("order.paid", bus._on)
+        try:
+            runner = ReconcileRunner(FakeProvider([_entry()]),
+                                     loader=lambda: dict(store),
+                                     updater=updater)
+            rep = runner.reconcile_once()
+        finally:
+            eventbus.unsubscribe("order.paid", bus._on)
+        self.assertEqual(rep.paid, 1)
+        self.assertIn(("order.paid", "k"), bus.events)
+        self.assertEqual(store["k"]["classify"], "paid")
+
     def test_report_summary_sane(self):
         rep = ReconcileReport(total=5, paid=1)
         self.assertIn("paid=1", rep.summary())
