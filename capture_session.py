@@ -259,7 +259,9 @@ def main():
             return 1
         if status != LOGIN_OK:
             print("\n[失败] 未检测到登录状态（{0}s 超时）。窗口已自动关闭，请重试。".format(MAX_WAIT_SEC))
-            browser.close()
+            # R3：与取消/验证失败路径同口径走 defensive close（Task 99d）——
+            # 用户超时前手动关窗时裸 close() 会抛错穿透 main()。
+            _safe_close_browser(browser)
             return 1
 
         # 最终验证：通过才存 Cookie、才打印成功（Task 65d）。
@@ -285,7 +287,9 @@ def main():
         # 原子写：写一半被杀会留下半截 JSON，下次下单直接"未登录"
         appcommon.atomic_write_json(cookie_path, cookie_dict)
 
-        browser.close()
+        # R3：Cookie 已落盘后走 defensive close——用户顺手关窗时裸 close()
+        # 抛错会穿透 main()，子进程调用方只看退出码，会把成功误判失败。
+        _safe_close_browser(browser)
         print("\n[完成] 已保存 {0} 个 Cookie 到 {1}".format(len(cookie_dict), cookie_path))
         print("之后直接运行：python monitor.py")
         return 0

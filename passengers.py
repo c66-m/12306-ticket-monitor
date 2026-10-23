@@ -432,8 +432,9 @@ def save_passengers(passengers, path=None, force=False, expect_stamp=_STAMP_UNSE
 
     expect_stamp 为 passengers_stamp() 在 load 后取到的指纹时做乐观并发
     检查（Task 88d，与 monitor.save_config 的 Task 87 口径一致）：在
-    跨进程锁内重读当前指纹，不一致说明用户交互期间有外部写入——打印警告
-    并返回 False（放弃本次保存，不静默覆写对方的修改）；一致则写入并
+    跨进程锁内重读当前指纹，不一致说明用户交互期间有外部写入——记
+    LOG.warning 并返回 False（放弃本次保存，不静默覆写对方的修改；
+    R3 起改走 LOG：print 在 GUI 进程里不可见）；一致则写入并
     返回 True。不传 expect_stamp 时保持旧行为（直接写）。
     整个"检查-写"包在 filelock（path + ".lock" sidecar，全仓既有约定）
     内，与 GUI/launcher 的并发写互斥。
@@ -444,8 +445,10 @@ def save_passengers(passengers, path=None, force=False, expect_stamp=_STAMP_UNSE
             if expect_stamp is not _STAMP_UNSET \
                     and passengers_stamp(path) != expect_stamp:
                 # 交互期间的外部写入优先：放弃本次保存，不静默丢失对方修改。
-                print("  [警告] passengers.json 在编辑期间被其他程序修改，"
-                      "本次保存已放弃（未覆盖对方的修改）。")
+                # R3：改走 LOG——本模块其余告警早已迁 LOG（Task 80c/100d），
+                # print 在 GUI 下直接消失，用户只会看到「保存没反应」。
+                LOG.warning("[乘车人] passengers.json 在编辑期间被其他程序修改，"
+                            "本次保存已放弃（未覆盖对方的修改）")
                 return False
             if not force and _is_undecryptable_box(path):
                 LOG.error("[安全] 拒绝覆盖不可解密的 passengers 数据（%s），"
@@ -455,7 +458,10 @@ def save_passengers(passengers, path=None, force=False, expect_stamp=_STAMP_UNSE
             enc_name, data_text = _encrypt(payload)
             box = {"version": 1, "enc": enc_name, "data": data_text}
             # 原子写：写一半被杀不留半截密文（密文损坏 = 乘车人数据全丢）
-            appcommon.atomic_write_json(path, box)
+            # mode=0o600（R3）：对齐同仓 config/密钥/cookie 的落盘口径——
+            # 无 cryptography 时 enc 降级为明文，证件号/手机号不得按默认
+            # umask（0644）裸奔，同机其他用户可直读。
+            appcommon.atomic_write_json(path, box, mode=0o600)
             return True
     except TimeoutError:
         # 锁争用：保持 bool 契约（GUI/launcher 调用方只处理 False，不接异常），

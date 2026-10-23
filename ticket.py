@@ -545,8 +545,29 @@ def refresh_station_cache(map_path="station_name.json", index_path="station_inde
                                   _abs_cache_path(index_path), force=True)
 
 
+# note_station_missing 节流（R3）：站名写错/不存在时每次未命中都 force
+# 全量下载 station_name.js，既浪费带宽，也抬高被 12306 按频率限制的概率
+# （IP 被限对此软件是致命伤）。一次全量刷新即覆盖全部缺失站名，故进程内
+# 全局冷却：冷却期内只放行第一次，其余直接跳过。
+_MISSING_REFRESH_COOLDOWN_SEC = 600.0
+_missing_last_refresh = [None]  # 上次放行的 monotonic 时刻；list 便于测试替身
+
+
+def _missing_now():
+    """节流时钟单点（测试可替换本函数注入假时钟）。"""
+    return time.monotonic()
+
+
 def note_station_missing(name=None):
-    """查不到车站时调用：后台强制刷新车站缓存（best-effort），新开车站下次可查到。"""
+    """查不到车站时调用：后台强制刷新车站缓存（best-effort），新开车站下次可查到。
+
+    进程内冷却 _MISSING_REFRESH_COOLDOWN_SEC 秒（见上方注释）：冷却期内
+    重复调用直接跳过，不再重复 spawn 全量下载线程。"""
+    now = _missing_now()
+    last = _missing_last_refresh[0]
+    if last is not None and now - last < _MISSING_REFRESH_COOLDOWN_SEC:
+        return
+    _missing_last_refresh[0] = now
     _refresh_station_cache_async(_abs_cache_path("station_name.json"),
                                  _abs_cache_path("station_index.json"),
                                  force=True)

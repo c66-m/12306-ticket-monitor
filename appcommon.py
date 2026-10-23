@@ -223,6 +223,12 @@ def replace_with_retry(src, dst, tries=5, delay=0.1, fallback_direct=False):
                         data = f.read()
                     with open(dst, "w", encoding="utf-8") as f:
                         f.write(data)
+                        # N4：直写分支补 fsync——R1-17 的 fsync 只覆盖
+                        # atomic 主路径（tmp 写后 fsync + replace），此兜底
+                        # 直写目标文件本身此前不落盘，断电/崩溃即丢这次写。
+                        # 走 _fsync_quietly 尽力而为口径，失败不传播。
+                        f.flush()
+                        _fsync_quietly(f.fileno())
                     return
                 raise
             time.sleep(delay)
