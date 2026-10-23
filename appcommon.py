@@ -228,10 +228,42 @@ def replace_with_retry(src, dst, tries=5, delay=0.1, fallback_direct=False):
             time.sleep(delay)
 
 
+def _fsync_quietly(fd):
+    """fsync 尽力而为（R1-17）：失败只记 debug，绝不影响写入成功语义——
+    个别文件系统/平台对 fsync 支持不全时，不能让全仓数据写路径跟着失败。"""
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        LOG.debug("[IO] fsync 失败（已忽略，不影响写入）: %s", e)
+
+
+def _fsync_parent_dir_quietly(path):
+    """replace 后 fsync 父目录，让新目录项落盘防断电回滚（R1-17）。
+
+    POSIX 可打开目录做 fsync；Windows 打开目录即失败，直接跳过。
+    本函数全程尽力而为、绝不抛。"""
+    if os.name == "nt":
+        return
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        _fsync_quietly(fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
                       replace_delay=0.1, fallback_direct=False, mode=None):
     """原子写 JSON：临时名带 pid+线程标识（同进程多线程/多窗口互不踩），
-    写完 replace 并对 Windows 占用做退避重试。
+    写完 fsync tmp 文件后 replace 并对 Windows 占用做退避重试，replace 后
+    再尽力 fsync 父目录（R1-17：防断电/崩溃丢失刚落盘的数据；fsync 失败
+    只记 debug，绝不改变写入成功语义）。
 
     fallback_direct=True 时 replace 重试耗尽改为直写（丢原子性保数据，
     仅 engine 的 state.json 兜底使用这一语义）。
@@ -244,10 +276,13 @@ def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
                                   threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.flush()
+        _fsync_quietly(f.fileno())
     if mode is not None:
         os.chmod(tmp, mode)
     replace_with_retry(tmp, path, tries=replace_tries, delay=replace_delay,
                        fallback_direct=fallback_direct)
+    _fsync_parent_dir_quietly(path)
     # 双写镜像（P0）统一锚在最底层：任何写者（write_state / update_state_locked /
     # engine 直写 state / append_history / upsert_order）都经过这里，保证不漏
     # （2026-10-20 实测：engine _save_state 的直写路径曾绕过 write_state 挂点，

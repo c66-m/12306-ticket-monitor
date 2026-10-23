@@ -8,6 +8,7 @@ SMTP 参数在 config.json 的 notify.email 中配置。
 
 import re
 import smtplib
+import ssl
 import sys
 import time
 import logging
@@ -86,7 +87,10 @@ def send_email(cfg, subject, body):
     if not isinstance(raw_pwd, str):
         # Task 71：手改配置把 password 写成非字符串（如数字）时，
         # secret_of 会 AttributeError 逃出 (ok,msg) 契约——如实报错。
-        return False, "邮件配置 password 非法（应为字符串）: {0!r}".format(raw_pwd)
+        # R1-15：只报类型名不报原值——原值是凭证，绝不进消息面（旧 {0!r}
+        # 会把手改成数字的授权码明文带进 rpc 返回/CLI 输出/日志）。
+        return False, "邮件配置 password 非法（应为字符串）: {0}".format(
+            type(raw_pwd).__name__)
     try:
         pwd = secret_of(raw_pwd)  # 兼容明文与 DPAPI 密文两种存储
     except SecretDecryptError as e:
@@ -108,11 +112,14 @@ def send_email(cfg, subject, body):
     last_err = None
     for attempt in range(3):
         try:
+            # R1-16：必须校验证书与主机名——smtplib 不传 context 时默认
+            # CERT_NONE，中间人冒充 SMTP 服务器即可截获 login 的授权码。
+            ctx = ssl.create_default_context()
             if port == 465:
-                s = smtplib.SMTP_SSL(host, port, timeout=15)
+                s = smtplib.SMTP_SSL(host, port, timeout=15, context=ctx)
             else:
                 s = smtplib.SMTP(host, port, timeout=15)
-                s.starttls()
+                s.starttls(context=ctx)
             s.login(user, pwd)
             s.sendmail(from_addr, to_addrs, msg.as_string())
             try:

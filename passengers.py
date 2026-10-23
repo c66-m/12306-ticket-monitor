@@ -197,8 +197,10 @@ def unprotect_secret(text):
         # .startswith 会裸 AttributeError 逃出；gui 邮箱设置对话框只捕
         # SecretDecryptError（Task 71 只修了 send_email 路径，显示路径遗漏）——
         # 走诚实报错路径，不抛裸 AttributeError。
+        # R1-15：只报类型名不报原值——凭证绝不进消息面（旧 %r 同型泄漏，
+        # 异常消息会经 gui 对话框/rpc 返回/日志带出授权码明文）。
         raise SecretDecryptError(
-            "敏感串类型非法（应为字符串）: %r" % (text,))
+            "敏感串类型非法（应为字符串）: %s" % type(text).__name__)
     if text and text.startswith(_DPAPI_PREFIX):
         try:
             return _dpapi_unprotect(
