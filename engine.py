@@ -1114,7 +1114,9 @@ class MonitorEngine(object):
                                        "blocked": "block_conflict",
                                        "unknown": "halt_manual", "error": "halt_manual"}[cls]
                         self._shadow_compare(date, train_code, p_names, attempt_ts,
-                                             "dup", _legacy_dup)
+                                             "dup", _legacy_dup,
+                                             from_station=info["from_name"],
+                                             to_station=info["to_name"])
                         appcommon.upsert_order(
                             self.orders_path, okey,
                             {"order_no": ono, "train": train_code, "date": date,
@@ -1201,7 +1203,9 @@ class MonitorEngine(object):
                                                  else "halt_manual"))
                             self._shadow_compare(date, train_code, p_names,
                                                  attempt_ts, "ambiguous",
-                                                 _legacy_amb)
+                                                 _legacy_amb,
+                                                 from_station=info["from_name"],
+                                                 to_station=info["to_name"])
                             if cls == "unpaid" and recent:
                                 self._record_success(
                                     task, info, date, seat_name,
@@ -1426,7 +1430,8 @@ class MonitorEngine(object):
 
     # ------------------------- P1 影子比对（判定内核验证期，只记不改） -------------------------
     def _shadow_compare(self, date, train_code, passenger_names,
-                        not_before_ts, phase, legacy_decision):
+                        not_before_ts, phase, legacy_decision,
+                        from_station="", to_station=""):
         """新判定内核（core/verdict）与现网旧分支的结果比对（影子模式）。
 
         只写结构化日志（[影子比对]），不改任何现有决策路径——验证期内系统
@@ -1440,7 +1445,9 @@ class MonitorEngine(object):
             from core.verdict import snapshot_view as vsv
             prov = SnapshotProvider(self._classify_session())
             orders = prov.fetch(date)
-            trip = TripKey.from_task(date, train_code, passenger_names)
+            trip = TripKey.from_task(date, train_code, passenger_names,
+                                     from_station=from_station,
+                                     to_station=to_station)
             v = vcore_engine.postconfirm(
                 trip, orders, passenger_names, not_before_ts)
             agree = legacy_decision == v.decision.value
