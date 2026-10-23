@@ -180,9 +180,12 @@ _NS_METHODS = {ns: METHODS[old] for ns, old in _NS_TO_OLD.items()}
 
 # 慢方法（网络/浏览器/大文件）：移出 stdin 分发线程，否则 1s/2s 的前端轮询
 # 会排在 3×15s 的会话检查后面（2026-10-19 审查）。threaded=True 时才异步。
+# startEngine/stopEngine/shutdown 同列：启停引擎要建引擎（首次联网加载
+# 车站表）/ join 引擎线程最长 10s，同步跑同样会冻结全量 RPC（深审 RPC 簇）。
 _SLOW_METHODS = frozenset({
     "queryTickets", "checkSession", "relogin", "sync12306Passengers",
     "reconcileHistory", "testEmail", "ipLocate", "getAccount",
+    "startEngine", "stopEngine", "shutdown",
 })
 
 _RPC_SLOTS = threading.BoundedSemaphore(6)
@@ -265,6 +268,31 @@ def rpc_dispatch(line, threaded=False):
         return
     _rpc_handle(id_, method, fn, params)
 
+# stdin 单行长度上限（约 1MB，文本流按字符计）：一行请求先完整读进内存
+# 才进 json 解析，写入方 bug 吐出无换行的超大流（或帧错位把日志流粘成
+# 一行）时会先吃掉等量内存、最坏 OOM 被杀。stdin 的坏 JSON/非对象/坏
+# method 都已逐项防崩，长度维度在此补齐（深审 RPC 簇）。
+_MAX_LINE_BYTES = 1024 * 1024
+
+
+def _iter_request_lines(stream):
+    """逐行产出请求行；超限行整行丢弃（先把残段读干净，避免其尾巴被当
+    成下一条请求）并回一条 bad_request，其余行原样产出。"""
+    while True:
+        chunk = stream.readline(_MAX_LINE_BYTES + 1)
+        if not chunk:
+            return
+        if len(chunk) > _MAX_LINE_BYTES:
+            while not chunk.endswith("\n"):
+                chunk = stream.readline(_MAX_LINE_BYTES + 1)
+                if not chunk:
+                    break
+            reply(None, error="单行请求超过长度上限，已丢弃",
+                  code="bad_request", evidence={"reason": "line_too_long"})
+            continue
+        yield chunk
+
+
 def main():
     # P2：三个杂项守护线程统一登记进 Scheduler（daemon 类型，原函数语义零改动）
     global _SCHED
@@ -286,7 +314,7 @@ def main():
         push("log", {"line": "[错误] 监控引擎启动失败：%s: %s" % (type(e).__name__, e),
                      "tag": "err"})
     push("ready", {"pid": os.getpid()})
-    for line in sys.stdin:
+    for line in _iter_request_lines(sys.stdin):
         try:
             rpc_dispatch(line, threaded=True)
         except Exception as e:

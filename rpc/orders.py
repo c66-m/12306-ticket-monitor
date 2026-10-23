@@ -98,7 +98,13 @@ def rpc_reconcile_history(p):
     只回答一个问题：这些记录背后平台到底有没有订单。
     不下单、不支付、不取消、不改 state.json / 防重记录、不动引擎轮询。
     """
-    limit = min(200, max(1, int(p.get("limit") or 50)))
+    # 与 rpc_list_history 同款兜底：limit 被传成 "abc"/列表等非法值时
+    # 回落 50，不让 ValueError/TypeError 逃出 handler 变 handler_error
+    try:
+        limit = int(p.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = min(200, max(1, limit))
     path = appcommon.history_path_of(load_config(), HERE)
 
     todo = ("failed", "ambiguous", "browser_dead")

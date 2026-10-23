@@ -48,7 +48,10 @@ def _task_dicts(cfg):
         if isinstance(t, dict):
             out.append(t)
         else:
-            _warn_shape_once("task_entry_not_dict", "条目 %r" % (t,))
+            # 只报类型不报原文：坏条目是用户 config 数据，可能含敏感样式
+            # 字符串，不许 %r 回显进告警（R1 第 15 条口径，评审 note N3）
+            _warn_shape_once("task_entry_not_dict",
+                             "条目类型 %s" % type(t).__name__)
     return out
 
 
