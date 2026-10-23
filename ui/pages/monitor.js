@@ -1,5 +1,5 @@
 /* pages/monitor.js —— 监控任务页（统计条/任务列表/右列车次结果卡/搜索框）。 */
-import { S, call, goto, hitSearch, localDate, dateSpan, SEAT_CHOICES, PAGES, registerPage } from "../store.js";
+import { S, call, goto, hitSearch, localDate, dateSpan, SEAT_CHOICES, PAGES, pageNameHit, registerPage } from "../store.js";
 import { $, esc } from "../components/dom.js";
 import { toast } from "../components/toast.js";
 import { openModal, confirmBox } from "../components/modal.js";
@@ -97,7 +97,7 @@ export function queryTrainOrStation(station) {
 
 export function runTaskSearch(q) {
   if (!q) return;
-  const p = Object.keys(PAGES).find((k) => PAGES[k].crumb.includes(q) || PAGES[k].title.includes(q));
+  const p = Object.keys(PAGES).find((k) => pageNameHit(k, q));
   if (p) return goto(p);
   S.searchQ = q;
   if (S.page !== "monitor") goto("monitor"); else updateMonitorView();
@@ -108,10 +108,18 @@ export function statbarHtml() {
   const nRun = ts.filter((t) => ["monitoring", "retrying"].includes(t.status)).length;
   const nHit = ts.filter((t) => t.status === "success").length;
   const nPause = ts.filter((t) => t.status === "paused").length;
+  // 待核对（ambiguous）单列：这是要用户去 12306 人工核对的状态，混在总数里
+  // 无归类等于没提示。仅 N>0 时出现，warn 色，点击切换「只看待核对」过滤。
+  const nAmb = ts.filter((t) => t.status === "ambiguous").length;
+  // 过滤死角自愈：ambOnly 开着但待核对已归零（如刚删掉最后一个待核对任务）时，
+  // chip 本身不再渲染、界面上没有取消过滤的入口，列表会被永久过滤成空——
+  // 直接复位；渲染顺序上 statbar 先于任务行，本轮即按未过滤渲染。
+  if (!nAmb && S.ambOnly) S.ambOnly = false;
   const dirty = ts.some((t) => !t.from && !t.to);
   return '<div class="s"><b class="run">' + nRun + "</b><span>监控中</span></div><span class='sep'></span>" +
     '<div class="s"><b class="ok">' + nHit + "</b><span>已抢到</span></div><span class='sep'></span>" +
     '<div class="s"><b>' + nPause + "</b><span>已暂停</span></div><span class='sep'></span>" +
+    (nAmb ? '<div class="s" id="mAmb" style="cursor:pointer" title="' + (S.ambOnly ? "正在只看待核对任务，点击取消过滤" : "点击只看待核对任务") + '"><b class="warn">' + nAmb + "</b><span>待核对</span></div><span class='sep'></span>" : "") +
     '<div class="s"><b>' + ts.length + "</b><span>全部任务</span></div>" +
     (dirty ? '<span class="sep"></span><div class="s"><b class="warn">!</b><span>存在空任务</span></div>' : "") +
     (S.engineRunning ? '<span class="sep"></span><div class="s"><b class="run">●</b><span>引擎运行中</span></div>' : "") +
@@ -133,7 +141,9 @@ export function searchBoxHtml() {
 }
 
 export function taskRowsHtml() {
-  const rows = S.monitor.map((t) => taskRow(t, S.mgr)).join("");
+  const rows = S.monitor
+    .filter((t) => !S.ambOnly || t.status === "ambiguous")
+    .map((t) => taskRow(t, S.mgr)).join("");
   return rows || '<div class="muted" style="padding:22px;text-align:center">' +
     (S.monitor.length ? "无匹配任务" : "暂无任务，点「＋ 新建任务」") + "</div>";
 }
@@ -170,7 +180,7 @@ export function renderMonitor(root) {
 export let _monitorSig = "";
 export function updateMonitorView() {
   if (S.page !== "monitor") return;
-  const sig = (S.mgr ? "1" : "0") + "|" + S.mgrSel.join(",") + "|" + S.engineRunning + "|" + S.searchQ + "|" +
+  const sig = (S.mgr ? "1" : "0") + "|" + S.mgrSel.join(",") + "|" + S.engineRunning + "|" + S.searchQ + "|" + (S.ambOnly ? "amb" : "") + "|" +
     JSON.stringify(S.monitor) + "|" + JSON.stringify(S.trainRes) + "|" + JSON.stringify(S.pickFrom);
   if (sig === _monitorSig) return;
   _monitorSig = sig;
@@ -221,6 +231,8 @@ export function bindStatbar() {
   };
   const tg = $("#mToggle");
   if (tg) tg.onclick = toggleEngine;
+  const amb = $("#mAmb");
+  if (amb) amb.onclick = () => { S.ambOnly = !S.ambOnly; updateMonitorView(); };
 }
 
 export function bindMgr() {
@@ -236,8 +248,11 @@ export function bindMgr() {
     const names = S.mgrSel.slice();
     if (!names.length) return;
     if (!await confirmBox("删除任务", "确定删除所选 " + names.length + " 个任务？")) return;
-    for (const n of names) await call("deleteTask", { name: n });
-    S.mgrSel = []; toast("已删除 " + names.length + " 个任务");
+    const { ok, failed } = await deleteTasksByName(names);
+    S.mgrSel = [];
+    toast(failed.length
+      ? "已删除 " + ok + " 个任务，" + failed.length + " 个删除失败：" + failed.join("、")
+      : "已删除 " + names.length + " 个任务", failed.length ? "err" : "");
     await refreshMonitor(); updateMonitorView();
   };
   const ddirty = $("#mDelDirty");
@@ -245,10 +260,28 @@ export function bindMgr() {
     const names = S.monitor.filter((t) => !t.from && !t.to).map((t) => t.name);
     if (!names.length) return toast("没有空任务");
     if (!await confirmBox("删除空任务", "将删除 " + names.length + " 个空任务（无区间配置）？")) return;
-    for (const n of names) await call("deleteTask", { name: n });
-    S.mgrSel = []; toast("已删除 " + names.length + " 个空任务");
+    const { ok, failed } = await deleteTasksByName(names);
+    S.mgrSel = [];
+    toast(failed.length
+      ? "已删除 " + ok + " 个空任务，" + failed.length + " 个删除失败：" + failed.join("、")
+      : "已删除 " + names.length + " 个空任务", failed.length ? "err" : "");
     await refreshMonitor(); updateMonitorView();
   };
+}
+
+// 批量删除逐项核对结果：后端以 {error} 返回的结果级失败不抛异常，RPC 级
+// 失败 call() 会 throw（且已 toast）——两种都计入 failed。旧实现循环完
+// 无条件报「已删除 N 个」，部分失败时用户以为全删了、实际列表里还剩着。
+async function deleteTasksByName(names) {
+  let ok = 0;
+  const failed = [];
+  for (const n of names) {
+    try {
+      const r = await call("deleteTask", { name: n });
+      if (r && r.error) failed.push(n); else ok++;
+    } catch (e) { failed.push(n); }
+  }
+  return { ok, failed };
 }
 
 export function toggleMgrSel(name) {
@@ -335,14 +368,16 @@ export function taskRow(t, mgr) {
 
 // 新建/编辑监控任务弹窗
 export async function openMonitorTaskForm(edit) {
-  if (!S.pax.length) await refreshPax();
+  // 预拉乘车人只是给表单备数据：refreshPax 内部已吞错保底，这里再兜一层，
+  // 保证后端抖动时表单照样能打开（大不了乘车人列表为空/旧缓存）。
+  if (!S.pax.length) { try { await refreshPax(); } catch (e) { /* 不挡开窗 */ } }
   const t = edit || {};
   const isEdit = !!edit;
   // 「自动下单」开关：编辑取任务原值，新建取设置里的任务默认值（与后端 _req_on 同口径）
   const autoOn = isEdit ? t.auto_order !== false
     : (((S.settings || {}).task_defaults || {}).auto_order) !== false;
   const { modal, close } = openModal(
-    "<h3>" + (isEdit ? "编辑任务" : "新建监控任务") + "</h3>" +
+    "<h3>" + (isEdit ? "编辑任务" : "新建" + PAGES.monitor.title + "任务") + "</h3>" +
     '<div class="mt-top"><div class="form-row grow"><label>出发站</label>' + stationInput("from", t.from) + "</div>" +
     '<div class="form-row grow"><label>到达站</label>' + stationInput("to", t.to) + "</div></div>" +
     '<div class="form-row"><label>车次（逗号分隔，可点查询选车）</label>' +
@@ -616,7 +651,7 @@ export function bindSearch() {
       const r = await call("searchStation", { q }).catch(() => ({ stations: [] }));
       const items = (r.stations || []).slice(0, 6).map((s) => ({ kind: "station", name: s.name, code: s.code, hint: s.code }));
       Object.keys(PAGES).forEach((k) => {
-        if (PAGES[k].crumb.includes(q) || PAGES[k].title.includes(q)) items.push({ kind: "page", title: PAGES[k].crumb, hint: "页面", key: k, name: PAGES[k].crumb });
+        if (pageNameHit(k, q)) items.push({ kind: "page", title: PAGES[k].crumb, hint: "页面", key: k, name: PAGES[k].crumb });
       });
       const hits2 = S.monitor.filter((t) => hitSearch(q, t.name, t.from, t.to, t.trains.join(","))).slice(0, 4);
       if (!items.length && hits2.length) items.push({ kind: "task", name: q, hint: hits2.length + " 个任务", q });
@@ -649,7 +684,7 @@ export function bindSearch() {
       });
       return;
     }
-    if (PAGES[q] || Object.keys(PAGES).some((k) => PAGES[k].crumb === q)) return goto(Object.keys(PAGES).find((k) => PAGES[k].crumb === q));
+    if (PAGES[q] || Object.keys(PAGES).some((k) => PAGES[k].crumb === q || (PAGES[k].aliases || []).includes(q))) return goto(Object.keys(PAGES).find((k) => PAGES[k].crumb === q || (PAGES[k].aliases || []).includes(q)));
     close();
     runTaskSearch(q);
   });

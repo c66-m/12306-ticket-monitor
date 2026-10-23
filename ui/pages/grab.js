@@ -123,7 +123,9 @@ export function renderGrabGrid(el) {
 
 // 抢票任务表单
 export async function openGrabForm(edit, preset) {
-  if (!S.pax.length) await refreshPax();
+  // 预拉乘车人只是给表单备数据：refreshPax 内部已吞错保底，这里再兜一层，
+  // 保证后端抖动时表单照样能打开（大不了乘车人列表为空/旧缓存）。
+  if (!S.pax.length) { try { await refreshPax(); } catch (e) { /* 不挡开窗 */ } }
   const t = Object.assign({}, _DEFAULT_LC, edit || {}, preset ? {
     from: preset.from, to: preset.to, trains: preset.trains || [], seat_types: preset.seat_types || [],
     seat_priority: preset.seat_priority || "",

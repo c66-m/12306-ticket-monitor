@@ -40,7 +40,16 @@ export function bindStation(root, id, name, code) {
   const load = async () => {
     const q = input.value.trim();
     if (!q) { ddEl.classList.add("hidden"); return; }
-    const r = await call("searchStation", { q });
+    let r;
+    try {
+      r = await call("searchStation", { q });
+    } catch (e) {
+      // 搜索失败（后端抖动）：清空并收起下拉。旧候选对应的是上一个查询串，
+      // 留着会让用户误选与当前输入无关的站；失败原因 call() 已 toast。
+      ddEl.innerHTML = "";
+      ddEl.classList.add("hidden");
+      return;
+    }
     // 不过滤与输入同名的项：同名精确命中排第一，用户要能看到并直接选它
     const hits = r.stations || [];
     ddEl.innerHTML = hits.map((s) => '<div class="item" data-n="' + esc(s.name) + '" data-c="' + esc(s.code) + '"><b>' + esc(s.name) + "</b>" +

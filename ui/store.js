@@ -44,6 +44,7 @@ export const S = {
   queryHistory: [],
   searchQ: "", stationHits: [], searchDD: [], searchLoading: false, trainRes: null, pickFrom: null,
   mgr: false, mgrSel: [], // 任务列表管理模式
+  ambOnly: false, // 监控页统计条「待核对」点击过滤：只看 ambiguous 任务
   appear: null,
   dd: null, // 右键菜单
 };
@@ -62,13 +63,21 @@ export function registerClosePanelHook(fn) { _closePanelHook = fn; }
 
 // ================= 页签 =================
 export const PAGES = {
-  monitor: { crumb: "直接抢票", title: "直接抢票" },
+  // aliases：改名前的旧称。用户按旧习惯搜「监控任务」时仍应命中本页
+  // （顶栏搜索的页面建议与 runTaskSearch 都经 pageNameHit 匹配）。
+  monitor: { crumb: "直接抢票", title: "直接抢票", aliases: ["监控任务"] },
   grab: { crumb: "抢票任务", title: "抢票任务" },
   pax: { crumb: "乘车人", title: "乘车人" },
   history: { crumb: "历史记录", title: "历史" },
   errlog: { crumb: "问题日志", title: "问题日志" },
   settings: { crumb: "设置", title: "设置" },
 };
+
+// 页签名命中：crumb/title 子串，或别名（旧称）子串
+export function pageNameHit(k, q) {
+  const p = PAGES[k];
+  return p.crumb.includes(q) || p.title.includes(q) || (p.aliases || []).some((a) => a.includes(q));
+}
 
 export function goto(page) {
   S.page = page;

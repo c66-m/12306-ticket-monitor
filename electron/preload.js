@@ -60,13 +60,15 @@ function _resolveMethod(method) {
 contextBridge.exposeInMainWorld("api", {
   // 请求-响应：window.api.call("queryTickets", {...})，旧名自动转新名；
   // 也可直接传新名，如 window.api.call("tickets.query", {...})
+  // 名称映射表 _NS_TO_OLD/_OLD_TO_NS 只在 preload 内部供 _resolveMethod
+  // 使用，不再挂到 window.api——渲染层无人读它（已核），暴露面能收则收。
   call: (method, params) => ipcRenderer.invoke("rpc", _resolveMethod(method), params),
-  // 名称映射表（与 api.py 的 _NS_TO_OLD 一致），供前端查名/调试
-  _NS_TO_OLD: _NS_TO_OLD,
-  _OLD_TO_NS: _OLD_TO_NS,
-  // 订阅 Python 主动推送（日志/状态/后端死亡）
+  // 订阅 Python 主动推送（日志/状态/后端死亡）；返回退订函数，重复订阅
+  // 时调用方可先退订，避免同一回调被叠加注册多次。
   onPush: (cb) => {
-    ipcRenderer.on("py-push", (_e, payload) => cb(payload));
+    const handler = (_e, payload) => cb(payload);
+    ipcRenderer.on("py-push", handler);
+    return () => { ipcRenderer.removeListener("py-push", handler); };
   },
   // 无边框窗口控制：min / max / close
   win: (action) => ipcRenderer.send("win", action),
@@ -76,8 +78,12 @@ contextBridge.exposeInMainWorld("api", {
   mini: () => ipcRenderer.invoke("mini-open"),
   miniClose: () => ipcRenderer.invoke("mini-close"),
   miniWin: (action) => ipcRenderer.send("mini-win", action),
-  // 小窗置顶状态回执
-  onMiniPin: (cb) => { ipcRenderer.on("mini-pin", (_e, on) => cb(on)); },
+  // 小窗置顶状态回执；同样返回退订函数
+  onMiniPin: (cb) => {
+    const handler = (_e, on) => cb(on);
+    ipcRenderer.on("mini-pin", handler);
+    return () => { ipcRenderer.removeListener("mini-pin", handler); };
+  },
   // 小窗开局参数：主进程用 additionalArguments 把主窗的外观 JSON 传过来
   // （localStorage 在 file:// 下不保证跨页共享，preload 是唯一可靠的传递点）
   appearArgs: (() => {

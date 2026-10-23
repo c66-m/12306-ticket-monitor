@@ -3,6 +3,7 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
+const { StringDecoder } = require("string_decoder");
 
 const PY_DIR = path.join(__dirname, "..");          // C:\develep\产物\12306
 let quitting = false;                                 // 用户退出：不再自动重启 Python
@@ -26,6 +27,11 @@ let rpcId = 0;
 // 调试日志脱敏：这几个方法的参数含证件号/手机号/授权码，只打键名
 const _SENSITIVE_RPC = new Set(["savePassengers", "passengerDetail", "saveSettings"]);
 
+// 超时放宽名单：纯查询类方法（无副作用，后端慢主要是官方接口慢），
+// 60s 容易误杀，放宽到 120s。preload 已把前端旧名转成新命名空间名，
+// 这里新旧名都列（main 自身直调与外部调试走旧名时也命中）。
+const _LONG_TIMEOUT_METHODS = new Set(["tickets.query", "queryTickets"]);
+
 function pyCall(method, params) {
   return new Promise((resolve, reject) => {
     if (!py || !py.stdin.writable) return reject(new Error("Python 后端正在重启，请稍后重试"));
@@ -40,13 +46,17 @@ function pyCall(method, params) {
     pending.set(id, entry);
     try { py.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"); }
     catch (e) { pending.delete(id); return reject(new Error("Python 后端已退出（" + (e && e.message) + "）")); }
-    // 60s 超时兜底（查票/会话检查可能慢）；响应到达时必须 clearTimeout
+    // 超时兜底（默认 60s，纯查询类放宽到 120s）；响应到达时必须 clearTimeout。
+    // 注意：超时只是前端不再等——后端不感知取消，仍会把这次调用执行完并
+    // 回包，迟到响应在 rl 侧已无 pending 可投递、直接丢弃。文案必须说清
+    // 「后端仍在执行」，否则用户以为没执行、立即重复发起同一操作。
+    const timeoutMs = _LONG_TIMEOUT_METHODS.has(method) ? 120000 : 60000;
     entry.timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
-        reject(new Error(method + " 超时"));
+        reject(new Error(method + " 超时（后端仍在执行，本次结果将被丢弃；请稍后再试，勿立即重复操作）"));
       }
-    }, 60000);
+    }, timeoutMs);
   });
 }
 
@@ -76,9 +86,16 @@ function startPython() {
   });
   // EPIPE 兜底：py 已退出瞬间 stdin 写失败会触发 'error'，吞掉由 pyCall 的 try/catch 走 reject
   py.stdin.on("error", () => {});
+  // 子进程失败一次性守卫（以子进程实例为键，本闭包一份）：spawn 失败时
+  // 'error' 与 'exit' 可能先后都触发，两条失败处理路径（广播失败、reject
+  // 在途 RPC、scheduleRestart）只许跑一遍——跑两遍会把同一次失败广播两次、
+  // 重启退避被叠加翻倍。先到者处理，后到者直接返回。
+  let failSettled = false;
   // spawn 失败（exe 不存在 / 不可执行）是异步 emit('error')，没有监听就是未捕获异常，
   // 直接把主进程带走 → 客户端白屏。接住它：在途 RPC 立即失败，再走同一套重启退避。
   py.on("error", (err) => {
+    if (failSettled) return;
+    failSettled = true;
     const msg = (err && err.message) || String(err);
     console.error("[py] spawn failed:", msg);
     broadcast("py-push", { method: "log", params: { line: "[系统] Python 后端启动失败：" + msg, tag: "err" } });
@@ -113,6 +130,9 @@ function startPython() {
           p.reject(err);
         }
         else p.resolve(msg.result);
+      } else if (process.env.DSH_DEBUG) {
+        // 前端已超时的迟到响应：无 pending 可投递，静默丢弃（此处仅调试留痕）
+        console.log("[rpc] 迟到响应已丢弃 id=" + msg.id);
       }
     } else if (msg.method) {
       // 主动推送（日志 / 状态）
@@ -129,15 +149,38 @@ function startPython() {
     return "info";
   }
 
+  // Python stderr 只记不崩（traceback 在这里）；控制台启动时落 _elog.txt/_eerr.txt，
+  // 日志页同时收一份（api.py 的 _warn 走这条路）。
+  // 按行缓冲再广播：管道 chunk 不按行切分——一行可被拆成两块、一块也可含
+  // 多行；整块当一行推会让日志行被截断/合并、级别 tag 按整块误判，且多字节
+  // 汉字恰被 chunk 边界劈开时 d.toString() 直接出乱码。用 StringDecoder
+  // 拼字节流、只在 \n 处切行（与 stdout 的 readline 同口径），每行单独广播。
+  const stderrDecoder = new StringDecoder("utf8");
+  let stderrBuf = "";
+  const emitStderrLine = (line) => {
+    if (!line) return;
+    console.error("[py]", line);
+    broadcast("py-push", { method: "log", params: { line, tag: stderrTag(line) } });
+  };
   py.stderr.on("data", (d) => {
-    // Python stderr 只记不崩（traceback 在这里）；控制台启动时落 _elog.txt/_eerr.txt，
-    // 日志页同时收一份（api.py 的 _warn 走这条路）。
-    const text = d.toString();
-    console.error("[py]", text);
-    broadcast("py-push", { method: "log", params: { line: text, tag: stderrTag(text) } });
+    stderrBuf += stderrDecoder.write(d);
+    let idx;
+    while ((idx = stderrBuf.indexOf("\n")) >= 0) {
+      const line = stderrBuf.slice(0, idx).replace(/\r$/, "");
+      stderrBuf = stderrBuf.slice(idx + 1);
+      emitStderrLine(line);
+    }
+  });
+  py.stderr.on("end", () => {
+    // 流结束时把没等到换行符的残段也推出去，别吞掉最后一行
+    const rest = (stderrBuf + stderrDecoder.end()).replace(/\r$/, "");
+    stderrBuf = "";
+    emitStderrLine(rest);
   });
 
   py.on("exit", (code) => {
+    if (failSettled) return;   // spawn 失败已由 'error' 路径处理过，同一次失败不重复
+    failSettled = true;
     // 正常退出（code 0/null）不刷屏；崩溃时留痕，配合上面的 stderr 转发定位
     if (code) console.error("[py] exited", code);
     py = null;

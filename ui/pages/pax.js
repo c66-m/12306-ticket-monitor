@@ -130,10 +130,15 @@ export async function openPaxForm(edit) {
 }
 
 export async function refreshPax() {
-  const r = await call("listPassengers");
-  S.pax = r.passengers || [];
-  S.paxStamp = r.stamp;
-  if (S.page === "pax") renderPage();
+  // 内部吞错保底（与 history/errlog 刷新函数同口径）：后端抖动/重启时保留
+  // 旧缓存与 stamp、不抛。否则抢票/监控表单打开前的预拉取一失败，异常会
+  // 把整个开窗流程打断（表单根本打不开）。失败原因 call() 已 toast。
+  try {
+    const r = await call("listPassengers");
+    S.pax = r.passengers || [];
+    S.paxStamp = r.stamp;
+    if (S.page === "pax") renderPage();
+  } catch (e) { /* 保留旧缓存，等下一轮刷新 */ }
 }
 export const ID_TYPE_NAMES = { "1": "二代身份证", "2": "一代身份证", "C": "港澳通行证", "G": "台湾通行证", "B": "护照", "H": "永久居留证", "L": "其他" };
 
