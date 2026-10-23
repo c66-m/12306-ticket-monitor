@@ -568,6 +568,66 @@ def _page_session_ok(page):
     return False, ""
 
 
+# 下单票据校验：initMy12306Api 只证明 uamtk 有效（页头能显示姓名），真正决定
+# 「点预订会不会被放行」的是 /otn/login/checkUser 的 data.flag。两者会不一致：
+# 会话从 cookie 重放回来时，常见「页头还是你的名字，checkUser 却 flag=false」，
+# 此时 12306 只弹「您尚未登录」、页面不跳转（2026-10-23 实测，见 HANDOFF §34）。
+_CHECKUSER_JS = """async () => {
+  try {
+    const r = await fetch('/otn/login/checkUser', {
+      method: 'POST', credentials: 'include', cache: 'no-store',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest'},
+      body: '_json=true'
+    });
+    const t = await r.text();
+    return {status: r.status, url: r.url, body: t.slice(0, 400)};
+  } catch (e) {
+    return {status: -1, url: '', body: 'ERR:' + String(e)};
+  }
+}"""
+
+# 12306 判定未登录时页面上的提示词（弹窗 / 顶部条都可能出现）
+_LOGIN_MODAL_WORDS = ("您尚未登录", "请先登录", "登录已过期")
+
+
+def _page_booking_ok(page):
+    """页面上「能不能下单」的真实判定：checkUser 的 data.flag。
+
+    返回 (ok, 原因)。**验不成时返回 True**（不阻断下单）：这里只是提前
+    发现"半残登录态"，真正的兜底是点「预订」后的弹窗检测与 30 秒等待——
+    宁可多试一次点击，也不要因为一次校验异常把有票的机会放过。
+    """
+    try:
+        r = page.evaluate(_CHECKUSER_JS)
+    except Exception:
+        return True, ""
+    if not isinstance(r, dict):
+        return True, ""
+    url = r.get("url") or ""
+    # 注意：checkUser 自己的路径就叫 /otn/login/checkUser，所以不能按 "/login"
+    # 一刀切判门户（那样每次都会误报）；只认真正的 passport 落点或路径被换掉。
+    if "/passport" in url or ("/login" in url and "checkUser" not in url):
+        return False, "checkUser 被跳到登录门户"
+    body = (r.get("body") or "").strip()
+    try:
+        data = json.loads(body)
+    except Exception:
+        return True, ""          # 风控页 / 空响应：不作为结论
+    if (data.get("data") or {}).get("flag"):
+        return True, ""
+    return False, "下单票据已失效（页头仍显示已登录，但 checkUser flag=false）"
+
+
+def _page_body(page):
+    """取页面正文（取不到就返回空串，绝不抛）。"""
+    try:
+        text = page.evaluate("() => document.body ? document.body.innerText : ''")
+    except Exception:
+        return ""
+    return text if isinstance(text, str) else ""
+
+
 # 会话失效判据：只有这两类算"确认失效"，其余（goto 超时 / 网络抖动 / 风控
 # 非 JSON 页）都是瞬时故障。默认方向取"重试"——误把任务标 failed 要人工恢复，
 # 代价比多试几轮大，所以拿白名单而不是把"校验异常"整类当永久。
@@ -1074,6 +1134,16 @@ def _run_fill_submit_confirm(ctx, page, info, date, seat_name, seat_code,
                 "picked": picked, "dlg_seat": dlg_seat, "t_submit": t_submit}
 
     try:
+        # 2.5) 点「预订」之前先确认这张票还允许下单。页头显示姓名只说明 uamtk
+        #      有效；会话由 cookie 重放回来时经常「名字还在、下单票据已废」，
+        #      这时点下去 12306 只弹「您尚未登录」、页面不跳转。
+        #      提前判定 → 不点、不创建订单草稿，直接给出可执行的结论。
+        booking_ok, booking_why = _page_booking_ok(page)
+        if not booking_ok:
+            return _fail("12306 判定未登录（%s）：本次未点「预订」、未提交订单。"
+                         "请重新登录后再试" % booking_why,
+                         {"reason": "need_relogin"})
+
         # 3) 点该车次的「预订」——精确匹配车次行。:has-text() 是子串匹配，
         #    查 G1 曾可能点中排在前面的 G11/G100 的「预订」，把订单下给别的车次
         book = page.evaluate(
@@ -1127,24 +1197,36 @@ def _run_fill_submit_confirm(ctx, page, info, date, seat_name, seat_code,
         # commit：导航一发起就走，不必等页面 load（后面有 limit_tickets 兜底）
         # 账号有未支付/未处理订单时，12306 会拦住预订、页面留在列表页并弹
         # 「您还有未处理的订单」——这里识别它，别再白等 40 秒超时。
+        arrived = False
         try:
+            # 先只等 3 秒：未登录时 12306 根本不跳转，只在列表页弹
+            # 「您尚未登录」。旧实现一次性等 30 秒，窗口看起来就是卡死。
             page.wait_for_url("**/confirmPassenger/initDc**",
-                              wait_until="commit", timeout=30000)
+                              wait_until="commit", timeout=3000)
+            arrived = True
         except Exception:
-            body = ""
-            for _ in range(3):   # 弹窗渲染可能晚于超时瞬间:复核 3 次
-                try:
-                    body = page.evaluate("() => document.body ? document.body.innerText : ''")
-                except Exception:
-                    body = ""
-                if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
-                    break
-                page.wait_for_timeout(500)
-            if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
-                i = max(0, body.find("订单") - 30)
+            body = _page_body(page)
+            if any(k in body for k in _LOGIN_MODAL_WORDS):
                 mark("result")
-                return _fail(body[i:i + 200].replace("\n", " "), {"reason": "dup"})
-            raise
+                return _fail("12306 判定未登录（页面弹「您尚未登录」）：本次未提交订单，"
+                             "登录票据已失效，请重新登录后再试",
+                             {"reason": "need_relogin"})
+        if not arrived:
+            try:
+                page.wait_for_url("**/confirmPassenger/initDc**",
+                                  wait_until="commit", timeout=27000)
+            except Exception:
+                body = ""
+                for _ in range(3):   # 弹窗渲染可能晚于超时瞬间:复核 3 次
+                    body = _page_body(page)
+                    if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
+                        break
+                    page.wait_for_timeout(500)
+                if any(k in body for k in ("未处理", "未支付", "未完成订单", "行程冲突")):
+                    i = max(0, body.find("订单") - 30)
+                    mark("result")
+                    return _fail(body[i:i + 200].replace("\n", " "), {"reason": "dup"})
+                raise
         page.wait_for_selector("#normal_passenger_id input[type=checkbox]",
                                state="attached", timeout=40000)
         page.wait_for_function(

@@ -78,8 +78,16 @@ def _probe_browser_session():
     if ok2:
         return {"ok": True, "unknown": False, "permanent": True,
                 "message": str(who or ""), "name": str(who or "")}
-    return {"ok": False, "unknown": False, "permanent": True,
-            "message": str(who or msg or ""), "name": ""}
+    # 复核也可能只是"没验成"（goto 超时 / 风控页 / 浏览器刚被杀）。旧代码这里
+    # 写死 unknown=False + permanent=True，于是一次瞬时失败被当成确认掉线：
+    # 顶栏头像变「未登录」，同一时刻引擎日志却写「登录状态正常：<姓名>」
+    # （2026-10-23 用户两次截图反馈）。判据交给 browser_order 的白名单。
+    detail = str(who or msg or "")
+    if browser_order.session_failure_is_permanent(detail):
+        return {"ok": False, "unknown": False, "permanent": True,
+                "message": detail, "name": ""}
+    return {"ok": False, "unknown": True, "permanent": False,
+            "message": detail, "name": ""}
 
 def probe_session(force=False):
     """当前登录态 {ok, unknown, permanent, message, name}。

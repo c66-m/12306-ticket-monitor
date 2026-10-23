@@ -913,3 +913,51 @@ DETECT → FILL → 22:53:38 报「页面上没有 K558 的『预订』按钮」
   统一 patch 到临时文件，mock 下单不再污染真实记录。历史 1473 条中
   1287 条 G101 mock 已归档为 `.bak-20261020` 并清理，剩 186 条真实车次。
 - 全量 **855 OK (skipped=15)**。
+
+## 34. 2026-10-23 「软件已登录、点预订却弹『您尚未登录』」
+
+**现象**：界面顶栏显示「王宇昊」、日志 `[会话] 登录状态正常`；任务进 FILL 后
+浏览器点「预订」，12306 在列表页弹「您尚未登录」，页面不跳确认页。脚本干等
+30 秒，最后只剩 `TargetClosedError`（用户手动暂停所致）。
+
+**取证**（只读探针，同一份 `data/.browser_state.json`）：
+
+| 接口 | 返回 |
+|---|---|
+| `/otn/index/initMy12306Api` | `status: true`（页头姓名的来源，只认 `uamtk`） |
+| `/otn/login/checkUser` | `data.flag: false`（点「预订」时 12306 前端自己调的下单校验） |
+
+即登录态是「半残」：`uamtk` 仍有效，`tk`（path=/otn 的下单票据）已废。
+`tk`/`JSESSIONID` 都是 session cookie，浏览器一关即清空，每次启动靠
+`save_state` / `add_cookies` 重放；两者生命周期不同步，于是常见
+「页头名字还在、下单票据已过期」。
+
+**改动**（`browser_order.py`）：
+- 新增 `_CHECKUSER_JS` / `_page_booking_ok()` / `_page_body()` /
+  `_LOGIN_MODAL_WORDS`。注意 `checkUser` 自身路径含 `/login`，判门户须排除，
+  否则每次都误报「被跳到登录门户」。
+- `_run_fill_submit_confirm` 在点「预订」**之前**用 `_page_booking_ok` 预检：
+  `flag=false` 直接返回 `reason=need_relogin`，不点击、不产生订单草稿。
+  校验不成（异常 / 非 JSON / 风控页）按「不阻断」处理，交点后兜底。
+- 点后等确认页改为「先等 3 秒 → 检查是否弹『您尚未登录』→ 再等余下 27 秒」，
+  未登录时秒级失败并给出可执行结论。
+
+**测试**：`TestBookingLoginTicket` 3 例（checkUser 三态判定 / 预检拦截不点击 /
+点后弹窗秒判）；全量 **784 OK (skipped=15)**。
+
+### 34.1 同批修掉的两处界面自相矛盾
+
+用户第二次截图：顶栏头像显示「未登录」，同一时刻日志写 `[会话] 登录状态正常：王子昊`，
+且该行被标成红色 `ERR`。
+
+- **顶栏「未登录」**：`rpc/session.py::_probe_browser_session` 快路是**无浏览器
+  指纹的 HTTP 校验**（`order.verify_session`），12306 对这类请求常回未登录；
+  随后真浏览器复核（`check_session(timeout=6)`）抛「校验异常」时，旧代码把结果
+  写死 `unknown=False, permanent=True` —— 一次「没验成」被当成确认掉线。
+  改为交给 `browser_order.session_failure_is_permanent()` 白名单判定，
+  非白名单一律 `unknown=True`，前端保留上一次结论。
+- **正常日志标红**：Electron `py.stderr` 转发一律 `tag:"err"`，而引擎 INFO
+  也走 stderr，于是「登录状态正常」是红的。新增 `stderrTag()` 按
+  `[ERROR]` / `[WARNING]` 映射 err / warn，其余 info。
+- 测试：`TestSessionProbeUnknown` 2 例（校验异常→unknown / 门户→permanent）；
+  全量 **786 OK (skipped=15)**，`node --check electron/main.js` 通过。

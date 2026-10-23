@@ -3218,6 +3218,133 @@ class TestSessionCheckTransient(TempDirCase):
         self.assertEqual(e.task_status(t), "failed")
 
 
+class TestBookingLoginTicket(unittest.TestCase):
+    """2026-10-23 实测：会话由 cookie 重放回来时，initMy12306Api 仍报
+    status=true（页头照样显示姓名），而 /otn/login/checkUser 返回 flag=false。
+    这时点「预订」12306 只弹「您尚未登录」、页面不跳转，旧实现干等 30 秒，
+    日志只剩一句 TargetClosedError。这里钉住两条新行为：
+      1. 点之前用 checkUser 预检：flag=false 直接判 need_relogin，不点预订；
+      2. 万一预检没验成，点后 3 秒内识别弹窗并立刻失败，不再干等。
+    """
+
+    CHECK_USER_TRUE = '{"status":true,"data":{"flag":true}}'
+    CHECK_USER_FALSE = '{"status":true,"data":{"flag":false}}'
+
+    class _Page:
+        def __init__(self, check_body, body_text=""):
+            self._check = check_body
+            self._body = body_text
+            self.clicked = False
+            self.waited = []
+
+        def evaluate(self, js, arg=None):
+            if "checkUser" in js:
+                return {"status": 200,
+                        "url": "https://kyfw.12306.cn/otn/login/checkUser",
+                        "body": self._check}
+            if "queryLeftTable" in js:
+                self.clicked = True
+                return {"ok": True}
+            if "document.body" in js:
+                return self._body
+            return ""
+
+        def wait_for_url(self, *a, **k):
+            self.waited.append(k.get("timeout"))
+            raise RuntimeError("Timeout 3000ms exceeded: url 没变")
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    def _run(self, page):
+        info = {"train_code": "D128", "from_name": "郑州", "to_name": "上海松江",
+                "from_code": "ZZF", "to_code": "SAH"}
+        return browser_order._run_fill_submit_confirm(
+            None, page, info, "2026-10-25", "硬座", "1", ["张三"],
+            mark=lambda name: None)
+
+    def test_page_booking_ok_reads_flag(self):
+        class P:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def evaluate(self, js, arg=None):
+                if isinstance(self.payload, Exception):
+                    raise self.payload
+                return self.payload
+
+        ok, _ = browser_order._page_booking_ok(
+            P({"url": "https://kyfw.12306.cn/otn/login/checkUser",
+               "body": self.CHECK_USER_TRUE}))
+        self.assertTrue(ok)
+        ok, why = browser_order._page_booking_ok(
+            P({"url": "https://kyfw.12306.cn/otn/login/checkUser",
+               "body": self.CHECK_USER_FALSE}))
+        self.assertFalse(ok)
+        self.assertIn("checkUser", why)
+        # 验不成（异常 / 非 JSON / 风控页）不阻断下单，交给点后弹窗兜底
+        self.assertTrue(browser_order._page_booking_ok(P(RuntimeError("boom")))[0])
+        self.assertTrue(browser_order._page_booking_ok(
+            P({"url": "https://kyfw.12306.cn/otn/login/checkUser",
+               "body": "<html>当前访问存在异常</html>"}))[0])
+
+    def test_checkuser_false_aborts_before_click(self):
+        page = self._Page(self.CHECK_USER_FALSE)
+        res = self._run(page)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["extra"]["reason"], "need_relogin")
+        self.assertIn("checkUser", res["msg"])
+        self.assertFalse(page.clicked, "票据失效时不能点「预订」")
+        self.assertEqual(page.waited, [], "预检失败不该再去等确认页")
+
+    def test_login_modal_after_click_fails_fast(self):
+        page = self._Page(self.CHECK_USER_TRUE, body_text="车票 您尚未登录 账号登录")
+        res = self._run(page)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["extra"]["reason"], "need_relogin")
+        self.assertIn("尚未登录", res["msg"])
+        self.assertTrue(page.clicked)
+        self.assertEqual(page.waited, [3000], "只做一次 3 秒探测，不再干等 27 秒")
+
+
+class TestSessionProbeUnknown(unittest.TestCase):
+    """顶栏「未登录」的数据源是 `rpc.session._probe_browser_session`。
+
+    2026-10-23 实测：快路（无浏览器指纹的 HTTP 校验）常回「未登录」，
+    随后真浏览器复核抛「校验异常」时，旧代码写死 `unknown=False` +
+    `permanent=True` —— 一次「没验成」被当成确认掉线：头像变「未登录」，
+    同一时刻引擎日志却写「登录状态正常：<姓名>」，界面自相矛盾。
+    """
+
+    def _probe(self, who):
+        from rpc import session as sm
+        sm.reset_session_cache()
+        with mock.patch.object(sm, "load_config",
+                               return_value={"order_mode": "browser"}), \
+             mock.patch.object(sm.os.path, "exists", return_value=True), \
+             mock.patch.object(sm.order_mod, "session_from_browser_state",
+                               return_value=object()), \
+             mock.patch.object(sm.order_mod, "verify_session",
+                               return_value=(False, "未登录", True)), \
+             mock.patch.object(sm.browser_order, "busy", return_value=False), \
+             mock.patch.object(sm.browser_order, "check_session",
+                               return_value=(False, who)):
+            return sm.probe_session(force=True)
+
+    def test_transient_check_error_is_unknown(self):
+        res = self._probe("校验异常: Timeout 20000ms exceeded")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["unknown"], "没验成不等于掉线，前端要保留上一次结论")
+        self.assertFalse(res["permanent"])
+
+    def test_portal_redirect_stays_permanent(self):
+        res = self._probe(
+            "已跳转登录门户：https://kyfw.12306.cn/otn/passport?redirect=/x")
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["unknown"])
+        self.assertTrue(res["permanent"])
+
+
 class TestEngineIdleKeepalive(TempDirCase):
     """保活三件套：浏览器模式待命（无活动任务）也体检会话，失效只告警不标任务。"""
 

@@ -120,11 +120,21 @@ function startPython() {
     }
   });
 
+  // Python 的 stderr 是引擎日志主通道，INFO 级别也走这里。以前一律标 err，
+  // 于是「[会话] 登录状态正常：<姓名>」在界面上是红色的 ERR（2026-10-23 反馈）。
+  // 按行首的级别标记映射：ERROR→err，WARNING→warn，其余→info。
+  function stderrTag(line) {
+    if (/\[ERROR\]|Traceback \(most recent call last\)/.test(line)) return "err";
+    if (/\[WARNING\]|\[WARN\]/.test(line)) return "warn";
+    return "info";
+  }
+
   py.stderr.on("data", (d) => {
     // Python stderr 只记不崩（traceback 在这里）；控制台启动时落 _elog.txt/_eerr.txt，
     // 日志页同时收一份（api.py 的 _warn 走这条路）。
-    console.error("[py]", d.toString());
-    broadcast("py-push", { method: "log", params: { line: d.toString(), tag: "err" } });
+    const text = d.toString();
+    console.error("[py]", text);
+    broadcast("py-push", { method: "log", params: { line: text, tag: stderrTag(text) } });
   });
 
   py.on("exit", (code) => {
