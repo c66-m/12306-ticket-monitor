@@ -65,6 +65,8 @@ export function writeExpiredDismissed(on) {
 // 两层防重：_expiredDialogOpen 防同时叠加；_expiredDismissed 记住「用户已点稍后」，
 // 本次失效期间不再打扰（会话恢复后由 refreshSession 复位，下次真失效仍会提示）。
 export function showSessionExpiredDialog(message) {
+  // 头像 doLogin 发起的 relogin 还没返回：用户正在登录，别抢着弹失效弹窗
+  if (S._reloginPending) return;
   if (S._expiredDialogOpen || S._expiredDismissed) return;
   // 刷新 / 重载界面后仍记得「点过稍后」：sessionStorage 是窗口级存储，
   // 关掉软件即失效，所以下次启动仍会正常提示一次。

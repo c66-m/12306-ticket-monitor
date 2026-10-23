@@ -678,15 +678,19 @@ def _login_locked(timeout_sec=300, stop_event=None):
         # CHECK_URL——探针页已删除，页面本身 30 秒内零导航（实测），
         # 拦截只剩副作用，去掉。
         if need_nav:
-            page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            # 显式 10 秒上限：不设 timeout 吃 Playwright 默认 30 秒，登录页
+            # 资源卡住时窗口半天没动静；超时抛错走既有失败路径，不另加等待。
+            page.goto(LOGIN_URL, timeout=10000, wait_until="domcontentloaded")
         # 登录期间一律不开新页面、不做整页导航：用户正对着登录页扫码，多一个
         # 窗口或一次导航都会打断（2026-10-18 反馈「两个登录页」「页面一直刷新」）。
         # 校验改在登录页内用同源 fetch 完成（_page_session_ok）：零窗口、零导航。
         deadline = time.time() + timeout_sec
         next_fast = 0.0   # 有登录信号时的校验节拍（2 秒）
         # 无信号时的兜底节拍：12306 改版导致 tk Cookie 没落地时靠它兜住。
-        # 推迟启动给扫码留安静时间（生产 20 秒；短超时按一半缩短，测试仍覆盖）。
-        next_slow = time.time() + min(20.0, timeout_sec / 2.0)
+        # 推迟启动给扫码留安静时间（生产 5 秒；短超时按一半缩短，测试仍覆盖）。
+        # 曾是 20 秒：改版无 tk 时用户登完要干等十几秒才被识别，和快信号的
+        # 1~2 秒形成两个世界，5 秒起兜、之后仍每 15 秒一探。
+        next_slow = time.time() + min(5.0, timeout_sec / 2.0)
         miss = 0          # 校验连续抛异常的次数（页面被关 / 被导航走）
         ok, who = False, ""
         while time.time() < deadline:

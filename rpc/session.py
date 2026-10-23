@@ -42,7 +42,8 @@ def reset_session_cache():
     _SESSION_CACHE["at"] = 0.0
     _SESSION_CACHE["res"] = None
 
-def _probe_browser_session():
+def _probe_browser_session(verify_timeout=None, verify_retries=None,
+                           skip_recheck=False):
     """浏览器模式的会话探测。
 
     快路用 .browser_state.json 的 cookie 直接打校验接口（约 0.6 秒，不碰浏览器）；
@@ -50,6 +51,11 @@ def _probe_browser_session():
     会回风控页，拿快路的下线结论直接报「未登录」就是本 bug 的镜像。真实浏览器校验
     要抢 profile 锁（引擎正在登录/下单时抢不到），所以只留给确认环节，抢不到就返回
     unknown：这不是掉线的证据。
+
+    verify_timeout/verify_retries：透传给 verify_session，None 即默认口径；
+    skip_recheck：登录路径专用 —— 快路已明确判失效时跳过无头复核，调用方
+    马上要开可见登录窗，冷启一次无头浏览器纯属重复劳动（慢两道冷启）；
+    展示/看门狗路径不传，复核保留（它防的是误报「未登录」）。
     """
     if not os.path.exists(browser_order.STATE_PATH):
         # 从没登录过：这是明确的未登录，不是「没验成」
@@ -60,12 +66,18 @@ def _probe_browser_session():
     except Exception as e:
         return {"ok": False, "unknown": True, "permanent": False,
                 "message": str(e), "name": ""}
-    ok, msg, permanent = order_mod.verify_session(sess)
+    ok, msg, permanent = order_mod.verify_session(
+        sess,
+        timeout=15 if verify_timeout is None else verify_timeout,
+        retries=3 if verify_retries is None else verify_retries)
     if ok:
         return {"ok": True, "unknown": False, "permanent": True,
                 "message": str(msg or ""), "name": str(msg or "")}
     if not permanent:
         return {"ok": False, "unknown": True, "permanent": False,
+                "message": str(msg or ""), "name": ""}
+    if skip_recheck:
+        return {"ok": False, "unknown": False, "permanent": True,
                 "message": str(msg or ""), "name": ""}
     if browser_order.busy():
         return {"ok": False, "unknown": True, "permanent": False,
@@ -89,11 +101,15 @@ def _probe_browser_session():
     return {"ok": False, "unknown": True, "permanent": False,
             "message": detail, "name": ""}
 
-def probe_session(force=False):
+def probe_session(force=False, verify_timeout=None, verify_retries=None,
+                  skip_recheck=False):
     """当前登录态 {ok, unknown, permanent, message, name}。
 
     unknown=True 表示这一轮没验成（浏览器忙 / 风控 / 网络），前端据此保留上一次
     结论，而不是把有效会话显示成「未登录」。force=True 走真实浏览器校验。
+    verify_timeout/verify_retries/skip_recheck 只供登录预检（rpc_relogin）
+    提速用：限时单次校验、判失效跳过无头复核；看门狗/展示路径不传，保持
+    默认口径（15 秒 × 3 次 + 真浏览器复核）。
     """
     now = time.time()
     if (not force and _SESSION_CACHE["res"] is not None
@@ -101,7 +117,10 @@ def probe_session(force=False):
         return _SESSION_CACHE["res"]
     if (load_config().get("order_mode") or "http") != "browser":
         try:
-            ok, msg, permanent = order_mod.verify_session(order_mod.load_session())
+            ok, msg, permanent = order_mod.verify_session(
+                order_mod.load_session(),
+                timeout=15 if verify_timeout is None else verify_timeout,
+                retries=3 if verify_retries is None else verify_retries)
         except Exception as e:
             res = {"ok": False, "unknown": False, "permanent": True,
                    "message": str(e), "name": ""}
@@ -110,7 +129,9 @@ def probe_session(force=False):
                    "permanent": bool(permanent), "message": str(msg or ""),
                    "name": str(msg or "") if ok else ""}
     else:
-        res = _probe_browser_session()
+        res = _probe_browser_session(verify_timeout=verify_timeout,
+                                     verify_retries=verify_retries,
+                                     skip_recheck=skip_recheck)
     # 两种模式共用缓存：http 的 3×15s 校验不能被前端与看门狗每 60s 各打一遍
     _SESSION_CACHE["at"] = time.time()
     _SESSION_CACHE["res"] = res
@@ -126,6 +147,11 @@ def _session_watch_step(res):
         _SESSION_WATCH["expired_pushed"] = False
         return False, 60
     if res.get("unknown") or not res.get("permanent"):
+        return False, 60
+    if _LOGIN_GUARD.locked():
+        # 登录正在进行（预检或登录窗已开）：用户已经在处理这件事，再推
+        # 「登录已失效」弹窗只会和登录动作打架。不推、也不消耗一次性边沿——
+        # 登录结束（guard 释放）后会话仍失效的话，下一轮照常推。
         return False, 60
     if not _SESSION_WATCH["expired_pushed"]:
         _SESSION_WATCH["expired_pushed"] = True
@@ -179,7 +205,12 @@ def rpc_relogin(p):
     try:
         if not p.get("force"):
             try:
-                res = probe_session(force=True)
+                # 预检只是为了省掉「会话还活着」时白开的窗口，慢和失败都不许
+                # 挡住开窗：限时单次校验（默认口径最坏约 47 秒），判失效跳过
+                # 无头复核直接开窗；验不成（unknown/异常）同样继续开窗，由
+                # login() 自己判定登录结果。
+                res = probe_session(force=True, verify_timeout=5, verify_retries=1,
+                                    skip_recheck=True)
             except Exception as e:
                 _warn("重新登录预检", e)
                 res = {}

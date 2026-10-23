@@ -64,7 +64,16 @@ document.addEventListener("keydown", (e) => {
 // 头像 = 登录入口（与会话卡同款）：已登录 → 乘车人，未登录 → 拉起登录
 export async function doLogin() {
   toast("正在检查登录状态…");
-  const r = await call("relogin").catch(() => null);
+  // relogin 未决期间抑制失效弹窗自动弹出：用户刚点了登录，看门狗推送 /
+  // 引擎日志若抢先弹「登录已失效」，两个动作只会互相打架。RPC 一返回就
+  // 清除——窗口开起来之后由后端 _LOGIN_GUARD 期间的推送抑制接棒。
+  S._reloginPending = true;
+  let r;
+  try {
+    r = await call("relogin").catch(() => null);
+  } finally {
+    S._reloginPending = false;
+  }
   if (!r) return;
   if (r.running) { toast(r.message || "登录窗口已经打开了"); return; }
   if (r.already) {          // 会话其实还活着：说清楚，别拉窗口让用户看它一闪而过

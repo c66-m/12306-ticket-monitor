@@ -3483,6 +3483,142 @@ class TestReloginSingleFlight(unittest.TestCase):
                                  "登录收尾后 guard 必须复位，否则再也登不上")
 
 
+class TestVerifySessionFastParams(unittest.TestCase):
+    """verify_session 的 timeout/retries 参数：默认口径不变，登录预检可限时单次。
+
+    背景：默认 3 次 × timeout 15 秒 + sleep，最坏约 47 秒。rpc_relogin 的
+    预检若照默认口径跑，用户点完登录要先干等近一分钟才开窗。
+    """
+
+    class _BusySession:
+        """永远回非 JSON 繁忙页的假会话，记录每次 get 用的 timeout。"""
+
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, timeout=None):
+            self.calls.append(timeout)
+            resp = mock.Mock()
+            resp.text = "<html>系统繁忙</html>"
+            resp.headers = {}
+            resp.url = "https://kyfw.12306.cn/otn/leftTicket/init"
+            return resp
+
+    def _verify(self, sess, **kw):
+        import types
+        import order
+        # sleep 换成空转：3 次重试的 1.2 秒间隔别让用例真等
+        with mock.patch.object(order, "time",
+                               types.SimpleNamespace(sleep=lambda _s: None)):
+            return order.verify_session(sess, **kw)
+
+    def test_default_is_three_attempts_timeout_15(self):
+        sess = self._BusySession()
+        ok, _who, permanent = self._verify(sess)
+        self.assertFalse(ok)
+        self.assertFalse(permanent, "繁忙页是临时故障，不能判失效")
+        self.assertEqual(sess.calls, [15, 15, 15], "默认口径必须保持 3 次 × 15 秒")
+
+    def test_fast_params_single_attempt_timeout_5(self):
+        sess = self._BusySession()
+        ok, _who, permanent = self._verify(sess, timeout=5, retries=1)
+        self.assertFalse(ok)
+        self.assertFalse(permanent)
+        self.assertEqual(sess.calls, [5], "登录预检：单次、5 秒，不许再拖 47 秒")
+
+
+class TestReloginPrecheckFast(unittest.TestCase):
+    """rpc_relogin 预检必须走快速口径：限时单次 + 跳过无头复核。
+
+    旧口径：probe_session(force=True) → verify_session 默认 3×15 秒、判失效
+    再冷启一次无头浏览器 check_session 复核，两道慢工序串在开窗之前。
+    """
+
+    def test_relogin_precheck_passes_fast_params(self):
+        import api
+        with mock.patch.object(api, "probe_session",
+                               return_value={"ok": True, "name": "王小明"}) as pr, \
+             mock.patch.object(api, "push"):
+            res = api.rpc_relogin({})
+        self.assertTrue(res.get("already"))
+        _args, kwargs = pr.call_args
+        self.assertTrue(kwargs.get("force"))
+        self.assertEqual(kwargs.get("verify_timeout"), 5)
+        self.assertEqual(kwargs.get("verify_retries"), 1)
+        self.assertTrue(kwargs.get("skip_recheck"),
+                        "判失效要跳过无头复核直接开窗")
+
+    def test_http_probe_threads_fast_params_to_verify(self):
+        from rpc import session as sm
+        sm.reset_session_cache()
+        seen = {}
+
+        def _fake_verify(_sess, timeout=None, retries=None):
+            seen["timeout"] = timeout
+            seen["retries"] = retries
+            return False, "接口返回 status=false", True
+
+        with mock.patch.object(sm, "load_config",
+                               return_value={"order_mode": "http"}), \
+             mock.patch.object(sm.order_mod, "load_session", return_value=object()), \
+             mock.patch.object(sm.order_mod, "verify_session",
+                               side_effect=_fake_verify):
+            sm.probe_session(force=True, verify_timeout=5, verify_retries=1)
+        self.assertEqual(seen, {"timeout": 5, "retries": 1})
+
+    def test_http_probe_default_params_unchanged(self):
+        from rpc import session as sm
+        sm.reset_session_cache()
+        seen = {}
+
+        def _fake_verify(_sess, timeout=None, retries=None):
+            seen["timeout"] = timeout
+            seen["retries"] = retries
+            return True, "王小明", True
+
+        with mock.patch.object(sm, "load_config",
+                               return_value={"order_mode": "http"}), \
+             mock.patch.object(sm.order_mod, "load_session", return_value=object()), \
+             mock.patch.object(sm.order_mod, "verify_session",
+                               side_effect=_fake_verify):
+            res = sm.probe_session(force=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual(seen, {"timeout": 15, "retries": 3},
+                         "看门狗/展示路径必须保持默认口径")
+
+
+class TestLoginSkipsBrowserRecheck(unittest.TestCase):
+    """登录路径判失效跳过无头复核；展示路径保留复核（防误报未登录）。"""
+
+    def _probe(self, **kw):
+        from rpc import session as sm
+        sm.reset_session_cache()
+        with mock.patch.object(sm, "load_config",
+                               return_value={"order_mode": "browser"}), \
+             mock.patch.object(sm.os.path, "exists", return_value=True), \
+             mock.patch.object(sm.order_mod, "session_from_browser_state",
+                               return_value=object()), \
+             mock.patch.object(sm.order_mod, "verify_session",
+                               return_value=(False, "未登录", True)), \
+             mock.patch.object(sm.browser_order, "busy", return_value=False), \
+             mock.patch.object(sm.browser_order, "check_session",
+                               return_value=(False, "已跳转登录门户")) as cs:
+            return sm.probe_session(force=True, **kw), cs
+
+    def test_login_path_skips_recheck(self):
+        res, cs = self._probe(skip_recheck=True)
+        cs.assert_not_called()
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["unknown"])
+        self.assertTrue(res["permanent"])
+
+    def test_display_path_keeps_recheck(self):
+        res, cs = self._probe()
+        cs.assert_called_once()
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["permanent"])
+
+
 class _FakePage:
     def __init__(self):
         self.url = "about:blank"
@@ -3567,6 +3703,46 @@ class TestLoginPollLoopIdle(unittest.TestCase):
         return d
 
 
+class TestLoginSlowProbeLead(unittest.TestCase):
+    """无 tk 信号时的兜底探测：首次推迟 5 秒（曾是 20 秒），之后每 15 秒。
+
+    背景：12306 改版让 tk Cookie 不落地时，登录成功只能靠兜底探测识别；
+    20 秒起兜意味着用户明明登完了还要干等十几秒才被认出来，慢全卡在这。
+    """
+
+    def test_first_slow_probe_fires_at_about_5_seconds(self):
+        import browser_order as bo
+        clock = _FakeClock()
+        probes = []
+
+        def _probe(_page):
+            probes.append(clock.now)
+            return False, ""
+
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "slow.lock"))
+        try:
+            with mock.patch.object(bo, "time", clock), \
+                    mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: _FakeCtx()), \
+                    mock.patch.object(bo, "_page_session_ok", _probe), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertFalse(bo.login(timeout_sec=60))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertTrue(probes, "60 秒内兜底探测必须至少跑一次")
+        self.assertLess(probes[0] - 1000.0, 15,
+                        "首次兜底探测应在约 5 秒处（旧口径 20 秒）：%r" % (probes,))
+        self.assertGreaterEqual(len(probes), 3,
+                                "首次之后应按 15 秒间隔继续兜底：%r" % (probes,))
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_slow_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
 class _RecordingPage(_FakePage):
     def __init__(self):
         _FakePage.__init__(self)
@@ -3604,6 +3780,27 @@ class TestLoginGotoFastLoad(unittest.TestCase):
         self.assertEqual(page.gotos[0][0], bo.LOGIN_URL)
         self.assertEqual(page.gotos[0][1].get("wait_until"), "domcontentloaded",
                          "登录页导航别等 load，否则窗口白屏")
+
+    def test_login_page_goto_has_explicit_timeout(self):
+        import browser_order as bo
+        page = _RecordingPage()
+        ctx = _FakeCtx()
+        ctx.pages = [page]
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "goto2.lock"))
+        try:
+            with mock.patch.object(bo, "launch", lambda _p, headless=False, extra_args=None: ctx), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
+                    mock.patch.object(bo, "save_state", lambda _ctx: None), \
+                    mock.patch.object(bo, "_log"), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                self.assertTrue(bo.login(timeout_sec=5))
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertEqual(page.gotos[0][1].get("timeout"), 10000,
+                         "登录页导航必须显式限时 10 秒，别吃默认 30 秒")
 
     def _tmp(self):
         d = tempfile.mkdtemp(prefix="t12306_goto_")
@@ -3803,6 +4000,38 @@ class TestExpiredDialogReloginForce(unittest.TestCase):
                       "弹窗「立即登录」必须带 force，否则先跑一轮注定失败的预检")
 
 
+class TestReloginPendingSuppressesDialog(unittest.TestCase):
+    """doLogin 的 relogin 未决期间，失效弹窗不得自动弹出。
+
+    用户点了头像登录、后端还在预检/开窗时，看门狗 sessionExpired 推送或
+    引擎日志若抢先弹「登录已失效」，两个动作互相打架（用户反馈）。doLogin
+    置 S._reloginPending，showSessionExpiredDialog 入口检查；relogin 返回
+    即清除，弹窗自带的「立即登录」路径不受影响。
+    """
+
+    def test_dologin_sets_and_clears_pending_flag(self):
+        with open(os.path.join(HERE, "ui", "app.js"), encoding="utf-8") as f:
+            js = f.read()
+        m = re.search(r"export async function doLogin\(.*?\n\}", js, re.S)
+        self.assertIsNotNone(m, "ui/app.js 里找不到 doLogin")
+        body = m.group(0)
+        self.assertIn("S._reloginPending = true", body)
+        self.assertIn("S._reloginPending = false", body,
+                      "relogin 结束必须清除 pending，否则之后永不弹失效窗")
+        self.assertLess(body.index("S._reloginPending = true"),
+                        body.index('call("relogin")'),
+                        "置位必须在发 relogin 之前")
+
+    def test_dialog_checks_pending_flag(self):
+        with open(os.path.join(HERE, "ui", "components", "session.js"),
+                  encoding="utf-8") as f:
+            js = f.read()
+        m = re.search(r"function showSessionExpiredDialog\(.*?\n\}", js, re.S)
+        self.assertIsNotNone(m, "ui/components/session.js 里找不到 showSessionExpiredDialog")
+        self.assertIn("S._reloginPending", m.group(0),
+                      "弹窗入口必须检查 doLogin 的 pending 标志")
+
+
 class TestSlowEndpointTuning(unittest.TestCase):
     """两处针对 12306 慢响应的确定性调优（2026-10-17 本机实测）。
 
@@ -3883,6 +4112,37 @@ class TestSessionWatchStep(TempDirCase):
             {"ok": False, "unknown": True, "permanent": False, "message": "浏览器正忙"})
         self.assertFalse(p)
         self.assertEqual(d, 60)
+
+
+class TestSessionWatchLoginGuard(unittest.TestCase):
+    """登录进行中（_LOGIN_GUARD 持有），看门狗不得推 sessionExpired。
+
+    用户点了登录、后端还在预检/开窗时抢先弹「登录已失效」，两个动作互相
+    打架。抑制不消耗一次性边沿：登录结束（guard 释放）后会话仍失效，
+    下一轮照常推。
+    """
+
+    BAD = {"ok": False, "unknown": False, "permanent": True,
+           "message": "已跳转登录门户"}
+
+    def test_no_push_while_login_inflight(self):
+        import api
+        api._SESSION_WATCH["expired_pushed"] = False
+        acquired = api._LOGIN_GUARD.acquire(blocking=False)
+        self.assertTrue(acquired, "guard 应空闲（前序用例不得泄漏登录锁）")
+        try:
+            push_now, delay = api._session_watch_step(self.BAD)
+            self.assertFalse(push_now, "登录进行中不得推失效弹窗")
+            self.assertEqual(delay, 60)
+            self.assertFalse(api._SESSION_WATCH["expired_pushed"],
+                             "抑制不能消耗一次性边沿")
+        finally:
+            api._LOGIN_GUARD.release()
+        try:
+            push_now, _delay = api._session_watch_step(self.BAD)
+            self.assertTrue(push_now, "登录结束后仍失效必须照常推")
+        finally:
+            api._SESSION_WATCH["expired_pushed"] = False
 
 
 class TestArmedPrepareLead(TempDirCase):

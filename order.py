@@ -315,16 +315,19 @@ def session_from_browser_state(state_path=None):
     return s
 
 
-def verify_session(session):
+def verify_session(session, timeout=15, retries=3):
     """校验会话是否有效。返回 (ok, who, permanent)：
     - ok=True：会话有效
     - permanent=True：确认会话已失效（跳转登录页 / 接口明确未登录）
     - permanent=False：临时故障（网络异常/非 JSON 响应，如系统繁忙页），稍后重试即可
-    非 JSON 响应会重试 3 次，避免把 12306 的临时繁忙误判成登录失效。"""
+    非 JSON 响应会重试 retries 次，避免把 12306 的临时繁忙误判成登录失效。
+    timeout/retries 默认即现行口径（15 秒 × 3 次，最坏约 47 秒）；登录预检
+    这类「慢了就该放行」的路径传小值（如 timeout=5, retries=1），别让校验
+    本身把开窗拖住。"""
     last_err = "未知错误"
-    for _ in range(3):
+    for _ in range(retries):
         try:
-            r = session.get(CHECK_URL, timeout=15)
+            r = session.get(CHECK_URL, timeout=timeout)
             text = r.text or ""
             if text.lstrip().startswith("{") or "json" in r.headers.get("Content-Type", ""):
                 data = r.json()
