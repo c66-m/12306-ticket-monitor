@@ -394,6 +394,11 @@ TASK_DEFAULTS_DEF = {"auto_order": True, "stop_after_order": True, "notify": Tru
 
 def _task_defaults(cfg):
     raw = cfg.get("task_defaults") or {}
+    if not isinstance(raw, dict):
+        # task_defaults 被手改成 list/字符串时按无自定义处理：缺省全开的
+        # 口径不变，不许 raw.get 抛 AttributeError 连带 createTask /
+        # saveSettings 一并失效（深审第 5 条）
+        raw = {}
     out = {}
     for k, v in TASK_DEFAULTS_DEF.items():
         val = raw.get(k)

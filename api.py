@@ -228,6 +228,14 @@ def rpc_dispatch(line, threaded=False):
         return
     id_ = msg.get("id")
     method = msg.get("method") or ""
+    if not isinstance(method, str):
+        # method 非字符串（数字/对象/数组）：旧代码在 METHODS.get 处抛
+        # unhashable TypeError、或在 "未知方法：" + method 处抛 TypeError，
+        # 冒泡出 stdin 主循环带崩整个后端进程（深审第 4 条）。与非对象载荷
+        # 同口径回 bad_request；evidence 只放原因类别，不回显 method 原值。
+        reply(id_, error="method 必须是字符串", code="bad_request",
+              evidence={"reason": "bad_method_type"})
+        return
     params = msg.get("params") or {}
     # 旧名直连（前端现状）或命名空间入口（tasks.list 风格，P4-B 新增契约）
     fn = METHODS.get(method) or _NS_METHODS.get(method)
@@ -279,7 +287,15 @@ def main():
                      "tag": "err"})
     push("ready", {"pid": os.getpid()})
     for line in sys.stdin:
-        rpc_dispatch(line, threaded=True)
+        try:
+            rpc_dispatch(line, threaded=True)
+        except Exception as e:
+            # 纵深防御：分发层已对坏输入逐项兜底，这里再兜一层——单行异常
+            # 绝不许杀进程，记台账后继续读下一行（深审第 4 条）。
+            traceback.print_exc(file=sys.stderr)
+            logutil.append_problem("ERROR", "api.main",
+                                   "%s: %s" % (type(e).__name__, e),
+                                   traceback.format_exc())
 
 
 if __name__ == "__main__":

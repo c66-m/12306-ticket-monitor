@@ -75,6 +75,11 @@ def rpc_delete_grab_task(p):
 # ---------------- 抢票引擎 ----------------
 
 _grabbers = {}  # id -> Grabber
+# 注册表锁：stdin 分发线程、armed 守护线程、ticker 三方并发读写。旧代码
+# 「查活→新建→注册」非原子，同秒双 start 会各建一个 Grabber，后写覆盖
+# 先者成停不到、结果无人消费的孤儿线程；ticker 的 del 还可能误删刚被
+# 新一轮 start 换上的新实例（深审第 6 条）。
+_grabbers_lock = threading.Lock()
 
 def rpc_start_grab(p):
     tid = p.get("id")
@@ -82,17 +87,23 @@ def rpc_start_grab(p):
     task = next((t for t in tasks if t.get("id") == tid), None)
     if not task:
         return {"ok": False, "error": "抢票任务不存在"}
-    g = _grabbers.get(tid)
-    if g and g.is_alive():
-        return {"ok": False, "error": "任务已在抢票中"}
-    g = grabber.Grabber(dict(task))
-    g.start()
-    _grabbers[tid] = g
+    # 查活+构造+启动+注册在锁内原子完成（与 start_engine 的
+    # _engine_start_lock 同口径）。Grabber.__init__ 只做本地状态初始化，
+    # 登录/预热都在它自己的线程里，构造不含网络等待，锁持有时间短；
+    # 故不走「占位→锁外构造→替换」的复杂方案。
+    with _grabbers_lock:
+        g = _grabbers.get(tid)
+        if g and g.is_alive():
+            return {"ok": False, "error": "任务已在抢票中"}
+        g = grabber.Grabber(dict(task))
+        g.start()
+        _grabbers[tid] = g
     return {"ok": True}
 
 def rpc_stop_grab(p):
     tid = p.get("id")
-    g = _grabbers.get(tid)
+    with _grabbers_lock:
+        g = _grabbers.get(tid)
     if g:
         g.stop()
         return {"ok": True}
@@ -121,35 +132,43 @@ def rpc_grab_ticker(_p):
             if t.get("result_reason"):
                 item["result_reason"] = t["result_reason"]
         if g and not g.is_alive() and g.result is not None:
-            ok, msg = g.result
-            reason = getattr(g, "result_reason", None)
-            item["result_ok"] = bool(ok)
-            item["result_msg"] = msg or ""
-            item["result_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-            if reason:
-                item["result_reason"] = reason
-            del _grabbers[tid]
-            # 状态 + 结果落盘（与 gui._tick 同逻辑：成功/失败回写任务库）
-            # B2：待核对（reason="ambiguous"）是独立终态，落 status="ambiguous"，
-            # 不回落 idle 按普通失败展示；普通结局清掉上一轮的待核对标记。
-            t["status"] = "ok" if ok else (
-                "ambiguous" if reason == "ambiguous" else "idle")
-            t["result_ok"] = bool(ok)
-            t["result_msg"] = msg or ""
-            t["result_at"] = item["result_at"]
-            if reason:
-                t["result_reason"] = reason
-            else:
-                t.pop("result_reason", None)
-            try:
-                tasks = grabber.load_grab_tasks()
-                for i, x in enumerate(tasks):
-                    if x.get("id") == tid:
-                        tasks[i] = t
-                        break
-                grabber.save_grab_tasks(tasks)
-            except Exception as e:
-                _warn("抢票结果回写任务库", e)
+            # 删除前在锁内校验注册表里仍是自己取到的这个实例：取 g 之后
+            # 用户可能已手动重开抢、新实例已注册——误删新实例会让它成
+            # 孤儿，旧结果回写还会覆盖新一轮的任务记录（深审第 6 条）。
+            # 不是同一实例时本轮不消费，旧结果直接丢弃。
+            with _grabbers_lock:
+                registered = _grabbers.get(tid) is g
+                if registered:
+                    del _grabbers[tid]
+            if registered:
+                ok, msg = g.result
+                reason = getattr(g, "result_reason", None)
+                item["result_ok"] = bool(ok)
+                item["result_msg"] = msg or ""
+                item["result_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                if reason:
+                    item["result_reason"] = reason
+                # 状态 + 结果落盘（与 gui._tick 同逻辑：成功/失败回写任务库）
+                # B2：待核对（reason="ambiguous"）是独立终态，落 status="ambiguous"，
+                # 不回落 idle 按普通失败展示；普通结局清掉上一轮的待核对标记。
+                t["status"] = "ok" if ok else (
+                    "ambiguous" if reason == "ambiguous" else "idle")
+                t["result_ok"] = bool(ok)
+                t["result_msg"] = msg or ""
+                t["result_at"] = item["result_at"]
+                if reason:
+                    t["result_reason"] = reason
+                else:
+                    t.pop("result_reason", None)
+                try:
+                    tasks = grabber.load_grab_tasks()
+                    for i, x in enumerate(tasks):
+                        if x.get("id") == tid:
+                            tasks[i] = t
+                            break
+                    grabber.save_grab_tasks(tasks)
+                except Exception as e:
+                    _warn("抢票结果回写任务库", e)
         st = grabber_utils.parse_dt(str(t.get("start_time") or ""))
         armed = bool(st and st > now)
         item["armed"] = armed
@@ -175,7 +194,8 @@ def rpc_grab_ticker(_p):
 
 def rpc_grab_result(p):
     tid = p.get("id")
-    g = _grabbers.get(tid)
+    with _grabbers_lock:
+        g = _grabbers.get(tid)
     if not g:
         return {"result": None}
     return {"result": getattr(g, "result", None)}

@@ -22,6 +22,36 @@ import appcommon
 
 # ---------------- RPC 方法 ----------------
 
+# 子结构形状告警去重：config/state 是官方支持用户手改的文件，坏形状若每次
+# 轮询（listMonitorTasks 每 2s 一次）都告警会把 stderr 刷爆——按坏法类别
+# 进程内只报一次（深审第 5 条）。
+_SHAPE_WARNED = set()
+
+
+def _warn_shape_once(kind, detail):
+    if kind in _SHAPE_WARNED:
+        return
+    _SHAPE_WARNED.add(kind)
+    _warn("任务数据形状非法已降级", detail)
+
+
+def _task_dicts(cfg):
+    """config.tasks 的 dict 条目视图：非列表按空表；非 dict 条目跳过并
+    一次性告警。核心 RPC 不许因一处手误恒崩、无降级无定位。"""
+    raw = cfg.get("tasks") or []
+    if not isinstance(raw, list):
+        _warn_shape_once("tasks_not_list",
+                         "tasks 应为列表，实际 %s" % type(raw).__name__)
+        return []
+    out = []
+    for t in raw:
+        if isinstance(t, dict):
+            out.append(t)
+        else:
+            _warn_shape_once("task_entry_not_dict", "条目 %r" % (t,))
+    return out
+
+
 def rpc_list_monitor_tasks(_p):
     cfg = load_config()
     try:
@@ -31,6 +61,15 @@ def rpc_list_monitor_tasks(_p):
         state = {}
     if not isinstance(state, dict):
         state = {}
+    state_tasks = state.get("tasks")
+    if not isinstance(state_tasks, dict):
+        # state.tasks 被手改成 list/字符串时按空表：读不到记录就按任务
+        # 自身状态展示，不许 .get 在字符串/列表上抛 AttributeError 恒崩
+        if state_tasks is not None:
+            _warn_shape_once("state_tasks_not_dict",
+                             "state.tasks 应为对象，实际 %s"
+                             % type(state_tasks).__name__)
+        state_tasks = {}
     # 编辑弹窗要用 code 回填 station-box 的选中态：任务里只存站名
     try:
         _name2code, _code2name = ticket.load_station_map()
@@ -38,9 +77,11 @@ def rpc_list_monitor_tasks(_p):
         _warn("加载车站映射", e)
         _name2code, _code2name = {}, {}
     tasks_out = []
-    for t in cfg.get("tasks") or []:
+    for t in _task_dicts(cfg):
         name = t.get("name", "")
-        rec = (state.get("tasks") or {}).get(name) or {}
+        rec = state_tasks.get(name) or {}
+        if not isinstance(rec, dict):
+            rec = {}
         tasks_out.append({
             "name": name,
             # uid 供前端精确删除/替换：同名任务（改日期后名字不变）只能靠它区分
@@ -194,7 +235,7 @@ def rpc_set_task_status(p):
         # 任意状态落盘会让界面显示 "?"，伪造 success 还会污染历史
         return {"ok": False, "error": "非法任务状态：%s" % status}
     cfg = load_config()
-    task = next((t for t in cfg.get("tasks") or [] if t.get("name") == name), None)
+    task = next((t for t in _task_dicts(cfg) if t.get("name") == name), None)
     if not task:
         return {"ok": False, "error": "任务不存在：" + str(name)}
     if engine_running():
@@ -216,7 +257,7 @@ def rpc_resume_all(_p):
     """全部恢复：把暂停中的任务批量转回 monitoring。"""
     cfg = load_config()
     n = 0
-    for t in cfg.get("tasks") or []:
+    for t in _task_dicts(cfg):
         rpc_set_task_status({"name": t.get("name"), "status": "monitoring", "message": "全部恢复"})
         n += 1
     return {"ok": True, "count": n}
@@ -224,7 +265,7 @@ def rpc_resume_all(_p):
 def rpc_pause_all(_p):
     cfg = load_config()
     n = 0
-    for t in cfg.get("tasks") or []:
+    for t in _task_dicts(cfg):
         rpc_set_task_status({"name": t.get("name"), "status": "paused", "message": "批量暂停"})
         n += 1
     return {"ok": True, "count": n}
@@ -235,9 +276,9 @@ def rpc_delete_task(p):
     task = None
     if uid:
         # 优先按 uid：编辑产生的重复任务名字完全相同，按名字删只能删到第一条
-        task = next((t for t in cfg.get("tasks") or [] if t.get("uid") == uid), None)
+        task = next((t for t in _task_dicts(cfg) if t.get("uid") == uid), None)
     if task is None and name:
-        task = next((t for t in cfg.get("tasks") or [] if t.get("name") == name), None)
+        task = next((t for t in _task_dicts(cfg) if t.get("name") == name), None)
     if not task:
         return {"ok": False, "error": "任务不存在：" + str(uid or name)}
     delete_task_everywhere(None, task)  # app=None → 文件路径清 state
