@@ -102,6 +102,7 @@ body {
 .mtask .ms { flex: 1; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st-monitoring { color: var(--accent); } .st-retrying { color: var(--warn); }
 .st-success { color: var(--ok); } .st-failed { color: var(--err); }
+.st-ambiguous { color: var(--warn); }
 .st-paused, .st-cancelled { color: var(--ink-3); }
 
 /* 日志区 */

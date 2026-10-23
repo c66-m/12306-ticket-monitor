@@ -1284,11 +1284,16 @@ class TestEngineFlow(TempDirCase):
         self.assertTrue(e.state["retry"])
 
     def test_ambiguous_stops_task(self):
-        # 结果未知且官方回读失败(查不到) → 保守停任务交人工
+        # 结果未知且官方回读失败(查不到) → 保守停任务交人工。
+        # B2：终态是独立的「待核对」（ambiguous），不再落 failed——订单可能
+        # 已生成待付款，误报失败会诱导重复下单；历史仍记 result="ambiguous"。
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
                                return_value=("error", "", "官方订单查询失败", None)):
             e = self._run((False, "提交后 90 秒未收到明确结果", {"reason": "ambiguous"}),
-                          expect_status="failed")
+                          expect_status="ambiguous")
+        entry = e.state["tasks"][e.tasks[0]["name"]]
+        self.assertIn("待核对", entry.get("message", ""))
+        self.assertNotIn(entry["status"], engine_mod.ACTIVE_STATUSES)
         hist = json.load(open(e.history_path, encoding="utf-8"))
         self.assertEqual(hist[-1]["result"], "ambiguous")
 
@@ -13346,6 +13351,179 @@ class TestReconcileHistory(TempDirCase):
                          ["2026-10-16 10:00:00", "2026-10-17 15:22:08"])
         self.assertEqual(out[0]["order_no"], "EOLD")
         self.assertEqual(out[0]["result"], "success")
+
+
+class TestB2AmbiguousTerminal(TempDirCase):
+    """修复B2：下单回读不确认不再误报 failed——终态层「待核对」+ 对账兜底。
+
+    (a) grabber：ambiguous 回读不确认 → result_reason="ambiguous" 独立结局，
+        停抢不重试，文案含待核对/勿重复下单；
+    (b) engine/task_sm：新状态词 ambiguous 是终态、标签「待核对」；
+    (c) rpc_grab_ticker：待核对结局落盘 status="ambiguous" 而非 idle；
+    (d) rpc.orders._classify_session 接通：_reconcile_tick 真正跑一轮对账，
+        不再每轮 NameError 被吞成「本轮跳过」。
+    """
+
+    # ---- (a) grabber 侧 ----
+
+    def _make_grabber(self):
+        import queue
+        lc = {"from": "北京", "to": "上海", "date": "2026-10-10",
+              "trains": ["G101"], "seat_types": ["二等座"],
+              "seat_priority": "", "passenger_names": ["张三"]}
+        g = grabber.Grabber(lc, logq=queue.Queue())
+        g._log = g.logq.put  # 不写真实日志文件
+        waits = []
+        g.stop_event = mock.Mock()
+        g.stop_event.is_set.return_value = False
+
+        def fake_wait(s):
+            waits.append(s)
+            return len(waits) >= 10  # 兜底停转，防测试无限循环
+        g.stop_event.wait.side_effect = fake_wait
+        return g
+
+    def test_grabber_ambiguous_unconfirmed_is_pending_check(self):
+        import contextlib
+        g = self._make_grabber()
+        train = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
+                 "start_time": "08:00", "available_seats": {"二等座": "有"}}
+        order_ret = (False, "提交后未收到明确结果", {"reason": "ambiguous"})
+        attempts = []
+
+        def fake_order(*a, **k):
+            attempts.append(1)
+            return order_ret
+        with contextlib.ExitStack() as stack:
+            p = stack.enter_context
+            p(mock.patch.object(ticket, "load_station_map",
+                                return_value=({"北京": "BJP", "上海": "SHH"},
+                                              {"BJP": "北京", "SHH": "上海"})))
+            p(mock.patch.object(grabber.browser_order, "busy",
+                                return_value=False))
+            p(mock.patch.object(grabber.browser_order, "check_session",
+                                return_value=(True, "user")))
+            p(mock.patch.object(ticket, "query_tickets",
+                                return_value=[{"row": 1}]))
+            p(mock.patch.object(ticket, "parse_row", return_value=train))
+            p(mock.patch.object(ticket, "seat_candidates_for",
+                                return_value=["二等座"]))
+            # 新旧两条下单链共用一个计数：无论走哪条，下单尝试总共只许一次
+            p(mock.patch.object(grabber.browser_order, "order_via_browser",
+                                side_effect=fake_order))
+            p(mock.patch.object(grabber.orderflow, "run_orderflow",
+                                side_effect=fake_order))
+            p(mock.patch.object(
+                grabber.order_mod, "classify_with_time",
+                return_value=("error", "", "官方订单查询失败", None)))
+            g._run()
+        self.assertIsNotNone(g.result)
+        ok, msg = g.result
+        self.assertFalse(ok)
+        # 独立待核对结局：机器可读标记 + 文案口径
+        self.assertEqual(g.result_reason, "ambiguous")
+        self.assertIn("待核对", msg)
+        self.assertIn("未支付订单", msg)
+        self.assertIn("勿重复下单", msg)
+        # 绝不自动重试下单：下单只发生一次
+        self.assertEqual(len(attempts), 1)
+
+    def test_grabber_plain_failure_has_no_pending_check_mark(self):
+        # 对照：普通明确失败不带待核对标记（标记只属于 ambiguous 结局）
+        g = self._make_grabber()
+        g.result = (False, "同一车次席别连续 5 次下单失败，已自动停止")
+        self.assertIsNone(g.result_reason)
+
+    # ---- (b) 状态词表 / 状态机 ----
+
+    def test_ambiguous_status_is_terminal_in_task_sm(self):
+        from core.state import task_sm
+        self.assertIs(task_sm.from_legacy("ambiguous"), task_sm.TaskStatus.AMBIGUOUS)
+        self.assertEqual(task_sm.to_legacy(task_sm.TaskStatus.AMBIGUOUS), "ambiguous")
+        self.assertTrue(task_sm.is_terminal("ambiguous"))
+        self.assertTrue(task_sm.is_order_blocked("ambiguous"))
+        self.assertTrue(task_sm.can_transition("monitoring", "ambiguous"))
+        self.assertTrue(task_sm.can_transition("retrying", "ambiguous"))
+        # 人工核对后只能手动恢复回监控，不许自动跳成功
+        self.assertTrue(task_sm.can_transition("ambiguous", "monitoring"))
+        self.assertFalse(task_sm.can_transition("ambiguous", "success"))
+        self.assertEqual(engine_mod.STATUS_LABELS["ambiguous"], "待核对")
+        self.assertNotIn("ambiguous", engine_mod.ACTIVE_STATUSES)
+
+    # ---- (c) ticker 落盘 ----
+
+    def test_grab_ticker_persists_ambiguous_outcome(self):
+        import rpc.grab as grab_rpc
+        task = {"id": "t-amb", "name": "待核对任务", "status": "idle",
+                "from": "北京", "to": "上海", "date": "2026-10-10",
+                "start_time": ""}
+        saved = []
+        fake = mock.Mock()
+        fake.is_alive.return_value = False
+        fake.result = (False, "结果未知待核对——请先到 12306 查未支付订单，勿重复下单")
+        fake.result_reason = "ambiguous"
+        with mock.patch.object(grabber, "load_grab_tasks",
+                               return_value=[dict(task)]), \
+             mock.patch.object(grabber, "save_grab_tasks",
+                               side_effect=lambda ts: saved.extend(ts)), \
+             mock.patch.dict(grab_rpc._grabbers, {"t-amb": fake}):
+            out = grab_rpc.rpc_grab_ticker({})
+        item = out["tasks"][0]
+        self.assertEqual(item["result_reason"], "ambiguous")
+        self.assertFalse(item["result_ok"])
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["status"], "ambiguous")
+        self.assertEqual(saved[0]["result_reason"], "ambiguous")
+
+    # ---- (d) 对账守护接通 ----
+
+    def test_classify_session_browser_mode_uses_browser_state(self):
+        import rpc.orders as orders_rpc
+        sentinel = object()
+        with mock.patch.object(orders_rpc, "load_config",
+                               return_value={"order_mode": "browser"}), \
+             mock.patch.object(orders_rpc.order_mod,
+                               "session_from_browser_state",
+                               return_value=sentinel) as m:
+            self.assertIs(orders_rpc._classify_session(), sentinel)
+        m.assert_called_once_with()
+
+    def test_classify_session_http_mode_loads_cookie_session(self):
+        import rpc.orders as orders_rpc
+        sentinel = object()
+        with mock.patch.object(orders_rpc, "load_config", return_value={}), \
+             mock.patch.object(orders_rpc.order_mod, "load_session",
+                               return_value=sentinel) as m:
+            self.assertIs(orders_rpc._classify_session(), sentinel)
+        m.assert_called_once()
+        self.assertTrue(str(m.call_args[0][0]).endswith("session_cookies.json"))
+
+    def test_reconcile_tick_actually_runs(self):
+        # 回归 pin：旧代码 _classify_session 未定义 → 每轮 NameError 被吞成
+        # 「[对账] 本轮跳过」，守护从未运行。现应真正构造 provider 并跑一轮。
+        import rpc.orders as orders_rpc
+        pushes = []
+        report = mock.Mock()
+        report.summary.return_value = "总记录=0 待决=0"
+        runner = mock.Mock()
+        runner.reconcile_once.return_value = report
+        session = mock.Mock()  # SnapshotProvider 只校验带 .post
+        with mock.patch.object(orders_rpc, "load_config",
+                               return_value={"order_mode": "browser"}), \
+             mock.patch.object(orders_rpc.order_mod,
+                               "session_from_browser_state",
+                               return_value=session), \
+             mock.patch("app.reconcile_service.ReconcileRunner",
+                        return_value=runner) as m_runner, \
+             mock.patch.object(orders_rpc, "push",
+                               side_effect=lambda *a, **k: pushes.append(a)):
+            orders_rpc._reconcile_tick()
+        prov = m_runner.call_args[0][0]
+        self.assertIs(prov._session, session)
+        runner.reconcile_once.assert_called_once_with()
+        lines = [a[1]["line"] for a in pushes if len(a) > 1 and a[0] == "log"]
+        self.assertTrue(any("台账对账完成" in ln for ln in lines), lines)
+        self.assertFalse(any("本轮跳过" in ln for ln in lines), lines)
 
 
 class TestHistoryLabelSync(unittest.TestCase):

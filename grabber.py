@@ -236,6 +236,9 @@ class Grabber(threading.Thread):
         self.logq = logq
         self.stop_event = threading.Event()
         self.result = None
+        # B2：结果的机器可读结局标记（None=普通成功/失败；"ambiguous"=结果
+        # 未知待核对）。result 元组形状不变，靠这个旁标记让落盘/UI 区分呈现。
+        self.result_reason = None
 
     def _log(self, msg):
         LOG.info(msg)  # 也落 logs/launcher_*.log：事后排查抢票过程全靠它
@@ -570,9 +573,14 @@ class Grabber(threading.Thread):
                             if self.stop_event.wait(2):
                                 break
                             continue
-                        self.result = (False, "订单提交后结果未知——请先到 12306 查「未支付订单」："
-                                              "有单就支付或取消，确认无单后再重新开抢")
-                        log("[错误] %s（下单返回：%s；官方核验：%s）" % (self.result[1], msg, raw))
+                        # B2：回读不确认 ≠ 失败——订单可能已生成待付款，误报失败
+                        # 会诱导用户重复下单。落独立「待核对」结局：就此停抢、绝不
+                        # 自动重试；本分支直接 return，不走下方 fail_streak 同目标
+                        # 连续失败计数。result_reason 让落盘/UI 按待核对呈现。
+                        self.result_reason = "ambiguous"
+                        self.result = (False, "结果未知待核对——请先到 12306 查未支付订单，"
+                                              "勿重复下单（有单就支付或取消，确认无单后再重新开抢）")
+                        log("[待核对] %s（下单返回：%s；官方核验：%s）" % (self.result[1], msg, raw))
                         return
                     if extra.get("reason") == "dup":
                         if extra.get("dup_kind") == "行程冲突":

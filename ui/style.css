@@ -550,6 +550,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .status.hit, .status.succ { color: var(--ok); background: var(--ok-bg); }
 .status.pause { color: var(--warn); background: var(--warn-bg); }
 .status.fail { color: var(--err); background: var(--err-bg); }
+.status.warn { color: var(--warn); background: var(--warn-bg); }
 .status.canc { color: var(--ink-3); background: color-mix(in srgb, var(--ink) 9%, transparent); }
 
 /* 问题日志页：可点击展开的堆栈块 */
@@ -811,6 +812,7 @@ input[type="range"] { padding: 0; height: 1.2rem; background: transparent; borde
 .g-result i { display: block; font-style: normal; font-size: .72rem; margin-top: .15rem; opacity: .8; }
 .g-result.ok  { color: var(--ok);  background: color-mix(in srgb, var(--ok) 12%, transparent);  border-color: color-mix(in srgb, var(--ok) 32%, transparent); }
 .g-result.err { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); border-color: color-mix(in srgb, var(--err) 32%, transparent); }
+.g-result.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
 
 /* -------- 日志条 -------- */
 .logbar { flex: 0 0 auto; max-height: var(--log-h); display: flex; flex-direction: column; padding: .5rem .7rem; }

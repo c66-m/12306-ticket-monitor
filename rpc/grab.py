@@ -118,17 +118,29 @@ def rpc_grab_ticker(_p):
             item["result_ok"] = bool(t.get("result_ok"))
             item["result_msg"] = t.get("result_msg") or ""
             item["result_at"] = t.get("result_at") or ""
+            if t.get("result_reason"):
+                item["result_reason"] = t["result_reason"]
         if g and not g.is_alive() and g.result is not None:
             ok, msg = g.result
+            reason = getattr(g, "result_reason", None)
             item["result_ok"] = bool(ok)
             item["result_msg"] = msg or ""
             item["result_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            if reason:
+                item["result_reason"] = reason
             del _grabbers[tid]
             # 状态 + 结果落盘（与 gui._tick 同逻辑：成功/失败回写任务库）
-            t["status"] = "ok" if ok else "idle"
+            # B2：待核对（reason="ambiguous"）是独立终态，落 status="ambiguous"，
+            # 不回落 idle 按普通失败展示；普通结局清掉上一轮的待核对标记。
+            t["status"] = "ok" if ok else (
+                "ambiguous" if reason == "ambiguous" else "idle")
             t["result_ok"] = bool(ok)
             t["result_msg"] = msg or ""
             t["result_at"] = item["result_at"]
+            if reason:
+                t["result_reason"] = reason
+            else:
+                t.pop("result_reason", None)
             try:
                 tasks = grabber.load_grab_tasks()
                 for i, x in enumerate(tasks):

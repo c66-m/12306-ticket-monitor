@@ -27,6 +27,26 @@ def _reconcile_update(key, rec):
     except Exception as e:
         _warn("对账写台账", e)
 
+def _classify_session():
+    """按 config 的 order_mode 选官方会话载体，返回 requests.Session。
+
+    本函数补的是 _reconcile_tick 原本想调的会话分类逻辑——与
+    engine.MonitorEngine._classify_session 同款口径（按模式选会话载体）；
+    rpc 侧没有引擎实例，故在本模块实现等价的模块级版本。与 engine 版的
+    差异：engine 在 browser 模式返回 None、由 classify 内部回退读
+    .browser_state.json；而 SnapshotProvider 必须拿到真实 Session（构造
+    时校验 .post），故这里 browser 模式直接 session_from_browser_state()。
+    会话文件缺失等异常向上抛——_reconcile_tick 捕获后按「本轮跳过」审计，
+    符合其「会话可用才跑」的设计（此前未定义此名，每轮必 NameError 被吞，
+    对账守护从未真正运行）。
+    """
+    cfg = load_config()
+    if (cfg.get("order_mode") or "http") == "browser":
+        return order_mod.session_from_browser_state()
+    return order_mod.load_session(
+        appcommon.data_path(
+            cfg.get("session_cookies_file", "session_cookies.json")))
+
 def _reconcile_tick():
     """后台对账守护（P3）：每 5 分钟扫台账未决记录，用官方快照改判。
 

@@ -85,8 +85,9 @@ export function renderGrabGrid(el) {
   el.innerHTML = S.grab.map((t) => {
     const running = t.running;
     const hasRes = t.result_msg !== undefined && t.result_msg !== null && t.result_msg !== "";
-    const st = t.status === "ok" ? "succ" : running ? "run" : "pause";
-    const stLabel = t.status === "ok" ? "已抢到" : running ? "抢票中" : "待命";
+    const amb = t.result_reason === "ambiguous" || t.status === "ambiguous";
+    const st = t.status === "ok" ? "succ" : running ? "run" : amb ? "warn" : "pause";
+    const stLabel = t.status === "ok" ? "已抢到" : running ? "抢票中" : amb ? "待核对" : "待命";
     return '<div class="card glass glass-surface grab-card">' +
       '<div class="sec-head"><h3>' + esc(t.name || t.id) + '</h3><span class="status ' + st + '">' + stLabel + "</span></div>" +
       '<div class="g-count"' + (running ? ' style="color:var(--ok)"' : "") + ">" + esc(t.countdown || "—") + "</div>" +
@@ -94,7 +95,7 @@ export function renderGrabGrid(el) {
       (t.trains && t.trains.length ? " · " + esc(t.trains.join(",")) : "") + "</div>" +
       '<div class="muted">' + esc((t.seat_types || []).join("/") || "未选席别") + (t.armed ? " · 🔔已武装" : "") + (t.auto_fired ? " · ⚡已自动触发" : "") + "</div>" +
       (hasRes
-        ? '<div class="g-result ' + (t.result_ok ? "ok" : "err") + '">' + (t.result_ok ? "✔ " : "✖ ") + esc(t.result_msg) +
+        ? '<div class="g-result ' + (t.result_ok ? "ok" : amb ? "warn" : "err") + '">' + (t.result_ok ? "✔ " : amb ? "⚠ " : "✖ ") + esc(t.result_msg) +
           (t.result_at ? '<i class="muted">' + esc(t.result_at) + "</i>" : "") + "</div>"
         : "") +
       '<div class="form-actions" style="margin-top:10px">' +

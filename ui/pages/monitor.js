@@ -309,6 +309,7 @@ export function taskRow(t, mgr) {
   if (!hitSearch(t.name, t.from, t.to, t.trains.join(","), t.status_label)) return "";
   const st = t.status;
   const cls = st === "success" ? "hit" : st === "failed" ? "fail" : st === "cancelled" ? "canc" :
+    st === "ambiguous" ? "warn" :
     ["monitoring", "retrying"].includes(st) ? "run" : "pause";
   const label = st === "success" ? "已抢到" : t.status_label;
   const route = (t.from && t.to) ? t.from + " → " + t.to : "空任务（无区间）";

@@ -74,6 +74,7 @@ STATUS_LABELS = {
     "cancelled": "已取消",
     "success": "已成功",
     "failed": "已失败",
+    "ambiguous": "待核对",
 }
 STATUS_COLORS = {}  # 预留；控制台不引入颜色库
 
@@ -1192,10 +1193,12 @@ class MonitorEngine(object):
                                 LOG.info("[结果回读] 任务「%s」%s 官方确认无此订单（%s），安全重试",
                                          name, date, cls)
                                 continue
-                            # unpaid 但时间对不上 / blocked / error / unknown：保守停
-                            self.set_task_status(task, "failed",
-                                "订单提交后结果未知——请先到 12306「未支付订单」核对："
-                                "有单就支付/取消，确认无单后再恢复本任务")
+                            # unpaid 但时间对不上 / blocked / error / unknown：保守停。
+                            # B2：落独立终态「待核对」（ambiguous），不再记 failed——
+                            # 订单可能已生成待付款，误报失败会诱导用户重复下单。
+                            self.set_task_status(task, "ambiguous",
+                                "订单提交后结果未知待核对——请先到 12306「未支付订单」核对："
+                                "有单就支付/取消，确认无单后再恢复本任务（勿重复下单）")
                             LOG.error("[警告] 任务「%s」%s %s 提交后结果未知，已停止自动重试",
                                       name, date, train_code)
                             appcommon.append_history(self.history_path, {

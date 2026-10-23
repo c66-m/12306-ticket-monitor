@@ -21,28 +21,34 @@ class TaskStatus(enum.Enum):
     SUCCESS = "success"         # 已成功下单（终态）
     FAILED = "failed"           # 失败/停止（可手动恢复）
     FULFILLED = "fulfilled"     # 已购得（终态，物理拦截下单）
+    AMBIGUOUS = "ambiguous"     # 结果未知待核对（终态，停任务交人工核对）
 
 
 # 合法迁移表：from -> set(to)。表外迁移一律抛 IllegalTransition。
 _TRANSITIONS = {
     TaskStatus.MONITORING: {TaskStatus.COOLING, TaskStatus.RETRYING,
                             TaskStatus.PAUSED, TaskStatus.SUCCESS,
-                            TaskStatus.FAILED, TaskStatus.FULFILLED},
+                            TaskStatus.FAILED, TaskStatus.FULFILLED,
+                            TaskStatus.AMBIGUOUS},
     TaskStatus.COOLING: {TaskStatus.MONITORING, TaskStatus.PAUSED,
                          TaskStatus.SUCCESS, TaskStatus.FAILED,
-                         TaskStatus.FULFILLED},
+                         TaskStatus.FULFILLED, TaskStatus.AMBIGUOUS},
     TaskStatus.RETRYING: {TaskStatus.MONITORING, TaskStatus.COOLING,
                           TaskStatus.PAUSED, TaskStatus.SUCCESS,
-                          TaskStatus.FAILED, TaskStatus.FULFILLED},
+                          TaskStatus.FAILED, TaskStatus.FULFILLED,
+                          TaskStatus.AMBIGUOUS},
     TaskStatus.PAUSED: {TaskStatus.MONITORING, TaskStatus.SUCCESS,
-                        TaskStatus.FAILED, TaskStatus.FULFILLED},
+                        TaskStatus.FAILED, TaskStatus.FULFILLED,
+                        TaskStatus.AMBIGUOUS},
     # 终态：不允许任何迁移（fulfilled 尤其：已购得的任务不允许回到下单路径）
     TaskStatus.SUCCESS: set(),
     TaskStatus.FAILED: {TaskStatus.MONITORING},  # 用户手动恢复才允许
     TaskStatus.FULFILLED: set(),
+    TaskStatus.AMBIGUOUS: {TaskStatus.MONITORING},  # 人工核对后手动恢复才允许（同 FAILED）
 }
 
-_TERMINAL = {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.FULFILLED}
+_TERMINAL = {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.FULFILLED,
+             TaskStatus.AMBIGUOUS}
 
 
 class IllegalTransition(ValueError):
@@ -89,6 +95,7 @@ _LEGACY = {
     "success": TaskStatus.SUCCESS,
     "failed": TaskStatus.FAILED,
     "fulfilled": TaskStatus.FULFILLED,
+    "ambiguous": TaskStatus.AMBIGUOUS,
 }
 
 
