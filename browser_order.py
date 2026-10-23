@@ -348,13 +348,54 @@ def _clear_profile_locks(baseline=None):
             pass
 
 
+def _acquire_locks_sliced(timeout, should_stop):
+    """exclusive 的分片等锁路径：两把锁都按约 1s 一片获取，每片之间检查
+    should_stop，被要求停时抛 RuntimeError 提前退出。总时长仍以 timeout
+    封顶，超时/被占的错误信息与单次阻塞路径完全一致。任一步失败都保证
+    已拿到的锁被释放（与单次路径同口径）。"""
+    deadline = time.monotonic() + max(0.0, timeout)
+
+    def _left():
+        return deadline - time.monotonic()
+
+    def _check_stop():
+        if should_stop():
+            raise RuntimeError(
+                "等待浏览器独占锁期间收到停止信号，已中止本次下单等待")
+
+    while True:
+        _check_stop()
+        if _BROWSER_LOCK.acquire(timeout=min(1.0, max(0.0, _left()))):
+            break
+        if _left() <= 0:
+            raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
+    try:
+        while True:
+            _check_stop()
+            if _PROFILE_LOCK.acquire(timeout=min(1.0, max(0.0, _left()))):
+                break
+            if _left() <= 0:
+                raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），请稍后重试")
+    except BaseException:
+        _BROWSER_LOCK.release()
+        raise
+
+
 @contextlib.contextmanager
-def exclusive(timeout=90):
+def exclusive(timeout=90, should_stop=None):
     """串行化 profile 访问：本进程线程锁 + 跨进程文件锁，拿不到就抛错。
 
     Playwright 的持久化 profile 是独占的。启动器与监控系统分属不同进程，
     只靠 RLock 挡不住——一边下单、另一边开浏览器体检，会把下单的浏览器掐死，
-    报 TargetClosedError: Target page, context or browser has been closed。"""
+    报 TargetClosedError: Target page, context or browser has been closed。
+
+    should_stop（可调用，或带 is_set 的 Event）：传入时等锁改为分片等待
+    （约 1s 一片），每片检查一次停止信号，被要求停时立即抛 RuntimeError
+    退出，不再整段睡满 timeout（旧行为：用户点停止后下单线程还在锁队列
+    里睡最多 180s，界面像「点了停止没反应」）。总等待上限仍是 timeout，
+    超时错误信息不变；不传 should_stop 的调用点保持原单次阻塞语义。"""
+    if should_stop is not None and not callable(should_stop):
+        should_stop = getattr(should_stop, "is_set", None)
     depth = _get_depth()
     if depth:
         # 同线程重入：外层已持有两把锁，直接放行（保留 RLock 语义）
@@ -374,14 +415,17 @@ def exclusive(timeout=90):
     # _LOCK_WAITERS 注释）。拿到两把锁或任一步失败后立即注销。
     waiter = _register_lock_waiter()
     try:
-        if not _BROWSER_LOCK.acquire(timeout=timeout):
-            raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
-        try:
-            if not _PROFILE_LOCK.acquire(timeout=timeout):
-                raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），请稍后重试")
-        except BaseException:
-            _BROWSER_LOCK.release()
-            raise
+        if should_stop is None:
+            if not _BROWSER_LOCK.acquire(timeout=timeout):
+                raise RuntimeError("另一处正在使用浏览器（登录/体检/下单），请稍后重试")
+            try:
+                if not _PROFILE_LOCK.acquire(timeout=timeout):
+                    raise RuntimeError("另一个程序正在使用浏览器（登录/体检/下单），请稍后重试")
+            except BaseException:
+                _BROWSER_LOCK.release()
+                raise
+        else:
+            _acquire_locks_sliced(timeout, should_stop)
     finally:
         _unregister_lock_waiter(waiter)
     _set_depth(1)
@@ -398,7 +442,10 @@ def _exclusive(lock_timeout=150):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             # 允许调用方用 lock_timeout= 覆盖等待上限（如抢票线程不想等 420 秒）
-            with exclusive(timeout=kwargs.pop("lock_timeout", lock_timeout)):
+            # should_stop 只借读给 exclusive 做分片等锁的停止检查，仍原样
+            # 传给被装饰函数（其签名内的同名参数语义不变）。
+            with exclusive(timeout=kwargs.pop("lock_timeout", lock_timeout),
+                           should_stop=kwargs.get("should_stop")):
                 return fn(*args, **kwargs)
         return wrapper
     return deco

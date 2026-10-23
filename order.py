@@ -599,6 +599,24 @@ def _normalize_order_item(item, status):
     }
 
 
+def _request_timeout(deadline_ts, default=15.0):
+    """单个请求的 timeout 与回读总时限联动（审查 N1）。
+
+    R1 的 deadline 只在发请求前检查：单个请求仍可吃满默认 15s，一轮回读
+    的实际耗时能超出总时限一大截。改为 timeout = min(默认, 剩余秒数)；
+    剩余不足 1s 时不再发起新请求，直接抛 RuntimeError 按超限收尾（与
+    check_existing_orders 的 _check_deadline 同口径）。deadline_ts 为
+    None（不设总时限）时返回默认 timeout，行为不变。
+    """
+    if deadline_ts is None:
+        return default
+    left = deadline_ts - time.time()
+    if left < 1.0:
+        raise RuntimeError(
+            "官方订单查询超过回读总时限（剩余 %.1fs，不再发起新请求）" % left)
+    return min(default, left)
+
+
 def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25,
                     deadline_ts=None):
     """新版 queryMyOrder（2026-10 实测参数）。query_where: G=未出行, H=历史。
@@ -613,7 +631,8 @@ def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25,
     实际订单量）。旧代码 pageIndex 恒 "0"，深页订单漏检。
 
     deadline_ts（回读总时限，绝对时刻）：每页请求发出前检查，超限抛
-    RuntimeError 中止——分页预算计入总窗，不让深页把回读拖过总时限。
+    RuntimeError 中止——分页预算计入总窗，不让深页把回读拖过总时限；
+    每页请求的 timeout 本身也经 _request_timeout 与剩余时限联动。
     """
     items = []
     for page in range(max_pages):
@@ -626,7 +645,7 @@ def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25,
                 "queryStartDate": start, "queryEndDate": end,
                 "queryType": "1", "sequeue_train_name": ""}
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrder",
-                         data=data, timeout=15)
+                         data=data, timeout=_request_timeout(deadline_ts))
         batch = ((r.json().get("data") or {}).get("OrderDTODataList") or [])
         items.extend(batch)
         if len(batch) < page_size:
@@ -662,9 +681,10 @@ def check_existing_orders(session, target_date, deadline_ts=None):
     ahead60 = (now_bj + datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     # 未完成订单（未支付）：不分日期车次，12306 规则是任一未完成订单都会挡新单
     _check_deadline("未完成订单")
+    nc_timeout = _request_timeout(deadline_ts)
     try:
         r = session.post("https://kyfw.12306.cn/otn/queryOrder/queryMyOrderNoComplete",
-                         data={"_json_att": ""}, timeout=15)
+                         data={"_json_att": ""}, timeout=nc_timeout)
         # 12306 对「当日取消次数过多」等封禁会返回 orderCacheDTO 而不是
         # orderDBList：message 是挡单原因（如「今日将不能继续受理您的订票
         # 请求」）。漏掉它会让回读误判「官方无此订单」→ 无限重下刷封禁。
@@ -872,11 +892,19 @@ def confirm_order(session, token, left_ticket_str, key_check, train_location,
 
 
 def _confirm_json_with_retry(session, token, left_ticket_str, key_check, train_location,
-                             passenger_ticket_str, old_passenger_str, purpose):
+                             passenger_ticket_str, old_passenger_str, purpose,
+                             date=None, train_code=None, passenger_names=None,
+                             not_before_ts=None):
     """confirmSingleForQueue + 非 JSON transient 重试（最多 3 次）。返回 (ok, msg)。
 
     非 JSON 响应（12306 WAF/网关偶发拦截页）按 transient 处理，重试口径与
     verify_session 一致；网络异常直接抛给调用方（保持旧行为）。
+
+    行程上下文（date/train_code/passenger_names/not_before_ts）齐全时，
+    每次重发前先查一次未完成订单：非 JSON 只说明响应被网关换掉，不代表
+    请求没到 12306——首次请求可能已经落单。同 token 重发只会拿到拒绝，
+    反而把已成的单误判成失败；归因到本次提交的单已存在即按已提交收尾，
+    不再重发。上下文不全的旧调用方不触发查询，保持原重发行为。
     """
     ok, msg = False, ""
     for _ in range(3):
@@ -885,21 +913,35 @@ def _confirm_json_with_retry(session, token, left_ticket_str, key_check, train_l
                                 old_passenger_str, purpose)
         if ok or not msg.startswith("confirmSingleForQueue 返回非 JSON"):
             return ok, msg
+        if date and train_code and not_before_ts is not None:
+            ono = fetch_unpaid_order_no(
+                session, date=date, train_code=train_code,
+                passenger_names=passenger_names, not_before_ts=not_before_ts)
+            if ono:
+                return True, ("订单已提交，处于【未完成订单】状态（未支付）："
+                              "confirm 响应非 JSON，但官方未完成订单已确认"
+                              "本次订单生成，订单号 {0}".format(ono))
         time.sleep(1.2)
     return ok, msg
 
 
 def confirm_with_busy_retry(session, token, left_ticket_str, key_check, train_location,
                             passenger_ticket_str, old_passenger_str, tries, delay,
-                            purpose="ADULT"):
-    """提交排队下单，遇"系统忙"类错误自动重试（间隔递增）。返回 (ok, msg)。"""
+                            purpose="ADULT", date=None, train_code=None,
+                            passenger_names=None, not_before_ts=None):
+    """提交排队下单，遇"系统忙"类错误自动重试（间隔递增）。返回 (ok, msg)。
+
+    行程上下文原样透传给 _confirm_json_with_retry（非 JSON 重发前先查
+    未完成订单，见其 docstring）。
+    """
     msg = ""
     for attempt in range(1, tries + 1):
         try:
-            ok, msg = _confirm_json_with_retry(session, token, left_ticket_str,
-                                               key_check, train_location,
-                                               passenger_ticket_str,
-                                               old_passenger_str, purpose)
+            ok, msg = _confirm_json_with_retry(
+                session, token, left_ticket_str, key_check, train_location,
+                passenger_ticket_str, old_passenger_str, purpose,
+                date=date, train_code=train_code,
+                passenger_names=passenger_names, not_before_ts=not_before_ts)
         except Exception as e:
             return False, "confirmSingleForQueue 异常: {0}".format(e)
         if ok or not is_busy_error(msg) or attempt >= tries:
@@ -1041,7 +1083,12 @@ def order_ticket(config, task, ticket, seat_name, should_stop=None):
                              to_station=ticket.get("to_name"),
                              seat_name=seat_name)
     except Exception as e:
-        print("    [查重异常] {0}（忽略，继续下单）".format(e))
+        # 查重自身异常 = 防重未执行：与上方「官方订单查询失败」同口径
+        # 中止本轮。旧代码只 print 一行（GUI/日志都看不见）后照常继续
+        # 下单，等于防重整层静默失效；且必须 LOG 留痕便于事后定位。
+        LOG.warning("防重复查重异常，本轮下单中止（防重未执行）: %s", e)
+        return False, ("防重复查重异常（{0}），按防重复保守规则中止本次下单，"
+                       "避免重复提交".format(e)), None
     if dup:
         return (False,
                 "账号中已存在相同行程订单（{0} 状态：{1}），按防重复规则跳过".format(
@@ -1061,9 +1108,12 @@ def order_ticket(config, task, ticket, seat_name, should_stop=None):
     # 本次提交动作的开始时刻：用于把官方未完成订单归因到"本次新建"，
     # 有历史未支付单时不再张冠李戴（成功消息里的单号必须是我们刚建的）。
     not_before_ts = time.time()
-    ok3, msg3 = confirm_with_busy_retry(sess, token, left_str, key_check,
-                                        ticket["train_location"], p_ticket_str,
-                                        old_str, tries, delay, purpose)
+    ok3, msg3 = confirm_with_busy_retry(
+        sess, token, left_str, key_check, ticket["train_location"],
+        p_ticket_str, old_str, tries, delay, purpose,
+        date=date, train_code=ticket["train_code"],
+        passenger_names=[p["name"] for p in picked],
+        not_before_ts=not_before_ts)
     if not ok3:
         return False, msg3, None
 

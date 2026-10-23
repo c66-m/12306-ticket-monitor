@@ -337,9 +337,10 @@ class TestJudgeDeadline(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             order_mod._query_my_order(
                 sess, "G", "2026-08-01", "2026-10-01",
-                deadline_ts=time.time() + 0.15)
-        # 每页满 8 条本会继续翻页；deadline 在第 3 页发出前到点 → 只发 2 页
-        self.assertEqual(sess.post.call_count, 2)
+                deadline_ts=time.time() + 1.25)
+        # 每页满 8 条本会继续翻页；剩余时限跌破 1s 后不再发新页（R3/N1：
+        # 单请求 timeout 与 deadline 联动，剩余 <1s 按超限收尾）→ 只发 3 页
+        self.assertEqual(sess.post.call_count, 3)
 
 
 # ---------------------------------------------------------------------------

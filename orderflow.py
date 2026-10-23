@@ -149,7 +149,8 @@ _JUDGE_DEADLINE_SECONDS = 45.0
 
 
 def _judge_official(date, train, passenger_names, t_submit, logger,
-                    retry_rounds=None, retry_interval=None, deadline_seconds=None):
+                    retry_rounds=None, retry_interval=None, deadline_seconds=None,
+                    picked=None):
     """官方订单接口回读（JUDGE）。
 
     unpaid 且下单时间落在本次提交窗口（recent）→ 本次成功（关全部页面后由
@@ -164,6 +165,11 @@ def _judge_official(date, train, passenger_names, t_submit, logger,
     deadline_seconds：回读总时限（默认 _JUDGE_DEADLINE_SECONDS=45s）。
     转成绝对时刻透传 classify_with_time（deadline_ts，三段查询内部截断），
     本函数每轮重试前再核一次总耗时，超限按 error 收尾、不再发起新查询。
+
+    picked：本次实际勾选的乘车人（FILL 阶段 res["picked"]）。成功时写进
+    extra["passengers"]，与 _finish_success 的 entry["picked"] 口径对齐——
+    任务未点名时 picked 是账号默认乘车人，只靠上层任务名单兜底会落空串；
+    不传 picked 时不写该键，留给上层既有兜底。
     """
     if retry_rounds is None:
         retry_rounds = _JUDGE_RETRY_ROUNDS
@@ -184,8 +190,11 @@ def _judge_official(date, train, passenger_names, t_submit, logger,
         _emit(logger, "[流程] JUDGE：官方回读 %s" % _judge_text(judge))
         if cls == "unpaid" and recent:
             order_no = (recent.get("order_no") or ono) if isinstance(recent, dict) else ono
-            return True, "订单已生成（未支付）：官方订单接口回读到本次订单 %s" % order_no, {
-                "flow_judge": judge, "order_no": order_no, "page_kind": "official"}
+            extra = {"flow_judge": judge, "order_no": order_no,
+                     "page_kind": "official"}
+            if picked:
+                extra["passengers"] = "、".join(picked)
+            return True, "订单已生成（未支付）：官方订单接口回读到本次订单 %s" % order_no, extra
         if cls not in ("error", "none") or attempt >= retry_rounds:
             return False, "订单结果未知：官方订单接口回读无法确认本次下单结果", {
                 "reason": "ambiguous", "flow_judge": judge}
@@ -281,6 +290,17 @@ def _finish_dup(url, body, logger):
     return False, body, {"reason": "dup", "dup_kind": dup_kind, "dup_url": url}
 
 
+def _close_page_quietly(page):
+    """收尾关页（异常吞掉）：warm 模式 ctx 长存，失败页（可能停在确认页）
+    不关会一直挂在预热现场里，后续复用时多一张无人看管的页；冷启动由
+    ExitStack 在 return 时统一关，提前关无副作用。关页失败不掩盖原始
+    失败结论，故吞异常。"""
+    try:
+        page.close()
+    except Exception:
+        pass
+
+
 def _reopen_and_order(ctx, info, date, seat_name, seat_code, passenger_names,
                       purpose, alias_name, purpose_map, should_stop, mark, stage, logger):
     """官方回读确认无 dup 后：新开页面从头重下一单（retry_open_times 次）。
@@ -288,12 +308,14 @@ def _reopen_and_order(ctx, info, date, seat_name, seat_code, passenger_names,
     返回 entry dict（成功提交，加入观察列表）或 (ok, msg, extra)（失败直接
     向上报，与主页面失败同语义）。防重复下单的最后防线在共享的
     _run_fill_submit_confirm 内部：它弹「未处理/未支付订单」即 dup 中止。
+    失败分支 return 前先关掉新开的页（见 _close_page_quietly）。
     """
     page = ctx.new_page()
     page.set_default_timeout(20000)
     try:
         _goto_and_query(page, info, date, should_stop=should_stop)
     except Exception as exc:
+        _close_page_quietly(page)
         if _window_dead_exc(exc):
             return False, "浏览器窗口异常关闭: %s: %s" % (
                 type(exc).__name__, str(exc)[:180]), {"reason": "browser_dead"}
@@ -305,6 +327,7 @@ def _reopen_and_order(ctx, info, date, seat_name, seat_code, passenger_names,
         purpose=purpose, alias_name=alias_name, purpose_map=purpose_map,
         should_stop=should_stop, mark=mark, stage_cb=stage)
     if not res["ok"]:
+        _close_page_quietly(page)
         return False, res["msg"], res["extra"]
     _emit(logger, "[流程] HOLD：新开页面重下已提交，新旧页并存各自观察")
     return {"page": page, "t_submit": res["t_submit"], "picked": res["picked"],
@@ -479,7 +502,8 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                             # 不落盘可能拿旧 cookie 把本可确认的订单降级。
                             _save_state_for_judge(ctx, logger)
                             return _judge_official(date, train, passenger_names,
-                                                   e["t_submit"], logger)
+                                                   e["t_submit"], logger,
+                                                   picked=e["picked"])
                     elif snap == "dup":
                         if on_lock:
                             # 锁定页里的「未完成订单」多是过程提示的链接文字，
@@ -496,7 +520,8 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                         _emit(logger, "[流程] JUDGE：网页报下单失败，先官方回读确认")
                         _save_state_for_judge(ctx, logger)
                         ok_f, msg_f, extra_f = _judge_official(
-                            date, train, passenger_names, e["t_submit"], logger)
+                            date, train, passenger_names, e["t_submit"], logger,
+                            picked=e["picked"])
                         if ok_f:
                             return ok_f, msg_f, extra_f
                         cls_f = ((extra_f or {}).get("flow_judge") or {}).get("cls")
@@ -557,7 +582,8 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                 except Exception as exc:
                     _emit(logger, "[流程] 会话落盘失败：%s（官方回读可能读到旧 cookie）" % exc)
                 ok, msg, extra = _judge_official(date, train, passenger_names,
-                                                 t_submit, logger)
+                                                 t_submit, logger,
+                                                 picked=res["picked"])
                 if ok:
                     return ok, msg, extra
                 # 只有官方明确「无单/已取消」才允许重下；error/unknown/blocked/
@@ -587,7 +613,8 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
         # 所有观察页超时退出：JUDGE 兜底（坑 8：交官方回读闭环，上层还会再判）
         stage("JUDGE")
         _save_state_for_judge(ctx, logger)
-        return _judge_official(date, train, passenger_names, t_submit, logger)
+        return _judge_official(date, train, passenger_names, t_submit, logger,
+                               picked=res["picked"])
 
 
 def run_orderflow(info, seat_name, seat_code, passenger_names, date,
