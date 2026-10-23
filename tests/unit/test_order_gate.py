@@ -13,9 +13,12 @@ class FakeProvider:
     def __init__(self, *snapshots):
         self._q = list(snapshots) or [None]
         self.calls = 0
+        self.force_calls = 0
 
-    def fetch(self, date):
+    def fetch(self, date, force=False):
         self.calls += 1
+        if force:
+            self.force_calls += 1
         if len(self._q) > 1:
             return self._q.pop(0)
         return self._q[0]
@@ -47,6 +50,39 @@ class TestOrderGate(unittest.TestCase):
         # 首读无单，二读变已支付（用户恰在窗口内付款）→ 采用保守成功
         gate = OrderGate(provider=FakeProvider([], [_e()]))
         v = gate.double_check_retry_safe(DATE, TRAIN, PAX, 10000.0, gap_seconds=0)
+        self.assertEqual(v.decision, VE.VerdictDecision.SUCCESS)
+
+    def test_double_check_second_read_forced(self):
+        # R2-2：第二读必须带 force——双读不得同读一份缓存快照
+        gate = OrderGate(provider=FakeProvider([], []))
+        v = gate.double_check_retry_safe(DATE, TRAIN, PAX, 10000.0,
+                                         gap_seconds=0)
+        self.assertEqual(v.decision, VE.VerdictDecision.RETRY_SAFE)
+        self.assertEqual(gate._provider.force_calls, 1)
+
+    def test_double_check_real_provider_bypasses_cache(self):
+        # R2-2：真 SnapshotProvider（60s TTL 缓存）+ 计数数据源替身：
+        # 一次 double_check 必须真打数据源两次；第二份出现已支付订单时
+        # 结论随第二份走（SUCCESS），不得被首份 NONE 缓存架空成 RETRY_SAFE
+        import order as order_mod
+        from adapters.railway.snapshot import SnapshotProvider
+        snaps = [[], [_e()]]
+        calls = {"n": 0}
+
+        def fake_check(session, date):
+            calls["n"] += 1
+            return snaps.pop(0) if len(snaps) > 1 else snaps[0]
+
+        orig = order_mod.check_existing_orders
+        order_mod.check_existing_orders = fake_check
+        try:
+            session = type("S", (), {"post": lambda self, *a, **k: None})()
+            gate = OrderGate(provider=SnapshotProvider(session))
+            v = gate.double_check_retry_safe(DATE, TRAIN, PAX, 10000.0,
+                                             gap_seconds=0)
+        finally:
+            order_mod.check_existing_orders = orig
+        self.assertEqual(calls["n"], 2, "双读必须真正打到数据源两次")
         self.assertEqual(v.decision, VE.VerdictDecision.SUCCESS)
 
     def test_postconfirm_unpaid_with_recent_success(self):

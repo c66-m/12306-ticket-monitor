@@ -86,23 +86,28 @@ class Scheduler:
 
     def _loop_run(self):
         while not self._stop.is_set():
-            now = clock.now_ts()
-            due = None
+            name = None
             with self._lock:
-                if self._heap:
-                    due, name = self._heap[0]
-            if due is not None and now >= due:
-                with self._lock:
-                    heapq.heappop(self._heap)
-                self._run_periodic(name)
-                interval = self._interval_of(name)
-                with self._lock:
-                    st = self.stats.get(name)
-                    if st is not None:
-                        st["due"] = now + interval
-                        heapq.heappush(self._heap, (st["due"], name))
-            else:
+                # peek + pop 必须同一临界区（R2-5）：旧实现两步之间若有
+                # 并发 add_periodic 推入更早到期项，pop 弹走的是新条目、
+                # 却按 peek 的旧 name 执行——新任务从此永不再被调度。
+                # 以 pop 出的元组为准执行，杜绝该交错。
+                if self._heap and clock.now_ts() >= self._heap[0][0]:
+                    _due, name = heapq.heappop(self._heap)
+            if name is None:
                 self._stop.wait(self._poll_s)
+                continue
+            self._run_periodic(name)
+            interval = self._interval_of(name)
+            # 下次到期以任务完成时刻锚定（R2-6）：旧实现用执行前的 now，
+            # 任务耗时超过 interval 时新 due 已在过去、会被立即连跑，
+            # stats 的 due 也失真。
+            done = clock.now_ts()
+            with self._lock:
+                st = self.stats.get(name)
+                if st is not None:
+                    st["due"] = done + interval
+                    heapq.heappush(self._heap, (st["due"], name))
 
     def _run_periodic(self, name):
         j = self._jobs.get(name)

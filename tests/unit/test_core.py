@@ -18,9 +18,10 @@ from core.verdict import engine as VE
 
 def entry(train="K123", date="2026-10-20", pax=("张三", "李四"),
           status="已支付(未出行)", order_ts=1000.0, no_complete=False,
-          order_no="E1234567890", cache_block=False):
+          order_no="E1234567890", cache_block=False, frm="", to=""):
     """构造一条 12306 订单条目（对齐 order._normalize_order_item 出口）。"""
     return {"order_no": order_no, "train": train, "date": date,
+            "from": frm, "to": to,
             "status": status, "passengers": list(pax),
             "order_time": "", "order_ts": order_ts,
             "_no_complete": no_complete, "_cache_block": cache_block}
@@ -58,6 +59,50 @@ class TestTripKey(unittest.TestCase):
     def test_invalid_date_rejected(self):
         with self.assertRaises(ValueError):
             TripKey.from_task("2026/10/20", "K123", ["张三"])
+
+
+class TestTripKeySegment(unittest.TestCase):
+    """R2-1：TripKey 区间分量（契约①：key = 日期+车次+区间+乘车人，不含席别）。"""
+
+    def _tk(self):
+        return TripKey.from_task("2026-10-20", "K123", ["张三", "李四"],
+                                 from_station="北京南", to_station="上海虹桥")
+
+    def test_segment_normalized_and_in_composite(self):
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三"],
+                               from_station=" 北京南 ", to_station="上海虹桥 ")
+        self.assertEqual(tk.from_station, "北京南")
+        self.assertEqual(tk.to_station, "上海虹桥")
+        self.assertIn("北京南>上海虹桥", tk.composite())
+
+    def test_composite_legacy_format_without_segment(self):
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        self.assertEqual(tk.composite(), "2026-10-20|K123|" + tk.pax_key)
+
+    def test_precheck_short_segment_paid_does_not_block(self):
+        # 已购短区间（北京南→南京南）不得挡长区间任务（北京南→上海虹桥）
+        orders = [entry(frm="北京南", to="南京南", status="已支付(未出行)")]
+        v = VE.precheck(self._tk(), orders, ["张三", "李四"])
+        self.assertEqual(v.decision, VE.VerdictDecision.PROCEED_ORDER)
+
+    def test_postconfirm_short_segment_paid_not_success(self):
+        orders = [entry(frm="北京南", to="南京南", status="已支付(未出行)")]
+        v = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0)
+        self.assertNotEqual(v.decision, VE.VerdictDecision.SUCCESS)
+        self.assertEqual(v.decision, VE.VerdictDecision.RETRY_SAFE)
+
+    def test_same_segment_paid_still_blocks(self):
+        # 防过修 pin：区间相同 → 原行为不变，照常 BLOCK_PAID
+        orders = [entry(frm="北京南", to="上海虹桥", status="已支付(未出行)")]
+        v = VE.precheck(self._tk(), orders, ["张三", "李四"])
+        self.assertEqual(v.decision, VE.VerdictDecision.BLOCK_PAID)
+
+    def test_no_segment_key_keeps_legacy_match(self):
+        # 无区间 key（旧构造点）维持原行为：不因条目带区间而不命中
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        orders = [entry(frm="北京南", to="南京南", status="已支付(未出行)")]
+        v = VE.precheck(tk, orders, ["张三", "李四"])
+        self.assertEqual(v.decision, VE.VerdictDecision.BLOCK_PAID)
 
 
 class TestOrderLifecycle(unittest.TestCase):
@@ -141,6 +186,15 @@ class TestClassifier(unittest.TestCase):
         self.assertIs(classifier.classify_snapshot(tk, orders, ["张三", "李四"]),
                       OLC.OrderState.PAID)
 
+    def test_snapshot_definite_state_beats_unknown_order(self):
+        # R2-7：同行程 [未知文案在前, 已支付在后] → 先扫明确态判 PAID，
+        # 不得被靠前的 UNKNOWN 短路成 UNKNOWN
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        orders = [entry(status="神秘文案xyz"),
+                  entry(status="已支付(未出行)")]
+        self.assertIs(classifier.classify_snapshot(tk, orders, ["张三", "李四"]),
+                      OLC.OrderState.PAID)
+
 
 class TestSnapshotView(unittest.TestCase):
     def test_dedupe_by_order_no(self):
@@ -168,6 +222,16 @@ class TestSnapshotView(unittest.TestCase):
                         no_complete=True, order_ts=t_submit + 200)]
         self.assertIsNone(
             sv.find_recent_order(tk, orders, ["张三", "李四"], t_submit))
+
+    def test_find_earliest_unpaid_missing_ts_no_crash(self):
+        # R2-9：首条缺 order_ts、次条有 ts → 归一比较，正常返回不抛 TypeError
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        orders = [entry(status="未完成/未支付", no_complete=True,
+                        order_ts=None),
+                  entry(status="未完成/未支付", no_complete=True,
+                        order_ts=500.0, order_no="E2")]
+        best = sv.find_earliest_unpaid(tk, orders, ["张三", "李四"])
+        self.assertIsNotNone(best)
 
 
 class TestVerdictEngine(unittest.TestCase):

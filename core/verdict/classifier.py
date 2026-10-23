@@ -58,8 +58,9 @@ def classify_entry(entry):
 
 
 def _trip_match(trip, entry, target_names):
-    """TripKey 与订单条目的身份匹配：车次/日期精确，乘车人全部目标命中。"""
-    if not trip.match_trip_fields(entry.get("train"), entry.get("date")):
+    """TripKey 与订单条目的身份匹配：车次/日期/区间精确，乘车人全部命中。"""
+    if not trip.match_trip_fields(entry.get("train"), entry.get("date"),
+                                  entry.get("from"), entry.get("to")):
         return False
     return trip.match_passengers(entry.get("passengers") or [], target_names)
 
@@ -92,13 +93,18 @@ def classify_snapshot(trip, orders, target_names):
     if inc:
         # 12306 规则：任何未完成都挡新单；非本行程的是账号级阻塞
         return OrderState.BLOCKED
-    # 3. 本行程已完成/历史条目
+    # 3. 本行程已完成/历史条目：先扫明确态（PAID/REFUNDED/CANCELLED），
+    # UNKNOWN 只作兜底——否则靠前的未识别文案会短路掉后面的已支付条目，
+    # 把已购行程误判成状态不明（R2-7）。
+    unknown_seen = False
     for e in trip_matched_entries(trip, orders, target_names):
         st = classify_entry(e)
         if st in (OrderState.PAID, OrderState.REFUNDED, OrderState.CANCELLED):
             return st
         if st == OrderState.UNKNOWN:
-            return OrderState.UNKNOWN
+            unknown_seen = True
+    if unknown_seen:
+        return OrderState.UNKNOWN
     # 4. 查无本行程
     return OrderState.NONE
 

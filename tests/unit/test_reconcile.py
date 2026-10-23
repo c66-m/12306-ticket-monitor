@@ -104,6 +104,29 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(rep.total, 2)
         self.assertEqual(rep.paid, 2)
 
+    def test_blocked_stays_pending_and_later_paid(self):
+        # R2-4：他人行程未支付挡路 → 本记录判 blocked；blocked 仍属待决，
+        # 不得计入 none；下一轮官方变为本行程已支付 → 仍能触发 order.paid
+        other_unpaid = _entry(train="K999", status="未完成/未支付",
+                              no_complete=True)
+        store = {"k": _rec()}
+
+        def updater(k, r):
+            store[k] = r
+
+        runner = ReconcileRunner(FakeProvider([other_unpaid]),
+                                 loader=lambda: dict(store), updater=updater)
+        rep1 = runner.reconcile_once()
+        self.assertEqual(store["k"]["classify"], "blocked")
+        self.assertEqual(rep1.none, 0, "blocked 不得计入 none 计数")
+
+        runner2 = ReconcileRunner(FakeProvider([_entry()]),
+                                  loader=lambda: dict(store), updater=updater)
+        rep2 = runner2.reconcile_once()
+        self.assertEqual(rep2.pending, 1, "blocked 记录应仍在待复核集合内")
+        self.assertEqual(rep2.paid, 1)
+        self.assertEqual(store["k"]["classify"], "paid")
+
     def test_report_summary_sane(self):
         rep = ReconcileReport(total=5, paid=1)
         self.assertIn("paid=1", rep.summary())

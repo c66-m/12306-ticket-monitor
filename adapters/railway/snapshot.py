@@ -28,13 +28,18 @@ class SnapshotProvider:
         self._lock = threading.Lock()
         self._cache = {}  # date -> (fetched_ts, orders)
 
-    def fetch(self, date):
-        """目标乘车日期 → 统一订单列表。查询失败向上抛（调用方按未知处理）。"""
-        now = clock.now_ts()
-        with self._lock:
-            hit = self._cache.get(date)
-            if hit and now - hit[0] < self._ttl:
-                return hit[1]
+    def fetch(self, date, force=False):
+        """目标乘车日期 → 统一订单列表。查询失败向上抛（调用方按未知处理）。
+
+        force=True：跳过缓存直接打数据源并刷新缓存——双读确认的第二次读
+        必须走这条路，否则 60s TTL 内必然同读一份快照，「双读」名存实亡
+        （R2-2）。"""
+        if not force:
+            now = clock.now_ts()
+            with self._lock:
+                hit = self._cache.get(date)
+                if hit and now - hit[0] < self._ttl:
+                    return hit[1]
         orders = order_mod.check_existing_orders(self._session, date)
         with self._lock:
             self._cache = {date: (clock.now_ts(), orders)}  # 单条防缓存膨胀

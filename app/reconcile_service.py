@@ -24,8 +24,13 @@ from adapters.store import repo
 
 LOG = logging.getLogger("monitor")
 
-# 需要复核的记录 classify 集合（收尾态 paid/cancelled/none 不重复动）
-PENDING_CLASSIFIES = {"unpaid", "unknown", "error"}
+# 需要复核的记录 classify 集合（收尾态 paid/cancelled/none 不重复动）。
+# blocked 纳入待决（R2-4）：blocked 多为「他人行程未支付单挡路」的暂时态，
+# 挡路单被处理后本记录应能继续收尾（转 paid/none）——若把 blocked 写回后
+# 就退出复核集，台账会永久停在 blocked、其订单后来支付也永不触发
+# order.paid。故选择「纳入 PENDING」而非「写回时保留原 classify」：写回仍
+# 存官方实测分类（台账语义不篡改），靠集合成员资格保证持续复核。
+PENDING_CLASSIFIES = {"unpaid", "unknown", "error", "blocked"}
 
 
 @dataclasses.dataclass
@@ -95,7 +100,9 @@ class ReconcileRunner:
                 report.skipped_no_pax += 1
                 return
             trip = TripKey.from_task(str(rec.get("date") or ""),
-                                     str(rec.get("train") or ""), pax)
+                                     str(rec.get("train") or ""), pax,
+                                     from_station=str(rec.get("from") or ""),
+                                     to_station=str(rec.get("to") or ""))
             cls = classifier.classify_snapshot(trip, snapshot, pax)
             decision = OLC.label(cls)
             new_rec = dict(rec)
@@ -112,8 +119,12 @@ class ReconcileRunner:
             elif cls == OLC.OrderState.UNPAID:
                 report.still_unpaid += 1
                 self._fire("order.still_unpaid", key, cls, decision)
-            else:
+            elif cls == OLC.OrderState.NONE:
+                # none 计数只计官方查无（R2-4）——blocked/cancelled 等
+                # 不得混进 none 拉低口径
                 report.none += 1
+                self._fire("order.reconciled", key, cls, decision)
+            else:
                 self._fire("order.reconciled", key, cls, decision)
         except Exception as e:
             report.errors += 1

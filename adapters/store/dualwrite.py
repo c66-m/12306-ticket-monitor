@@ -20,7 +20,11 @@ from adapters.store import db
 
 LOG = logging.getLogger("monitor")
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 三层 dirname 与 adapters/store/db.py 的 HERE 对齐（仓库根）——旧实现只剥
+# 两层算成 …/adapters，DATA_DIR 随之错位，无 T12306_DATA_DIR 时
+# _is_data_target 对真实数据路径恒 False、双写静默永不执行（R2-3）。
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
 DATA_DIR = os.path.join(ROOT, "data")
 
 

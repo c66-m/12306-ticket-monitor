@@ -27,9 +27,13 @@ class OrderGate:
         self._attempt_store = attempt_store  # 未注入则 attempt 只记内存
 
     # ------------------------- PreCheck（下单前） -------------------------
-    def precheck(self, date, train_code, passenger_names):
-        """下单前预检 → Verdict。BLOCK_* / HALT 直接终止本轮。"""
-        trip = tripkey_mod.TripKey.from_task(date, train_code, passenger_names)
+    def precheck(self, date, train_code, passenger_names,
+                 from_station="", to_station=""):
+        """下单前预检 → Verdict。BLOCK_* / HALT 直接终止本轮。
+        from_station/to_station 为任务区间（拿不到时留空，匹配不收窄）。"""
+        trip = tripkey_mod.TripKey.from_task(
+            date, train_code, passenger_names,
+            from_station=from_station, to_station=to_station)
         if self._provider is None:
             return verdict_engine.Verdict(
                 verdict_engine.VerdictDecision.ERROR,
@@ -41,9 +45,11 @@ class OrderGate:
 
     # ------------------------- PostConfirm（提交后） -------------------------
     def postconfirm(self, date, train_code, passenger_names, not_before_ts,
-                    page_success=False):
+                    page_success=False, from_station="", to_station=""):
         """提交后单快照确认（归因窗口已收紧）。RETRY_SAFE 需再双读确认。"""
-        trip = tripkey_mod.TripKey.from_task(date, train_code, passenger_names)
+        trip = tripkey_mod.TripKey.from_task(
+            date, train_code, passenger_names,
+            from_station=from_station, to_station=to_station)
         if self._provider is None:
             return verdict_engine.Verdict(
                 verdict_engine.VerdictDecision.ERROR,
@@ -57,13 +63,18 @@ class OrderGate:
         return v
 
     def double_check_retry_safe(self, date, train_code, passenger_names,
-                                not_before_ts, gap_seconds=2.0):
+                                not_before_ts, gap_seconds=2.0,
+                                from_station="", to_station=""):
         """双读确认：连续两次官方快照均判 RETRY_SAFE 才返回 RETRY_SAFE。
 
         第一次快照 NONE → 等 gap 秒（让 12306 落库延迟过期）→ 第二次快照
         归因。任一次出现非 RETRY_SAFE 结论，采用那个更保守的结论。
+        第二读必须 force 绕过 provider 缓存（R2-2）：gap 默认 2s 远小于
+        快照 60s TTL，同读一份缓存等于没读第二次。
         """
-        trip = tripkey_mod.TripKey.from_task(date, train_code, passenger_names)
+        trip = tripkey_mod.TripKey.from_task(
+            date, train_code, passenger_names,
+            from_station=from_station, to_station=to_station)
         if self._provider is None:
             return verdict_engine.Verdict(
                 verdict_engine.VerdictDecision.ERROR,
@@ -73,7 +84,7 @@ class OrderGate:
         if v1.decision != verdict_engine.VerdictDecision.RETRY_SAFE:
             return v1
         _time.sleep(max(0.0, float(gap_seconds)))
-        orders2 = self._provider.fetch(date)
+        orders2 = self._provider.fetch(date, force=True)
         v2 = verdict_engine.postconfirm(trip, orders2, passenger_names,
                                         not_before_ts)
         if v2.decision != verdict_engine.VerdictDecision.RETRY_SAFE:

@@ -69,8 +69,10 @@ def find_earliest_unpaid(trip, orders, target_names):
     for e in for_trip(trip, orders, target_names):
         if not e.get("_no_complete"):
             continue
+        # 缺 order_ts 的条目统一按 0 归一后再比——直接拿 None 比较会
+        # TypeError（R2-9）；旧写法 `ts < best.get(...) or 0` 还有优先级坑。
         ts = e.get("order_ts") or 0
-        if best is None or ts < best.get("order_ts") or 0:
+        if best is None or ts < (best.get("order_ts") or 0):
             best = e
     return best
 

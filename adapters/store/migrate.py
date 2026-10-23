@@ -69,7 +69,11 @@ def extract_payloads(state, orders_db, history):
 
 
 def backup_sources(state_path, orders_path, history_path, dry_run=False):
-    """复制三份 JSON 到备份目录。返回备份目录路径（dry_run 返回计划路径）。"""
+    """复制三份 JSON 到备份目录，并逐文件 md5 校验备份完整性。
+
+    校验不过（复制被截断等）抛 RuntimeError——备份是回滚的唯一依据，
+    坏备份不得放行迁移（模块 docstring 承诺「md5 校验备份完整后才」
+    继续，R2-8 补齐实现）。返回备份目录路径（dry_run 返回计划路径）。"""
     ts = __import__("infra.clock", fromlist=["now_str"]).now_str(
         "%Y%m%d-%H%M%S-%f")
     dst_dir = os.path.join(BACKUP_ROOT, ts)
@@ -81,6 +85,10 @@ def backup_sources(state_path, orders_path, history_path, dry_run=False):
         if os.path.exists(src):
             dst = os.path.join(dst_dir, os.path.basename(src))
             shutil.copy2(src, dst)
+            if _md5_file(src) != _md5_file(dst):
+                raise RuntimeError(
+                    "备份校验失败（md5 不一致），已中止迁移：%s -> %s"
+                    % (src, dst))
             copied.append(dst)
     return dst_dir
 
@@ -108,8 +116,12 @@ def run_migrate(state_path, orders_path, history_path,
         if not force and old_fp == new_fp:
             report["skipped"] = True  # 该批数据已迁移过
             return report
-        report["backup_dir"] = backup_sources(
-            state_path, orders_path, history_path, dry_run=dry_run)
+        try:
+            report["backup_dir"] = backup_sources(
+                state_path, orders_path, history_path, dry_run=dry_run)
+        except Exception as e:  # 备份不完整 → 中止，DB 一字不改
+            report["errors"].append("备份失败/校验不通过，已中止迁移：%s" % e)
+            return report
         if dry_run:
             report["tasks"] = len(tasks_m)
             report["orders"] = len(orders_m)

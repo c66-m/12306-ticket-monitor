@@ -29,6 +29,15 @@ def normalize_name(name):
     return _SPACE_RE.sub("", str(name).strip())
 
 
+def normalize_station(name):
+    """站名规范化：与 order._normalize_order_item 的出口对齐——订单条目的
+    from/to 是 12306 页面的原始站名（_f 只做数组拼接、不改写），故这里只做
+    strip + 去全部空白（与本模块姓名/车次的归一口径一致），不做别名映射。"""
+    if name is None:
+        return ""
+    return _SPACE_RE.sub("", str(name).strip())
+
+
 def pax_fingerprint(tokens):
     """乘车人指纹（核心函数）。
 
@@ -61,16 +70,27 @@ def passenger_id_token(name, id_no=None):
 
 @dataclasses.dataclass(frozen=True)
 class TripKey:
-    """行程身份：乘车日期 + 车次 + 乘车人指纹。全部字段规范化后存储。"""
+    """行程身份：乘车日期 + 车次 + 区间 + 乘车人指纹（契约①：防重 key
+    = 日期+车次+区间+乘车人，不含席别）。全部字段规范化后存储。
+
+    from_station/to_station 缺省为空——旧构造点/旧台账没有区间时按空值
+    处理，匹配时不以区间为由排除（与 order.find_duplicate 的既有口径
+    一致），保证向后兼容。"""
     date: str          # 乘车日期 YYYY-MM-DD
     train: str         # 车次（大写、去空格）
     pax_key: str       # pax_fingerprint 结果（12 位 hex）
+    from_station: str = ""   # 出发站名（规范化后）
+    to_station: str = ""     # 到达站名（规范化后）
 
     def __post_init__(self):
         # frozen dataclass 里做规范化，用 object.__setattr__
         object.__setattr__(self, "date", (self.date or "").strip())
         object.__setattr__(self, "train",
                            re.sub(r"\s+", "", (self.train or "").upper()))
+        object.__setattr__(self, "from_station",
+                           normalize_station(self.from_station))
+        object.__setattr__(self, "to_station",
+                           normalize_station(self.to_station))
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", self.date):
             raise ValueError("乘车日期应为 YYYY-MM-DD: %r" % (self.date,))
         if not self.train:
@@ -79,25 +99,50 @@ class TripKey:
             raise ValueError("乘车人指纹非法: %r" % (self.pax_key,))
 
     def composite(self):
-        """台账/日志的复合键。"""
+        """台账/日志的复合键。带区间时插入「出发>到达」段；无区间时保持
+        旧三段格式——composite 只影响新写入，读取端按不透明字符串处理，
+        旧台账记录不会因格式变化失效。"""
+        if self.from_station or self.to_station:
+            return "%s|%s|%s>%s|%s" % (self.date, self.train,
+                                       self.from_station, self.to_station,
+                                       self.pax_key)
         return "%s|%s|%s" % (self.date, self.train, self.pax_key)
 
     @classmethod
-    def from_tokens(cls, date, train, pax_tokens):
+    def from_tokens(cls, date, train, pax_tokens,
+                    from_station="", to_station=""):
         """pax_tokens: 身份 token 序列（见 pax_fingerprint）。"""
         return cls(date=date, train=train,
-                   pax_key=pax_fingerprint(pax_tokens))
+                   pax_key=pax_fingerprint(pax_tokens),
+                   from_station=from_station, to_station=to_station)
 
     @classmethod
-    def from_task(cls, date, train, passenger_names):
+    def from_task(cls, date, train, passenger_names,
+                  from_station="", to_station=""):
         """直接从任务的 passenger_names 构造（下单链路最常见的入口）。
-        空乘车人列表在这里直接抛 ValueError，拒绝进判定。"""
-        return cls.from_tokens(date, train, passenger_names)
+        空乘车人列表在这里直接抛 ValueError，拒绝进判定。
+        from_station/to_station 传任务的出发/到达站名；拿不到时留空。"""
+        return cls.from_tokens(date, train, passenger_names,
+                               from_station=from_station,
+                               to_station=to_station)
 
-    def match_trip_fields(self, order_train, order_date):
-        """车次/日期两个身份字段的精确匹配（不含乘车人）。"""
-        return (re.sub(r"\s+", "", (order_train or "").upper()) == self.train
-                and (order_date or "")[:10] == self.date)
+    def match_trip_fields(self, order_train, order_date,
+                          order_from=None, order_to=None):
+        """车次/日期/区间身份字段的精确匹配（不含乘车人）。
+
+        区间口径与 order.find_duplicate 对齐：key 与订单双方都有值时才
+        比对，任一侧缺失不以此为由排除——同车次短区间已购挡死长区间
+        任务的场景里双方都有值，照常精确区分。"""
+        if not (re.sub(r"\s+", "", (order_train or "").upper()) == self.train
+                and (order_date or "")[:10] == self.date):
+            return False
+        of = normalize_station(order_from)
+        ot = normalize_station(order_to)
+        if self.from_station and of and of != self.from_station:
+            return False
+        if self.to_station and ot and ot != self.to_station:
+            return False
+        return True
 
     def match_passengers(self, order_passengers, target_names=None):
         """乘车人匹配：订单乘车人集合必须包含全部目标乘车人（收紧语义）。
