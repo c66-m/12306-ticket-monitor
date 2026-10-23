@@ -18,7 +18,7 @@ export async function call(method, params) {
 
 // ================= 全局状态 =================
 export const S = {
-  page: "monitor",
+  page: "grab",
   engineRunning: false,
   monitor: [], monitorBusy: false,
   grab: [], grabBusy: false,
@@ -54,7 +54,7 @@ export function registerClosePanelHook(fn) { _closePanelHook = fn; }
 
 // ================= 页签 =================
 export const PAGES = {
-  monitor: { crumb: "监控任务", title: "监控任务" },
+  monitor: { crumb: "直接抢票", title: "直接抢票" },
   grab: { crumb: "抢票任务", title: "抢票任务" },
   pax: { crumb: "乘车人", title: "乘车人" },
   history: { crumb: "历史记录", title: "历史" },
