@@ -408,7 +408,7 @@ class Grabber(threading.Thread):
         fail_streak = 0
         busy_n = 0           # 系统繁忙连续次数，用于冷却退避
         bad = set()          # {(车次, 席别)}：网页端下单页不下发的组合，永久跳过
-        ambiguous_retries = 0  # 提交后结果未知且官方查无订单的安全重试计数
+        ambiguous_retries = {}  # {(车次, 席别): 次数}：提交后结果未知且官方查无单的安全重试计数（R3 起按目标键控）
         MAX_ORDER_FAILS = 5  # 同一目标连续失败这么多次就停，不再无限重复
         exc_key, exc_streak = None, 0  # 同一异常连续计数（Task 55a：防吞异常无限活锁）
         MAX_SAME_EXC = 3     # 同一异常连续这么多次 → 计入失败走正常停止逻辑
@@ -422,6 +422,21 @@ class Grabber(threading.Thread):
             else:
                 exc_key, exc_streak = key, 1
             return exc_streak >= MAX_SAME_EXC
+
+        def note_ambiguous_none(target):
+            """同一目标「提交后未知/dup 但官方查无单」计数 +1，返回新计数。
+
+            ambiguous 分支与 R1 的 dup 安全重试分支共用同一本账、语义
+            一致（同一目标连续多次查无单才停）；按 (车次, 席别) 键控，
+            绝不跨目标累计——旧实现是全生命周期单计数器，相隔数小时、
+            不同车次各出现一次也会攒满停抢（R3）。
+            """
+            ambiguous_retries[target] = ambiguous_retries.get(target, 0) + 1
+            return ambiguous_retries[target]
+
+        def clear_ambiguous(target):
+            """目标出现确定性结局（下单成功/定论失败）后清掉其未知计数。"""
+            ambiguous_retries.pop(target, None)
 
         try:
             while not self.stop_event.is_set():
@@ -506,6 +521,7 @@ class Grabber(threading.Thread):
                         continue
                     exc_key, exc_streak = None, 0  # 本次下单尝试正常返回：异常 streak 断开
                     if ok:
+                        clear_ambiguous((info["train_code"], seat))  # R3：成功定论，清该目标未知计数
                         self.result = (True, msg)
                         # Task 84c：日志路径 PII 脱敏（订单号打码）；self.result /
                         # 历史记录 / 通知里的原文不动，用户仍能在界面看到完整订单号
@@ -541,6 +557,7 @@ class Grabber(threading.Thread):
                         cls, ono, raw, recent = order_mod.classify_with_time(
                             date, info["train_code"], names, not_before_ts=attempt_ts)
                         if cls == "unpaid" and recent:
+                            clear_ambiguous((info["train_code"], seat))  # R3：成功定论，清该目标未知计数
                             order_no = ono or (recent.get("order_no") or "")
                             self.result = (True,
                                 "订单已提交成功（未支付）：订单号 %s，下单时间 %s，请尽快去 12306 支付"
@@ -563,13 +580,13 @@ class Grabber(threading.Thread):
                             self._notify_success(info, seat, self.result[1])
                             return
                         if cls in ("none", "cancelled"):
-                            ambiguous_retries += 1
-                            if ambiguous_retries >= 3:
+                            n_amb = note_ambiguous_none((info["train_code"], seat))
+                            if n_amb >= 3:
                                 self.result = (False,
-                                    "连续多次提交后结果未知且官方查无订单，请人工核对后重新开抢")
+                                    "同一车次席别连续 3 次提交后结果未知且官方查无订单，请人工核对后重新开抢")
                                 log("[错误] %s" % self.result[1])
                                 return
-                            log("[提醒] 提交结果未知但官方确认无此订单（第 %d 次），继续重试" % ambiguous_retries)
+                            log("[提醒] 提交结果未知但官方确认无此订单（同目标第 %d 次），继续重试" % n_amb)
                             if self.stop_event.wait(2):
                                 break
                             continue
@@ -600,15 +617,15 @@ class Grabber(threading.Thread):
                             # 分支的 none/cancelled 口径对齐：安全重试，
                             # 多次仍查无单才失败收尾；绝不置成功、绝不发
                             # 成功通知、历史不记 success/dup。
-                            ambiguous_retries += 1
-                            if ambiguous_retries >= 3:
+                            n_amb = note_ambiguous_none((info["train_code"], seat))
+                            if n_amb >= 3:
                                 self.result = (False,
-                                    "网页端多次判已有订单但官方查无此单（%s），"
+                                    "同一车次席别连续 3 次被网页判已有订单但官方查无此单（%s），"
                                     "请人工核对后重新开抢" % cls)
                                 log("[错误] %s" % self.result[1])
                                 return
-                            log("[提醒] 网页判已有订单，但官方核验无此订单（%s，第 %d 次），继续重试"
-                                % (cls, ambiguous_retries))
+                            log("[提醒] 网页判已有订单，但官方核验无此订单（%s，同目标第 %d 次），继续重试"
+                                % (cls, n_amb))
                             if self.stop_event.wait(2):
                                 break
                             continue
@@ -622,6 +639,7 @@ class Grabber(threading.Thread):
                                                   "勿重复下单（有单就支付或取消，确认无单后再重新开抢）")
                             log("[待核对] %s（下单返回：%s；官方核验：%s）" % (self.result[1], msg, raw))
                             return
+                        clear_ambiguous((info["train_code"], seat))  # R3：paid/unpaid 定论，清该目标未知计数
                         result_kind = "dup"
                         if cls == "paid":
                             self.result = (True, "该行程订单已支付，请查收")
@@ -698,6 +716,9 @@ class Grabber(threading.Thread):
                             break
                         continue
                     target = (info["train_code"], seat)
+                    # R3：这是定论失败（非未知），该目标的未知计数就此清零，
+                    # 之后再出现「未知+查无单」从 1 重新计连续次数。
+                    clear_ambiguous(target)
                     if target == last_target:
                         fail_streak += 1
                     else:

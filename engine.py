@@ -295,6 +295,16 @@ def _drop_dedup(state):
     return appcommon.drop_dedup_state(state)
 
 
+def _tasks_fingerprint(tasks):
+    """任务集合（名+全部内容）的指纹：供 _sync_config 判断任务是否实际
+    变化。序列化失败（极端形状）返回 None，调用方按「已变化」保守处理。"""
+    try:
+        return json.dumps(tasks, sort_keys=True, ensure_ascii=False,
+                          default=str)
+    except (TypeError, ValueError):
+        return None
+
+
 class MonitorEngine(object):
     def __init__(self, config_path=None, setup_logging=True):
         """setup_logging=False 时由调用方（如 GUI）自行接管日志处理器。"""
@@ -369,6 +379,7 @@ class MonitorEngine(object):
             LOG.error("[网络] 车站数据加载失败，将以空表降级运行：%s", e)
             self.name2code, self.code2name = {}, {}
         self.tasks = _sanitize_tasks(self.config.get("tasks"))
+        self._tasks_changed = False  # _sync_config 维护：任务集合是否实际变化
         # 已删除任务名的墓碑（内存态）：删任务与在途轮询竞速时，拦住
         # _note_failure / 轮询后 setdefault 把已清掉的 state 条目复活。
         # _sync_config 见到同名任务重建即清除，不影响新任务。
@@ -693,7 +704,10 @@ class MonitorEngine(object):
 
     def _sync_config(self):
         """检测 config.json 是否被修改（GUI 增删任务）：有则热更新任务列表。
-        返回 True 表示任务列表可能变化，主循环需重建调度表。"""
+        返回 True 表示本次同步已应用（配置/任务列表已刷新）；任务集合
+        （名+内容指纹）是否实际变化另记于 self._tasks_changed，主循环
+        仅在其为 True 时重建调度表——仅设置类变更（通知/预设等）不得
+        重置各任务的 next_due（含失败退避）（R3）。"""
         try:
             m = os.path.getmtime(self.config_path)
         except OSError:
@@ -725,6 +739,7 @@ class MonitorEngine(object):
                                     self.config.get("min_interval_seconds", 30),
                                     30, "min_interval_seconds"))
         raw_tasks = self.config.get("tasks")
+        old_fp = _tasks_fingerprint(self.tasks)
         self.tasks = _sanitize_tasks(raw_tasks)
         current_names = {t.get("name") or "" for t in self.tasks}
         # Task 72：清孤儿 state 条目——config 已无此任务，state 残留不再需要，
@@ -760,6 +775,8 @@ class MonitorEngine(object):
                 self._deleted_names = set(
                     list(self._deleted_names)[:500])
         self._ensure_task_names()
+        # 任务集合指纹须在补名后计算（与同步前的 self.tasks 同口径比对）
+        self._tasks_changed = _tasks_fingerprint(self.tasks) != old_fp
         self._resume_or_init_status()  # 仅补缺省状态，不覆盖已有状态
         self._check_duplicate_task_names()
         LOG.info("[配置] 已同步任务列表，共 %d 个任务", len(self.tasks))
@@ -976,6 +993,14 @@ class MonitorEngine(object):
         trains = normalize_trains(task)
         seats_want_all = normalize_seat_types(task)
         seats_by_date = task.get("seats_by_date") or {}
+        if not isinstance(seats_by_date, dict):
+            # R3：与 trains/seat_types/dates 的 Task 68/93 消毒口径对齐。
+            # 手改成 list/str 时旧代码在下方 seats_by_date.get(date) 抛
+            # AttributeError 穿出本轮、被结算层当「内部异常」退避且每轮
+            # 原样重演，任务永不恢复；记警告后按无按日席别处理。
+            LOG.warning("[配置] 任务「%s」的 seats_by_date 形状非法 %r，"
+                        "已按无按日席别处理", name, seats_by_date)
+            seats_by_date = {}
         auto_order = bool(task.get("auto_order", True))
         stop_after = bool(task.get("stop_after_order", True))
 
@@ -1162,7 +1187,12 @@ class MonitorEngine(object):
                                         "账号存在该行程更早的未支付订单 %s——请核对后尽快支付"
                                         % (ono or "未知"))
                                     return True, False
-                            continue
+                            # R3：stop_after_order=False 时比照 paid 分支收尾。
+                            # 本行程已有未支付订单，同车次换席别再下单只会被
+                            # 判 dup 白耗一轮提交（旧代码 continue 到下一席别
+                            # 逐个重走完整浏览器下单）。结束本车次本轮处理
+                            # （break 出席别循环），其它日期仍可继续。
+                            break
                         if cls in ("cancelled", "none"):
                             # 连击退避：官方反复说无单但网页端反复判 dup，说明存在
                             # 官方接口看不见的挡单（如「取消次数过多」当日封禁）。
@@ -1754,8 +1784,11 @@ class MonitorEngine(object):
                 if stop_event is not None and stop_event.is_set():
                     break
                 self._sync_state()  # 同步外部（GUI）对状态文件的修改
-                if self._sync_config():
-                    # 任务列表变化（增/删）：按最新列表重建调度表，避免旧索引错位
+                if self._sync_config() and getattr(self, "_tasks_changed", True):
+                    # 任务集合实际变化（增/删/改内容）：按最新列表重建调度
+                    # 表，避免旧索引错位。仅设置类变更时 _tasks_changed 为
+                    # False，保留各任务原 next_due（含失败退避），不再让
+                    # 全部活动任务无条件立即提前轮询一轮（R3）。
                     next_due = {t["name"]: time.time()
                                 for t in self.tasks
                                 if self.task_status(t) in ACTIVE_STATUSES}
