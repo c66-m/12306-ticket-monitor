@@ -1163,6 +1163,7 @@ class MonitorEngine(object):
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
                             "passengers": p_names, "order_no": ono,
+                            "screenshot": (extra or {}).get("screenshot") or "",
                             "message": "官方核验:%s(%s)。决策:%s" % (raw or cls, cls, decision),
                             "notify": "未通知",
                         })
@@ -1286,6 +1287,7 @@ class MonitorEngine(object):
                                 "train": train_code, "date": date, "from": info["from_name"],
                                 "to": info["to_name"], "seat": seat_name,
                                 "passengers": p_names, "order_no": ono,
+                                "screenshot": (extra or {}).get("screenshot") or "",
                                 "message": msg, "notify": "",
                             })
                             return True, False
@@ -1432,6 +1434,7 @@ class MonitorEngine(object):
                             "train": train_code, "date": date, "from": info["from_name"],
                             "to": info["to_name"], "seat": seat_name,
                             "passengers": p_names, "order_no": "",
+                            "screenshot": (extra or {}).get("screenshot") or "",
                             "message": msg, "notify": "",
                         })
                         continue  # 临时性失败（无票/排队失败），下轮继续
@@ -1560,6 +1563,7 @@ class MonitorEngine(object):
             "order_no": order_no,
             "pay_evidence": pay_evidence,
             "page_kind": page_kind,
+            "screenshot": (extra.get("screenshot") or "") if extra else "",
             "message": "订单提交成功（未支付）" + ("，勾选 %s 同价按 %s 出票" % (
                 extra.get("selected_seat") or seat_name, alias_seat) if alias_seat else ""),
             "notify": notify_txt,
@@ -1691,10 +1695,44 @@ class MonitorEngine(object):
 
     # ----------------------------- 主循环 -----------------------------
 
+    def _cleanup_old_snaps(self):
+        """每天首次启动清理超过 30 天的下单截图/失败现场（2026-10-25 用户
+        口径：一天开关几次软件只清一次）。闸门落 state.json 的
+        snap_cleanup_last（跨重启持久）；范围：logs/order_*.png（下单关键页
+        留证）与 logs/booking_fail_*.png/.json（预订按钮失败现场）。
+        单个文件被占用/消失按跳过处理，下个周期再清。"""
+        today = time.strftime("%Y-%m-%d")
+        if (self.state or {}).get("snap_cleanup_last") == today:
+            return
+        self.state["snap_cleanup_last"] = today
+        self._save_state()
+        d = os.path.join(HERE, "logs")
+        try:
+            names = os.listdir(d)
+        except Exception:
+            return
+        cutoff = time.time() - 30 * 86400
+        removed = 0
+        for n in names:
+            is_snap = n.startswith("order_") and n.endswith(".png")
+            is_fail_scene = (n.startswith("booking_fail_")
+                             and (n.endswith(".png") or n.endswith(".json")))
+            if not (is_snap or is_fail_scene):
+                continue
+            try:
+                if os.path.getmtime(os.path.join(d, n)) < cutoff:
+                    os.remove(os.path.join(d, n))
+                    removed += 1
+            except Exception:
+                pass
+        LOG.info("[清理] 截图留存检查完成（30 天）：本次清除 %d 个过期文件", removed)
+
     def run(self, stop_event=None):
         """主循环。stop_event: threading.Event，置位后本轮结束即优雅退出（GUI 内嵌用）。"""
         LOG.info("=" * 64)
         LOG.info("监控引擎启动")
+        # 截图留存：每天第一次启动检查一次，清掉超 30 天的截图/失败现场
+        self._cleanup_old_snaps()
         # 暴露给在途任务线程：_run_task 每轮查一次，停止后尽快收手
         self._stop_event = stop_event
         # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核

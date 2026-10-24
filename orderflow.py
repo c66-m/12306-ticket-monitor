@@ -37,6 +37,7 @@ from browser_order import (
     _safe_close_ctx,
     _slide_up,
     _wait_slide_gone,
+    snap_page_evidence,
     _window_dead_exc,
     launch,
     save_state,
@@ -326,6 +327,10 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
              "page_kind": "payOrder"}
     if ono:
         extra["order_no"] = ono
+    shot = snap_page_evidence(entry["page"], "locked", train, date)
+    if shot:
+        extra["screenshot"] = shot
+        _emit(logger, "[流程] 成功页截图已存：%s" % shot)
     # 成功页就是「席位已锁定」的订单界面：headless 没有窗口可看，直接跳过；
     # 否则保留窗口供核对与支付（关窗 / 手动停止 / 超时才继续）。
     if not headless:
@@ -530,12 +535,18 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     if not on_lock:
                         # 重复订单特征（已有未支付订单）：本单未新生成，
                         # 直接返回 dup 交上层处理，绝不重下撞出第二单。
+                        shot = snap_page_evidence(page, "dup", train, date)
+                        if shot:
+                            _emit(logger, "[流程] 重复订单页截图已存：%s" % shot)
                         return _finish_dup(url, body, logger)
                     # 锁定页里的「未完成订单」多是过程提示的链接文字，
                     # 不能据此关页：继续等锁定词或显式失败
                 elif snap == "fail":
                     # 页面明确报失败（出票失败 / 订票失败 / 余票不足 /
                     # 系统繁忙）：直接返回失败，原文即软件显示的文案。
+                    shot = snap_page_evidence(page, "fail", train, date)
+                    if shot:
+                        _emit(logger, "[流程] 失败页截图已存：%s" % shot)
                     _emit(logger, "[流程] HOLD：网页报下单失败，直接返回")
                     return False, body, {"reason": "fail"}
                 # wait / ambiguous：过程提示、旧单列表、初始化页——

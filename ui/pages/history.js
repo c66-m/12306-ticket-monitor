@@ -23,8 +23,23 @@ export function renderHistory(root) {
         (r.date ? ' <span class="muted" style="font-size:11px;opacity:.72">' + esc(r.date) + "</span>" : "") + "</span>" +
         '<span class="v">' + esc(r.time || "") + "</span>" +
         '<span class="chip status ' + cls + '">' + esc(HISTORY_LABELS[r.result] || r.result) + "</span></div>" +
-        (r.message ? '<div class="muted" style="margin:-4px 0 6px 2px;font-size:11px">' + esc(r.message) + "</div>" : "");
+        (r.message ? '<div class="muted" style="margin:-4px 0 6px 2px;font-size:11px">' + esc(r.message) + "</div>" : "") +
+        (r.screenshot ? '<div style="margin:-2px 0 8px 2px"><span class="chip" data-shot="' + esc(r.screenshot) + '" style="cursor:pointer">🖼 截图</span></div>' : "");
     }).join("") || '<div class="muted" style="padding:20px;text-align:center">暂无记录</div>') + "</div></div>";
+
+  // 截图留证：点「🖼 截图」懒加载 <img>（file:// 直读，无需新增 RPC）
+  root.querySelectorAll("[data-shot]").forEach((chip) => {
+    chip.onclick = () => {
+      let img = chip.parentElement.querySelector("img");
+      if (!img) {
+        img = document.createElement("img");
+        img.src = "file:///" + encodeURI(String(chip.dataset.shot).replace(/\\/g, "/"));
+        img.style.cssText = "display:block;max-width:100%;margin:6px 0 2px;border-radius:8px";
+        chip.parentElement.appendChild(img);
+      }
+      img.hidden = !img.hidden;
+    };
+  });
 
   const hb = root.querySelector("#hReconcile");
   if (hb) hb.onclick = async () => {

@@ -1073,6 +1073,28 @@ def _dump_booking_failure(page, info, diag):
         return ""
 
 
+def snap_page_evidence(page, kind, train_code="", date=""):
+    """下单关键页留证截图（锁定成功页 / 重复订单页 / 失败页）：存
+    logs/order_{kind}_{车次}_{日期}_{时刻}.png（2026-10-25 用户要求保留截图）。
+
+    只在真实 Playwright 页面生效：测试替身没有 screenshot 直接跳过。
+    headless 下同样可截（渲染照常）。任何异常都吞掉——留证不能打断
+    下单结论。返回存盘路径，失败返回空串。
+    """
+    if not hasattr(page, "screenshot"):
+        return ""
+    try:
+        d = os.path.join(HERE, "logs")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "order_%s_%s_%s_%s.png" % (
+            kind, train_code or "x", date or "x",
+            time.strftime("%Y%m%d-%H%M%S")))
+        page.screenshot(path=path, full_page=False)
+        return path
+    except Exception:
+        return ""
+
+
 def _cls_has(cls_text, name):
     """className 精确 token 匹配（Task 65g）。
 
