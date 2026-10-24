@@ -27,6 +27,7 @@ import time
 from browser_order import (
     _SLIDE_WAIT_SEC,
     _exclusive,
+    _lock_waiter_count,
     _extract_pay_evidence,
     _goto_and_query,
     _hold_pay_page,
@@ -46,6 +47,10 @@ from browser_order import (
 from order import classify_with_time, fetch_unpaid_order_no, session_from_browser_state
 
 # HOLD 快照词表：dup 优先于 fail（与旧链结果循环口径一致，坑 3）
+# 锁定页静态温馨提示（2026-10-24 D290 实跑）：提交后跳到 initDc 锁定页时，
+# 这句静态提示先于 JS 渲染的「席位已锁定」出现，且正好命中 dup 词「未支付」。
+# 它是锁定页到来的标志（确认页本身没有这句），故用作 initDc 页的确认窗锚点。
+_LOCK_TIP = "逾期未支付"
 _DUP_KEYS = ("未支付", "未完成订单", "未处理", "已预订", "行程冲突", "已购买")
 _FAIL_KEYS = ("订票失败", "出票失败", "余票不足", "系统繁忙")
 # 确认提交后的过程提示：12306 在点确认的同一同步栈里就弹出「正在处理，
@@ -70,7 +75,11 @@ _PAY_LOCK_KEY = "席位已锁定"
 _SEAT_SCAN = ("无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座")
 
 _FLOW_DEFAULTS = {"read_poll_seconds": 0.5, "page_wait_seconds": 30.0,
-                  "retry_open_times": 1, "lock_confirm_seconds": 3.0}
+                  "retry_open_times": 1, "lock_confirm_seconds": 3.0,
+                  # 锁定页 dup/fail 抑制窗（秒）：提示先出、锁定词后出的那一拍
+                  # 内不判 dup/fail。成功静置仍用 lock_confirm_seconds（3s）；
+                  # 本窗只延迟 dup/fail 结论，不改变成功时机（2026-10-25 审）。
+                  "lock_dup_grace_seconds": 10.0}
 # 锁定座位页静置确认窗（秒）：进入 payOrder 后先在原页静置再下结论。
 # 12306 点确认后要 2–8 秒才渲染出「席位已锁定」，期间正文可能还是旧页或
 # 过程提示；窗内不重下、不关页、不判 dup/fail。2026-10-24 用户口径：
@@ -264,15 +273,29 @@ def _start_judge_thread(entry, page, date, train, passenger_names, logger):
     if ctx is not None:
         _save_state_for_judge(ctx, logger)
 
+    # 锁定词闪烁（出现→半渲染消失→再现）时不重复启动：上一条线程仍
+    # 在跑就复用它，同一单的证据只取一份（2026-10-25 审）。
+    _old = entry.get("judge_thread")
+    if _old is not None and _old.is_alive():
+        return
+    entry["judge_valid"] = True
+
     def _run():
         try:
-            entry["judge_order_no"] = fetch_unpaid_order_no(
+            ono = fetch_unpaid_order_no(
                 session_from_browser_state(), date, train,
                 passenger_names, entry["t_submit"])
+            # 主流程已从其它出口结束（停止/关窗/dup/fail）时，迟到的
+            # 回读日志会与结论矛盾：只在主流程仍有效时写回与落日志。
+            if not entry.get("judge_valid", True):
+                return
+            entry["judge_order_no"] = ono
             if entry.get("judge_order_no"):
                 _emit(logger, "[流程] JUDGE：官方回读到本次订单号 %s"
                               % entry["judge_order_no"])
         except Exception as exc:
+            if not entry.get("judge_valid", True):
+                return
             entry["judge_error"] = str(exc)[:160]
             _emit(logger, "[流程] JUDGE：订单号回读失败（%s），不影响本次成功判定"
                           "（可到 12306「未完成订单」核对）" % str(exc)[:120])
@@ -300,9 +323,21 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
     ono = None
     th = entry.get("judge_thread")
     if th is not None:
-        # 回读已在锁定页出现时后台启动（_start_judge_thread）：join 取结果；
-        # 超时按「本次成功、单号待查」收尾，不改变成功结论
-        th.join(timeout=_JUDGE_JOIN_TIMEOUT)
+        # 回读已在锁定页出现时后台启动（_start_judge_thread）：分片 join
+        # 取结果；超时按「本次成功、单号待查」收尾，不改变成功结论。
+        # 分片间查等锁者：已有其它任务在等独占锁时提前收尾，不让 40s
+        # join 拖住其它任务（线程本身是 daemon，迟到结果仍会落日志）。
+        for _ in range(int(_JUDGE_JOIN_TIMEOUT)):
+            th.join(timeout=1.0)
+            if not th.is_alive():
+                break
+            try:
+                if _lock_waiter_count() > 0:
+                    _emit(logger, "[流程] JUDGE：有其它任务在等锁，提前按已提交"
+                                  "成功收尾（订单号回读仍在后台继续）")
+                    break
+            except Exception:
+                pass
         ono = entry.get("judge_order_no")
         if th.is_alive():
             _emit(logger, "[流程] JUDGE：后台订单号回读 %.0fs 未完成，先按已提交"
@@ -322,9 +357,13 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
                           "（可到 12306「未完成订单」核对）" % str(e)[:120])
     if ono:
         _emit(logger, "[流程] JUDGE：官方回读到本次订单号 %s" % ono)
+    # page_kind 按真实 URL 填：真实锁定页是 initDc，旧 payOrder 硬编码
+    # 会让历史/日志里的页面类型与实际不符（2026-10-25 审）。
+    page_kind = ("payOrder" if "payOrder" in url else
+                 "initDc" if "initDc" in url else "")
     extra = {"passengers": "、".join(entry["picked"]), "seat_on_page": seat_on_page,
              "seat_in_dialog": entry["dlg_seat"], "pay_evidence": pay_evidence,
-             "page_kind": "payOrder"}
+             "page_kind": page_kind}
     if ono:
         extra["order_no"] = ono
     shot = snap_page_evidence(entry["page"], "locked", train, date)
@@ -338,6 +377,20 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
         if hold > 0:
             _hold_pay_page(entry.get("page"), hold, stop)
     return True, "已提交订单（未支付）：%s%s" % (url, warn), extra
+
+
+def _matched_fail_key(body):
+    """命中失败词（与 classify_snapshot 同口径：先剔链接噪声再匹配）。
+
+    HOLD 失败返回的 msg 只用这个词，不把整页正文送进日志与历史。
+    """
+    clean = body
+    for noise in _LINK_NOISE:
+        clean = clean.replace(noise, "")
+    for k in _FAIL_KEYS:
+        if k in clean:
+            return k
+    return ""
 
 
 def _finish_dup(url, body, logger, screenshot=""):
@@ -421,6 +474,11 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
     except (TypeError, ValueError):
         lock_confirm = _FLOW_DEFAULTS["lock_confirm_seconds"]
     lock_confirm = max(_LOCK_CONFIRM_MIN, min(lock_confirm, _LOCK_CONFIRM_MAX))
+    try:
+        dup_grace = float(cfg["lock_dup_grace_seconds"])
+    except (TypeError, ValueError):
+        dup_grace = _FLOW_DEFAULTS["lock_dup_grace_seconds"]
+    dup_grace = max(0.0, min(dup_grace, 60.0))
     train = (info or {}).get("train_code")
 
     def _stopped():
@@ -487,37 +545,58 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
         t_submit = res["t_submit"]
         # 2026-10-24 用户口径：下单后只等座位锁定页。锁定页出现后稳
         # lock_confirm 秒才判成功；页面明确报失败直接返回失败；其余
-        # 快照（过程提示 / 旧单列表 / 初始化页）一律继续等，不设观察
-        # 时限、不转官方回读、不新开页重下——此前「没等锁定页出来就
-        # 返回重下、而订单其实已生成待付款」的问题即由此而来。
-        # 唯一提前出口：手动停止、滑块超时、浏览器窗口关闭。
+        # 快照（过程提示）继续等，不设观察时限、不转官方回读、不新开页
+        # 重下——此前「没等锁定页出来就返回重下、而订单其实已生成待付
+        # 款」的问题即由此而来。
+        # 提前出口（2026-10-25 审）：手动停止、滑块超时、浏览器窗口关闭，
+        # 以及不可能再转锁定页的终态页（旧单列表/初始化页/登录页）——后者
+        # 交上层官方回读定生死，不占着独占锁无限等。锁定页确认窗另见
+        # lock_dup_grace_seconds：提示先出、锁定词后出的那一拍不判 dup。
         stage("HOLD")
         _emit(logger, "[流程] HOLD：驻留观察网页变化（每 %.1fs 读 url+正文，"
                       "只等锁定页或明确失败）" % poll)
         e = {"page": page, "t_submit": t_submit, "picked": res["picked"],
              "dlg_seat": res["dlg_seat"], "lock_seen_at": None,
-             "success_since": None}
+             "success_since": None, "last_url": None, "judge_valid": True}
         tick = 0
         while True:
             if _stopped():
+                e["judge_valid"] = False
                 return False, ("手动停止：确认已提交但结果未知，"
                                 "请先到 12306 核对未完成订单"), {"reason": "ambiguous"}
             try:
                 url, body = _read_page(page)
             except Exception as exc:
                 if _window_dead_exc(exc):
+                    e["judge_valid"] = False
                     return False, "浏览器窗口异常关闭", {"reason": "browser_dead"}
                 url, body = "", ""
+            # 会话失效跳登录页：结果已不可知（旧口径会无限等下去）。交
+            # 上层官方回读定生死，不占着独占锁空转。
+            if "login.html" in url or "passport" in url:
+                e["judge_valid"] = False
+                _emit(logger, "[流程] HOLD：页面跳到登录页（会话失效），"
+                              "交上层官方回读")
+                return False, body, {"reason": "ambiguous"}
             snap = classify_snapshot(url, body)
-            on_lock = "payOrder" in url
+            # 锁定页判定（2026-10-25 审）：fd611fd 前只认 payOrder，但真实
+            # 锁定页是 initDc——提示先出、锁定词后出的那一拍曾被误判 dup。
+            # 故锁定页锚点 = payOrder URL，或正文出现锁定页静态温馨提示。
+            on_lock = ("payOrder" in url) or (_LOCK_TIP in body)
+            if url != e["last_url"]:
+                # 换页重锚：同一 URL 内确认页→锁定页的转变由温馨提示锚定
+                # （确认页无此提示），跨页跳转则靠 URL 变化重锚。
+                e["lock_seen_at"] = None
+                e["last_url"] = url
             if on_lock and e["lock_seen_at"] is None:
                 e["lock_seen_at"] = time.time()
                 _emit(logger, "[流程] HOLD：进入锁定座位页，静置确认 %.1fs"
-                              "（期间不重下、不关页）" % lock_confirm)
-            # 锁座确认窗：刚进入 payOrder 的 lock_confirm 秒内正文可能
-            # 还是旧页/半渲染，只认「席位已锁定」，不判 dup/fail。
+                              "（期间不重下、不关页、不判 dup/fail）" % dup_grace)
+            # 锁座确认窗：刚进入锁定页的 dup_grace 秒内正文可能还是旧页/
+            # 半渲染，只认「席位已锁定」，不判 dup/fail。成功静置仍走
+            # success_since + lock_confirm，与本窗互不干扰。
             in_confirm = (on_lock and e["lock_seen_at"] is not None
-                          and time.time() - e["lock_seen_at"] < lock_confirm)
+                          and time.time() - e["lock_seen_at"] < dup_grace)
             if snap == "success":
                 if e["success_since"] is None:
                     e["success_since"] = time.time()
@@ -535,21 +614,34 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
             else:
                 # 锁定信号消失（跳走/半渲染）：重新计时，避免瞬时误判
                 e["success_since"] = None
+                if snap == "ambiguous":
+                    # classify 只对旧单列表 / 订单初始化页判 ambiguous：
+                    # 这类页不可能再转成锁定页（2026-10-25 审：旧口径会
+                    # 无限等下去）。立即交上层官方回读定生死，释放独占锁。
+                    e["judge_valid"] = False
+                    _emit(logger, "[流程] HOLD：终态页（旧单列表/初始化页），"
+                                  "交上层官方回读")
+                    return False, body, {"reason": "ambiguous"}
                 if in_confirm:
                     pass          # 确认窗内一律 wait，交给下一轮
                 elif snap == "dup":
-                    if not on_lock:
+                    if (not on_lock) or (not in_confirm):
                         # 重复订单特征（已有未支付订单）：本单未新生成，
                         # 直接返回 dup 交上层处理，绝不重下撞出第二单。
+                        # 确认窗内锁定页的「未完成订单」多是过程提示的链接
+                        # 文字，窗内不判；窗外 dup 证据已稳定，不再等下去
+                        # （旧口径在锁定页上对 dup 永等，提示页会卡死）。
                         shot = snap_page_evidence(page, "dup", train, date)
                         if shot:
                             _emit(logger, "[流程] 重复订单页截图已存：%s" % shot)
+                        e["judge_valid"] = False
                         return _finish_dup(url, body, logger, screenshot=shot)
-                    # 锁定页里的「未完成订单」多是过程提示的链接文字，
+                    # 确认窗内锁定页的「未完成订单」多是过程提示的链接文字，
                     # 不能据此关页：继续等锁定词或显式失败
                 elif snap == "fail":
                     # 页面明确报失败（出票失败 / 订票失败 / 余票不足 /
-                    # 系统繁忙）：直接返回失败，原文即软件显示的文案。
+                    # 系统繁忙）：直接返回失败。msg 只取命中的失败词，
+                    # 不把整页正文（含乘车人等信息）原样送进日志与历史。
                     shot = snap_page_evidence(page, "fail", train, date)
                     if shot:
                         _emit(logger, "[流程] 失败页截图已存：%s" % shot)
@@ -557,17 +649,20 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     fail_extra = {"reason": "fail"}
                     if shot:
                         fail_extra["screenshot"] = shot
-                    return False, body, fail_extra
-                # wait / ambiguous：过程提示、旧单列表、初始化页——
-                # 都只是「还没出结果」，继续等，不转回读、不重下。
+                    e["judge_valid"] = False
+                    return False, _matched_fail_key(body) or body[:120], fail_extra
+                # wait：过程提示等——只是「还没出结果」，继续等，
+                # 不转回读、不重下。
             # 滑块出现即停交人工（坑 7）：脚本不绕过。
             # tick%4==1 降频查询，与旧链 250ms 结果循环的滑块查询频率对齐
             if tick % 4 == 1 and _slide_up(page):
                 waited = _wait_slide_gone(page, _SLIDE_WAIT_SEC, stop=_stopped)
                 if waited == "user_stopped":
+                    e["judge_valid"] = False
                     return False, "手动停止：滑块等待期间用户已停止任务", {
                         "reason": "ambiguous", "need_captcha": True}
                 if waited is False:
+                    e["judge_valid"] = False
                     return False, "滑块验证等待超时（%d 秒），请重试" % _SLIDE_WAIT_SEC, {
                         "reason": "ambiguous", "need_captcha": True}
                 _emit(logger, "[流程] HOLD：滑块已消失（人工 %.1fs）" % waited)
@@ -581,9 +676,11 @@ def run_orderflow(info, seat_name, seat_code, passenger_names, date,
     """阶段化下单入口。返回 (ok, msg, extra)，契约与 order_via_browser 一致。
 
     flow_cfg: config.json 的 order_flow 段（read_poll_seconds /
-        page_wait_seconds / retry_open_times / lock_confirm_seconds），
-        缺省见 _FLOW_DEFAULTS；其中 page_wait_seconds /
-        retry_open_times 自 2026-10-24 起不再影响 HOLD（仅配置兼容）。
+        page_wait_seconds / retry_open_times / lock_confirm_seconds /
+        lock_dup_grace_seconds），缺省见 _FLOW_DEFAULTS；其中
+        page_wait_seconds / retry_open_times 自 2026-10-24 起不再影响
+        HOLD（仅配置兼容）。lock_dup_grace_seconds 是锁定页 dup/fail
+        抑制窗（默认 10s），成功静置仍用 lock_confirm_seconds。
     logger: [流程] 阶段日志的落点。engine 传 monitor LOG、launcher 传
         launcher LOG（各自日志文件 + GUI 全局日志区）；None 时兜底 print。
 

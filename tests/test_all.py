@@ -12920,6 +12920,102 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertIn("order_dup_G101_2026-10-17_", extra["screenshot"])
         self.assertTrue(extra["screenshot"].endswith(".png"))
 
+    def test_e2e_lock_tip_then_lock_text_is_success_not_dup(self):
+        # 2026-10-25 审：initDc 锁定页先出温馨提示（含 dup 词「未支付」）、
+        # 后出「席位已锁定」的那一拍，旧口径（确认窗只认 payOrder）会立刻
+        # 误判 dup；新口径以温馨提示锚定确认窗，等到锁定词后判成功。
+        class _TipThenLock(self._HoldPage):
+            def __init__(self):
+                super().__init__(TestOrderflowE2EMock.INIT_URL, "")
+                self.n = 0
+
+            def evaluate(self, js, arg=None):
+                if "document.body" in js:
+                    self.n += 1
+                    self._body = (
+                        "温馨提示：逾期未支付，系统将取消本次交易"
+                        if self.n <= 2 else
+                        "席位已锁定，请尽快完成支付。"
+                        "温馨提示：逾期未支付，系统将取消本次交易")
+                return super().evaluate(js, arg)
+
+        page = _TipThenLock()
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertTrue(ok, msg)
+        self.assertEqual(extra["page_kind"], "initDc")
+        self.assertEqual(extra["order_no"], "E123")
+
+    def test_e2e_lock_tip_only_grace_expires_then_dup(self):
+        # 确认窗不是无限抑制：提示页稳定超过 grace 后 dup 仍应返回，
+        # 否则带提示的真 dup 页会卡死在 HOLD 里。
+        page = self._HoldPage(
+            self.INIT_URL, "温馨提示：逾期未支付，系统将取消本次交易")
+        (ok, msg, extra), stages, _, _ = self._core(
+            page, flow_cfg={"lock_dup_grace_seconds": 1.0})
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "dup")
+        self.assertEqual(extra["dup_kind"], "未支付")
+
+    def test_e2e_old_order_list_returns_ambiguous_immediately(self):
+        # 旧单列表页不可能再转锁定页：旧口径无限等，新口径立即交上层回读。
+        page = self._HoldPage(
+            "https://kyfw.12306.cn/otn/queryOrder/initMyOrderNoComplete",
+            "历史订单列表")
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+
+    def test_e2e_login_page_returns_ambiguous_immediately(self):
+        # 会话失效跳登录页：旧口径无限等，新口径立即交上层回读并释放锁。
+        page = self._HoldPage(
+            "https://kyfw.12306.cn/otn/resources/login.html", "")
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "ambiguous")
+
+    def test_e2e_fail_msg_is_keyword_not_full_body(self):
+        # 失败返回的 msg 只取命中的失败词，不把整页正文（含乘车人信息）
+        # 原样送进日志与历史。
+        page = self._HoldPage(
+            self.INIT_URL, "出票失败，乘车人张三 13800000000 请稍后重试")
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "出票失败")
+        self.assertEqual(extra["reason"], "fail")
+
+    def test_judge_thread_not_started_twice(self):
+        # 锁定词闪烁（出现→消失→再现）时不重复启动回读线程。
+        import orderflow
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_fetch(*a, **k):
+            started.wait(timeout=5)
+            release.wait(timeout=5)
+            return "E1"
+
+        class _NoCtxPage:
+            context = None
+
+        entry = {"t_submit": 1000.0, "judge_thread": None}
+        with mock.patch.object(orderflow, "fetch_unpaid_order_no",
+                               side_effect=slow_fetch), \
+             mock.patch.object(orderflow, "session_from_browser_state",
+                               return_value=object()):
+            orderflow._start_judge_thread(entry, _NoCtxPage(), "2026-10-17",
+                                          "G101", ["张三"], None)
+            first = entry["judge_thread"]
+            self.assertIsNotNone(first)
+            started.set()
+            orderflow._start_judge_thread(entry, _NoCtxPage(), "2026-10-17",
+                                          "G101", ["张三"], None)
+            self.assertIs(first, entry["judge_thread"])
+            release.set()
+            first.join(timeout=5)
+        self.assertEqual(entry.get("judge_order_no"), "E1")
+
     def test_e2e_fail_body(self):
         # 2026-10-24 用户口径：页面明确报失败直接返回，不再先走官方回读。
         import orderflow
