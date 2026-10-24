@@ -1911,6 +1911,11 @@ class MonitorEngine(object):
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
+                # 截图留存不只挂启动：引擎连续跑数周不重启时，首日的清理
+                # 后过期截图会一直滞留（2026-10-25 审）。每轮顺带调一次，
+                # 闸门（snap_cleanup_last == 今天）使非清理日直接返回，
+                # 成本一次 state 查表。
+                self._cleanup_old_snaps()
                 self._sync_state()  # 同步外部（GUI）对状态文件的修改
                 if self._sync_config() and getattr(self, "_tasks_changed", True):
                     # 任务集合实际变化（增/删/改内容）：按最新列表重建调度

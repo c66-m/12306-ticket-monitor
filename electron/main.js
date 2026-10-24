@@ -27,10 +27,25 @@ let rpcId = 0;
 // 调试日志脱敏：这几个方法的参数含证件号/手机号/授权码，只打键名
 const _SENSITIVE_RPC = new Set(["savePassengers", "passengerDetail", "saveSettings"]);
 
-// 超时放宽名单：纯查询类方法（无副作用，后端慢主要是官方接口慢），
-// 60s 容易误杀，放宽到 120s。preload 已把前端旧名转成新命名空间名，
-// 这里新旧名都列（main 自身直调与外部调试走旧名时也命中）。
-const _LONG_TIMEOUT_METHODS = new Set(["tickets.query", "queryTickets"]);
+// 超时放宽名单：后端慢方法（官方接口慢 / 启停引擎），60s 容易误杀，
+// 放宽到 120s。preload 把前端旧名转成新命名空间名再发给 main，
+// 故新旧名都列（main 自身直调与外部调试走旧名时也命中）；与后端
+// api.py _SLOW_METHODS 对齐，改后端慢方法时这里要同步改
+// （2026-10-25 审：旧名单只有 tickets.query，reconcileHistory /
+// relogin / startEngine 等在壳里仍只有 60s，与后端慢方法脱节）。
+const _LONG_TIMEOUT_METHODS = new Set([
+  "tickets.query", "queryTickets",
+  "session.check", "checkSession",
+  "session.relogin", "relogin",
+  "passengers.sync_12306", "sync12306Passengers",
+  "history.reconcile", "reconcileHistory",
+  "settings.test_email", "testEmail",
+  "network.ip_loc", "ipLocate",
+  "session.account", "getAccount",
+  "engines.start", "startEngine",
+  "engines.stop", "stopEngine",
+  "system.shutdown", "shutdown",
+]);
 
 function pyCall(method, params) {
   return new Promise((resolve, reject) => {

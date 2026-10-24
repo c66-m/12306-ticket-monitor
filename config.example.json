@@ -46,8 +46,9 @@
     "read_poll_seconds": 0.5,
     "page_wait_seconds": 30,
     "retry_open_times": 1,
-    "lock_confirm_seconds": 1.5
+    "lock_confirm_seconds": 3.0
   },
+  "_order_flow_notes": "page_wait_seconds / retry_open_times 仅兼容保留：96aab5a 后 HOLD 不再用它们限制等待（一直等到锁定页/失败/手动停止）；lock_confirm_seconds 是锁定页稳几秒判成功，默认 3.0。",
   "task_defaults": {
     "auto_order": true,
     "stop_after_order": true,

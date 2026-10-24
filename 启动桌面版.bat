@@ -8,6 +8,21 @@ rem Drop RUN_AS_NODE inherited from an Electron parent, or electron.exe runs as
 rem node and crashes with "Cannot read properties of undefined (reading handle)".
 set ELECTRON_RUN_AS_NODE=
 
+rem Preflight (2026-10-25 review): the shell used to open with a dead
+rem backend when python was missing or api.py was moved; fail fast here
+rem with a readable message instead of a blank window.
+where python >nul 2>nul
+if errorlevel 1 (
+  echo [error] python not found in PATH. Install Python 3, then retry.
+  pause
+  exit /b 1
+)
+if not exist "%~dp0api.py" (
+  echo [error] api.py not found next to this launcher: %~dp0api.py
+  pause
+  exit /b 1
+)
+
 set "APP=%~dp0electron"
 set "EXE=%APP%\node_modules\electron\dist\electron.exe"
 
