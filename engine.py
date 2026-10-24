@@ -1211,6 +1211,12 @@ class MonitorEngine(object):
                                 retry_map[dedup_key(task, date, train_code, s,
                                                     task.get("passenger_names") or [])] = recheck_due
                             self._save_state()
+                            # 冷却期内任务列表应如实显示「暂缓下单、X 秒后复查」，
+                            # 而不是旧文案（2026-10-25 审）。轮次起点检查点到期
+                            # 后会把 retrying 恢复为 monitoring，与此配对。
+                            self.set_task_status(task, "retrying",
+                                "待支付:本行程暂缓下单,%d秒后自动复查,请尽快支付"
+                                % UNPAID_RECHECK_SECONDS)
                             break
                         if cls in ("cancelled", "none"):
                             # 连击退避：官方反复说无单但网页端反复判 dup，说明存在
@@ -1223,11 +1229,21 @@ class MonitorEngine(object):
                             if streak >= 3:
                                 streaks.pop(key, None)
                                 self._save_state()
-                                self.set_task_status(task, "failed",
-                                    "网页端连续 %d 次判重复下单但官方查无此单：疑似账号被限"
-                                    "（如取消次数过多），请到 12306 核对后恢复任务" % streak)
+                                _fail_msg = ("网页端连续 %d 次判重复下单但官方查无此单：疑似账号被限"
+                                             "（如取消次数过多），请到 12306 核对后恢复任务" % streak)
+                                self.set_task_status(task, "failed", _fail_msg)
                                 LOG.error("[警告] 任务「%s」%s 连续 %d 次 dup 且官方无单，"
                                           "停止自动重试", name, date, streak)
+                                # 其它终态（browser_dead/ambiguous）均有历史，dup 连击
+                                # 终态旧口径只写状态不写历史，用户查历史看不到失败原因。
+                                appcommon.append_history(self.history_path, {
+                                    "time": self._now(), "task": name, "result": "failed",
+                                    "train": train_code, "date": date, "from": info["from_name"],
+                                    "to": info["to_name"], "seat": seat_name,
+                                    "passengers": p_names, "order_no": ono,
+                                    "screenshot": (extra or {}).get("screenshot") or "",
+                                    "message": _fail_msg, "notify": "",
+                                })
                                 return True, False
                             continue
                         if cls == "blocked":
@@ -1274,6 +1290,31 @@ class MonitorEngine(object):
                                 LOG.info("[结果回读] 任务「%s」%s 官方确认无此订单（%s），安全重试",
                                          name, date, cls)
                                 continue
+                            if cls == "paid":
+                                # 用户已在别处付款：已购得，不是待核对。旧口径落
+                                # ambiguous 停任务，用户可能误以为没买到而重下
+                                # （2026-10-25 审）。不发成功通知：通知文案是
+                                # 「未支付请尽快支付」，对已支付单是错误信息；
+                                # 状态与历史已足够说明结论（与 dup paid 分支同口径）。
+                                LOG.info("[结果回读] 任务「%s」%s 官方确认已支付 %s，判定已购得",
+                                         name, date, _mask_order_no(ono))
+                                appcommon.append_history(self.history_path, {
+                                    "time": self._now(), "task": name, "result": "success",
+                                    "train": train_code, "date": date, "from": info["from_name"],
+                                    "to": info["to_name"], "seat": seat_name,
+                                    "passengers": p_names, "order_no": ono,
+                                    "screenshot": (extra or {}).get("screenshot") or "",
+                                    "message": "官方确认已支付，订单 %s" % (ono or "未知"),
+                                    "notify": "",
+                                })
+                                if stop_after:
+                                    self.set_task_status(task, "success",
+                                                         "官方确认已支付,订单 %s" % (ono or "未知"))
+                                    return True, False
+                                if self.task_status(task) == "retrying":
+                                    self.set_task_status(task, "monitoring",
+                                        "官方确认已支付（订单 %s），继续监控其它日期" % (ono or "未知"))
+                                return True, False
                             # unpaid 但时间对不上 / blocked / error / unknown：保守停。
                             # B2：落独立终态「待核对」（ambiguous），不再记 failed——
                             # 订单可能已生成待付款，误报失败会诱导用户重复下单。
@@ -1386,6 +1427,28 @@ class MonitorEngine(object):
                                 LOG.error("[窗口异常] 任务「%s」浏览器窗口关闭，官方回读=%s，停止自动重试",
                                           name, cls)
                                 return True, False
+                            if cls == "paid":
+                                # 窗口虽死，官方确认已支付：与 ambiguous 分支同口径
+                                # 判已购得，不发未支付口径的成功通知（2026-10-25 审）。
+                                LOG.info("[窗口异常] 任务「%s」浏览器窗口关闭，但官方确认已支付 %s，判定已购得",
+                                         name, _mask_order_no(ono))
+                                appcommon.append_history(self.history_path, {
+                                    "time": self._now(), "task": name, "result": "success",
+                                    "train": train_code, "date": date, "from": info["from_name"],
+                                    "to": info["to_name"], "seat": seat_name,
+                                    "passengers": p_names, "order_no": ono,
+                                    "screenshot": (extra or {}).get("screenshot") or "",
+                                    "message": "官方确认已支付，订单 %s" % (ono or "未知"),
+                                    "notify": "",
+                                })
+                                if stop_after:
+                                    self.set_task_status(task, "success",
+                                                         "官方确认已支付,订单 %s" % (ono or "未知"))
+                                    return True, False
+                                if self.task_status(task) == "retrying":
+                                    self.set_task_status(task, "monitoring",
+                                        "官方确认已支付（订单 %s），继续监控其它日期" % (ono or "未知"))
+                                return True, False
                             # unpaid 但时间对不上 / blocked / unknown / error：保守停
                             self.set_task_status(
                                 task, "failed",
@@ -1461,8 +1524,17 @@ class MonitorEngine(object):
                     return True
                 # R1-13：任务在下单途中被删除（墓碑）也视为应停——否则
                 # 删除拦不住一张正在提交的订单，与删除意图完全相反。
-                return task_name in (getattr(self, "_deleted_names", None)
-                                     or ())
+                if task_name in (getattr(self, "_deleted_names", None) or ()):
+                    return True
+                # 2026-10-25 审：暂停也要中断在途下单——HOLD 等锁定页可达
+                # 数分钟，旧口径只查 stop_event 与墓碑，暂停期间下单仍走完
+                # 并记成功历史，与「暂停即不买」相违。注意 task_status 对
+                # state 里没有的任务默认返回 paused，故这里直接读 state，
+                # 缺条目按「在途」（不停）处理，不误伤未建条目的任务。
+                # 后续 ambiguous 分支的状态写入会被 paused 防覆盖守卫拦下
+                # （任务保持 paused），历史记录仍会落盘留证。
+                cur = self.state.get("tasks", {}).get(task_name, {}).get("status")
+                return cur is not None and cur not in ACTIVE_STATUSES
 
             ok, msg, extra = order_mod.order_ticket(
                 self.config, task, info, seat_name,
@@ -1535,7 +1607,7 @@ class MonitorEngine(object):
             extra.get("selected_seat") or seat_name, alias_seat) if alias_seat else "")
         subject = "[购票成功] {0} {1} 有余票且已提交订单".format(info["train_code"], date)
         body = (
-            "已自动提交订单（未支付，请在 12306 45 分钟内完成支付）：\n\n"
+            "已自动提交订单（未支付，请在 12306 30 分钟内完成支付）：\n\n"
             "车次：{train}\n日期：{date}\n区间：{_from} -> {_to}\n"
             "发车：{start}  到达：{arrive}\n席别/座位类型：{seat}\n（座位号以出票后为准）\n"
             "乘车人：{passengers}\n"

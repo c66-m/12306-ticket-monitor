@@ -667,9 +667,26 @@ def menu_task_ops():
             eng.set_task_status(task, "cancelled", "用户手动取消", force=True)
             print("  已取消（任务保留在列表中，可删除）。")
     elif op == "4":
-        if ask_yes_no("  确认重置「%s」状态为监控中？" % task["name"], "n"):
+        if ask_yes_no("  确认重置「%s」状态为监控中？（并清除本行程的复查冷却与 dup 连击计数）" % task["name"], "n"):
             eng.set_task_status(task, "monitoring", "已重置", force=True)
-            print("  已重置为监控中。")
+            # 菜单承诺「清除防重记录」：旧口径只复位状态，600 秒复查冷却
+            # 与 dup_streak 连击计数全保留，重置后下轮仍被冷却/连击判失败
+            # （2026-10-25 审）。清本行程的瞬态控制态；orders.json 的官方
+            # 订单证据不动——删它会丢防重依据，可能导致重复下单。
+            names_key = "|".join(sorted(task.get("passenger_names") or [])) or "*"
+            cleared = 0
+            for table in ("retry", "dup_streak"):
+                m = eng.state.get(table) or {}
+                for k in [k for k in m
+                          if len(k.split("|")) == 6
+                          and k.split("|")[0] == task.get("from")
+                          and k.split("|")[1] == task.get("to")
+                          and k.split("|")[5] == names_key]:
+                    m.pop(k, None)
+                    cleared += 1
+            if cleared:
+                eng._save_state()
+            print("  已重置为监控中（清除冷却/连击计数 %d 项，订单记录保留）。" % cleared)
     elif op == "5":
         if ask_yes_no("  确认从配置中删除任务「%s」？" % task["name"], "n"):
             del config["tasks"][idx]

@@ -1228,6 +1228,74 @@ class TestEngineFlow(TempDirCase):
             for _ in range(3):
                 e._run_task(t)
         self.assertEqual(e.state["tasks"][t["name"]]["status"], "failed")
+
+    def test_dup_none_streak_3_writes_failed_history(self):
+        # 2026-10-25 审：dup 连击终态旧口径只写状态不写历史，用户查历史
+        # 看不到失败原因；其它终态均有历史。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "monitoring", "fail_streak": 0}
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(False, "已有订单", {"reason": "dup"})), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("none", "", "未找到", None)), \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")):
+            for _ in range(3):
+                e._run_task(t)
+        recs = appcommon.read_history_records(e.history_path)
+        self.assertTrue(any(r.get("result") == "failed" and "连续 3 次" in (r.get("message") or "")
+                            for r in recs))
+
+    def test_ambiguous_paid_is_success_not_ambiguous(self):
+        # 2026-10-25 审：结果未知分支里官方回读已是 paid（用户在别处已付款），
+        # 旧口径落 ambiguous 停任务，用户可能误以为没买到而重下。
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("paid", "E9", "已支付", None)):
+            e = self._run((False, "结果未知", {"reason": "ambiguous"}),
+                          expect_status="success", notify_calls=0)
+
+    def test_browser_dead_paid_is_success_not_failed(self):
+        # 2026-10-25 审：窗口关闭分支里官方回读已是 paid，旧口径直接置
+        # failed「官方订单状态无法确认」并停任务。
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("paid", "E9", "已支付", None)):
+            e = self._run((False, "浏览器窗口异常关闭", {"reason": "browser_dead"}),
+                          expect_status="success", notify_calls=0)
+
+    def test_dup_unpaid_cooldown_sets_retrying_status(self):
+        # 2026-10-25 审：600 秒复查冷却写入后任务列表应显示 retrying 与
+        # 倒计时文案，而不是旧文案；轮次起点检查点到期后会恢复 monitoring。
+        with mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付", None)):
+            e = self._run((False, "已有订单", {"reason": "dup"}),
+                          expect_status="retrying", stop_after_order=False)
+        self.assertIn("暂缓下单", e.state["tasks"]["t1"].get("message") or "")
+
+    def test_order_once_should_stop_paused_and_missing(self):
+        # 2026-10-25 审：暂停要中断在途下单；state 里没有条目的任务按
+        # 「在途」处理（task_status 默认 paused 会误伤，必须绕开它）。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        captured = {}
+
+        def fake_order(config, task, info, seat_name, should_stop=None):
+            captured["should_stop"] = should_stop
+            return (True, "ok", {})
+
+        with mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               side_effect=fake_order):
+            e._order_once(t, {}, "2026-10-17", "硬座")
+        self.assertIsNotNone(captured["should_stop"])
+        self.assertFalse(captured["should_stop"]())
+        e.state["tasks"][t["name"]] = {"status": "paused"}
+        self.assertTrue(captured["should_stop"]())
+        e.state["tasks"][t["name"]] = {"status": "monitoring"}
+        self.assertFalse(captured["should_stop"]())
         self.assertEqual(e.state.get("dup_streak", {}), {})
 
     def test_dup_none_streak_reset_by_unpaid(self):

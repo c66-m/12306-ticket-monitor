@@ -536,6 +536,7 @@ class Grabber(threading.Thread):
                                  "date": date, "from": info["from_name"],
                                  "to": info["to_name"], "seat": seat,
                                  "passengers": names, "order_no": order_no,
+                                 "screenshot": (extra or {}).get("screenshot") or "",
                                  "message": msg, "notify": "已通知(启动器)"})
                         except Exception as e:
                             log("[提醒] 购票历史写入失败：%s" % e)
@@ -574,6 +575,7 @@ class Grabber(threading.Thread):
                                      "date": date, "from": info["from_name"],
                                      "to": info["to_name"], "seat": seat,
                                      "passengers": names, "order_no": order_no,
+                                     "screenshot": (extra or {}).get("screenshot") or "",
                                      "message": self.result[1], "notify": "已通知(启动器)"})
                             except Exception as e:
                                 log("[提醒] 购票历史写入失败：%s" % e)
@@ -665,6 +667,7 @@ class Grabber(threading.Thread):
                                  "date": date, "from": info["from_name"],
                                  "to": info["to_name"], "seat": seat,
                                  "passengers": names, "order_no": ono or "",
+                                 "screenshot": (extra or {}).get("screenshot") or "",
                                  "message": self.result[1],
                                  "notify": "已通知(启动器)" if result_kind == "success" else ""})
                         except Exception:

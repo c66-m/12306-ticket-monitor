@@ -1086,9 +1086,12 @@ def snap_page_evidence(page, kind, train_code="", date=""):
     try:
         d = os.path.join(HERE, "logs")
         os.makedirs(d, exist_ok=True)
+        # 毫秒后缀：同秒同车次同日期同类先后两张不再互相覆盖
+        # （失败返回快，独占锁串行仍可同秒；2026-10-25 审）。
         path = os.path.join(d, "order_%s_%s_%s_%s.png" % (
             kind, train_code or "x", date or "x",
-            time.strftime("%Y%m%d-%H%M%S")))
+            time.strftime("%Y%m%d-%H%M%S") + "-%03d" % (
+                int(time.time() * 1000) % 1000)))
         page.screenshot(path=path, full_page=False)
         return path
     except Exception:
@@ -1912,12 +1915,15 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             return (False, "滑块验证再次出现，已中止（脚本不绕过验证码）",
                                     extra)
                 url = page.url
-                if any(k in url for k in ("payOrder", "MyOrderNoComplete", "order/init")):
+                if any(k in url for k in ("payOrder", "initDc", "MyOrderNoComplete", "order/init")):
                     _log("  [浏览器] 结果页用时 %.1fs（%d 轮）" % (time.time() - t_submit, tick))
                     # 只有付款页才是「本次下单成功」；未完成订单列表/订单初始化页
                     # 可能是账号里更早的旧单，不能当成功直接停机，标 ambiguous
-                    # 交上层官方接口回读（旧代码三 URL 一锅烩误报成功）
-                    if "payOrder" not in url:
+                    # 交上层官方接口回读（旧代码三 URL 一锅烩误报成功）。
+                    # 2026-10-25 审：真实锁定页 URL 是 initDc 而非 payOrder，
+                    # 旧链门控漏了它，D290 类成功在旧链上只会等到 deadline
+                    # 后判 ambiguous；initDc 与 payOrder 同走锁定词确认。
+                    if "payOrder" not in url and "initDc" not in url:
                         mark("result")
                         return (False,
                                 "订单结果落在 %s（非付款页）——无法确认本次下单结果，"
@@ -1932,7 +1938,8 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                                 "已跳到付款页但没出现「席位已锁定」界面"
                                 "（页面可能仍在加载、被踢或已失效）——"
                                 "无法确认本次下单成功，交官方订单接口回读",
-                                {"reason": "ambiguous", "page_kind": "payOrder"})
+                                {"reason": "ambiguous",
+                                 "page_kind": "payOrder" if "payOrder" in url else "initDc"})
                     # 页面正文已拿到：核对真实显示的席别，防止静默买错
                     seat_on_page = ""
                     body = body_raw.replace("\n", " ")
@@ -1957,7 +1964,8 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     return True, "已提交订单（未支付）：%s%s" % (url, warn), {
                         "passengers": "、".join(picked), "seat_on_page": seat_on_page,
                         "seat_in_dialog": dlg_seat,
-                        "pay_evidence": pay_evidence, "page_kind": "payOrder"}
+                        "pay_evidence": pay_evidence,
+                        "page_kind": "payOrder" if "payOrder" in url else "initDc"}
                 # 失败提示：500ms 一轮只做一次 innerText 读。原来 8 次
                 # locator.count() 放大成 8 次同步 IPC，页面跳转期排队会加重卡顿
                 if tick % 2 == 0:
