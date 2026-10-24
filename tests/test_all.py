@@ -12895,6 +12895,30 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertFalse(ok)
         self.assertEqual(extra["reason"], "dup")
         self.assertEqual(extra["dup_kind"], "未完成订单")
+        self.assertNotIn("screenshot", extra)
+
+    def test_e2e_dup_page_screenshot_carried_in_extra(self):
+        # 2026-10-25 补：dup 页截图路径必须进 extra，引擎才能写历史
+        # 记录的 🖼 按钮；只存盘不带路径等于白截。
+        import browser_order
+
+        class _ShotPage(self._HoldPage):
+            def __init__(self, url, body):
+                super().__init__(url, body)
+                self.shots = []
+
+            def screenshot(self, path=None, full_page=False):
+                self.shots.append(path)
+
+        page = _ShotPage(self.INIT_URL, "您有未完成订单，请先处理")
+        with mock.patch.object(browser_order, "HERE", self.tmp):
+            (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(extra["reason"], "dup")
+        self.assertEqual(len(page.shots), 1)
+        self.assertEqual(extra["screenshot"], page.shots[0])
+        self.assertIn("order_dup_G101_2026-10-17_", extra["screenshot"])
+        self.assertTrue(extra["screenshot"].endswith(".png"))
 
     def test_e2e_fail_body(self):
         # 2026-10-24 用户口径：页面明确报失败直接返回，不再先走官方回读。
@@ -12906,6 +12930,7 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertFalse(ok)
         self.assertEqual(msg, "余票不足")
         self.assertEqual(extra["reason"], "fail")
+        self.assertNotIn("screenshot", extra)
         self.assertNotIn("JUDGE", stages)
 
     def test_e2e_fail_word_returns_fail_without_judge(self):
@@ -12920,6 +12945,30 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertEqual(msg, "出票失败")
         self.assertEqual(extra["reason"], "fail")
         self.assertNotIn("JUDGE", stages)
+
+    def test_e2e_fail_page_screenshot_carried_in_extra(self):
+        # 2026-10-25 补：失败页截图路径必须进 extra，引擎才能写历史
+        # 记录的 🖼 按钮；只存盘不带路径等于白截。
+        import browser_order
+
+        class _ShotPage(self._HoldPage):
+            def __init__(self, url, body):
+                super().__init__(url, body)
+                self.shots = []
+
+            def screenshot(self, path=None, full_page=False):
+                self.shots.append(path)
+
+        page = _ShotPage(self.INIT_URL, "出票失败")
+        with mock.patch.object(browser_order, "HERE", self.tmp):
+            (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "出票失败")
+        self.assertEqual(extra["reason"], "fail")
+        self.assertEqual(len(page.shots), 1)
+        self.assertEqual(extra["screenshot"], page.shots[0])
+        self.assertIn("order_fail_G101_2026-10-17_", extra["screenshot"])
+        self.assertTrue(extra["screenshot"].endswith(".png"))
 
     def test_e2e_unresolved_page_waits_until_user_stops(self):
         # 2026-10-24 用户口径：页面始终无结论时不再超时转回读，

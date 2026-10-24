@@ -340,8 +340,11 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
     return True, "已提交订单（未支付）：%s%s" % (url, warn), extra
 
 
-def _finish_dup(url, body, logger):
-    """任一页读到重复订单特征：关全部页面返回 dup（dup_kind 区分行程冲突）。"""
+def _finish_dup(url, body, logger, screenshot=""):
+    """任一页读到重复订单特征：关全部页面返回 dup（dup_kind 区分行程冲突）。
+
+    screenshot：dup 页留证路径（有则进 extra，引擎据此写历史记录的
+    🖼 按钮；无则不写该键，与旧口径一致）。"""
     clean = body
     for noise in _LINK_NOISE:
         clean = clean.replace(noise, "")
@@ -350,7 +353,10 @@ def _finish_dup(url, body, logger):
     hit = body[max(0, i - 60):i + 60].replace("\n", " ")
     _emit(logger, "[流程] JUDGE：网页判定重复订单（%s）url=%s 原文=%s"
           % (dup_kind, url[:120], hit))
-    return False, body, {"reason": "dup", "dup_kind": dup_kind, "dup_url": url}
+    extra = {"reason": "dup", "dup_kind": dup_kind, "dup_url": url}
+    if screenshot:
+        extra["screenshot"] = screenshot
+    return False, body, extra
 
 
 def _close_page_quietly(page):
@@ -538,7 +544,7 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                         shot = snap_page_evidence(page, "dup", train, date)
                         if shot:
                             _emit(logger, "[流程] 重复订单页截图已存：%s" % shot)
-                        return _finish_dup(url, body, logger)
+                        return _finish_dup(url, body, logger, screenshot=shot)
                     # 锁定页里的「未完成订单」多是过程提示的链接文字，
                     # 不能据此关页：继续等锁定词或显式失败
                 elif snap == "fail":
@@ -548,7 +554,10 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     if shot:
                         _emit(logger, "[流程] 失败页截图已存：%s" % shot)
                     _emit(logger, "[流程] HOLD：网页报下单失败，直接返回")
-                    return False, body, {"reason": "fail"}
+                    fail_extra = {"reason": "fail"}
+                    if shot:
+                        fail_extra["screenshot"] = shot
+                    return False, body, fail_extra
                 # wait / ambiguous：过程提示、旧单列表、初始化页——
                 # 都只是「还没出结果」，继续等，不转回读、不重下。
             # 滑块出现即停交人工（坑 7）：脚本不绕过。
