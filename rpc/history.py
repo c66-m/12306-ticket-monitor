@@ -30,6 +30,7 @@ def rpc_clear_problem_logs(p):
     必须显式 confirm=true：RPC 冒烟测试会带空参数逐个调用方法，不加这道门
     会在跑测试时把用户真实台账清掉。
     """
-    if not p.get("confirm"):
+    # 只认真值 True / 1 / "true"：旧口径判真值，字符串 "false" 同样通过门禁。
+    if p.get("confirm") not in (True, 1, "true"):
         return {"ok": False, "error": "需要 confirm=true 才清空问题日志"}
     return {"ok": logutil.clear_problem_log()}

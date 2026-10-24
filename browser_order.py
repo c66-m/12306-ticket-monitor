@@ -562,6 +562,12 @@ def save_state(ctx):
         tmp = STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"cookies": cookies}, f, ensure_ascii=False, indent=2)
+        # 会话 Cookie 是登录凭证：chmod 在 replace 之前做在 tmp 上，
+        # 目标文件权限一次到位，不留可读窗口（2026-10-25 审）。
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
         os.replace(tmp, STATE_PATH)
         return True
     except Exception:
@@ -1915,7 +1921,20 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                             return (False, "滑块验证再次出现，已中止（脚本不绕过验证码）",
                                     extra)
                 url = page.url
-                if any(k in url for k in ("payOrder", "initDc", "MyOrderNoComplete", "order/init")):
+                # initDc 页正文已见失败词时不走锁定确认：失败页可能落在
+                # initDc URL 上，而锁定页正文绝无失败词；跳过门控，落到
+                # 下方的失败词检查（dup 优先），不烧 10 秒锁定轮询。
+                # （旧链循环顺序是滑块→URL 门→失败词；initDc 入门控后
+                # 抢跑，曾把 fail+dup 页误判 ambiguous、把滑块重现挡在门外。）
+                _gate_fail = False
+                if "initDc" in url and "payOrder" not in url:
+                    try:
+                        _peek = page.evaluate(
+                            "() => document.body ? document.body.innerText : ''") or ""
+                    except Exception:
+                        _peek = ""
+                    _gate_fail = any(k in _peek for k in _fail_keys)
+                if any(k in url for k in ("payOrder", "initDc", "MyOrderNoComplete", "order/init")) and not _gate_fail:
                     _log("  [浏览器] 结果页用时 %.1fs（%d 轮）" % (time.time() - t_submit, tick))
                     # 只有付款页才是「本次下单成功」；未完成订单列表/订单初始化页
                     # 可能是账号里更早的旧单，不能当成功直接停机，标 ambiguous
@@ -1933,13 +1952,20 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     locked, body_raw, pay_evidence = _wait_pay_locked(
                         page, _PAY_LOCK_WAIT_SEC, _stopped)
                     if not locked:
-                        mark("result")
-                        return (False,
-                                "已跳到付款页但没出现「席位已锁定」界面"
-                                "（页面可能仍在加载、被踢或已失效）——"
-                                "无法确认本次下单成功，交官方订单接口回读",
-                                {"reason": "ambiguous",
-                                 "page_kind": "payOrder" if "payOrder" in url else "initDc"})
+                        if "payOrder" in url:
+                            mark("result")
+                            return (False,
+                                    "已跳到付款页但没出现「席位已锁定」界面"
+                                    "（页面可能仍在加载、被踢或已失效）——"
+                                    "无法确认本次下单成功，交官方订单接口回读",
+                                    {"reason": "ambiguous",
+                                     "page_kind": "payOrder"})
+                        # initDc 未见锁定词：不立即判 ambiguous，继续循环——
+                        # 滑块重现/失败词等探测仍需跑；结果 deadline 到时
+                        # 循环外自有 ambiguous 兜底（旧链 initDc 本就不进门控，
+                        # 立即判 ambiguous 是本轮引入的抢跑）。
+                        _log("  [浏览器] initDc 页未见「席位已锁定」，继续等待…")
+                        continue
                     # 页面正文已拿到：核对真实显示的席别，防止静默买错
                     seat_on_page = ""
                     body = body_raw.replace("\n", " ")

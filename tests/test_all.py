@@ -4780,6 +4780,11 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         # 走官方回读，而不是旧代码那样直接 return True 停机
         clock = self._Clock()
         page = self._Page(clock)
+        # 夹具的 INIT_URL 是 initDc（真实锁定页 URL）：结果循环首轮
+        # 读到 initDc + 锁定正文即判成功，到不了 NoComplete 页；把
+        # 结果前的 URL 换成中性确认页，保留本测试「落在旧单列表页」
+        # 的原意（2026-10-25 审后修正）。
+        page.INIT_URL = "https://kyfw.12306.cn/otn/confirmPassenger/confirm"
         page.PAY_URL = "https://kyfw.12306.cn/otn/queryOrder/initMyOrderNoComplete"
         self._stub_playwright()
         info = {"train_code": "G101", "from_name": "北京", "to_name": "上海",
@@ -4795,7 +4800,10 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
         # 付款页 URL 成功返回的 extra 必须带 page_kind 与 pay_evidence 键
         ok, msg, extra, page = self._run_order()
         self.assertTrue(ok)
-        self.assertEqual(extra.get("page_kind"), "payOrder")
+        # 夹具结果循环首轮读到的是 INIT_URL（initDc，真实锁定页 URL），
+        # 成功即发生在 initDc 上：page_kind 如实报 initDc，不再是旧代码
+        # 硬编码的 payOrder（2026-10-25 审后修正）。
+        self.assertEqual(extra.get("page_kind"), "initDc")
         self.assertIn("pay_evidence", extra)
 
     # ---------- 方案A：should_stop 与 browser_dead ----------
@@ -13024,22 +13032,38 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertEqual(extra["reason"], "dup")
         self.assertEqual(extra["dup_kind"], "未支付")
 
-    def test_e2e_old_order_list_returns_ambiguous_immediately(self):
-        # 旧单列表页不可能再转锁定页：旧口径无限等，新口径立即交上层回读。
+    def test_e2e_old_order_list_waits_until_stop(self):
+        # 2026-10-24 用户口径：旧单列表页一直等到手动停止，不提前返回。
+        # （A1 曾改成立即返回，与用户「中途不再提前返回」及 r1 钉子测试冲突，
+        # 本轮已回退；终态页无限等的代价列入汇报建议，由用户定。）
         page = self._HoldPage(
             "https://kyfw.12306.cn/otn/queryOrder/initMyOrderNoComplete",
             "历史订单列表")
-        (ok, msg, extra), stages, _, _ = self._core(page)
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
+
+        (ok, msg, extra), stages, _, _ = self._core(page, should_stop=stop)
         self.assertFalse(ok)
         self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("手动停止", msg)
 
-    def test_e2e_login_page_returns_ambiguous_immediately(self):
-        # 会话失效跳登录页：旧口径无限等，新口径立即交上层回读并释放锁。
+    def test_e2e_login_page_waits_until_stop(self):
+        # 会话失效跳登录页：同上，一直等到手动停止（暂停同样中断 HOLD）。
         page = self._HoldPage(
             "https://kyfw.12306.cn/otn/resources/login.html", "")
-        (ok, msg, extra), stages, _, _ = self._core(page)
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
+
+        (ok, msg, extra), stages, _, _ = self._core(page, should_stop=stop)
         self.assertFalse(ok)
         self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("手动停止", msg)
 
     def test_e2e_fail_msg_is_keyword_not_full_body(self):
         # 失败返回的 msg 只取命中的失败词，不把整页正文（含乘车人信息）
@@ -15141,7 +15165,11 @@ class TestR3EngineDupUnpaidPerTrain(TempDirCase):
         self.assertEqual(m_order.call_count, 2,
                          "unpaid 后不得同车次逐席别重走下单：calls=%d"
                          % m_order.call_count)
-        self.assertEqual(e.state["tasks"][t["name"]]["status"], "monitoring")
+        # 2026-10-25 审：冷却写入后任务列表应如实显示 retrying 与倒计时
+        # 文案（此前状态仍显示 monitoring，与冷却行为不符）；轮次起点
+        # 检查点到期后会恢复 monitoring，与 busy 路径的冷却口径一致。
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "retrying")
+        self.assertIn("暂缓下单", e.state["tasks"][t["name"]].get("message") or "")
 
 
 class TestR3SyncConfigSchedule(TempDirCase):

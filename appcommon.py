@@ -692,12 +692,18 @@ def cookie_path(name=None) -> str:
 
 def state_path_of(config, base_dir):
     """config 的 state_file 键 → 绝对路径（缺省 state.json）。"""
-    return resolve_data_file(base_dir, config.get("state_file", "state.json"))
+    name = config.get("state_file", "state.json")
+    if not isinstance(name, str):
+        name = "state.json"
+    return resolve_data_file(base_dir, name)
 
 
 def history_path_of(config, base_dir):
     """config 的 history_file 键 → 绝对路径（缺省 order_history.json）。"""
-    return resolve_data_file(base_dir, config.get("history_file", "order_history.json"))
+    name = config.get("history_file", "order_history.json")
+    if not isinstance(name, str):
+        name = "order_history.json"
+    return resolve_data_file(base_dir, name)
 
 
 def read_config_or_empty(path, *, missing=None, broken=None, non_dict=None):
@@ -843,10 +849,17 @@ def update_state_locked(path, mutator, *, read_state, tmp_kind="tmp",
             if os.path.exists(path):
                 try:
                     with open(path, encoding="utf-8-sig") as f:
-                        json.load(f)
+                        raw = json.load(f)
                 except Exception as e:
                     raise RuntimeError(
                         "state.json 读取失败，本次写入已取消：%s" % e)
+                # 有效 JSON 但非 dict（如数组）：旧口径解析成功即放行，随后
+                # state={} 派生覆写，全部任务 status/retry 清零（2026-10-25 审）。
+                # 与 read_state_or_none 的口径一致：非 dict 按损坏拒写。
+                if not isinstance(raw, dict):
+                    raise RuntimeError(
+                        "state.json 顶层不是对象（实际 %s），本次写入已取消"
+                        % type(raw).__name__)
         if not isinstance(state, dict):
             if on_non_dict is not None:
                 on_non_dict(state)

@@ -282,7 +282,10 @@ def _iter_request_lines(stream):
         chunk = stream.readline(_MAX_LINE_BYTES + 1)
         if not chunk:
             return
-        if len(chunk) > _MAX_LINE_BYTES:
+        # 恰好 1MB 内容 + 换行 = MAX+1 字节：readline(MAX+1) 整行返回，
+        # 旧口径 len > MAX 即误判超限丢弃（差一错误，2026-10-25 审）。
+        # 以换行结尾的 MAX+1 字节行是合法行，放行；无换行结尾的才是真超限。
+        if len(chunk) > _MAX_LINE_BYTES and not chunk.endswith("\n"):
             while not chunk.endswith("\n"):
                 chunk = stream.readline(_MAX_LINE_BYTES + 1)
                 if not chunk:

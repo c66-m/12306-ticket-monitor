@@ -125,7 +125,14 @@ def _split_date_input(p):
     ISO 列表，date_range 是 [起, 止] 或空列表。前端曾把 date_range 传成
     "起~止" 字符串，落盘后被 engine 判为形状非法整段丢弃（任务靠 dates 还能跑，
     区间语义却丢了，日志里那行「date_range 形状非法」就是它）。"""
-    dates = [str(x) for x in (p.get("dates") or [])
+    raw_dates = p.get("dates")
+    if isinstance(raw_dates, str):
+        # 前端漏写方括号传来裸字符串：旧口径逐字符迭代，"2026-10-25" 落盘
+        # 成 10 个单字符，引擎判非 ISO 全部丢弃，任务永不触发而界面显示已武装。
+        raw_dates = [raw_dates]
+    elif not isinstance(raw_dates, (list, tuple)):
+        raw_dates = []
+    dates = [str(x) for x in raw_dates
              if isinstance(x, str) and x.strip()]
     raw = p.get("date_range")
     if isinstance(raw, (list, tuple)) and len(raw) == 2:
@@ -259,8 +266,20 @@ def rpc_set_task_status(p):
 def rpc_resume_all(_p):
     """全部恢复：把暂停中的任务批量转回 monitoring。"""
     cfg = load_config()
+    state = load_state() or {}
+    state_tasks = state.get("tasks") if isinstance(state, dict) else None
+    if not isinstance(state_tasks, dict):
+        state_tasks = {}
     n = 0
     for t in _task_dicts(cfg):
+        # 生效状态与 listMonitorTasks 同口径：state 优先，缺省 paused。
+        # 旧口径不加过滤：一次点击把已购 success / 已取消任务全部重新武装，
+        # 与本函数文档串承诺相反（2026-10-25 审）。
+        rec = state_tasks.get(t.get("name"))
+        status = rec.get("status") if isinstance(rec, dict) else None
+        status = status or t.get("status") or "paused"
+        if status != "paused":
+            continue
         rpc_set_task_status({"name": t.get("name"), "status": "monitoring", "message": "全部恢复"})
         n += 1
     return {"ok": True, "count": n}

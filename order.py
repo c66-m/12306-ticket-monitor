@@ -137,7 +137,8 @@ def save_session(session, cookie_path=None):
     ])
     if not cookies:
         return
-    appcommon.atomic_write_json(path, cookies)
+    # 会话 Cookie 是登录凭证：0600（2026-10-25 审）。
+    appcommon.atomic_write_json(path, cookies, mode=0o600)
 
 
 CHECK_URL = "https://kyfw.12306.cn/otn/index/initMy12306Api"
@@ -495,17 +496,23 @@ def get_passengers(session):
 
     # 兜底：若上面接口字段路径变了，用 passengers/query
     if not passengers:
-        r2 = session.post("https://kyfw.12306.cn/otn/passengers/query",
-                          data={"pageIndex": 1, "pageSize": 10}, timeout=15)
-        for p in (r2.json().get("data") or {}).get("datas") or []:
-            passengers.append({
-                "name": p.get("passenger_name"),
-                "id_type": p.get("passenger_id_type_code", "1"),
-                "id_no": p.get("passenger_id_no"),
-                "mobile": p.get("mobile_no") or "",
-                "is_adult": p.get("isAdult", 1) != 0,
-                "type_name": p.get("passenger_type_name") or "",
-            })
+        # 旧口径只取第 1 页 10 条：账号乘车人超过 10 人时第 11 人起
+        # 永远选不到（2026-10-25 审）。翻页拉全量，上限 20 页防死循环。
+        for page in range(1, 21):
+            r2 = session.post("https://kyfw.12306.cn/otn/passengers/query",
+                              data={"pageIndex": page, "pageSize": 10}, timeout=15)
+            datas = (r2.json().get("data") or {}).get("datas") or []
+            for p in datas:
+                passengers.append({
+                    "name": p.get("passenger_name"),
+                    "id_type": p.get("passenger_id_type_code", "1"),
+                    "id_no": p.get("passenger_id_no"),
+                    "mobile": p.get("mobile_no") or "",
+                    "is_adult": p.get("isAdult", 1) != 0,
+                    "type_name": p.get("passenger_type_name") or "",
+                })
+            if len(datas) < 10:
+                break
     return passengers
 
 
@@ -650,6 +657,16 @@ def _query_my_order(session, query_where, start, end, page_size=8, max_pages=25,
         items.extend(batch)
         if len(batch) < page_size:
             break
+    else:
+        # for/else：循环未 break 即 25 页全部满额——可能还有第 26 页未拉到。
+        # 审后曾改成抛错保守中止，但 test_query_my_order_page_cap 钉住
+        # 「25 页截断返回 200 条」的既有契约（200 条远超 60 天窗口实际量）；
+        # 折中：保留截断返回，但不再静默——打一条大写警告进日志，
+        # 漏检风险可见而非悄悄发生（2026-10-25 审后修正）。
+        if len(batch) == page_size:
+            LOG.warning("[订单] 官方订单查询触顶 %d 页上限且末页满额，"
+                        "可能漏检深页订单（已返回 %d 条）",
+                        max_pages, len(items))
     return items
 
 
@@ -887,7 +904,7 @@ def confirm_order(session, token, left_ticket_str, key_check, train_location,
         return False, "下单失败: {0}".format(d.get("messages", d.get("validateMessages")))
     data_ = d.get("data") or {}
     if data_.get("submitStatus"):
-        return True, "订单已提交，处于【未完成订单】状态（未支付，请在 App/网页 45 分钟内支付）"
+        return True, "订单已提交，处于【未完成订单】状态（未支付，请在 App/网页 30 分钟内支付）"
     return False, "排队未成功: {0}".format(data_)
 
 
@@ -914,10 +931,16 @@ def _confirm_json_with_retry(session, token, left_ticket_str, key_check, train_l
         if ok or not msg.startswith("confirmSingleForQueue 返回非 JSON"):
             return ok, msg
         if date and train_code and not_before_ts is not None:
+            # 证据单号查询也受总时限约束：失败只丢证据，不影响主流程
+            # （fetch_unpaid_order_no 内部已吞异常，2026-10-25 审）。
             ono = fetch_unpaid_order_no(
                 session, date=date, train_code=train_code,
-                passenger_names=passenger_names, not_before_ts=not_before_ts)
+                passenger_names=passenger_names, not_before_ts=not_before_ts,
+                deadline_ts=time.time() + 180)
             if ono:
+                # 订单号不脱敏：它是用户去支付/核对的行动标识，r3 钉子测试
+                # 要求消息里带完整号；历史记录里同样存完整号，单掩消息
+                # 并不改善隐私，只会让用户对不上单（2026-10-25 审后修正）。
                 return True, ("订单已提交，处于【未完成订单】状态（未支付）："
                               "confirm 响应非 JSON，但官方未完成订单已确认"
                               "本次订单生成，订单号 {0}".format(ono))
@@ -951,7 +974,7 @@ def confirm_with_busy_retry(session, token, left_ticket_str, key_check, train_lo
 
 
 def fetch_unpaid_order_no(session, date=None, train_code=None, passenger_names=None,
-                          not_before_ts=None):
+                          not_before_ts=None, deadline_ts=None):
     """尽力获取「本次提交生成」的未完成订单号（失败不影响主流程）。
 
     按 not_before_ts 做下单时间归因：只返回 order_ts 落在本次提交窗口内、且
@@ -960,7 +983,8 @@ def fetch_unpaid_order_no(session, date=None, train_code=None, passenger_names=N
     （宁可缺省，不给过期单号）。
     """
     try:
-        orders = check_existing_orders(session, date or time.strftime("%Y-%m-%d"))
+        orders = check_existing_orders(session, date or time.strftime("%Y-%m-%d"),
+                                       deadline_ts=deadline_ts)
     except Exception:
         return None
     inc = [o for o in orders
@@ -1120,7 +1144,7 @@ def order_ticket(config, task, ticket, seat_name, should_stop=None):
     order_no = fetch_unpaid_order_no(
         sess, date=date, train_code=ticket["train_code"],
         passenger_names=[p["name"] for p in picked],
-        not_before_ts=not_before_ts)
+        not_before_ts=not_before_ts, deadline_ts=time.time() + 180)
     passenger_names = "、".join(p["name"] for p in picked)
     extra = {"order_no": order_no, "passengers": passenger_names, "date": date,
              "train": ticket["train_code"], "seat": seat_name,

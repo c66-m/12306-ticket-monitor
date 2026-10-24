@@ -47,9 +47,17 @@ def rebuild(force=False):
                  "未学习标待识别,查询使用会自动补全;更新: python station_db.py rebuild",
           "version": 1, "updated": now, "count": len(rows), "stations": rows}
     tmp = DB_PATH + ".tmp%s" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, DB_PATH)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, DB_PATH)
+    finally:
+        # 写盘/替换中途崩溃会把半截 tmp 永久留在仓库目录（2026-10-25 审）：
+        # replace 成功后 tmp 已不存在，remove 会 No such file，吞掉即可。
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     if not rows and force:
         # --force 显式覆盖的空库："共 0 站（运营中）"是虚假表述，改发警告。
         print("警告：已按 --force 显式写入空车站库（0 站），旧库已被覆盖。")

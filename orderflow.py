@@ -548,10 +548,13 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
         # 快照（过程提示）继续等，不设观察时限、不转官方回读、不新开页
         # 重下——此前「没等锁定页出来就返回重下、而订单其实已生成待付
         # 款」的问题即由此而来。
-        # 提前出口（2026-10-25 审）：手动停止、滑块超时、浏览器窗口关闭，
-        # 以及不可能再转锁定页的终态页（旧单列表/初始化页/登录页）——后者
-        # 交上层官方回读定生死，不占着独占锁无限等。锁定页确认窗另见
-        # lock_dup_grace_seconds：提示先出、锁定词后出的那一拍不判 dup。
+        # 提前出口：手动停止、滑块超时、浏览器窗口关闭。旧单列表 /
+        # 初始化页 / 登录页不提前返回（2026-10-24 用户口径：只等锁定页，
+        # 中途不再提前返回；终态页无限等的代价见本轮汇报的建议项，
+        # 由用户定是否加时限——审后曾一度改成立即返回，与用户口径及
+        # test_r1_order_core 的钉子测试冲突，已回退）。
+        # 锁定页确认窗另见 lock_dup_grace_seconds：提示先出、锁定词
+        # 后出的那一拍不判 dup。
         stage("HOLD")
         _emit(logger, "[流程] HOLD：驻留观察网页变化（每 %.1fs 读 url+正文，"
                       "只等锁定页或明确失败）" % poll)
@@ -571,13 +574,8 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     e["judge_valid"] = False
                     return False, "浏览器窗口异常关闭", {"reason": "browser_dead"}
                 url, body = "", ""
-            # 会话失效跳登录页：结果已不可知（旧口径会无限等下去）。交
-            # 上层官方回读定生死，不占着独占锁空转。
-            if "login.html" in url or "passport" in url:
-                e["judge_valid"] = False
-                _emit(logger, "[流程] HOLD：页面跳到登录页（会话失效），"
-                              "交上层官方回读")
-                return False, body, {"reason": "ambiguous"}
+            # 登录页也不提前返回：与旧单列表/初始化页同按 2026-10-24
+            # 用户口径一直等，直到手动停止（暂停同样中断 HOLD）。
             snap = classify_snapshot(url, body)
             # 锁定页判定（2026-10-25 审）：fd611fd 前只认 payOrder，但真实
             # 锁定页是 initDc——提示先出、锁定词后出的那一拍曾被误判 dup。
@@ -614,14 +612,10 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
             else:
                 # 锁定信号消失（跳走/半渲染）：重新计时，避免瞬时误判
                 e["success_since"] = None
-                if snap == "ambiguous":
-                    # classify 只对旧单列表 / 订单初始化页判 ambiguous：
-                    # 这类页不可能再转成锁定页（2026-10-25 审：旧口径会
-                    # 无限等下去）。立即交上层官方回读定生死，释放独占锁。
-                    e["judge_valid"] = False
-                    _emit(logger, "[流程] HOLD：终态页（旧单列表/初始化页），"
-                                  "交上层官方回读")
-                    return False, body, {"reason": "ambiguous"}
+                # snap == "ambiguous"（旧单列表/初始化页）不提前返回：
+                # 2026-10-24 用户口径要求一直等到手动停止，落到下方
+                # in_confirm/dup/fail 皆不中即继续等（与 test_r1_order_core
+                # 的钉子测试一致）。
                 if in_confirm:
                     pass          # 确认窗内一律 wait，交给下一轮
                 elif snap == "dup":

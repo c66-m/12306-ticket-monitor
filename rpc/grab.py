@@ -14,6 +14,8 @@ import threading
 import time
 import traceback
 
+import filelock
+
 from rpc.common import (_warn, push)
 
 import grabber
@@ -161,12 +163,16 @@ def rpc_grab_ticker(_p):
                 else:
                     t.pop("result_reason", None)
                 try:
-                    tasks = grabber.load_grab_tasks()
-                    for i, x in enumerate(tasks):
-                        if x.get("id") == tid:
-                            tasks[i] = t
-                            break
-                    grabber.save_grab_tasks(tasks)
+                    # ticker 每秒回写与用户编辑任务同走无锁 load-modify-save：
+                    # 并发交错时一方修改被静默丢掉（2026-10-25 审）。整段包进
+                    # 文件锁，与 history/orders/config/state 的口径一致。
+                    with filelock.file_lock(grabber.GRAB_TASKS_PATH + ".lock", timeout=10):
+                        tasks = grabber.load_grab_tasks()
+                        for i, x in enumerate(tasks):
+                            if x.get("id") == tid:
+                                tasks[i] = t
+                                break
+                        grabber.save_grab_tasks(tasks)
                 except Exception as e:
                     _warn("抢票结果回写任务库", e)
         st = grabber_utils.parse_dt(str(t.get("start_time") or ""))
@@ -270,11 +276,23 @@ def rpc_query_tickets(p):
         })
     return {"trains": trains, "date": date}
 
+def _as_list(value):
+    """字符串包成单元素列表、非列表降级为空列表。
+
+    字符串若原样透传，下游推导式会逐字符拆（trains="G101" → {'G','1','0'}）。
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
 def rpc_seat_priority_feedback(p):
     """首选席别输入框即时反馈（与 gui.NewTaskDialog 同源）。"""
     text = p.get("text") or ""
-    checked = p.get("checked") or []
-    trains = p.get("trains") or []
+    checked = _as_list(p.get("checked"))
+    trains = _as_list(p.get("trains"))
     txt, bad = ticket.seat_priority_feedback(text, checked, trains)
     return {"text": txt or "不填 = 只按下面勾选的席别顺序", "warn": bool(bad)}
 
@@ -331,34 +349,54 @@ def rpc_search_station(p):
     return {"stations": [{"name": h["name"], "code": h["code"],
                           "kind": grabber.station_kind(h["code"])} for h in hits]}
 
+def _presets_of(cfg):
+    """launcher 预设列表视图：字符串等非 list 按空表处理并告警。
+
+    旧口径：list 原样返回字符串给前端；save 对字符串枚举字符后 x.get 抛错、
+    保存失败原因不透明（2026-10-25 审）。
+    """
+    presets = cfg.get("presets")
+    if presets is None:
+        return []
+    if not isinstance(presets, list):
+        _warn("预设数据形状非法已降级",
+              "presets 应为列表，实际 %s" % type(presets).__name__)
+        return []
+    return presets
+
+
 def rpc_list_presets(_p):
     cfg = grabber.load_launcher_config()
-    return {"presets": cfg.get("presets") or [],
+    return {"presets": _presets_of(cfg),
             "station_history": cfg.get("station_history") or [],
             "query_history": cfg.get("query_history") or []}
 
 def rpc_delete_preset(p):
     """p = {name}：删除常用行程预设。"""
-    cfg = grabber.load_launcher_config()
-    name = p.get("name")
-    before = cfg.get("presets") or []
-    cfg["presets"] = [x for x in before if not (isinstance(x, dict) and x.get("name") == name)]
-    if len(cfg["presets"]) == len(before):
-        return {"ok": False, "error": "预设不存在：" + str(name)}
-    appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
+    with filelock.file_lock(grabber.LAUNCHER_CFG_PATH + ".lock", timeout=10):
+        cfg = grabber.load_launcher_config()
+        name = p.get("name")
+        before = _presets_of(cfg)
+        cfg["presets"] = [x for x in before if not (isinstance(x, dict) and x.get("name") == name)]
+        if len(cfg["presets"]) == len(before):
+            return {"ok": False, "error": "预设不存在：" + str(name)}
+        appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
     return {"ok": True}
 
 def rpc_save_preset(p):
     """p = {name, from, to, ...}"""
-    cfg = grabber.load_launcher_config()
-    presets = cfg.setdefault("presets", [])
-    name = p.get("name") or ("预设 %d" % (len(presets) + 1))
-    p["name"] = name
-    for i, x in enumerate(presets):
-        if x.get("name") == name:
-            presets[i] = p
-            break
-    else:
-        presets.append(p)
-    appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
+    # 预设写路径与 ticker 回写同病：无锁 load-modify-save，并发交错丢修改。
+    with filelock.file_lock(grabber.LAUNCHER_CFG_PATH + ".lock", timeout=10):
+        cfg = grabber.load_launcher_config()
+        presets = _presets_of(cfg)
+        cfg["presets"] = presets
+        name = p.get("name") or ("预设 %d" % (len(presets) + 1))
+        p["name"] = name
+        for i, x in enumerate(presets):
+            if isinstance(x, dict) and x.get("name") == name:
+                presets[i] = p
+                break
+        else:
+            presets.append(p)
+        appcommon.atomic_write_json(grabber.LAUNCHER_CFG_PATH, cfg)
     return {"ok": True}

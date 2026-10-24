@@ -82,9 +82,14 @@ def banner(title):
 
 _PII_VALUE_RE = re.compile(
     r'("(?:passenger_name|passenger_id_no|mobile_no|id_no|user_name|username|name|'
-    r'phone_no|email|address|born_date)"'
+    r'phone_no|email|address|born_date|newapptk|apptk|uamtk|tk)"'
     r"\s*:\s*\""
     r')(?:[^"\\]|\\.)*(")')
+
+# 无引号数字型值（如 "id_no": 110101199001011234）：旧口径只抹带引号
+# 字符串，数字型证件/电话原样穿透（2026-10-25 审）。
+_PII_NUMERIC_RE = re.compile(
+    r'("(?:passenger_id_no|id_no|mobile_no|phone_no)"\s*:\s*)[0-9+][0-9\- ]{5,}')
 
 
 def _mask_pii(text):
@@ -97,7 +102,8 @@ def _mask_pii(text):
     """
     if not text:
         return text
-    return _PII_VALUE_RE.sub(r"\1***\2", text)
+    text = _PII_VALUE_RE.sub(r"\1***\2", text)
+    return _PII_NUMERIC_RE.sub(r"\1***", text)
 
 
 def _mask_scalar(value):
@@ -195,6 +201,12 @@ def create_qr_raw():
         try:
             with open(QR_IMAGE_PATH, "wb") as f:
                 f.write(base64.b64decode(image_b64))
+            # 二维码是登录凭证：默认 umask 下同机其它用户可读，收紧到 0600
+            # （与 probe_cookies.json 的口径一致，2026-10-25 审）。
+            try:
+                os.chmod(QR_IMAGE_PATH, 0o600)
+            except OSError:
+                pass
         except Exception:
             pass
     return uuid
@@ -238,6 +250,10 @@ def step3_create_qr():
         try:
             with open(QR_IMAGE_PATH, "wb") as f:
                 f.write(base64.b64decode(image_b64))
+            try:
+                os.chmod(QR_IMAGE_PATH, 0o600)
+            except OSError:
+                pass
             print("\n  二维码已保存到：" + QR_IMAGE_PATH)
             print("  >>> 请打开该图片，用【铁路12306 App】扫一扫，并在手机上确认登录。")
         except Exception as e:
@@ -327,6 +343,9 @@ def step4_poll_qr(uuid):
                     print("  [失败] 刷新二维码失败，终止。")
                     return None
                 print("  新二维码已覆盖保存到：" + QR_IMAGE_PATH + "（请扫最新这一张）")
+                # 新码是新一轮等待：deadline 从刷新起顺延，否则旧码耗掉的
+                # 时间吃掉新码的扫码窗口（2026-10-25 审）。
+                deadline = time.time() + POLL_TIMEOUT_SEC
                 last_msg = None
                 continue
 
@@ -499,6 +518,12 @@ def main():
     # （仅 JSESSIONID）无诊断价值，且会覆盖此前成功探测的有效会话。
     if logged_in:
         step7_save_cookies()
+        # 二维码已完成使命：删图，免得登录凭证图片长期留在仓库目录
+        # （2026-10-25 审）。删失败不影响结论。
+        try:
+            os.remove(QR_IMAGE_PATH)
+        except OSError:
+            pass
     else:
         print("  登录失败，本次不保存 Cookie（保留旧 probe_cookies.json）。")
 

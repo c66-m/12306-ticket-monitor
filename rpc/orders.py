@@ -108,14 +108,29 @@ def rpc_reconcile_history(p):
     path = appcommon.history_path_of(load_config(), HERE)
 
     todo = ("failed", "ambiguous", "browser_dead")
-    targets = [r for r in appcommon.read_history_records(path, limit=limit)
-               if isinstance(r, dict)
-               and r.get("result") in todo
-               and not r.get("reconciled_at")
-               and (r.get("date") or "").strip()]
+    # 形状守卫：历史记录被手改后 date/time/train 可能为数字或 dict，
+    # 旧口径在筛选（数字 date 调 .strip）或 outcome 元组键（dict 值不可哈希）
+    # 处抛错，且都在 try 外，整批对账变 handler_error、一条都对不了。
+    targets = []
+    skipped = 0
+    for r in appcommon.read_history_records(path, limit=limit):
+        if not (isinstance(r, dict) and r.get("result") in todo
+                and not r.get("reconciled_at")):
+            continue
+        if not isinstance(r.get("date"), str) or not r["date"].strip():
+            skipped += 1
+            continue
+        if r.get("time") is not None and not isinstance(r.get("time"), str):
+            skipped += 1
+            continue
+        if r.get("train") is not None and not isinstance(r.get("train"), str):
+            skipped += 1
+            continue
+        targets.append(r)
     if not targets:
-        return {"ok": True, "checked": 0, "changed": 0,
-                "message": "没有需要核对的记录"}
+        return {"ok": True, "checked": 0, "changed": 0, "skipped": skipped,
+                "message": "没有需要核对的记录"
+                         + ("（跳过形状异常记录 %d 条）" % skipped if skipped else "")}
 
     try:
         sess = order_mod.session_from_browser_state()
@@ -182,8 +197,10 @@ def rpc_reconcile_history(p):
         return {"ok": False, "message": "写回历史失败：%s" % e}
 
     msg = "核对 %d 条，更新 %d 条" % (len(targets), changed)
+    if skipped:
+        msg += "（跳过形状异常记录 %d 条）" % skipped
     if errors:
         msg += "；%d 个日期查询失败" % len(errors)
     push("log", {"line": "[对账] " + msg, "tag": "info"})
     return {"ok": True, "checked": len(targets), "changed": changed,
-            "errors": errors, "message": msg}
+            "skipped": skipped, "errors": errors, "message": msg}

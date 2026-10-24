@@ -285,7 +285,8 @@ def main():
             print("[警告] 以下关键 Cookie 未捕获: {0}（不影响保存，但下单可能失败）".format(missing))
 
         # 原子写：写一半被杀会留下半截 JSON，下次下单直接"未登录"
-        appcommon.atomic_write_json(cookie_path, cookie_dict)
+        # 会话 Cookie 是登录凭证：0600，免得同机其它用户可读（2026-10-25 审）。
+        appcommon.atomic_write_json(cookie_path, cookie_dict, mode=0o600)
 
         # R3：Cookie 已落盘后走 defensive close——用户顺手关窗时裸 close()
         # 抛错会穿透 main()，子进程调用方只看退出码，会把成功误判失败。

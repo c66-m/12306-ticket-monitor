@@ -35,9 +35,22 @@ def rpc_check_update(_p):
 
 # ---------------- 设置（SMTP + 会话 + order_mode） ----------------
 
+def _notify_dict(cfg):
+    """config.notify 的 dict 视图：手改成字符串等非 dict 时降级为空 dict。
+
+    旧口径假定 notify/email 必为 dict：config 被手改成 "notify": "oops"
+    时 .get() 抛错，设置页整体打不开——而设置页正是能修它的入口
+    （2026-10-25 审）。与 _task_defaults 对 task_defaults 的口径一致。
+    """
+    notify = cfg.get("notify") if isinstance(cfg, dict) else None
+    if not isinstance(notify, dict):
+        return {}
+    return notify
+
+
 def rpc_get_settings(_p):
     cfg = load_config()
-    email = dict((cfg.get("notify") or {}).get("email") or {})
+    email = dict(_notify_dict(cfg).get("email") or {})
     # 授权码脱敏显示：有密码 → 掩码占位，前端保存时才回写
     out = dict(email)
     if out.get("password"):
@@ -50,7 +63,7 @@ def rpc_get_settings(_p):
     return {
         "order_mode": cfg.get("order_mode") or "http",
         "email": out,
-        "notify_enabled": bool((cfg.get("notify") or {}).get("email", {}).get("enabled")),
+        "notify_enabled": bool(_notify_dict(cfg).get("email", {}).get("enabled")),
         "poll_interval_seconds": cfg.get("poll_interval_seconds"),
         "task_defaults": _task_defaults(cfg),
         # 乐观并发基线：设置页保存时原样带回（与 listPassengers 的 stamp 同口径）
@@ -66,9 +79,13 @@ def rpc_save_settings(p):
     try:
         def _upd(cfg):
             if p.get("email") is not None:
+                # notify 被手改成非 dict 时先复位，否则 setdefault 返回
+                # 字符串、后续 ["email"] 赋值抛错，保存路径同样被堵。
+                if not isinstance(cfg.get("notify"), dict):
+                    cfg["notify"] = {}
                 email = dict(p["email"])
                 # 掩码占位不动原密码；明文才加密回写
-                old_pw = (cfg.get("notify") or {}).get("email", {}).get("password", "")
+                old_pw = _notify_dict(cfg).get("email", {}).get("password", "")
                 pw = email.get("password") or ""
                 if pw == "******":
                     email["password"] = old_pw
@@ -81,6 +98,11 @@ def rpc_save_settings(p):
                 email = normalize_email_settings(email)
                 cfg.setdefault("notify", {})["email"] = email
             if p.get("order_mode"):
+                # 引擎以 == "browser" 判断，拼写错误会把 browser 用户静默
+                # 切回 http 模式（2026-10-25 审）：只接受白名单，其余报错。
+                if p["order_mode"] not in ("http", "browser"):
+                    raise ValueError("order_mode 只能是 http 或 browser：%s"
+                                     % p["order_mode"])
                 cfg["order_mode"] = p["order_mode"]
             if p.get("poll_interval_seconds") is not None:
                 cfg["poll_interval_seconds"] = int(p["poll_interval_seconds"])
