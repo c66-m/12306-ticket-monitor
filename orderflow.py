@@ -21,6 +21,7 @@
 """
 
 import contextlib
+import threading
 import time
 
 from browser_order import (
@@ -81,8 +82,9 @@ def classify_snapshot(url, body):
     """HOLD 快照分类（纯函数，供单测）。
 
     返回 success / dup / fail / ambiguous / wait：
-    - success: url 含 payOrder 且正文出现「席位已锁定」——以锁定座位的订单
-      界面为唯一成功口径（2026-10-18 用户要求）。
+    - success: 正文出现「席位已锁定」——以锁定座位的订单界面为唯一成功
+      口径（2026-10-18 用户要求），不看 URL（真实锁定页 URL 为
+      confirmPassenger/initDc；payOrder 分支保留兼容）。
     - ambiguous: 旧单列表（MyOrderNoComplete）/ 订单初始化页（order/init），
       可能是账号里更早的旧单，不能直接当成功，交官方回读。
     - dup: 账号已有未支付订单等，再重试只会得到同样的拒绝。
@@ -91,10 +93,16 @@ def classify_snapshot(url, body):
       「订单已经提交…」）——那时结果还没出来，正文里的「未完成订单」
       只是提示框指向订单列表的链接文字，不是重复订单证据。
     """
-    if "payOrder" in url:
-        return "success" if _PAY_LOCK_KEY in body else "wait"
     if "MyOrderNoComplete" in url or "order/init" in url:
         return "ambiguous"
+    if _PAY_LOCK_KEY in body:
+        # 「席位已锁定」即成功口径（2026-10-18 用户口径），不看 URL：真实
+        # 锁定页 URL 是 confirmPassenger/initDc 而非 payOrder，且其温馨提示
+        # 「逾期未支付，系统将取消本次交易」恰好命中 dup 词表——2026-10-24
+        # 实跑 D290 曾把刚下成功的单判成 dup，引发逐轮重复下单。
+        return "success"
+    if "payOrder" in url:
+        return "wait"
     if any(k in body for k in _PENDING_KEYS):
         # 提交过程提示（「正在处理，请稍候。」等）：结果还没出来，继续观察
         return "wait"
@@ -235,6 +243,43 @@ def _save_state_for_judge(ctx, logger):
         _emit(logger, "[流程] 会话落盘失败：%s（官方回读可能读到旧 cookie）" % exc)
 
 
+# 后台回读线程的 join 上限（秒）：fetch 单发请求自带 http_timeout，正常
+# 数秒内返回；超时按「本次成功、单号待查」收尾，不阻塞成功结论。
+_JUDGE_JOIN_TIMEOUT = 40.0
+
+
+def _start_judge_thread(entry, page, date, train, passenger_names, logger):
+    """锁定页一出现就后台启动官方订单号回读（2026-10-24 用户口径：静置
+    等待期间后台自动核对并更新软件日志，不让用户盯着静屏等结果）。
+
+    回读是纯 HTTP（session 读自落盘的 browser_state），与页面无关，可在
+    后台线程进行；save_state 留在主线程（Playwright 上下文不跨线程）。
+    结果由 _finish_success join 后取用；流程若从其它出口结束，daemon 线程
+    随进程退出，不阻塞。"""
+    try:
+        ctx = page.context
+    except Exception:
+        ctx = None      # 测试替身页无 context：跳过落盘（真实页不受影响）
+    if ctx is not None:
+        _save_state_for_judge(ctx, logger)
+
+    def _run():
+        try:
+            entry["judge_order_no"] = fetch_unpaid_order_no(
+                session_from_browser_state(), date, train,
+                passenger_names, entry["t_submit"])
+            if entry.get("judge_order_no"):
+                _emit(logger, "[流程] JUDGE：官方回读到本次订单号 %s"
+                              % entry["judge_order_no"])
+        except Exception as exc:
+            entry["judge_error"] = str(exc)[:160]
+            _emit(logger, "[流程] JUDGE：订单号回读失败（%s），不影响本次成功判定"
+                          "（可到 12306「未完成订单」核对）" % str(exc)[:120])
+
+    entry["judge_thread"] = threading.Thread(target=_run, daemon=True)
+    entry["judge_thread"].start()
+
+
 def _finish_success(entry, url, body, date, train, passenger_names, seat_name, logger,
                     headless=False, stop=None):
     """HOLD 读到「席位已锁定」界面：取证（页面席别 + 支付证据 + 官方回读单号），返回成功。
@@ -252,17 +297,28 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
     if entry["dlg_seat"] and entry["dlg_seat"] != seat_name:
         warn += "（核对窗曾显示席别 %s，请以订单详情为准）" % entry["dlg_seat"]
     ono = None
-    try:
-        # 用户可能刚在页面上重新登录过：先落盘会话，再回读，避免读到旧 cookie
+    th = entry.get("judge_thread")
+    if th is not None:
+        # 回读已在锁定页出现时后台启动（_start_judge_thread）：join 取结果；
+        # 超时按「本次成功、单号待查」收尾，不改变成功结论
+        th.join(timeout=_JUDGE_JOIN_TIMEOUT)
+        ono = entry.get("judge_order_no")
+        if th.is_alive():
+            _emit(logger, "[流程] JUDGE：后台订单号回读 %.0fs 未完成，先按已提交"
+                          "成功收尾（可到 12306「未完成订单」核对）"
+                          % _JUDGE_JOIN_TIMEOUT)
+    else:
         try:
-            save_state(entry["page"].context)
-        except Exception:
-            pass
-        ono = fetch_unpaid_order_no(session_from_browser_state(), date, train,
-                                    passenger_names, entry["t_submit"])
-    except Exception as e:
-        _emit(logger, "[流程] JUDGE：订单号回读失败（%s），不影响本次成功判定"
-                      "（可到 12306「未完成订单」核对）" % str(e)[:120])
+            # 用户可能刚在页面上重新登录过：先落盘会话，再回读，避免读到旧 cookie
+            try:
+                save_state(entry["page"].context)
+            except Exception:
+                pass
+            ono = fetch_unpaid_order_no(session_from_browser_state(), date, train,
+                                        passenger_names, entry["t_submit"])
+        except Exception as e:
+            _emit(logger, "[流程] JUDGE：订单号回读失败（%s），不影响本次成功判定"
+                          "（可到 12306「未完成订单」核对）" % str(e)[:120])
     if ono:
         _emit(logger, "[流程] JUDGE：官方回读到本次订单号 %s" % ono)
     extra = {"passengers": "、".join(entry["picked"]), "seat_on_page": seat_on_page,
@@ -456,6 +512,9 @@ def _run_orderflow_core(info, seat_name, seat_code, passenger_names, date,
                     e["success_since"] = time.time()
                     _emit(logger, "[流程] HOLD：读到「席位已锁定」，静置 %.1fs"
                                   "确认订单状态保持不变" % lock_confirm)
+                    # 静置期间后台启动官方回读并实时落日志（2026-10-24 用户口径）
+                    _start_judge_thread(e, page, date, train,
+                                        passenger_names, logger)
                 elif time.time() - e["success_since"] >= lock_confirm:
                     _emit(logger, "[流程] HOLD：锁定界面稳定 %.1fs（提交后 %.1fs）"
                           % (lock_confirm, time.time() - e["t_submit"]))

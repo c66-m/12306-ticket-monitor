@@ -54,6 +54,13 @@ MIN_INTERVAL_FLOOR = 1
 # 用长间隔并告警，避免无效高频轮询（_run_task 会把该任务标为失败并停止）
 NO_DATES_FALLBACK_INTERVAL = 300
 
+# 判定「已有未支付订单」后本行程（各席别）的复查冷却（秒）：stop_after_order
+# 关闭的任务不停止，但同一车次+日期在支付窗口内反复下单只会被 12306 以重复
+# 订单拒绝（2026-10-24 D290 实跑：判定「任务停止」8 秒后即重新走完整下单
+# 流程）。冷却到期自动复查：期间已支付→后续 dup 核查判 paid；已被 12306
+# 逾期自动取消→恢复可下单。
+UNPAID_RECHECK_SECONDS = 600
+
 # 例行字段（last_poll/message/fail_streak）合并冲刷间隔（秒）：这些字段每轮
 # 必写但价值低（纯展示/计数），高频轮询下逐次落盘会造成多余的文件锁争用与
 # IO。改为打脏标，由主循环在此间隔内合并写一次；retry/status 等重要
@@ -1125,7 +1132,9 @@ class MonitorEngine(object):
                         LOG.info("[防重核查] 任务「%s」%s %s 官方查询结果=%s %s",
                                  name, date, train_code, cls,
                                  ("订单号 %s,官方状态「%s」" % (_mask_order_no(ono), raw)) if ono else raw)
-                        decision = {"unpaid": "待支付:任务停止,请尽快支付",
+                        decision = {"unpaid": ("待支付:任务停止,请尽快支付" if stop_after else
+                                               "待支付:本行程暂缓下单,%d秒后自动复查,请尽快支付"
+                                               % UNPAID_RECHECK_SECONDS),
                                     "paid": "已支付:判定为已购得,任务停止",
                                     "cancelled": "已取消:清除本地防重记录,允许重新下单",
                                     "none": "官方无此订单:清除本地记录,允许重新下单",
@@ -1192,6 +1201,15 @@ class MonitorEngine(object):
                             # 判 dup 白耗一轮提交（旧代码 continue 到下一席别
                             # 逐个重走完整浏览器下单）。结束本车次本轮处理
                             # （break 出席别循环），其它日期仍可继续。
+                            # 2026-10-24 补：仅 break 挡不住下一轮轮询——单日
+                            # 期任务 8 秒后即重走完整下单（D290 实跑）。本行程
+                            # 各席别进入复查冷却，到期自动复查；其它日期不受影响。
+                            retry_map = self.state.setdefault("retry", {})
+                            recheck_due = time.time() + UNPAID_RECHECK_SECONDS
+                            for s in (cand or [seat_name]):
+                                retry_map[dedup_key(task, date, train_code, s,
+                                                    task.get("passenger_names") or [])] = recheck_due
+                            self._save_state()
                             break
                         if cls in ("cancelled", "none"):
                             # 连击退避：官方反复说无单但网页端反复判 dup，说明存在
