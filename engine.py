@@ -1142,8 +1142,14 @@ class MonitorEngine(object):
                                     "unknown": "官方状态不明确:保留本地记录,下轮再核",
                                     "error": "官方查询失败:保留本地记录,下轮再核"}[cls]
                         # P1 影子比对：新判定内核与现网 dup 决策对比（不改变现网行为）
-                        _legacy_dup = {"paid": "block_paid",
-                                       "unpaid": "success" if recent else "halt_manual",
+                        # _legacy_* 是旧分类按内核 postconfirm 决策表的翻译（比对
+                        # 的是「内核流水线对同一快照的结论」，不是引擎下游动作）：
+                        # paid→SUCCESS、旧单 unpaid→BLOCK_UNPAID；旧口径 paid 错
+                        # 写 block_paid（BLOCK_PAID 属下单前相，与 postconfirm
+                        # 的 PAID→SUCCESS 不符）、旧单错写 halt_manual，都会
+                        # 在影子报告里造出假分歧（2026-10-25 审）。
+                        _legacy_dup = {"paid": "success",
+                                       "unpaid": "success" if recent else "block_unpaid",
                                        "cancelled": "retry_safe", "none": "retry_safe",
                                        "blocked": "block_conflict",
                                        "unknown": "halt_manual", "error": "halt_manual"}[cls]
@@ -1260,12 +1266,22 @@ class MonitorEngine(object):
                                 date, train_code, task.get("passenger_names") or [],
                                 not_before_ts=attempt_ts,
                                 session=self._classify_session())
-                            # P1 影子比对：新判定内核与现网 ambiguous 决策对比
-                            _legacy_amb = ("success"
-                                           if (cls == "unpaid" and recent)
-                                           else ("retry_safe"
-                                                 if cls in ("none", "cancelled")
-                                                 else "halt_manual"))
+                            # P1 影子比对：新判定内核与现网 ambiguous 决策对比。
+                            # 与 dup 期同口径：旧分类按 postconfirm 决策表翻译；
+                            # 旧口径把 blocked 一并归入 halt_manual（else 兜底），
+                            # 与内核的 BLOCKED→BLOCK_CONFLICT 错位，造假分歧。
+                            if cls == "unpaid" and recent:
+                                _legacy_amb = "success"
+                            elif cls == "paid":
+                                _legacy_amb = "success"
+                            elif cls in ("none", "cancelled"):
+                                _legacy_amb = "retry_safe"
+                            elif cls == "unpaid":
+                                _legacy_amb = "block_unpaid"
+                            elif cls == "blocked":
+                                _legacy_amb = "block_conflict"
+                            else:
+                                _legacy_amb = "halt_manual"
                             self._shadow_compare(date, train_code, p_names,
                                                  attempt_ts, "ambiguous",
                                                  _legacy_amb,
@@ -1566,7 +1582,21 @@ class MonitorEngine(object):
             from core.domain.tripkey import TripKey
             from core.verdict import engine as vcore_engine
             from core.verdict import snapshot_view as vsv
-            prov = SnapshotProvider(self._classify_session())
+            sess = self._classify_session()
+            if sess is None:
+                # browser 模式下 HTTP 会话可能不存在：旧口径直接
+                # SnapshotProvider(None) 抛 TypeError，被宽泛 except
+                # 吞成一行 warning，影子静默失效（2026-10-25 审）。
+                # 先试浏览器存档会话，仍无则明说跳过，不记假分歧。
+                try:
+                    sess = order_mod.session_from_browser_state()
+                except Exception:
+                    sess = None
+            if sess is None:
+                LOG.error("[影子比对] %s %s %s 无可用会话，影子比对跳过",
+                          phase, date, train_code)
+                return None
+            prov = SnapshotProvider(sess)
             orders = prov.fetch(date)
             trip = TripKey.from_task(date, train_code, passenger_names,
                                      from_station=from_station,

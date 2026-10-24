@@ -55,6 +55,12 @@ class Scheduler:
 
     # ---------------- 启停 ----------------
     def start(self):
+        # 幂等：运行中重复 start 旧口径会再起一套 daemon 线程与周期 loop
+        # （_stop 被 clear 后旧 loop 也不停，两套 loop 并行调度；
+        # 2026-10-25 审）。stop() 后 _loop 已死，alive() 为 False，
+        # 可正常重起。
+        if self.alive():
+            return
         with self._lock:
             daemons = [n for n, j in self._jobs.items()
                        if j["type"] == "daemon"]

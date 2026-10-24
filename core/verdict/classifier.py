@@ -74,30 +74,56 @@ def trip_matched_entries(trip, orders, target_names):
 def classify_snapshot(trip, orders, target_names):
     """对整个快照做「本行程」状态分类 → OrderState。
 
-    规则（与 order._classify_orders 语义对齐并收紧）：
-    1. 挡单（cache_block）优先 → BLOCKED（账号级封禁，不是本行程问题）；
-    2. 未完成订单（_no_complete）中，本行程 → UNPAID，非本行程 → BLOCKED；
+    规则（与 order._classify_orders 语义对齐）：
+    1. 未完成订单（_no_complete）中，本行程 → UNPAID；
+    2. 挡单（cache_block）→ BLOCKED；非本行程的未完成 → BLOCKED
+       （12306 规则：任何未完成都挡新单）；
     3. 本行程的已支付/历史条目按票级状态归类（REFUNDED/CANCELLED 允许重抢）；
     4. 查无本行程 → NONE。
+
+    顺序说明（2026-10-25 审）：旧口径挡单优先于行程匹配，与现网
+    order._classify_orders（先行程匹配、再判挡路）相反——本行程已有
+    未支付订单时旧口径报账号级 BLOCKED，掩盖本行程真相；现改回
+    行程优先。单条目 classify_entry 内的 cache_block 优先不受影响
+    （那是单条目文案识别，不是快照规则顺序）。
     """
     orders = list(orders or [])
-    # 1. 挡单封禁（12306 当日取消次数过多等）：原文直出
-    for e in _no_complete_entries(orders):
-        if e.get("_cache_block") or e.get("status", "").find("受理") >= 0:
-            return OrderState.BLOCKED
-    # 2. 未完成订单
+    # 1. 未完成订单：本行程优先
     inc = _no_complete_entries(orders)
     for e in inc:
         if _trip_match(trip, e, target_names):
             return OrderState.UNPAID
+    # 2. 挡单封禁（12306 当日取消次数过多等）与非本行程未完成
+    for e in inc:
+        if e.get("_cache_block") or e.get("status", "").find("受理") >= 0:
+            return OrderState.BLOCKED
     if inc:
         # 12306 规则：任何未完成都挡新单；非本行程的是账号级阻塞
         return OrderState.BLOCKED
-    # 3. 本行程已完成/历史条目：先扫明确态（PAID/REFUNDED/CANCELLED），
-    # UNKNOWN 只作兜底——否则靠前的未识别文案会短路掉后面的已支付条目，
-    # 把已购行程误判成状态不明（R2-7）。
+    # 3. 本行程已完成/历史条目。带时间戳时以 order_ts 最新的条目定状态：
+    # 旧口径跳过 UNKNOWN 取后续确定态，旧 PAID 条目 + 更新 UNKNOWN 条目
+    # 时会误判成功（危险方向）；最新态未知即判 UNKNOWN（保守停）。
+    # 无时间戳时保留旧扫描口径（R2-7：靠前的未识别文案不短路后面的
+    # 已支付条目）。
+    matched = trip_matched_entries(trip, orders, target_names)
+    stamped = [e for e in matched
+               if isinstance(e.get("order_ts"), (int, float))]
+    if stamped:
+        # 最新时间戳组内扫描：组内先扫明确态（R2-7 在等时间戳时仍成立，
+        # max() 取首条会把后置 PAID 判成 UNKNOWN）；组内无明确态但有
+        # UNKNOWN 时判 UNKNOWN（最新态不明，保守停）。
+        max_ts = max(e["order_ts"] for e in stamped)
+        group = [e for e in stamped if e["order_ts"] == max_ts]
+        for e in group:
+            st = classify_entry(e)
+            if st in (OrderState.PAID, OrderState.REFUNDED,
+                      OrderState.CANCELLED):
+                return st
+        if any(classify_entry(e) == OrderState.UNKNOWN for e in group):
+            return OrderState.UNKNOWN
+        # 组内只有 UNPAID/BLOCKED 等非规则态：落到下方全量旧扫描。
     unknown_seen = False
-    for e in trip_matched_entries(trip, orders, target_names):
+    for e in matched:
         st = classify_entry(e)
         if st in (OrderState.PAID, OrderState.REFUNDED, OrderState.CANCELLED):
             return st

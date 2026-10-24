@@ -39,11 +39,14 @@ class SnapshotProvider:
             with self._lock:
                 hit = self._cache.get(date)
                 if hit and now - hit[0] < self._ttl:
-                    return hit[1]
+                    # 返回副本：旧口径直接返回缓存列表，调用方一旦改动
+                    # （排序/过滤原地操作）即污染缓存，后续比对读到脏
+                    # 快照（2026-10-25 审）。条目 dict 仍共享，只防列表级改动。
+                    return list(hit[1])
         orders = order_mod.check_existing_orders(self._session, date)
         with self._lock:
             self._cache = {date: (clock.now_ts(), orders)}  # 单条防缓存膨胀
-        return orders
+        return list(orders)
 
     def invalidate(self):
         with self._lock:

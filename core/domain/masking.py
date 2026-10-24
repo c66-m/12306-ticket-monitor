@@ -41,9 +41,12 @@ def mask_names(names):
 
 
 def mask_id_partial(id_no):
-    """证件号脱敏：保留前 3 位与后 4 位，其余打码。"""
-    if not id_no or len(id_no) < 8:
-        return id_no or ""
+    """证件号脱敏：保留前 3 位与后 4 位，其余打码；短于 8 位全打码
+    （旧口径短输入原样返回，短证件/短号直接穿透，2026-10-25 审）。"""
+    if not id_no:
+        return ""
+    if len(id_no) < 8:
+        return "*" * len(id_no)
     return id_no[:3] + "*" * (len(id_no) - 7) + id_no[-4:]
 
 

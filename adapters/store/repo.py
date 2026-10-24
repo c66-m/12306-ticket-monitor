@@ -64,7 +64,12 @@ def read_history(limit=None):
     hist = _load_json(_data_path("order_history.json"))
     if not isinstance(hist, list):
         return []
-    return hist[-limit:] if limit else hist
+    # limit=0 旧口径因 falsy 返回全量（2026-10-25 审）：0 应的语义是空表。
+    if limit is None:
+        return hist
+    if limit <= 0:
+        return []
+    return hist[-limit:]
 
 
 # ----------------------------- SQLite 直读（影子/对账/校验） -----------------------------

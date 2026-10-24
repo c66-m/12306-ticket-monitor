@@ -63,14 +63,15 @@ class OrderGate:
         return v
 
     def double_check_retry_safe(self, date, train_code, passenger_names,
-                                not_before_ts, gap_seconds=2.0,
+                                not_before_ts, gap_seconds=5.0,
                                 from_station="", to_station=""):
         """双读确认：连续两次官方快照均判 RETRY_SAFE 才返回 RETRY_SAFE。
 
         第一次快照 NONE → 等 gap 秒（让 12306 落库延迟过期）→ 第二次快照
         归因。任一次出现非 RETRY_SAFE 结论，采用那个更保守的结论。
-        第二读必须 force 绕过 provider 缓存（R2-2）：gap 默认 2s 远小于
-        快照 60s TTL，同读一份缓存等于没读第二次。
+        第二读必须 force 绕过 provider 缓存（R2-2）：gap 默认 5s（旧 2s
+        小于落库延迟上界，第二读可能仍读到落库前的空快照，假确认；
+        2026-10-25 审）仍远小于快照 60s TTL。
         """
         trip = tripkey_mod.TripKey.from_task(
             date, train_code, passenger_names,

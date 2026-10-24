@@ -99,10 +99,13 @@ class TripKey:
             raise ValueError("乘车人指纹非法: %r" % (self.pax_key,))
 
     def composite(self):
-        """台账/日志的复合键。带区间时插入「出发>到达」段；无区间时保持
-        旧三段格式——composite 只影响新写入，读取端按不透明字符串处理，
-        旧台账记录不会因格式变化失效。"""
-        if self.from_station or self.to_station:
+        """台账/日志的复合键。双侧区间齐全时插入「出发>到达」段；否则
+        保持旧三段格式——composite 只影响新写入，读取端按不透明字符串
+        处理，旧台账记录不会因格式变化失效。
+        单侧区间旧口径照插空段（「北京>」），格式畸形且与无区间键
+        难区分（2026-10-25 审）；单侧信息仍由 match_trip_fields 的
+        双侧有值才比对口径覆盖，不丢匹配能力。"""
+        if self.from_station and self.to_station:
             return "%s|%s|%s>%s|%s" % (self.date, self.train,
                                        self.from_station, self.to_station,
                                        self.pax_key)

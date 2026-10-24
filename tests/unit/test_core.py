@@ -10,6 +10,7 @@ import unittest
 
 from core.domain.tripkey import (TripKey, pax_fingerprint, normalize_name,
                                  passenger_id_token)
+from core.domain import masking
 from core.state import order_lifecycle as OLC
 from core.state import task_sm
 from core.verdict import classifier, snapshot_view as sv
@@ -194,6 +195,51 @@ class TestClassifier(unittest.TestCase):
                   entry(status="已支付(未出行)")]
         self.assertIs(classifier.classify_snapshot(tk, orders, ["张三", "李四"]),
                       OLC.OrderState.PAID)
+
+    def test_snapshot_trip_match_beats_block(self):
+        # 2026-10-25 审：本行程已有未支付订单 + 他行程挡单并存时，
+        # 行程优先判 UNPAID（旧口径挡单优先报 BLOCKED，掩盖本行程真相；
+        # 与现网 order._classify_orders 的先行程后挡路同序）。
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        orders = [entry("K123", "2026-10-20", status="未完成/未支付",
+                        no_complete=True),
+                  entry("K999", "2026-10-20", status="今日将不能继续受理您的订票请求",
+                        no_complete=True, cache_block=True)]
+        self.assertIs(classifier.classify_snapshot(tk, orders, ["张三", "李四"]),
+                      OLC.OrderState.UNPAID)
+
+    def test_snapshot_latest_ts_unknown_beats_old_paid(self):
+        # 2026-10-25 审：旧 PAID 条目 + 更新 UNKNOWN 条目 → 最新态不明
+        # 判 UNKNOWN（旧口径跳过 UNKNOWN 取后续确定态，会把旧 PAID
+        # 当成当前态误判成功）。
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        orders = [entry(status="已支付(未出行)", order_ts=1000.0),
+                  entry(status="神秘文案xyz", order_ts=2000.0)]
+        self.assertIs(classifier.classify_snapshot(tk, orders, ["张三", "李四"]),
+                      OLC.OrderState.UNKNOWN)
+
+    def test_snapshot_latest_ts_paid_beats_old_unknown(self):
+        # 反向：旧 UNKNOWN + 更新 PAID → 最新态 PAID，不受旧 UNKNOWN 干扰。
+        tk = TripKey.from_task("2026-10-20", "K123", ["张三", "李四"])
+        orders = [entry(status="神秘文案xyz", order_ts=1000.0),
+                  entry(status="已支付(未出行)", order_ts=2000.0)]
+        self.assertIs(classifier.classify_snapshot(tk, orders, ["张三", "李四"]),
+                      OLC.OrderState.PAID)
+
+    def test_composite_single_side_no_segment(self):
+        # 2026-10-25 审：单侧区间不插空段，退回三段格式。
+        tk = TripKey(date="2026-10-20", train="K123",
+                     pax_key=pax_fingerprint(["张三"]),
+                     from_station="北京", to_station="")
+        self.assertEqual(tk.composite(), "2026-10-20|K123|%s"
+                         % pax_fingerprint(["张三"]))
+
+    def test_mask_id_partial_short_fully_masked(self):
+        # 2026-10-25 审：短于 8 位不再原样返回。
+        self.assertEqual(masking.mask_id_partial("1234567"), "*******")
+        self.assertEqual(masking.mask_id_partial(""), "")
+        self.assertEqual(masking.mask_id_partial("110101199001011234"),
+                         "110" + "*" * 11 + "1234")
 
 
 class TestSnapshotView(unittest.TestCase):

@@ -48,12 +48,18 @@ def _load_json(path):
         return json.load(f)
 
 
-def _source_fingerprint(state_path, orders_path, history_path):
-    """三文件 md5 串联；缺失的文件按空占位（保证指纹稳定可跳过）。"""
-    parts = []
-    for p in (state_path, orders_path, history_path):
-        parts.append(_md5_file(p) if os.path.exists(p) else "MISSING")
-    return "|".join(parts)
+def _source_fingerprint(state, orders_db, history):
+    """三份已加载对象规范 JSON 的 md5（2026-10-25 审）。
+
+    旧口径取文件字节 md5：同一数据换行/缩进/键序一变就触发重迁移，
+    而数据本身没变；反之，文件被改写回旧字节时指纹也回旧值，迁移
+    幂等判断被文件表象左右。对象口径只认数据本身。
+    注意：口径切换后旧指纹全部失效，会触发一次性重迁移（幂等重导，
+    数据不变，仅重写镜像与指纹）。
+    """
+    blob = json.dumps([state, orders_db, history], sort_keys=True,
+                      ensure_ascii=False, default=str)
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()
 
 
 def extract_payloads(state, orders_db, history):
@@ -112,7 +118,7 @@ def run_migrate(state_path, orders_path, history_path,
     conn = db.connect(db_file)
     try:
         old_fp = db.meta_get(conn, "last_migrate_fingerprint")
-        new_fp = _source_fingerprint(state_path, orders_path, history_path)
+        new_fp = _source_fingerprint(state, orders_db, history)
         if not force and old_fp == new_fp:
             report["skipped"] = True  # 该批数据已迁移过
             return report
@@ -151,10 +157,25 @@ def latest_backup_dir():
 
 
 def rollback(state_path, orders_path, history_path, backup=None, dry_run=False):
-    """从备份目录恢复三份 JSON。返回放回列表。"""
+    """从备份目录恢复三份 JSON。返回放回列表。
+
+    恢复前先校验三份备份都可解析（2026-10-25 审）：旧口径直接覆盖，
+    备份若已损坏会把好数据盖成坏数据，且三份是逐个覆盖、坏在中途
+    会留下一半新一半旧的混合态。
+    """
     bd = backup or latest_backup_dir()
     if not bd or not os.path.isdir(bd):
         return []
+    for name in ("state.json", "orders.json", "order_history.json"):
+        src = os.path.join(bd, name)
+        if not os.path.exists(src):
+            continue
+        try:
+            with open(src, encoding="utf-8-sig") as f:
+                json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                "备份 %s 已损坏（%s），已中止恢复，未覆盖任何文件" % (src, e))
     restored = []
     for name in ("state.json", "orders.json", "order_history.json"):
         src = os.path.join(bd, name)

@@ -33,9 +33,21 @@ def collect(since=None, log_dir=LOGS):
     files = sorted(glob.glob(os.path.join(log_dir, "monitor_20*.log"))
                    + glob.glob(os.path.join(log_dir, "launcher_20*.log")))
     if since:
-        files = [f for f in files if os.path.basename(f) >=
-                 "monitor_%s.log" % since.replace("-", "") or
-                 os.path.basename(f) >= "launcher_%s.log" % since.replace("-", "")]
+        # 按文件名前缀分别过滤（2026-10-25 审）：旧口径用 or 连接两个
+        # 比较，monitor_ 文件因 'm' > 'l' 恒过第二条件，--since 对
+        # monitor 日志完全失效。
+        m_prefix = "monitor_%s.log" % since.replace("-", "")
+        l_prefix = "launcher_%s.log" % since.replace("-", "")
+
+        def _keep(f):
+            b = os.path.basename(f)
+            if b.startswith("monitor_"):
+                return b >= m_prefix
+            if b.startswith("launcher_"):
+                return b >= l_prefix
+            return True
+
+        files = [f for f in files if _keep(f)]
     for fp in files:
         try:
             with open(fp, encoding="utf-8", errors="replace") as f:

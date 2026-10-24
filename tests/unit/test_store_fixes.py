@@ -8,7 +8,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from adapters.store import db, dualwrite, migrate
+from adapters.store import db, dualwrite, migrate, repo
+from adapters.railway import snapshot as snapshot_mod
+from tools import shadow_report
 
 
 class TestDualwriteRoot(unittest.TestCase):
@@ -72,6 +74,35 @@ class TestMigrateBackupVerify(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_fingerprint_ignores_formatting(self):
+        # 2026-10-25 审：指纹取已加载对象规范 JSON，同一数据换行/缩进/
+        # 键序变化不再触发重迁移；数据本身变化则指纹必变。
+        a = migrate._source_fingerprint({"tasks": {"t1": {"b": 1, "a": 2}}},
+                                        {"orders": {}}, [])
+        b = migrate._source_fingerprint({"tasks": {"t1": {"a": 2, "b": 1}}},
+                                        {"orders": {}}, [])
+        c = migrate._source_fingerprint({"tasks": {"t1": {"a": 3}}},
+                                        {"orders": {}}, [])
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_rollback_rejects_corrupt_backup(self):
+        # 2026-10-25 审：备份损坏时恢复必须中止，且不得覆盖任何好文件。
+        with tempfile.TemporaryDirectory() as d:
+            sp, op, hp = self._write_sources(d)
+            bd = os.path.join(d, "backup", "20260101-000000-000000")
+            os.makedirs(bd)
+            for name, content in (("state.json", "{\"tasks\": {}}"),
+                                  ("orders.json", "{\"orders\": {}}"),
+                                  ("order_history.json", "[{broken")):
+                with open(os.path.join(bd, name), "w", encoding="utf-8") as f:
+                    f.write(content)
+            with self.assertRaises(RuntimeError):
+                migrate.rollback(sp, op, hp, backup=bd)
+            with open(sp, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["tasks"]["t1"]["status"],
+                                 "monitoring")
+
     def test_intact_backup_migrates(self):
         # 防过修 pin：备份完好时迁移照常完成
         with tempfile.TemporaryDirectory() as d:
@@ -82,6 +113,52 @@ class TestMigrateBackupVerify(unittest.TestCase):
                 report = migrate.run_migrate(sp, op, hp, db_file=db_file)
             self.assertEqual(report["errors"], [])
             self.assertEqual(report["tasks"], 1)
+
+
+class TestRepoHistoryLimit(unittest.TestCase):
+    def test_limit_zero_returns_empty(self):
+        # 2026-10-25 审：limit=0 旧口径因 falsy 返回全量。
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "order_history.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump([{"a": 1}, {"a": 2}], f)
+            with mock.patch.dict(os.environ, {"T12306_DATA_DIR": d}):
+                self.assertEqual(repo.read_history(limit=0), [])
+                self.assertEqual(len(repo.read_history(limit=1)), 1)
+                self.assertEqual(len(repo.read_history()), 2)
+
+
+class TestSnapshotFetchCopy(unittest.TestCase):
+    def test_fetch_returns_copy(self):
+        # 2026-10-25 审：缓存返回共享列表时调用方原地改动会污染缓存。
+        class _Sess(object):
+            def post(self, *a, **k):
+                raise AssertionError("不应直连")
+
+        prov = snapshot_mod.SnapshotProvider(_Sess())
+        with mock.patch.object(snapshot_mod.order_mod,
+                               "check_existing_orders",
+                               return_value=[{"order_no": "E1"}]):
+            first = prov.fetch("2026-10-20")
+            first.append({"order_no": "E2"})
+            second = prov.fetch("2026-10-20")
+        self.assertEqual([o["order_no"] for o in second], ["E1"])
+
+
+class TestShadowReportSince(unittest.TestCase):
+    def test_since_filters_monitor_files(self):
+        # 2026-10-25 审：--since 旧口径对 monitor 日志恒过（'m' > 'l'）。
+        with tempfile.TemporaryDirectory() as d:
+            old = os.path.join(d, "monitor_20261001.log")
+            new = os.path.join(d, "monitor_20261020.log")
+            line = ("[影子比对] dup 2026-10-20 K123 旧=success 新=success "
+                    "一致=True\n")
+            for fp in (old, new):
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(line)
+            infos, _ = shadow_report.collect(since="2026-10-15", log_dir=d)
+            # 两文件各 1 条 info；since 过滤后只剩新文件那条
+            self.assertEqual(len(infos), 1)
 
 
 if __name__ == "__main__":

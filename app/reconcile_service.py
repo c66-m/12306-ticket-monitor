@@ -109,7 +109,9 @@ class ReconcileRunner:
             # 只在本轮分类相对落盘值发生变化时广播——blocked 自 R2-4 纳入
             # 待决集后每轮都会被反复确认，若未变也 fire，notify_service 在
             # 启用 email 时会每轮发一封「blocked」对账邮件，形成周期骚扰。
-            # order.paid / order.still_unpaid 不走此门，行为不变。
+            # order.paid 天然只 fire 一次（转 paid 后即退出待决集）；
+            # order.still_unpaid 自 2026-10-25 起同样走边沿门（unpaid 留在
+            # 待决集里，每轮 fire 会形成同样的周期骚扰）。
             changed = cls.value != (rec.get("classify") or "none")
             new_rec = dict(rec)
             new_rec["classify"] = cls.value
@@ -124,7 +126,14 @@ class ReconcileRunner:
                 self._fire("order.paid", key, cls, decision)
             elif cls == OLC.OrderState.UNPAID:
                 report.still_unpaid += 1
-                self._fire("order.still_unpaid", key, cls, decision)
+                # 边沿触发（2026-10-25 审）：unpaid 留在待决集里，每轮
+                # 都会被反复确认；旧口径每轮都 fire，email 启用时每轮
+                # 发一封「仍待付」邮件，形成周期骚扰。paid 天然只 fire
+                # 一次（转 paid 后即退出待决集），故只收 still_unpaid。
+                # 首次落盘即 unpaid 的记录由引擎侧已通知/记历史，对账
+                # 事件只报「变化」，不重复报。
+                if changed:
+                    self._fire("order.still_unpaid", key, cls, decision)
             elif cls == OLC.OrderState.NONE:
                 # none 计数只计官方查无（R2-4）——blocked/cancelled 等
                 # 不得混进 none 拉低口径
@@ -140,6 +149,11 @@ class ReconcileRunner:
 
     def _fire(self, tag, key, cls, decision):
         if not self._emit:
+            return
+        # dry-run（未传 updater）不广播（2026-10-25 审）：旧口径 emit
+        # 默认 True，干跑结论也会经 eventbus 触达 notify/UI，而结论
+        # 根本没落盘——下游会对未持久化的结论发通知/刷新显示。
+        if self._updater is None:
             return
         try:
             from infra import eventbus

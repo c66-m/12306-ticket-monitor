@@ -48,8 +48,16 @@ def _to_email(tag, payload):
             "行程 %s 官方状态 %s\n决策：%s" % (key, cls, decision))
 
 
+# 已接线的 handler（单例）：eventbus 按 fn 身份去重，但 start 每次
+# 新建闭包，重复调用会重复订阅——email 启用时同一事件发多封邮件。
+# 幂等 start：首次调用胜出，后续调用直接返回旧 handler（2026-10-25 审）。
+_STARTED = {"handler": None}
+
+
 def start(config=None, only_audit=False):
     """接线 eventbus。进程初始化时调用一次。only_audit=True 时永不发邮件。"""
+    if _STARTED["handler"] is not None:
+        return _STARTED["handler"]
     from infra import eventbus
 
     def _on(tag, payload):
@@ -60,4 +68,5 @@ def start(config=None, only_audit=False):
     eventbus.subscribe("order.reconciled", _on)
     eventbus.subscribe("order.paid", _on)
     eventbus.subscribe("order.still_unpaid", _on)
+    _STARTED["handler"] = _on
     return _on
