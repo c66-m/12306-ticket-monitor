@@ -130,7 +130,8 @@ _AMBIG_JUDGE = (False, "订单结果未知：官方订单接口回读无法确�
 
 
 class TestHoldAmbiguousAndInit(unittest.TestCase):
-    """第 7、8 条：HOLD ambiguous 分支落盘 + order/init 不立即定案。"""
+    """第 7、8 条（2026-10-24 新口径）：HOLD ambiguous / order/init
+    不再转回读，只等到锁定页、明确失败或用户手动停止。"""
 
     # _run_orderflow_core 开头无条件局部导入
     # `from playwright.sync_api import sync_playwright`（warm 路径也躲不开）；
@@ -163,7 +164,7 @@ class TestHoldAmbiguousAndInit(unittest.TestCase):
             else:
                 sys.modules[k] = v
 
-    def _core(self, page, judge_side=None, flow_cfg=None):
+    def _core(self, page, judge_side=None, flow_cfg=None, should_stop=None):
         """跑 _run_orderflow_core；返回 (out, events, judge_mock)。
 
         events 按调用序记录 "save" / "judge"；judge_side 为 _judge_official
@@ -207,21 +208,28 @@ class TestHoldAmbiguousAndInit(unittest.TestCase):
                 {"train_code": "G101", "from_name": "北京", "to_name": "上海"},
                 "二等座", "O", ["张三"], "2026-10-17",
                 headless=True, purpose="ADULT", warm=warm, alias_name=None,
-                purpose_map=None, should_stop=None,
+                purpose_map=None, should_stop=should_stop,
                 mark=lambda s: None, stage=lambda s: None,
                 flow_cfg=flow_cfg or {}, logger=None)
         return out, events
 
     # -- 第 7 条 ---------------------------------------------------------
 
-    def test_ambiguous_branch_saves_state_before_judge(self):
-        # 落在旧单列表（MyOrderNoComplete）：走官方回读前必须先落盘会话，
-        # 与 fail 分支、最终 JUDGE 的 _save_state_for_judge 口径一致。
+    def test_ambiguous_page_waits_until_stop(self):
+        # 2026-10-24 用户口径：落在旧单列表（MyOrderNoComplete）不再
+        # 转官方回读，只等到用户手动停止；期间不落盘、不回读。
         page = _SeqPage([(NOCOMPLETE_URL, "未完成订单列表")])
-        out, events = self._core(page, judge_side=lambda *a, **k: _AMBIG_JUDGE)
-        self.assertEqual(events, ["save", "judge"])
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
+
+        out, events = self._core(page, should_stop=stop)
+        self.assertEqual(events, [])
         self.assertFalse(out[0])
         self.assertEqual(out[2]["reason"], "ambiguous")
+        self.assertIn("手动停止", out[1])
 
     # -- 第 8 条 ---------------------------------------------------------
 
@@ -242,35 +250,38 @@ class TestHoldAmbiguousAndInit(unittest.TestCase):
         self.assertEqual(out[2]["page_kind"], "payOrder")
         self.assertEqual(events, [])
 
-    def test_order_init_stalled_snapshot_goes_to_judge(self):
-        # order/init 快照持续不变（页面停滞）：才转回读 JUDGE，且回读前
-        # 先落盘；不得在第一轮读页就定案（reads>=3 才允许 judge）。
+    def test_order_init_stalled_snapshot_waits_until_stop(self):
+        # 2026-10-24 用户口径：order/init 快照持续不变（页面停滞）
+        # 也不再转回读，只等到用户手动停止；期间不落盘、不回读、不重下。
         page = _SeqPage([(ORDER_INIT_URL, "订单初始化中")])
-        reads_at_judge = []
+        state = {"n": 0}
 
-        def judge(*a, **k):
-            reads_at_judge.append(page.reads)
-            return _AMBIG_JUDGE
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
 
-        out, events = self._core(page, judge_side=judge)
-        self.assertEqual(events, ["save", "judge"])
-        self.assertEqual(len(reads_at_judge), 1)
-        self.assertGreaterEqual(reads_at_judge[0], 3)
+        out, events = self._core(page, should_stop=stop)
+        self.assertEqual(events, [])
         self.assertFalse(out[0])
         self.assertEqual(out[2]["reason"], "ambiguous")
+        self.assertIn("手动停止", out[1])
 
-    def test_order_init_changing_until_deadline_goes_to_final_judge(self):
-        # order/init 正文每轮都在变（未停滞）→ 一直观察到本页 deadline，
-        # 由最终 JUDGE 兜底（落盘后回读），期间不提前定案、不重下。
+    def test_order_init_changing_waits_until_stop(self):
+        # 2026-10-24 用户口径：order/init 正文每轮都在变（未停滞）
+        # 也一直等，不提前定案、不转回读、不重下，直到用户手动停止。
         states = [(ORDER_INIT_URL, "订单初始化中 %d" % i) for i in range(30)]
         page = _SeqPage(states)
-        out, events = self._core(
-            page, judge_side=lambda *a, **k: _AMBIG_JUDGE,
-            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 3,
-                      "retry_open_times": 0})
-        self.assertEqual(events, ["save", "judge"])
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
+
+        out, events = self._core(page, should_stop=stop)
+        self.assertEqual(events, [])
         self.assertFalse(out[0])
         self.assertEqual(out[2]["reason"], "ambiguous")
+        self.assertIn("手动停止", out[1])
 
 
 # ---------------------------------------------------------------------------

@@ -465,9 +465,13 @@ class TestJudgeSuccessPassengersPicked(unittest.TestCase):
 
     def test_core_judge_success_records_picked_not_task_names(self):
         # 任务未点名（passenger_names=[]）、实际勾选账号乘车人「张三」：
-        # HOLD 落旧单列表走 JUDGE 成功 → 记录 passengers 必须是 picked。
+        # 2026-10-24 新口径下 HOLD 直接等到锁定页成功 → 记录 passengers
+        # 必须是 picked（实际勾选），而非任务名单。
         clock = _Clock()
-        page = _SeqPage([(NOCOMPLETE_URL, "未完成订单列表")])
+        page = _SeqPage([(
+            "https://kyfw.12306.cn/otn/confirmPassenger/payOrder/init",
+            "席位已锁定，请在提示时间内尽快完成支付，"
+            "支付剩余时间：00时19分34秒")])
 
         def fake_fill(*a, **k):
             return {"ok": True, "msg": "", "extra": {}, "clicked": True,
@@ -482,10 +486,10 @@ class TestJudgeSuccessPassengersPicked(unittest.TestCase):
                               side_effect=fake_fill),
             mock.patch.object(orderflow, "save_state",
                               side_effect=lambda ctx: None),
-            mock.patch.object(
-                orderflow, "classify_with_time",
-                return_value=("unpaid", "E123", "未完成/未支付",
-                              {"order_no": "E123"})),
+            mock.patch.object(orderflow, "fetch_unpaid_order_no",
+                              return_value="E123"),
+            mock.patch.object(orderflow, "session_from_browser_state",
+                              return_value=object()),
         ]
         with _Multi(patches):
             out = orderflow._run_orderflow_core(
@@ -497,6 +501,7 @@ class TestJudgeSuccessPassengersPicked(unittest.TestCase):
                 flow_cfg={}, logger=None)
         self.assertTrue(out[0], out[1])
         self.assertEqual(out[2]["passengers"], "张三")
+        self.assertEqual(out[2]["page_kind"], "payOrder")
 
     def test_order_ticket_via_browser_keeps_judge_passengers(self):
         # 新链 extra 已带 picked 时，order_ticket_via_browser 的任务名单

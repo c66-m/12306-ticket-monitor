@@ -12766,7 +12766,7 @@ class TestOrderflowE2EMock(TempDirCase):
 
     冷启动链（launch/session_ok/_goto_and_query）全部 patch，走 warm 路径；
     FILL/SUBMIT/CONFIRM 的 DOM 序列由 T1 提取的 _run_fill_submit_confirm
-    承担（旧测试已覆盖其内部），这里只验证阶段编排与 HOLD/JUDGE 语义。
+    承担（旧测试已覆盖其内部），这里只验证阶段编排与 HOLD 语义。
     """
 
     class _Clock:
@@ -12897,64 +12897,50 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertEqual(extra["dup_kind"], "未完成订单")
 
     def test_e2e_fail_body(self):
-        # B1：fail 词先走官方回读；多轮回读明确无单（none）才认网页失败，
-        # 返回与旧行为一致的 (False, 网页原文, None)
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
+        # 2026-10-24 用户口径：页面明确报失败直接返回，不再先走官方回读。
+        import orderflow
         page = self._HoldPage(self.INIT_URL, "余票不足")
-        (ok, msg, extra), stages, _, _ = self._core(page, judge_result=judge)
+        with mock.patch.object(orderflow, "_judge_official",
+                               side_effect=AssertionError("失败不再走回读")):
+            (ok, msg, extra), stages, _, _ = self._core(page)
         self.assertFalse(ok)
         self.assertEqual(msg, "余票不足")
-        self.assertIsNone(extra)
+        self.assertEqual(extra["reason"], "fail")
+        self.assertNotIn("JUDGE", stages)
 
-    def test_e2e_fail_word_but_official_unpaid_succeeds(self):
-        # B1：页面报「出票失败」但订单已生成待付款（12306 误报）——
-        # 官方回读到本次未支付订单时按成功返回，不再误报失败关页。
-        judge = (True, "订单已生成（未支付）：官方订单接口回读到本次订单 E123",
-                 {"flow_judge": {"cls": "unpaid", "order_no": "E123"},
-                  "order_no": "E123", "page_kind": "official"})
-        page = self._HoldPage(self.INIT_URL, "出票失败")
-        (ok, msg, extra), stages, _, _ = self._core(page, judge_result=judge)
-        self.assertTrue(ok, msg)
-        self.assertEqual(extra["order_no"], "E123")
-        self.assertEqual(extra["page_kind"], "official")
-
-    def test_e2e_fail_word_judge_error_is_ambiguous(self):
-        # B1：fail 词后回读不确定（error）→ 返回 ambiguous 形状交上层，
-        # 绝不按普通失败返回（上层据此盲重试可能撞出第二单）。
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous", "flow_judge": {"cls": "error"}})
-        page = self._HoldPage(self.INIT_URL, "系统繁忙")
-        (ok, msg, extra), stages, _, _ = self._core(page, judge_result=judge)
-        self.assertFalse(ok)
-        self.assertEqual(extra["reason"], "ambiguous")
-        self.assertEqual(extra["flow_judge"]["cls"], "error")
-
-    def test_e2e_final_judge_saves_state_first(self):
-        # B1：最终 JUDGE 前必须先落盘会话（与首轮同口径）——回读读的是
-        # 磁盘 cookie，不落盘会拿旧 cookie 判错。事件序应为：首轮
-        # save→judge，观察超时后的最终 JUDGE 再 save→judge。
+    def test_e2e_fail_word_returns_fail_without_judge(self):
+        # 2026-10-24 用户口径：页面报「出票失败」直接返回失败，不再以
+        # 官方回读翻案（10-19 的误报保护随本口径移除）。
         import orderflow
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
-        events = []
+        page = self._HoldPage(self.INIT_URL, "出票失败")
+        with mock.patch.object(orderflow, "_judge_official",
+                               side_effect=AssertionError("失败不再走回读")):
+            (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "出票失败")
+        self.assertEqual(extra["reason"], "fail")
+        self.assertNotIn("JUDGE", stages)
 
-        def fake_judge(*a, **k):
-            events.append("judge")
-            return judge
+    def test_e2e_unresolved_page_waits_until_user_stops(self):
+        # 2026-10-24 用户口径：页面始终无结论时不再超时转回读，
+        # 一直等到用户手动停止；期间绝不调用回读与重开。
+        import orderflow
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
 
         page = self._HoldPage(self.INIT_URL, "")
-        with mock.patch.object(orderflow, "save_state",
-                               side_effect=lambda ctx: events.append("save")), \
-             mock.patch.object(orderflow, "_judge_official",
-                               side_effect=fake_judge):
-            (ok, msg, extra), stages, _, _ = self._core(
-                page, flow_cfg={"read_poll_seconds": 0.5,
-                                "page_wait_seconds": 10,
-                                "retry_open_times": 0})
+        with mock.patch.object(orderflow, "_judge_official",
+                               side_effect=AssertionError("不再走回读")), \
+             mock.patch.object(orderflow, "_reopen_and_order",
+                               side_effect=AssertionError("不再重开重下")):
+            (ok, msg, extra), stages, _, _ = self._core(page, should_stop=stop)
         self.assertFalse(ok)
-        self.assertIn("JUDGE", stages)
-        self.assertEqual(events, ["save", "judge", "save", "judge"])
+        self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("手动停止", msg)
+        self.assertNotIn("JUDGE", stages)
 
     def test_e2e_slide_user_stopped(self):
         # 坑 7：滑块出现即停交人工，返回 ambiguous + need_captcha
@@ -12981,55 +12967,57 @@ class TestOrderflowE2EMock(TempDirCase):
         self.assertEqual(extra["reason"], "ambiguous")
         self.assertIn("手动停止", msg)
 
-    def test_e2e_hold_timeout_judge_fallback(self):
-        # 每页 10s 无果退出 → JUDGE 兜底官方回读
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
-        page = self._HoldPage(self.INIT_URL, "")
-        (ok, msg, extra), stages, _, _ = self._core(
-            page, judge_result=judge, flow_cfg={"read_poll_seconds": 0.5,
-                                                "page_wait_seconds": 10,
-                                                "retry_open_times": 0})
-        self.assertFalse(ok)
-        self.assertEqual(extra["reason"], "ambiguous")
-        self.assertIn("JUDGE", stages)
+    def test_e2e_lock_page_arriving_late_still_succeeds(self):
+        # 用户实报：界面反应慢，锁定页迟迟才出来——只要最终出来就
+        # 按成功收尾，绝不在中途返回重下。
+        import orderflow
+        success_body = self.pay_body_default()
 
-    def test_e2e_reopen_retry_new_page_success(self):
-        # 首读未获 → 官方回读明确「无单」→ 新开页重下 → 新页读到付款页成功
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous", "flow_judge": {"cls": "none"}})
-        new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
-        clock = self._Clock()
-        reopen_entry = {"page": new_page, "t_submit": clock.now,
-                        "picked": ["张三"], "dlg_seat": "二等座"}
-        page = self._HoldPage(self.INIT_URL, "")
-        # reopen 的 t_submit 用测试时钟，core 里 deadline 用 orderflow.time；
-        # 传入同一 clock 的 now 保证窗口成立
-        (ok, msg, extra), stages, _, _ = self._core(
-            page, judge_result=judge, reopen_entry=reopen_entry,
-            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
-                      "retry_open_times": 1})
+        class _Late(self._HoldPage):
+            def __init__(self):
+                super().__init__(TestOrderflowE2EMock.INIT_URL, "")
+                self.n = 0
+
+            @property
+            def url(self):
+                return (TestOrderflowE2EMock.INIT_URL if self.n < 20
+                        else TestOrderflowE2EMock.PAY_URL)
+
+            def evaluate(self, js, arg=None):
+                if "document.body" in js:
+                    self.n += 1
+                    self._body = ("" if self.n <= 20 else success_body)
+                return super().evaluate(js, arg)
+
+        page = _Late()
+        with mock.patch.object(orderflow, "_judge_official",
+                               side_effect=AssertionError("不再走回读")):
+            (ok, msg, extra), stages, _, _ = self._core(page, no_reopen=True)
         self.assertTrue(ok, msg)
         self.assertEqual(extra["page_kind"], "payOrder")
-        self.assertEqual(extra["order_no"], "E123")
+        self.assertNotIn("JUDGE", stages)
 
-    def test_e2e_judge_error_never_reopens(self):
-        # 官方回读失败/不可判定（error/unknown/blocked）不是「无单」：
-        # 允许重下会撞出第二张单（2026-10-19 审查 P0）
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous", "flow_judge": {"cls": "error"}})
-        page = self._HoldPage(self.INIT_URL, "")
-        (ok, msg, extra), stages, _, _ = self._core(
-            page, judge_result=judge, no_reopen=True,
-            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
-                      "retry_open_times": 1})
-        self.assertFalse(ok)
-        self.assertEqual(extra["reason"], "ambiguous")
-        self.assertIn("JUDGE", stages)
+    def test_e2e_lock_page_default_settle_is_3s(self):
+        # 2026-10-24 用户口径：锁定页出现后稳 3 秒再返回成功。
+        class _Counting(self._HoldPage):
+            def __init__(self, url, body):
+                super().__init__(url, body)
+                self.reads = 0
+
+            def evaluate(self, js, arg=None):
+                if "document.body" in js:
+                    self.reads += 1
+                return super().evaluate(js, arg)
+
+        page = _Counting(self.PAY_URL, self.pay_body_default())
+        (ok, msg, extra), stages, _, _ = self._core(page)
+        self.assertTrue(ok, msg)
+        # 0.5s 一轮 × 3s 确认窗 = 至少 7 次正文读（首读 + 6 轮）
+        self.assertGreaterEqual(page.reads, 7, "锁定页未稳 3 秒就返回成功")
 
     def test_e2e_lock_page_stabilizes_before_success(self):
-        # 2026-10-19 用户口径：进入锁定座位页后必须静置 1–2s 再判成功，
-        # 防止半渲染/瞬时信号被当成最终结果后立刻关页。
+        # 显式传入 2s 确认窗时仍按传入值执行：进入锁定座位页后必须静置
+        # 再判成功，防止半渲染/瞬时信号被当成最终结果后立刻关页。
         class _Counting(self._HoldPage):
             def __init__(self, url, body):
                 super().__init__(url, body)
@@ -13046,39 +13034,48 @@ class TestOrderflowE2EMock(TempDirCase):
         # 0.5s 一轮 × 2s 确认窗 = 至少 5 次正文读（首读 + 4 轮）
         self.assertGreaterEqual(page.reads, 5, "锁定页未静置确认就返回成功")
 
-    def test_e2e_pending_prompt_blocks_early_reopen(self):
-        # 2026-10-19 实测 bug：点确认后页面显示「订单已经提交，系统正在
-        # 处理中」期间，官方回读必然 ambiguous；旧逻辑据此立刻新开页重下，
-        # 下出第二单被 12306 判「出票失败/未完成订单」——处理中必须先等。
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous"})
-        new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
-        reopen_entry = {"page": new_page, "t_submit": 1_700_000_000.0,
-                        "picked": ["张三"], "dlg_seat": "二等座"}
+    def test_e2e_pending_prompt_waits_until_stop(self):
+        # 2026-10-24 用户口径：点确认后页面显示「订单已经提交，系统正在
+        # 处理中」期间只等，不转回读、不重下，直到用户手动停止。
+        import orderflow
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
+
         page = self._HoldPage(self.INIT_URL,
                               "【提示框】订单已经提交，系统正在处理中，请稍候。")
-        (ok, msg, extra), stages, _, _ = self._core(
-            page, judge_result=judge, reopen_entry=reopen_entry,
-            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
-                      "retry_open_times": 1})
+        with mock.patch.object(orderflow, "_judge_official",
+                               side_effect=AssertionError("不再走回读")), \
+             mock.patch.object(orderflow, "_reopen_and_order",
+                               side_effect=AssertionError("不再重开重下")):
+            (ok, msg, extra), stages, _, _ = self._core(page, should_stop=stop)
         self.assertFalse(ok)
         self.assertEqual(extra["reason"], "ambiguous", "处理中页面被提前重下")
+        self.assertIn("手动停止", msg)
+        self.assertNotIn("JUDGE", stages)
 
-    def test_e2e_lock_page_never_reopens_second_order(self):
-        # 已进入锁定页但还没刷出「席位已锁定」：只等，绝不下第二单；
-        # 观察窗到期交官方回读（ambiguous），由上层保守处理。
-        judge = (False, "订单结果未知：官方订单接口回读无法确认本次下单结果",
-                 {"reason": "ambiguous"})
-        new_page = self._HoldPage(self.PAY_URL, self.pay_body_default())
-        reopen_entry = {"page": new_page, "t_submit": 1_700_000_000.0,
-                        "picked": ["张三"], "dlg_seat": "二等座"}
+    def test_e2e_lock_page_without_lock_text_waits_until_stop(self):
+        # 已进入锁定页但还没刷出「席位已锁定」：只等，绝不下第二单，
+        # 也不转回读，直到用户手动停止。
+        import orderflow
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return state["n"] > 3
+
         page = self._HoldPage(self.PAY_URL, "页面加载中")
-        (ok, msg, extra), stages, _, _ = self._core(
-            page, judge_result=judge, reopen_entry=reopen_entry,
-            flow_cfg={"read_poll_seconds": 0.5, "page_wait_seconds": 10,
-                      "retry_open_times": 1})
+        with mock.patch.object(orderflow, "_judge_official",
+                               side_effect=AssertionError("不再走回读")), \
+             mock.patch.object(orderflow, "_reopen_and_order",
+                               side_effect=AssertionError("不再重开重下")):
+            (ok, msg, extra), stages, _, _ = self._core(page, should_stop=stop)
         self.assertFalse(ok)
         self.assertEqual(extra["reason"], "ambiguous")
+        self.assertIn("手动停止", msg)
+        self.assertNotIn("JUDGE", stages)
 
     def test_e2e_transient_dup_on_lock_page_ignored(self):
         # 刚进锁定页 1–2s 内正文残留「未完成订单」链接噪声：不能判 dup
