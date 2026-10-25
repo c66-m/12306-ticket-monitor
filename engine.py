@@ -791,7 +791,14 @@ class MonitorEngine(object):
         return True
 
     def _prune_retry_map(self, retry_map, max_entries=200):
-        """冷却表防膨胀：清除过期条目；仍过多则裁掉最旧的。"""
+        """冷却表防膨胀：清除过期条目；仍过多则裁掉最旧的。
+
+        retry_reason（冷却原因表，2026-10-26 防重硬防线）与 retry 同键，
+        冷却键被清掉时原因键一并清，防残留 reason 让下一轮冷却误走回读分支。"""
+        reason_map = (self.state or {}).get("retry_reason")
+        if isinstance(reason_map, dict):
+            for k in [k for k in reason_map if k not in retry_map]:
+                del reason_map[k]
         if len(retry_map) <= max_entries:
             return
         now = time.time()
@@ -1099,7 +1106,47 @@ class MonitorEngine(object):
                                  name, int(due_at - time.time()))
                         continue
                     if due_at:
-                        # 冷却到期：恢复为监控中，本轮正常尝试下单
+                        # 冷却到期。系统忙/改判类冷却直接恢复下单；「未支付复查」
+                        # 冷却（retry_reason[key]=="unpaid"）到期必须先回读官方
+                        # 订单再决定——盲提会钻进 12306 未完成订单挡单的延迟窗口
+                        # （2026-10-25 D290 实跑：600s 冷却间隙连出两个未支付订单）。
+                        reason_map = self.state.setdefault("retry_reason", {})
+                        reason = reason_map.pop(key, None)
+                        if reason == "unpaid":
+                            try:
+                                ucls, uono, uraw, _ur = order_mod.classify_with_time(
+                                    date, train_code, task.get("passenger_names") or [],
+                                    not_before_ts=0,
+                                    session=self._classify_session())
+                            except Exception as _ue:
+                                ucls, uono, uraw = "error", "", str(_ue)[:80]
+                            if ucls == "paid":
+                                retry_map.pop(key, None)
+                                if stop_after:
+                                    self.set_task_status(task, "success",
+                                        "复查确认已支付，订单 %s" % (uono or "未知"))
+                                    return True, False
+                                if self.task_status(task) == "retrying":
+                                    self.set_task_status(task, "monitoring",
+                                        "复查确认已支付（订单 %s），继续监控其它日期" % (uono or "未知"))
+                                LOG.info("[防重复查] 任务「%s」%s 冷却到期，官方确认已支付，不再下单", name, date)
+                                continue
+                            if ucls not in ("none", "cancelled"):
+                                # unpaid（旧单仍在）/ blocked（他行程挡路）续满冷却；
+                                # unknown/error 是查询没成，短冷却后再查，均不下单
+                                wait = UNPAID_RECHECK_SECONDS if ucls in ("unpaid", "blocked") else 60
+                                retry_map[key] = time.time() + wait
+                                reason_map[key] = "unpaid"
+                                self._save_state()
+                                msg = ("待支付:复查仍有未支付订单，%d秒后再复查，请尽快支付" % wait
+                                       if ucls != "error" else "复查官方订单失败，%d秒后重试" % wait)
+                                self.set_task_status(task, "retrying", msg)
+                                LOG.info("[防重复查] 任务「%s」%s 冷却到期，官方回读=%s，%d秒后再查（不下单）",
+                                         name, date, ucls, wait)
+                                continue
+                            LOG.info("[防重复查] 任务「%s」%s 冷却到期，官方确认无未支付订单（%s），恢复下单尝试",
+                                     name, date, ucls)
+                            # none / cancelled：防线解除，落到下方正常提交
                         retry_map.pop(key, None)
                         if self.task_status(task) == "retrying":
                             self.set_task_status(task, "monitoring", "冷却结束，恢复下单尝试")
@@ -1112,6 +1159,7 @@ class MonitorEngine(object):
                     result_msg, extra = self._order_once(task, info, date, seat_name)
                     if result_msg == "ok":
                         retry_map.pop(key, None)
+                        (self.state.get("retry_reason") or {}).pop(key, None)
                         self.state.setdefault("dup_streak", {}).pop(key, None)
                         self._save_state()
                         self._record_success(task, info, date, seat_name, extra)
@@ -1213,10 +1261,13 @@ class MonitorEngine(object):
                             # 期任务 8 秒后即重走完整下单（D290 实跑）。本行程
                             # 各席别进入复查冷却，到期自动复查；其它日期不受影响。
                             retry_map = self.state.setdefault("retry", {})
+                            reason_map = self.state.setdefault("retry_reason", {})
                             recheck_due = time.time() + UNPAID_RECHECK_SECONDS
                             for s in (cand or [seat_name]):
-                                retry_map[dedup_key(task, date, train_code, s,
-                                                    task.get("passenger_names") or [])] = recheck_due
+                                k = dedup_key(task, date, train_code, s,
+                                              task.get("passenger_names") or [])
+                                retry_map[k] = recheck_due
+                                reason_map[k] = "unpaid"
                             self._save_state()
                             # 冷却期内任务列表应如实显示「暂缓下单、X 秒后复查」，
                             # 而不是旧文案（2026-10-25 审）。轮次起点检查点到期

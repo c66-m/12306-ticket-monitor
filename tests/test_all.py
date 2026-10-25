@@ -1275,6 +1275,93 @@ class TestEngineFlow(TempDirCase):
                           expect_status="retrying", stop_after_order=False)
         self.assertIn("暂缓下单", e.state["tasks"]["t1"].get("message") or "")
 
+    def _armed_with_expired_unpaid_cooldown(self, e, t):
+        """预置一个已到期的「未支付复查」冷却（模拟上一轮 R3 写入、600s 后到期）。"""
+        tomorrow = t["dates"][0]
+        k = engine_mod.dedup_key(t, tomorrow, "K225", "硬座", t["passenger_names"])
+        e.state.setdefault("retry", {})[k] = time.time() - 10
+        e.state.setdefault("retry_reason", {})[k] = "unpaid"
+        return k
+
+    def test_unpaid_cooldown_expiry_recheck_blocks_resubmit(self):
+        # 防重硬防线（2026-10-26）：unpaid 冷却到期先回读官方，仍是 unpaid
+        # → 续冷却不下单。旧代码到期盲提，D290 曾钻挡单延迟窗口连出两单。
+        e = make_engine(self.tmp)
+        t = task_of(stop_after_order=False)
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "retrying", "fail_streak": 0}
+        k = self._armed_with_expired_unpaid_cooldown(e, t)
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket") as m_order, \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("unpaid", "E9", "未支付", None)):
+            e._run_task(t)
+        self.assertFalse(m_order.called, "复查仍 unpaid 时绝不能再提交下单")
+        self.assertGreater(e.state["retry"][k], time.time(), "冷却应续期")
+        self.assertEqual(e.state["retry_reason"].get(k), "unpaid")
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "retrying")
+        self.assertIn("复查仍有未支付订单", e.state["tasks"][t["name"]].get("message") or "")
+
+    def test_unpaid_cooldown_expiry_none_allows_resubmit(self):
+        # 官方确认旧单已取消/不存在：防线解除，恢复下单。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "retrying", "fail_streak": 0}
+        k = self._armed_with_expired_unpaid_cooldown(e, t)
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123", "passengers": "张三"})) as m_order, \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("cancelled", "E9", "已取消", None)):
+            e._run_task(t)
+        self.assertTrue(m_order.called, "官方确认无未支付订单后应恢复下单")
+        self.assertNotIn(k, e.state.get("retry", {}))
+        self.assertNotIn(k, e.state.get("retry_reason", {}))
+
+    def test_unpaid_cooldown_expiry_paid_stops_task(self):
+        # 复查发现用户已在别处支付：按已购得收尾，不再下单。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "retrying", "fail_streak": 0}
+        self._armed_with_expired_unpaid_cooldown(e, t)
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket") as m_order, \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time",
+                               return_value=("paid", "E9", "已支付", None)):
+            e._run_task(t)
+        self.assertFalse(m_order.called)
+        self.assertEqual(e.state["tasks"][t["name"]]["status"], "success")
+
+    def test_plain_cooldown_expiry_resubmits_without_recheck(self):
+        # 系统忙类冷却（无 reason）到期不回读官方，直接恢复下单——
+        # 防重回读只属于 unpaid 冷却，别把普通重试拖慢一轮查询。
+        e = make_engine(self.tmp)
+        t = task_of()
+        e.tasks = [t]
+        e.state["tasks"][t["name"]] = {"status": "retrying", "fail_streak": 0}
+        tomorrow = t["dates"][0]
+        k = engine_mod.dedup_key(t, tomorrow, "K225", "硬座", t["passenger_names"])
+        e.state.setdefault("retry", {})[k] = time.time() - 10
+        with mock.patch.object(e, "_query_with_retry",
+                               return_value=[synthetic_row()]), \
+             mock.patch.object(engine_mod.order_mod, "order_ticket",
+                               return_value=(True, "ok 订单号: E123",
+                                             {"order_no": "E123", "passengers": "张三"})) as m_order, \
+             mock.patch.object(engine_mod.notify_mod, "send_email",
+                               return_value=(True, "ok")), \
+             mock.patch.object(engine_mod.order_mod, "classify_with_time") as m_cls:
+            e._run_task(t)
+        self.assertTrue(m_order.called)
+        self.assertFalse(m_cls.called, "普通冷却到期不应触发官方回读")
+
     def test_order_once_should_stop_paused_and_missing(self):
         # 2026-10-25 审：暂停要中断在途下单；state 里没有条目的任务按
         # 「在途」处理（task_status 默认 paused 会误伤，必须绕开它）。
