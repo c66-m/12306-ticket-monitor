@@ -876,32 +876,6 @@ def _safe_close_ctx(ctx):
         pass
 
 
-# 下单成功后「席位已锁定」付款页的保留策略（2026-10-25 用户口径：不自动关窗）。
-# 缺省不限时：弹窗 5 秒后自动点掉、后台持续回读页面状态播报给软件，直到用户
-# 自己关页 / 手动停止 / 有其它任务在等独占锁才收尾。
-# config.json：keep_pay_page=false 关掉留窗（立即收尾）；pay_page_keep_seconds
-# 填正数 = 限时上限（秒）；缺省或 0 = 不限时。
-_PAY_PAGE_DEFAULT_HOLD = -1      # -1 = 不限时（留窗循环里没有 deadline）
-_PAY_PAGE_NO_HOLD = 0            # keep_pay_page=false：不留窗
-
-
-def _pay_page_hold_seconds():
-    """读 config.json 的付款页保留配置。
-
-    返回 -1 = 不限时（缺省）；0 = 不留窗；正数 = 限时秒数。"""
-    try:
-        cfg = appcommon.read_config_or_empty(os.path.join(HERE, "config.json"))
-    except Exception:
-        return _PAY_PAGE_DEFAULT_HOLD
-    if cfg.get("keep_pay_page") is False:
-        return _PAY_PAGE_NO_HOLD
-    try:
-        raw = int(cfg.get("pay_page_keep_seconds", _PAY_PAGE_DEFAULT_HOLD))
-    except (TypeError, ValueError):
-        return _PAY_PAGE_DEFAULT_HOLD
-    return raw if raw > 0 else _PAY_PAGE_DEFAULT_HOLD
-
-
 # 下单成功后锁定座位付款页的停留时长（秒）。2026-10-25 用户口径：页面出现
 # 锁定提示条即下单成功，后台返回订票成功，页面停留 5 秒后关闭；弹窗
 # （「二等座已售完分配无座」等）不特殊处理，随页面一起关闭。
