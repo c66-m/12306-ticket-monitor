@@ -15,6 +15,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: install deps
+        # order.py 顶层 import requests（引擎被测试顶层导入），纯标准库跑不起来。
+        # 只装库不装浏览器二进制——测试全程 mock，不真实拉起浏览器。
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
       - name: py_compile all py files
         run: |
           python -m compileall -q .
