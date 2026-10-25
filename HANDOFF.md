@@ -988,3 +988,31 @@ DETECT → FILL → 22:53:38 报「页面上没有 K558 的『预订』按钮」
 **测试**：`TestKeepPayPage` 配置六态随新口径更新；`test_extract_pay_evidence_variants`
 改双词断言并补「座位已锁定」变体；`test_classify_snapshot_six_states` 补
 「座位已锁定 → success」钉子；弹窗相关 6 例随逻辑移除。全量 **921 OK (skipped=15)**。
+
+## 36. 2026-10-25 启动即暂停：重开窗口不再自动恢复任务
+
+**现象**：用户重开软件、登录后，D290 任务自动恢复监控并直接进入下单流程
+（任务行显示「会话已恢复，自动重新监控」）。用户口径：上次关闭前没停的
+任务，重开窗口也一律不自动恢复——要继续监控由用户手动恢复。
+
+**根因**（两条自动恢复链叠加）：
+1. `engine.py` 会话看门狗（~1794）：会话校验成功后，把 `failed` 且 message
+   含「登录会话失效」的任务自动拉回 monitoring——上次运行时登录失效失败
+   的任务，本次一登录就复活开抢。
+2. `rpc/common.py::_resume_stopped_tasks`：启动时把 message=="引擎已停止"
+   的任务恢复监控（另一条历史链路）；进程被硬杀时这条也不走，state 里
+   残留的 monitoring 会被引擎直接捡起来。
+
+**改动**（`rpc/common.py` + `api.py` 导入）：
+- `_resume_stopped_tasks` → `_pause_all_tasks_on_startup`：启动时统一标
+  paused（message=「软件重启，已全部暂停」）。覆盖三态：monitoring/retrying
+  （含硬杀残态）、failed+登录会话失效（不清掉会被会话恢复拉起，这正是本次
+  现象的通道）、message=="软件启动自动恢复"（旧版残态）。用户手动暂停、
+  永久失败、已取消原样不动（message 保留）。
+- `_auto_start_engine` 顺序不变：先落盘暂停再 start_engine（引擎首次创建读
+  state，顺序反了就会把上次在跑的任务直接捡起来开抢）。
+- engine 的会话恢复（登录成功→自动拉起会话失效任务）保留：只服务「本次
+  运行中途登录失效又恢复」的场景；跨重启的残态已在启动时清掉，不会复活。
+
+**测试**：`TestAutoStartEngine` 重写（启动全暂停四态断言 / 坏 state 容错 /
+先暂停后启引擎顺序 / auto_start_engine=false 不动）；全量 **921 OK (skipped=15)**。

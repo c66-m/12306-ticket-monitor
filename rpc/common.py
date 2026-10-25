@@ -306,12 +306,16 @@ def _mark_running_tasks_paused():
     return changed[0]
 
 
-def _resume_stopped_tasks():
-    """软件启动时把上次被动暂停的任务恢复监控。
+def _pause_all_tasks_on_startup():
+    """软件启动时把所有任务统一标 paused（2026-10-25 用户口径：重新打开
+    窗口一律关闭所有任务，是否继续监控由用户手动恢复）。
 
-    只认 message=="引擎已停止"（_mark_running_tasks_paused 的标记）：那是停引擎/
-    关软件留下的，不是用户的意思。用户手动暂停的任务 message 是别的文案，不动
-    ——「我暂停的不该被重启拉起」。
+    覆盖三态：monitoring/retrying（上次在跑，含进程被硬杀没走
+    _mark_running_tasks_paused 的残态）、failed 且 message 含「登录会话失效」
+    （engine 的会话恢复逻辑会在登录成功后自动拉起它们——不先清掉，就会出现
+    「一打开、一登录，任务自己开抢」）、message=="软件启动自动恢复"（旧版本
+    自动恢复留下的残态）。用户手动暂停（message 为其它文案）与永久失败、
+    已取消原样不动，保留用户看到的上次文案。
     """
     changed = [0]
 
@@ -320,31 +324,37 @@ def _resume_stopped_tasks():
         if not isinstance(tasks, dict):
             return
         for rec in tasks.values():
-            if isinstance(rec, dict) and rec.get("status") == "paused" \
-                    and rec.get("message") == "引擎已停止":
-                rec["status"] = "monitoring"
-                rec["message"] = "软件启动自动恢复"
+            if not isinstance(rec, dict):
+                continue
+            st, msg = rec.get("status"), rec.get("message") or ""
+            if st in ("monitoring", "retrying") \
+                    or (st == "failed" and "登录会话失效" in msg) \
+                    or msg == "软件启动自动恢复":
+                rec["status"] = "paused"
+                rec["message"] = "软件重启，已全部暂停"
                 changed[0] += 1
 
     try:
         update_state_locked(_set)
         if changed[0]:
-            grabber.log("[启动] %d 个任务自动恢复监控" % changed[0])
+            grabber.log("[启动] %d 个任务已按「启动即暂停」标记，需要继续监控"
+                        "请手动恢复" % changed[0])
     except Exception as e:
-        grabber.log("[启动] 任务自动恢复失败：%s" % e)
+        grabber.log("[启动] 启动暂停任务失败：%s" % e)
     return changed[0]
 
 
 def _auto_start_engine():
     """启动软件即启动监控引擎；config.json 里 auto_start_engine=false 可关。
 
-    先恢复被动暂停的任务再起引擎：get_engine() 首次创建时会读一遍 state 文件，
-    顺序反了引擎读到的是旧的 paused。
+    先暂停所有任务再起引擎（2026-10-25 用户口径：重开窗口一律不自动恢复）：
+    get_engine() 首次创建时会读一遍 state 文件，顺序反了引擎会把上次在跑的
+    任务直接捡起来开抢。
     """
     if not load_config().get("auto_start_engine", True):
         grabber.log("[启动] auto_start_engine=false，跳过自动启动引擎")
         return False
-    _resume_stopped_tasks()
+    _pause_all_tasks_on_startup()
     return start_engine()
 
 

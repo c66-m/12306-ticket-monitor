@@ -13465,14 +13465,20 @@ def _multi(patches):
 
 
 class TestAutoStartEngine(TempDirCase):
-    """启动软件自动启动引擎（m00986）：引擎线程自动起 + 上次被动暂停的任务恢复监控。"""
+    """启动软件自动启动引擎（m00986）。2026-10-25 用户口径改为：启动即把
+    所有任务统一标 paused（含上次在跑的、会话失效失败的、旧版自动恢复残态），
+    重开窗口绝不自动恢复监控，是否继续由用户手动恢复。"""
 
-    def test_resume_only_engine_stopped_tasks(self):
+    def test_startup_pauses_everything(self):
         import api
         state = {"tasks": {
-            "被动暂停": {"status": "paused", "message": "引擎已停止"},
+            "上次监控中": {"status": "monitoring", "message": ""},
+            "上次重试中": {"status": "retrying", "message": "重试中"},
+            "会话失效失败": {"status": "failed",
+                             "message": "登录会话失效，请重新登录后恢复任务"},
+            "自动恢复残态": {"status": "monitoring", "message": "软件启动自动恢复"},
             "用户暂停": {"status": "paused", "message": "手动暂停"},
-            "监控中": {"status": "monitoring", "message": ""},
+            "永久失败": {"status": "failed", "message": "席别不可下单，永久跳过"},
             "已取消": {"status": "cancelled", "message": "引擎已停止"},
         }}
         seen = {}
@@ -13483,45 +13489,48 @@ class TestAutoStartEngine(TempDirCase):
 
         with mock.patch.object(api, "update_state_locked", _fake), \
              mock.patch.object(api.grabber, "log"):
-            n = api._resume_stopped_tasks()
-        self.assertEqual(n, 1)
-        self.assertEqual(seen["tasks"]["被动暂停"]["status"], "monitoring")
-        self.assertEqual(seen["tasks"]["被动暂停"]["message"], "软件启动自动恢复")
-        # 用户主动暂停 / 已取消 / 已在监控：原样不动
+            n = api._pause_all_tasks_on_startup()
+        self.assertEqual(n, 4)
+        for name in ("上次监控中", "上次重试中", "会话失效失败", "自动恢复残态"):
+            self.assertEqual(seen["tasks"][name]["status"], "paused", name)
+            self.assertEqual(seen["tasks"][name]["message"],
+                             "软件重启，已全部暂停", name)
+        # 用户主动暂停 / 永久失败 / 已取消：原样不动（message 保留）
         self.assertEqual(seen["tasks"]["用户暂停"]["status"], "paused")
         self.assertEqual(seen["tasks"]["用户暂停"]["message"], "手动暂停")
+        self.assertEqual(seen["tasks"]["永久失败"]["status"], "failed")
         self.assertEqual(seen["tasks"]["已取消"]["status"], "cancelled")
-        self.assertEqual(seen["tasks"]["监控中"]["status"], "monitoring")
 
-    def test_resume_survives_broken_state(self):
+    def test_pause_all_survives_broken_state(self):
         import api
         # tasks 不是 dict：不能抛，返回 0
         with mock.patch.object(api, "update_state_locked",
                                lambda fn: fn({"tasks": None})), \
              mock.patch.object(api.grabber, "log"):
-            self.assertEqual(api._resume_stopped_tasks(), 0)
+            self.assertEqual(api._pause_all_tasks_on_startup(), 0)
 
-    def test_auto_start_engine_resumes_then_starts(self):
+    def test_auto_start_engine_pauses_then_starts(self):
         import api
         order = []
         with mock.patch.object(api, "load_config", return_value={}), \
-             mock.patch.object(api, "_resume_stopped_tasks",
-                               side_effect=lambda: order.append("resume")), \
+             mock.patch.object(api, "_pause_all_tasks_on_startup",
+                               side_effect=lambda: order.append("pause")), \
              mock.patch.object(api, "start_engine",
                                side_effect=lambda: (order.append("start"), True)[1]):
             self.assertTrue(api._auto_start_engine())
-        # 顺序：先落盘恢复任务状态，再起引擎（引擎首次创建会读 state）
-        self.assertEqual(order, ["resume", "start"])
+        # 顺序：先落盘暂停所有任务，再起引擎（引擎首次创建会读 state，
+        # 反了就会把上次在跑的任务直接捡起来开抢）
+        self.assertEqual(order, ["pause", "start"])
 
     def test_auto_start_engine_disabled_by_config(self):
         import api
         with mock.patch.object(api, "load_config",
                                return_value={"auto_start_engine": False}), \
-             mock.patch.object(api, "_resume_stopped_tasks") as m_res, \
+             mock.patch.object(api, "_pause_all_tasks_on_startup") as m_pause, \
              mock.patch.object(api, "start_engine") as m_st, \
              mock.patch.object(api.grabber, "log"):
             self.assertFalse(api._auto_start_engine())
-        self.assertFalse(m_res.called)
+        self.assertFalse(m_pause.called)
         self.assertFalse(m_st.called)
 
     def test_main_calls_auto_start_before_ready(self):
