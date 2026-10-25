@@ -4762,14 +4762,15 @@ class TestSlideWaitDeadlineCompensation(TempDirCase):
 
     def test_extract_pay_evidence_variants(self):
         # 支付证据纯函数：锁定位/支付剩余时间两特征各状态全覆盖
-        locked_time = ("席位已锁定，请在提示时间内尽快完成支付，完成网上购票。"
+        # （2026-10-25 起锁定词两种写法都算，证据串统一为「座位/席位已锁定」）
+        locked_time = ("座位已锁定，请在提示时间内尽快完成支付，完成网上购票。"
                        "支付剩余时间：00时19分34秒")
         self.assertEqual(
             browser_order._extract_pay_evidence(locked_time),
-            "席位已锁定+支付剩余时间00时19分34秒")
+            "座位/席位已锁定+支付剩余时间00时19分34秒")
         self.assertEqual(
             browser_order._extract_pay_evidence("席位已锁定，请尽快支付"),
-            "席位已锁定")
+            "座位/席位已锁定")
         self.assertEqual(
             browser_order._extract_pay_evidence("支付剩余时间： 23时59分01秒"),
             "支付剩余时间23时59分01秒")
@@ -12707,6 +12708,9 @@ class TestOrderflowClassifySnapshot(TempDirCase):
         self.assertEqual(orderflow.classify_snapshot(
             "https://kyfw.12306.cn/otn/leftTicket/init", "预订 余票充足"), "wait")
         self.assertEqual(orderflow.classify_snapshot(pay, "席位已锁定，请在 30 分钟内完成支付"), "success")
+        # 2026-10-25 起锁定词两种写法都算：D290 实跑提示条写「座位已锁定」，
+        # 旧口径只认「席位已锁定」会漏判。泛化的「订单提交成功」仍不算。
+        self.assertEqual(orderflow.classify_snapshot(pay, "座位已锁定，请在提示时间内尽快完成支付"), "success")
         # 2026-10-18 起成功口径收紧为「出现席位已锁定界面」：只有泛化的
         # 「订单提交成功」不算（可能是过程中提示或旧单页），继续观察。
         self.assertEqual(orderflow.classify_snapshot(pay, "订单提交成功，请尽快支付"), "wait")
@@ -14376,16 +14380,18 @@ class TestKeepPayPage(unittest.TestCase):
     """下单成功后把「席位已锁定」付款页留给用户核对/支付（2026-10-18 需求）。
 
     座位锁定页是判断「真的下单成功」最直观的证据；旧流程成功后立刻 ctx.close()，
-    用户只看到窗口一闪。现在保留窗口，关窗 / 手动停止 / 超时才继续。
+    用户只看到窗口一闪。现在保留窗口。2026-10-25 口径：成功即回报，页面停留
+    缺省 5 秒后关闭（弹窗不特殊处理）；keep_pay_page=false / 0 = 不停留。
     """
 
     def test_hold_seconds_respects_config(self):
         import browser_order as bo
-        cases = ((({}, 300)),
+        cases = ((({}, 5)),
+                 ({"pay_page_keep_seconds": 0}, 0),
                  ({"keep_pay_page": False}, 0),
                  ({"pay_page_keep_seconds": 60}, 60),
-                 ({"pay_page_keep_seconds": "abc"}, 300),
-                 ({"pay_page_keep_seconds": 99999}, 1200))
+                 ({"pay_page_keep_seconds": "abc"}, 5),
+                 ({"pay_page_keep_seconds": 99999}, 99999))
         for cfg, want in cases:
             with mock.patch.object(bo.appcommon, "read_config_or_empty", return_value=cfg):
                 self.assertEqual(bo._pay_page_hold_seconds(), want, cfg)

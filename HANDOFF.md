@@ -961,3 +961,30 @@ DETECT → FILL → 22:53:38 报「页面上没有 K558 的『预订』按钮」
   `[ERROR]` / `[WARNING]` 映射 err / warn，其余 info。
 - 测试：`TestSessionProbeUnknown` 2 例（校验异常→unknown / 门户→permanent）；
   全量 **786 OK (skipped=15)**，`node --check electron/main.js` 通过。
+
+## 35. 2026-10-25 成功即回报 + 付款页停留 5 秒关闭 + 锁定词兼容「座位已锁定」
+
+**需求**（用户口径，当日两次收敛的最终版）：页面出现锁定提示条（显示框内的
+文字）就是下单成功，后台随即返回订票成功；付款页停留 5 秒后关闭；有没有弹
+「二等座已售完，系统自动分配无座票」提示框都不影响——弹窗不特殊处理。
+
+**改动**：
+- `orderflow.py`：`_PAY_LOCK_KEY` → `_PAY_LOCK_KEYS = ("座位已锁定", "席位已锁定")`。
+  D290 实跑提示条写的是「座位已锁定」，旧口径只认「席位已锁定」存在漏判面；
+  classify_snapshot 两种写法都判 success。旧链同步：`browser_order._PAY_LOCK_TEXTS`
+  （`_wait_pay_locked`）与 `_extract_pay_evidence`（证据串统一为
+  「座位/席位已锁定(+支付剩余时间…)」）。
+- `browser_order.py`：`_PAY_PAGE_DEFAULT_HOLD` 300 → 5（停留 5 秒后随调用方
+  ctx.close 关闭）；`_pay_page_hold_seconds` 语义：缺省 5，keep_pay_page=false
+  或 0 = 不停留，正数 = 自定义秒数（1200s 封顶取消）；两条链调用门禁
+  `hold > 0` → `hold != 0`。`_hold_pay_page` 维持轻量轮询（关窗 / 手动停止 /
+  等锁即提前收尾），无弹窗/回读逻辑。此前的「不限时保留 + 弹窗点掉 + 状态
+  播报」版本被本口径取代（未提交即重写）。
+- profile 独占锁语义不变（审查第 10 条）：留窗占锁，其它任务一等锁就提前
+  收尾让锁。
+- `config.example.json`：`pay_page_keep_seconds` 300 → 5，`_pay_page_notes`
+  说明新语义。
+
+**测试**：`TestKeepPayPage` 配置六态随新口径更新；`test_extract_pay_evidence_variants`
+改双词断言并补「座位已锁定」变体；`test_classify_snapshot_six_states` 补
+「座位已锁定 → success」钉子；弹窗相关 6 例随逻辑移除。全量 **921 OK (skipped=15)**。

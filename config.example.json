@@ -40,7 +40,8 @@
   "order_mode": "browser",
   "browser_headless": false,
   "keep_pay_page": true,
-  "pay_page_keep_seconds": 300,
+  "pay_page_keep_seconds": 5,
+  "_pay_page_notes": "下单成功（出现「座位/席位已锁定」提示条）即回报订票成功，付款页停留 pay_page_keep_seconds 秒（缺省 5）后关闭，弹窗不特殊处理；keep_pay_page=false 或填 0 = 不停留立即收尾；正数 = 自定义停留秒数。",
   "order_flow_mode": true,
   "order_flow": {
     "read_poll_seconds": 0.5,

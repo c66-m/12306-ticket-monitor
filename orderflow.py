@@ -67,11 +67,12 @@ _READ_JS = ("() => { const b = document.body ? document.body.innerText : '';"
             " const p = document.querySelector('#orderResultInfo_id');"
             " const t = p ? p.innerText.trim() : '';"  # 空容器只有空白，别当提示
             " return t ? ('【提示框】' + t + '\\n' + b) : b; }")
-# 付款页成功词：必须是「席位已锁定」的订单界面（2026-10-18 用户口径：
-# 以弹出锁定席位的界面为准）。只看到「待支付 / 订单提交成功」这类泛化词
+# 付款页成功词：锁定座位界面的提示条文字（2026-10-25 用户口径：显示框内的
+# 文字就是下单成功——D290 实跑截图框内写的是「座位已锁定」，旧口径只认
+# 「席位已锁定」，两种写法都算）。只看到「待支付 / 订单提交成功」这类泛化词
 # 不判成功——那可能是旧单列表、过程中提示或错误页；URL 已到 payOrder 但
 # 正文还没渲染出锁定界面时判 wait，下一轮再读。
-_PAY_LOCK_KEY = "席位已锁定"
+_PAY_LOCK_KEYS = ("座位已锁定", "席位已锁定")
 _SEAT_SCAN = ("无座", "硬座", "硬卧", "软卧", "二等座", "一等座", "商务座")
 
 _FLOW_DEFAULTS = {"read_poll_seconds": 0.5, "page_wait_seconds": 30.0,
@@ -92,9 +93,9 @@ def classify_snapshot(url, body):
     """HOLD 快照分类（纯函数，供单测）。
 
     返回 success / dup / fail / ambiguous / wait：
-    - success: 正文出现「席位已锁定」——以锁定座位的订单界面为唯一成功
-      口径（2026-10-18 用户要求），不看 URL（真实锁定页 URL 为
-      confirmPassenger/initDc；payOrder 分支保留兼容）。
+    - success: 正文出现「座位已锁定 / 席位已锁定」——以锁定座位的订单界面为
+      唯一成功口径（2026-10-18 用户要求；2026-10-25 起两种写法都算），不看
+      URL（真实锁定页 URL 为 confirmPassenger/initDc；payOrder 分支保留兼容）。
     - ambiguous: 旧单列表（MyOrderNoComplete）/ 订单初始化页（order/init），
       可能是账号里更早的旧单，不能直接当成功，交官方回读。
     - dup: 账号已有未支付订单等，再重试只会得到同样的拒绝。
@@ -105,11 +106,11 @@ def classify_snapshot(url, body):
     """
     if "MyOrderNoComplete" in url or "order/init" in url:
         return "ambiguous"
-    if _PAY_LOCK_KEY in body:
-        # 「席位已锁定」即成功口径（2026-10-18 用户口径），不看 URL：真实
-        # 锁定页 URL 是 confirmPassenger/initDc 而非 payOrder，且其温馨提示
-        # 「逾期未支付，系统将取消本次交易」恰好命中 dup 词表——2026-10-24
-        # 实跑 D290 曾把刚下成功的单判成 dup，引发逐轮重复下单。
+    if any(k in body for k in _PAY_LOCK_KEYS):
+        # 「座位/席位已锁定」即成功口径（2026-10-18/2026-10-25 用户口径），
+        # 不看 URL：真实锁定页 URL 是 confirmPassenger/initDc 而非 payOrder，
+        # 且其温馨提示「逾期未支付，系统将取消本次交易」恰好命中 dup 词表
+        # ——2026-10-24 实跑 D290 曾把刚下成功的单判成 dup，引发逐轮重复下单。
         return "success"
     if "payOrder" in url:
         return "wait"
@@ -370,11 +371,12 @@ def _finish_success(entry, url, body, date, train, passenger_names, seat_name, l
     if shot:
         extra["screenshot"] = shot
         _emit(logger, "[流程] 成功页截图已存：%s" % shot)
-    # 成功页就是「席位已锁定」的订单界面：headless 没有窗口可看，直接跳过；
-    # 否则保留窗口供核对与支付（关窗 / 手动停止 / 超时才继续）。
+    # 成功页就是锁定座位的订单界面：headless 没有窗口可看，直接跳过；否则
+    # 页面停留（缺省 5 秒，2026-10-25 用户口径：成功结论随后返回、页面关闭，
+    # 弹窗不特殊处理）——关窗 / 手动停止 / 等锁 / 限时到即收尾。
     if not headless:
         hold = _pay_page_hold_seconds()
-        if hold > 0:
+        if hold != 0:
             _hold_pay_page(entry.get("page"), hold, stop)
     return True, "已提交订单（未支付）：%s%s" % (url, warn), extra
 

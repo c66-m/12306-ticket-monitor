@@ -876,31 +876,58 @@ def _safe_close_ctx(ctx):
         pass
 
 
-# 下单成功后「席位已锁定」付款页的保留时长（秒）。12306 的座位锁定是 20 分钟，
-# 这里默认 5 分钟：足够核对订单、完成支付，又不至于长期占住独占锁。
-# config.json：keep_pay_page=false 关掉；pay_page_keep_seconds 自定义时长。
-_PAY_PAGE_DEFAULT_HOLD = 300
+# 下单成功后「席位已锁定」付款页的保留策略（2026-10-25 用户口径：不自动关窗）。
+# 缺省不限时：弹窗 5 秒后自动点掉、后台持续回读页面状态播报给软件，直到用户
+# 自己关页 / 手动停止 / 有其它任务在等独占锁才收尾。
+# config.json：keep_pay_page=false 关掉留窗（立即收尾）；pay_page_keep_seconds
+# 填正数 = 限时上限（秒）；缺省或 0 = 不限时。
+_PAY_PAGE_DEFAULT_HOLD = -1      # -1 = 不限时（留窗循环里没有 deadline）
+_PAY_PAGE_NO_HOLD = 0            # keep_pay_page=false：不留窗
 
 
 def _pay_page_hold_seconds():
-    """读 config.json 的付款页保留配置，返回秒数（0 = 不保留）。"""
+    """读 config.json 的付款页保留配置。
+
+    返回 -1 = 不限时（缺省）；0 = 不留窗；正数 = 限时秒数。"""
+    try:
+        cfg = appcommon.read_config_or_empty(os.path.join(HERE, "config.json"))
+    except Exception:
+        return _PAY_PAGE_DEFAULT_HOLD
+    if cfg.get("keep_pay_page") is False:
+        return _PAY_PAGE_NO_HOLD
+    try:
+        raw = int(cfg.get("pay_page_keep_seconds", _PAY_PAGE_DEFAULT_HOLD))
+    except (TypeError, ValueError):
+        return _PAY_PAGE_DEFAULT_HOLD
+    return raw if raw > 0 else _PAY_PAGE_DEFAULT_HOLD
+
+
+# 下单成功后锁定座位付款页的停留时长（秒）。2026-10-25 用户口径：页面出现
+# 锁定提示条即下单成功，后台返回订票成功，页面停留 5 秒后关闭；弹窗
+# （「二等座已售完分配无座」等）不特殊处理，随页面一起关闭。
+# config.json：keep_pay_page=false 不留窗（立即收尾）；pay_page_keep_seconds
+# 正数 = 自定义停留秒数；缺省 5；0 = 不留窗。
+_PAY_PAGE_DEFAULT_HOLD = 5
+
+
+def _pay_page_hold_seconds():
+    """读 config.json 的付款页停留配置，返回秒数（0 = 不停留）。"""
     try:
         cfg = appcommon.read_config_or_empty(os.path.join(HERE, "config.json"))
     except Exception:
         return _PAY_PAGE_DEFAULT_HOLD
     if cfg.get("keep_pay_page") is False:
         return 0
-    raw = cfg.get("pay_page_keep_seconds", _PAY_PAGE_DEFAULT_HOLD)
     try:
-        return max(0, min(int(raw), 1200))     # 上限 20 分钟 = 座位锁定窗口
+        return max(0, int(cfg.get("pay_page_keep_seconds", _PAY_PAGE_DEFAULT_HOLD)))
     except (TypeError, ValueError):
         return _PAY_PAGE_DEFAULT_HOLD
 
 
 def _hold_pay_page(page, seconds, should_stop=None):
-    """把「席位已锁定」付款页留在屏幕上，直到关窗 / 手动停止 / 超时 /
-    有其它任务在等独占锁。
+    """把锁定座位的付款页留在屏幕上 seconds 秒后收尾（页面随后由调用方关闭）。
 
+    提前收尾条件：用户关窗 / 手动停止 / 有其它任务在等独占锁。
     留窗全程占着 profile 独占锁：若已有任务在 exclusive() 里排队等锁，
     继续留窗只会让对方等锁超时、错过放票窗口（审查第 10 条）——每轮
     检查等待者登记，有等待者即提前结束留窗；无人等待时保持原时长。
@@ -914,9 +941,8 @@ def _hold_pay_page(page, seconds, should_stop=None):
             return
     except Exception:
         return
-    _log("  [浏览器] 席位已锁定：付款页已保留，请核对订单并完成支付；"
-         "关闭窗口或 %d 秒后程序继续（未支付订单在「未完成订单」里可继续支付）。"
-         % seconds)
+    _log("  [浏览器] 座位已锁定：付款页停留 %d 秒后关闭；订单已生成，"
+         "未支付订单在「未完成订单」里可继续支付。" % seconds)
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:
@@ -927,16 +953,16 @@ def _hold_pay_page(page, seconds, should_stop=None):
             return
         if _lock_waiter_count() > 0:
             _log("  [浏览器] 已有其它任务在等待使用浏览器，提前结束付款页"
-                 "保留（订单已生成，可在「未完成订单」里继续支付）。")
+                 "停留（订单已生成，可在「未完成订单」里继续支付）。")
             return
         if should_stop is not None and should_stop():
-            _log("  [浏览器] 已手动停止，关闭付款页。")
+            _log("  [浏览器] 已手动停止，结束付款页停留。")
             return
         try:
             page.wait_for_timeout(500)
         except Exception:
             return
-    _log("  [浏览器] 付款页保留 %d 秒后自动关闭；订单仍可在「未完成订单」里继续支付。"
+    _log("  [浏览器] 付款页停留 %d 秒后关闭；订单仍可在「未完成订单」里继续支付。"
          % seconds)
 
 
@@ -1163,26 +1189,27 @@ def _window_dead_exc(e):
 def _extract_pay_evidence(body):
     """付款页正文→支付证据串。无证据返回空串。纯函数便于单测。"""
     m = _PAY_TIME_RE.search(body)
-    locked = "席位已锁定" in body
+    locked = any(k in body for k in _PAY_LOCK_TEXTS)
     if locked and m:
-        return "席位已锁定+支付剩余时间%s" % m.group(1)
+        return "座位/席位已锁定+支付剩余时间%s" % m.group(1)
     if locked:
-        return "席位已锁定"
+        return "座位/席位已锁定"
     if m:
         return "支付剩余时间%s" % m.group(1)
     return ""
 
 
-# 「下单成功」的唯一口径：页面上真的出现「席位已锁定」的订单界面。
+# 「下单成功」的唯一口径：页面上真的出现锁定座位的订单界面（提示条两种
+# 写法都算，2026-10-25 用户口径：显示框内的文字就是下单成功）。
 # 只看 URL 不够——payOrder 加载失败 / 被踢 / 只渲染一半时 URL 是对的，
 # 页面却是空白或错误页，按 URL 判成功会把失败当成功（用户 2026-10-18 要求
 # 以「弹出锁定席位的界面」为准）。
-_PAY_LOCK_TEXT = "席位已锁定"
+_PAY_LOCK_TEXTS = ("座位已锁定", "席位已锁定")
 _PAY_LOCK_WAIT_SEC = 10.0
 
 
 def _wait_pay_locked(page, wait_sec=_PAY_LOCK_WAIT_SEC, stop=None):
-    """轮询页面正文直到出现「席位已锁定」界面，返回 (ok, body, evidence)。
+    """轮询页面正文直到出现锁定座位界面，返回 (ok, body, evidence)。
 
     页面从 payOrder 跳到渲染完成有 1~3 秒延迟，所以给一个短窗口轮询；
     stop 置位（用户点停止）立即放弃，交上层按「结果未知」处理。
@@ -1194,7 +1221,7 @@ def _wait_pay_locked(page, wait_sec=_PAY_LOCK_WAIT_SEC, stop=None):
             body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
         except Exception:
             return False, body, ""
-        if _PAY_LOCK_TEXT in body:
+        if any(k in body for k in _PAY_LOCK_TEXTS):
             return True, body, _extract_pay_evidence(body)
         if stop is not None and stop():
             return False, body, ""
@@ -1994,12 +2021,13 @@ def _order_impl(info, seat_name, seat_code, passenger_names, date,
                     if dlg_seat and dlg_seat != seat_name:
                         warn += "（核对窗曾显示席别 %s，请以订单详情为准）" % dlg_seat
                     mark("result")
-                    # 成功页就是「席位已锁定」的付款页：先别关窗，留给用户核对与
-                    # 支付（关窗 / 手动停止 / 超时才继续）。headless 没有窗口可看，
-                    # 且自动化场景不需要人工确认，直接跳过。
+                    # 成功页就是锁定座位的付款页：停留（缺省 5 秒，2026-10-25
+                    # 用户口径：成功结论返回后页面关闭，弹窗不特殊处理）——
+                    # 关窗 / 手动停止 / 等锁 / 限时到即收尾。headless 没有窗口
+                    # 可看，且自动化场景不需要人工确认，直接跳过。
                     if not headless:
                         _hold = _pay_page_hold_seconds()
-                        if _hold > 0:
+                        if _hold != 0:
                             _hold_pay_page(page, _hold, _stopped)
                     return True, "已提交订单（未支付）：%s%s" % (url, warn), {
                         "passengers": "、".join(picked), "seat_on_page": seat_on_page,
