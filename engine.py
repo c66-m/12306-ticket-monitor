@@ -1604,13 +1604,25 @@ class MonitorEngine(object):
             v = vcore_engine.postconfirm(
                 trip, orders, passenger_names, not_before_ts)
             agree = legacy_decision == v.decision.value
-            LOG.info("[影子比对] %s %s %s 旧=%s 新=%s 一致=%s 快照=%s",
-                     phase, date, train_code, legacy_decision,
-                     v.decision.value, agree, vsv.summarize(orders))
+            # 窗口边沿 triage（建议清单④）：分歧时用现网宽窗重算，
+            # 宽窗结论与现网一致才标边沿；重算失败则按真实分歧记，
+            # 绝不因 triage 本身丢掉一次比对。
+            window_edge = False
             if not agree:
-                LOG.warning("[影子比对·分歧] %s %s %s 旧=%s 新=%s 新理由=%s",
+                try:
+                    window_edge = vcore_engine.is_window_edge_divergence(
+                        v, trip, orders, passenger_names, not_before_ts,
+                        legacy_decision)
+                except Exception:
+                    window_edge = False
+            edge_mark = " 窗口边沿" if window_edge else ""
+            LOG.info("[影子比对] %s %s %s 旧=%s 新=%s 一致=%s%s 快照=%s",
+                     phase, date, train_code, legacy_decision,
+                     v.decision.value, agree, edge_mark, vsv.summarize(orders))
+            if not agree:
+                LOG.warning("[影子比对·分歧] %s %s %s 旧=%s 新=%s%s 新理由=%s",
                             phase, date, train_code, legacy_decision,
-                            v.decision.value, v.reason)
+                            v.decision.value, edge_mark, v.reason)
             return v
         except Exception as e:  # noqa: BLE001 影子比对绝不影响现网决策
             LOG.warning("[影子比对] %s %s %s 异常(不阻断现网决策): %s",

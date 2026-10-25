@@ -17,6 +17,12 @@ from core.verdict.classifier import classify_entry, trip_matched_entries
 RECENT_WINDOW_LO = 5     # 领先容差（时钟偏差容忍下限）
 RECENT_WINDOW_HI = 180   # 落库 + 处理延迟上限
 
+# 现网窗口（order.py find_recent_order 的口径：下界 30s、上界 600s）。
+# 仅供影子比对的窗口边沿 triage 使用：内核自身仍用上面的收紧窗口，
+# 两边是否收敛由用户在切 B 线时定，本模块不擅自改动任一边。
+LIVE_WINDOW_LO = 30
+LIVE_WINDOW_HI = 600
+
 
 def dedupe(orders):
     """按订单号去重（order_no 非空优先保留；空 order_no 原样退让）。

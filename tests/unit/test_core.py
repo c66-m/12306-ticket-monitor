@@ -327,6 +327,61 @@ class TestVerdictEngine(unittest.TestCase):
         v = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0)
         self.assertEqual(v.decision, VE.VerdictDecision.BLOCK_UNPAID)
 
+    def test_postconfirm_wide_window_edge_band(self):
+        # 建议清单④：边沿带订单 t-10s（紧窗 [t-5s,t+180s] 外、
+        # 现网 [t-30s,t+600s] 内）→ 紧窗判遗留单，宽窗判本次成功
+        orders = [entry("K123", "2026-10-20", status="未完成/未支付",
+                        no_complete=True, order_ts=9990.0)]
+        v = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0)
+        self.assertEqual(v.decision, VE.VerdictDecision.BLOCK_UNPAID)
+        v_wide = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0,
+                                window_lo=sv.LIVE_WINDOW_LO,
+                                window_hi=sv.LIVE_WINDOW_HI)
+        self.assertEqual(v_wide.decision, VE.VerdictDecision.SUCCESS)
+
+    def test_postconfirm_wide_window_future_edge(self):
+        # t+300s（紧窗外、现网窗内）同理
+        orders = [entry("K123", "2026-10-20", status="未完成/未支付",
+                        no_complete=True, order_ts=10300.0)]
+        v = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0)
+        self.assertEqual(v.decision, VE.VerdictDecision.BLOCK_UNPAID)
+        v_wide = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0,
+                                window_lo=sv.LIVE_WINDOW_LO,
+                                window_hi=sv.LIVE_WINDOW_HI)
+        self.assertEqual(v_wide.decision, VE.VerdictDecision.SUCCESS)
+
+    def test_postconfirm_wide_window_still_blocks_far_old(self):
+        # 窗外旧单：宽窗也不翻案
+        orders = [entry("K123", "2026-10-20", status="未完成/未支付",
+                        no_complete=True, order_ts=9000.0)]
+        v_wide = VE.postconfirm(self._tk(), orders, ["张三", "李四"], 10000.0,
+                                window_lo=sv.LIVE_WINDOW_LO,
+                                window_hi=sv.LIVE_WINDOW_HI)
+        self.assertEqual(v_wide.decision, VE.VerdictDecision.BLOCK_UNPAID)
+
+    def test_is_window_edge_divergence(self):
+        orders_edge = [entry("K123", "2026-10-20", status="未完成/未支付",
+                             no_complete=True, order_ts=9990.0)]
+        tight = VE.postconfirm(self._tk(), orders_edge, ["张三", "李四"], 10000.0)
+        # 宽窗结论与现网一致 → 分歧纯由窗口收紧所致
+        self.assertTrue(VE.is_window_edge_divergence(
+            tight, self._tk(), orders_edge, ["张三", "李四"], 10000.0, "success"))
+        # 宽窗结论与现网不一致 → 不是纯窗口所致
+        self.assertFalse(VE.is_window_edge_divergence(
+            tight, self._tk(), orders_edge, ["张三", "李四"], 10000.0,
+            "block_conflict"))
+        orders_old = [entry("K123", "2026-10-20", status="未完成/未支付",
+                            no_complete=True, order_ts=9000.0)]
+        tight_old = VE.postconfirm(self._tk(), orders_old, ["张三", "李四"], 10000.0)
+        self.assertFalse(VE.is_window_edge_divergence(
+            tight_old, self._tk(), orders_old, ["张三", "李四"], 10000.0, "success"))
+        # 本来就一致 → 不是分歧
+        orders_recent = [entry("K123", "2026-10-20", status="未完成/未支付",
+                               no_complete=True, order_ts=9997.0)]
+        tight_ok = VE.postconfirm(self._tk(), orders_recent, ["张三", "李四"], 10000.0)
+        self.assertFalse(VE.is_window_edge_divergence(
+            tight_ok, self._tk(), orders_recent, ["张三", "李四"], 10000.0, "success"))
+
     def test_postconfirm_none_retry_safe(self):
         v = VE.postconfirm(self._tk(), [], ["张三", "李四"], 10000.0)
         self.assertEqual(v.decision, VE.VerdictDecision.RETRY_SAFE)

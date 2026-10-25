@@ -86,16 +86,20 @@ def precheck(trip, orders, target_names):
 
 
 def postconfirm(trip, orders, target_names, not_before_ts,
-                page_success=False):
+                page_success=False,
+                window_lo=sv.RECENT_WINDOW_LO,
+                window_hi=sv.RECENT_WINDOW_HI):
     """提交后确认：页面证据优先，其次官方快照 + 收紧时间戳归因。
 
     page_success: 浏览器侧是否读到「席位已锁定/待付款页」（唯一页面级成功
     信号）。True 直接判 SUCCESS。
     注意 RETRY_SAFE 返回不代表立即重试——调用方必须双读两次均为无单。
+    window_lo/window_hi: 归因窗口，默认紧窗；影子 triage 可传现网宽窗重算，
+    内核默认行为不变。
     """
     ev = {"phase": "postconfirm", "page_success": page_success,
           "t_submit": round(not_before_ts, 3),
-          "window": [sv.RECENT_WINDOW_LO, sv.RECENT_WINDOW_HI]}
+          "window": [window_lo, window_hi]}
     if page_success:
         return Verdict(VerdictDecision.SUCCESS, "页面确认席位已锁定（待付款）",
                        ev, _CONF_HIGH)
@@ -109,7 +113,8 @@ def postconfirm(trip, orders, target_names, not_before_ts,
         return Verdict(VerdictDecision.SUCCESS, "官方确认本次行程已支付（他端已付或已成功）",
                        ev, _CONF_HIGH)
     if cls == OLC.OrderState.UNPAID:
-        recent = sv.find_recent_order(trip, orders, target_names, not_before_ts)
+        recent = sv.find_recent_order(trip, orders, target_names, not_before_ts,
+                                      window_lo, window_hi)
         if recent is not None:
             ev["order_no"] = masking.mask_order_no(recent.get("order_no"))
             ev["order_time"] = recent.get("order_time") or ""
@@ -131,3 +136,23 @@ def postconfirm(trip, orders, target_names, not_before_ts,
     return Verdict(VerdictDecision.HALT_MANUAL,
                    "平台状态不明（%s），停任务交人工核对" % OLC.label(cls),
                    ev, _CONF_LOW)
+
+
+def is_window_edge_divergence(tight_verdict, trip, orders, target_names,
+                              not_before_ts, legacy_decision):
+    """本次分歧是否纯由归因窗口收紧所致（影子报告 triage 用，纯计算）。
+
+    严格定义：紧窗结论已与现网不一致，且把同一快照按现网宽窗
+    [LIVE_WINDOW_LO, LIVE_WINDOW_HI] 重算后结论恰好等于现网结论——
+    此时窗口是分歧的唯一解释。宽窗重算仍不一致，或本来就一致，
+    都不算边沿，仍按真实分歧处理。
+    """
+    if tight_verdict.decision.value == legacy_decision:
+        return False
+    try:
+        wide = postconfirm(trip, orders, target_names, not_before_ts,
+                           window_lo=sv.LIVE_WINDOW_LO,
+                           window_hi=sv.LIVE_WINDOW_HI)
+    except Exception:
+        return False
+    return wide.decision.value == legacy_decision
