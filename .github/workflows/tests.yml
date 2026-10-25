@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unittest:
+    # Windows 是本项目的实际运行环境（msvcrt 文件锁 / DPAPI 加密 / Edge 通道）。
+    # 测试套件仅用标准库（见 requirements-dev.txt），无需 pip install。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: py_compile all py files
+        run: |
+          python -m compileall -q .
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          echo "py_compile OK"
+      - name: full unittest suite
+        run: |
+          python -m unittest discover -s tests -v 2>&1 | Tee-Object -Variable out
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $out | Select-String -Pattern '^(Ran|OK|FAILED)'

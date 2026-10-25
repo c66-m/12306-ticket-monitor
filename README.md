@@ -75,7 +75,7 @@ state.json / orders.json / 购票历史 / 邮件通知
 | `tools/clean_profile.py` | 约 135 行 | 清 `.browser_profile/` 可再生产物（缓存/遥测/崩溃转储），保留登录态；无参干跑、`--force` 真删，抢不到 profile 锁即认为浏览器在跑并拒绝清理 |
 | `tools/migrate_data_dir.py` | 约 185 行 | 根目录 → `data/` 的一次性数据迁移（幂等、先备份、md5 校验后才删源）；支持 `--dry-run` 与 `--rollback` |
 | `tools/check.py` | 约 270 行 | **一键自检**：语法编译 → 遗留引用扫描（`launcher`→`grabber`、`gui`→`legacy`、数据文件 `HERE` 硬拼）→ 数据完整性（存在/非空/JSON 可解析）→ 车站四库一致性 → 全量测试。`--quick` 跳过测试（约 1 秒）。退出码 0/1，可直接接 CI |
-| `tools/verify_session_dialog.py` | 约 110 行 | **登录失效弹窗去重的手动验证**（真实 Chromium 加载真实 `ui/app.js`，mock RPC 桥）：首弹 / 重复推送不叠加 / 点稍后后两个来源都不再弹 / 会话恢复后能重新提示。7 项断言，不进 807 单元测试（避免拖入浏览器依赖） |
+| `tools/verify_session_dialog.py` | 约 110 行 | **登录失效弹窗去重的手动验证**（真实 Chromium 加载真实 `ui/app.js`，mock RPC 桥）：首弹 / 重复推送不叠加 / 点稍后后两个来源都不再弹 / 会话恢复后能重新提示。7 项断言，不进 921 单元测试（避免拖入浏览器依赖） |
 | `pyproject.toml` | — | 项目元数据与工具口径（**不打包分发**）：`requires-python >=3.9`、运行时依赖（与 requirements.txt 同源）、ruff 检查范围（排除 legacy/产物目录）、pytest 收集路径 |
 | `data/` | 数据目录 | 运行时数据与静态资产（2026-10-18 从根目录分离）：`state.json` / `orders.json` / `order_history.json` / `passengers.json` / `grab_tasks.json` / `session_cookies.json` / `.browser_state.json` + 车站四份库文件。路径统一由 `appcommon.data_path()` 解析（`data/` 优先、旧根目录布局兼容回退）。`config.json` / `launcher_config.json` 是用户可手改的配置，仍留根目录；`.browser_profile/`（Playwright 身份目录）与 `logs/` 也维持原位置 |
 | `notify.py` | 约 145 行 | 邮件通知：订单提交成功后发送购票详情（SMTP SSL） |
@@ -103,21 +103,21 @@ state.json / orders.json / 购票历史 / 邮件通知
 
 ## 部署三步
 
-1. 安装依赖：`pip install -r requirements.txt`，然后 `playwright install msedge`（或使用本机已装 Edge/Chrome）。
+1. 安装依赖：`pip install -r requirements.txt`，然后 `playwright install msedge`（或使用本机已装 Edge/Chrome）；桌面版外壳另需 `cd electron && npm install`。
 2. 登录：运行 `python browser_order.py login`，在弹出的浏览器里完成 12306 登录（扫码或账密+滑块），会话存入 `.browser_profile/`。
 3. 建任务：桌面版「监控任务」页新建任务，或在「抢票任务」页配置车次/席别/乘车人，勾选自动下单。
 
-> **下单成功以「席位已锁定」界面为准**：命中并提交后，浏览器窗口停在 12306 的
-> 订单页，页面上真的出现「席位已锁定，请在 xx 分 xx 秒内完成支付」才判本次成功
-> （只有 URL 到 payOrder、页面还是空白/错误页时不算）。窗口保留到关闭（或手动
-> 停止、超过 `pay_page_keep_seconds`，默认 300 秒）后程序才继续；不需要可设
-> `"keep_pay_page": false`。座位锁定本身是 20 分钟，超时后仍可在
+> **下单成功以锁定座位界面为准**：命中并提交后，浏览器停在 12306 的订单页，
+> 页面上真的出现「座位已锁定 / 席位已锁定，请在 xx 分 xx 秒内完成支付」才判
+> 本次成功（两种写法都算；只有 URL 到 payOrder、页面还是空白/错误页时不算）。
+> 成功回报后付款页停留 `pay_page_keep_seconds`（默认 5 秒）即关闭并继续流程；
+> 不需要停留可设 `"keep_pay_page": false`。座位锁定本身是 20 分钟，超时后仍可在
 > 「未完成订单」里继续支付。
 
 ## 改完代码怎么验证
 
 ```bash
-python tools/check.py          # 全量自检：编译 / 遗留引用 / 数据 / 车站库 / 807 测试
+python tools/check.py          # 全量自检：编译 / 遗留引用 / 数据 / 车站库 / 921 测试
 python tools/check.py --quick  # 跳过测试，约 1 秒
 ```
 
