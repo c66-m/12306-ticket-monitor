@@ -13536,12 +13536,19 @@ class TestAutoStartEngine(TempDirCase):
     def test_main_calls_auto_start_before_ready(self):
         import api
         events = []
+
+        def _record(method, *a, **k):
+            # 只记 ready 推送：main 启动期还可能有其它 push（config.json
+            # 缺失时的日志推送——全新克隆/外人下载就没有 config.json），
+            # 一律计入会误判顺序断言。
+            if method == "ready":
+                events.append("ready")
+
         with mock.patch.object(api, "log_pump"), \
              mock.patch.object(api, "_armed_loop"), \
              mock.patch.object(api, "_auto_start_engine",
                                side_effect=lambda: events.append("auto")), \
-             mock.patch.object(api, "push",
-                               side_effect=lambda *a, **k: events.append("ready")), \
+             mock.patch.object(api, "push", side_effect=_record), \
              mock.patch.object(sys, "stdin", io.StringIO("")):
             api.main()
         # ready 之前自动启引擎：前端一就绪拿到的 engineRunning 就是 true
