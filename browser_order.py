@@ -515,6 +515,20 @@ def launch(p, headless=False, restore=True, extra_args=None):
                 "--disable-sync",
                 "--no-first-run",
                 "--no-default-browser-check",
+                # 2026-10-25 专属浏览器优化：抢票窗口常被用户切到后台/遮挡，
+                # Chromium 默认会节流后台标签的定时器——HOLD 轮询与页面 JS
+                # 不能被降速，关键秒级反应不能拖
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                # 崩溃挂起对话框 / 表单重发提示 / 翻译条会在下单途中抢焦点
+                "--disable-hang-monitor",
+                "--disable-prompt-on-repost",
+                "--disable-features=Translate",
+                # 页面广告/视频不发声
+                "--mute-audio",
+                # 自动化通用口径：关 IPC 防抖限制（配合 AutomationControlled）
+                "--disable-ipc-flooding-protection",
             ] + list(extra_args or []),
         )
         if ch:

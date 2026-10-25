@@ -29,6 +29,7 @@ import logging
 import math
 import os
 import queue
+import shutil
 import sys
 import time
 import threading
@@ -1841,12 +1842,57 @@ class MonitorEngine(object):
                 pass
         LOG.info("[清理] 截图留存检查完成（30 天）：本次清除 %d 个过期文件", removed)
 
+    def _cleanup_browser_profile(self):
+        """每天首次启动清理专属浏览器的诊断垃圾（2026-10-25 专属浏览器优化）。
+
+        BrowserMetrics（UMA 遥测，实测 81MB）与 Crashpad 崩溃报告（39MB）在
+        自动化场景只增不减、与抢票无关；old_* 是崩溃后遗留的改名目录。
+        只动诊断目录，不碰 Default/（cookies、Local Storage、会话数据）。
+        浏览器正忙（登录/下单在跑）则本轮不清、也不写闸门，明天再试。"""
+        today = time.strftime("%Y-%m-%d")
+        if (self.state or {}).get("profile_cleanup_last") == today:
+            return
+        try:
+            import browser_order
+            if browser_order.busy():
+                return
+        except Exception:
+            pass
+        self.state["profile_cleanup_last"] = today
+        self._save_state()
+        prof = os.path.join(HERE, ".browser_profile")
+        targets = [os.path.join(prof, "BrowserMetrics"),
+                   os.path.join(prof, "Crashpad", "reports"),
+                   os.path.join(prof, "Crashpad", "completed"),
+                   os.path.join(prof, "Crashpad", "pending")]
+        freed = 0
+        for t in targets:
+            if not os.path.isdir(t):
+                continue
+            for n in os.listdir(t):
+                p = os.path.join(t, n)
+                try:
+                    if os.path.isfile(p):
+                        freed += os.path.getsize(p)
+                        os.remove(p)
+                except Exception:
+                    pass    # 文件被占用/已消失：跳过，下个周期再清
+        try:
+            for n in os.listdir(prof):
+                if n.startswith("old_"):
+                    shutil.rmtree(os.path.join(prof, n), ignore_errors=True)
+        except Exception:
+            pass
+        LOG.info("[清理] 专属浏览器诊断文件：释放 %.1f MB", freed / 1048576)
+
     def run(self, stop_event=None):
         """主循环。stop_event: threading.Event，置位后本轮结束即优雅退出（GUI 内嵌用）。"""
         LOG.info("=" * 64)
         LOG.info("监控引擎启动")
         # 截图留存：每天第一次启动检查一次，清掉超 30 天的截图/失败现场
         self._cleanup_old_snaps()
+        # 专属浏览器：每天首次启动清一次诊断垃圾（BrowserMetrics/Crashpad）
+        self._cleanup_browser_profile()
         # 暴露给在途任务线程：_run_task 每轮查一次，停止后尽快收手
         self._stop_event = stop_event
         # 启动恢复:从 orders.json 载入未完成订单上下文,并逐一用官方接口复核
