@@ -266,12 +266,14 @@ def _fsync_parent_dir_quietly(path):
             pass
 
 
-def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=5,
+def atomic_write_json(path, obj, *, tmp_kind="tmp", replace_tries=20,
                       replace_delay=0.1, fallback_direct=False, mode=None):
     """原子写 JSON：临时名带 pid+线程标识（同进程多线程/多窗口互不踩），
     写完 fsync tmp 文件后 replace 并对 Windows 占用做退避重试，replace 后
     再尽力 fsync 父目录（R1-17：防断电/崩溃丢失刚落盘的数据；fsync 失败
     只记 debug，绝不改变写入成功语义）。
+    replace_tries 默认 20（预算 2s，2026-10-26 由 5 提高）：本默认值会显式
+    传给 replace_with_retry，改后者默认值挡不住这条路径（CI 实证）。
 
     fallback_direct=True 时 replace 重试耗尽改为直写（丢原子性保数据，
     仅 engine 的 state.json 兜底使用这一语义）。
