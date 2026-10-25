@@ -205,9 +205,11 @@ def parse_date_range(raw_from, raw_to=None, max_span_days=MAX_DATE_SPAN_DAYS):
 
 # ----------------------------- 原子文件 IO -----------------------------
 
-def replace_with_retry(src, dst, tries=5, delay=0.1, fallback_direct=False):
+def replace_with_retry(src, dst, tries=20, delay=0.1, fallback_direct=False):
     """os.replace 带 Windows 占用重试：目标/源被并发读写句柄占用的瞬间会
     PermissionError（杀毒扫描、对方 json.load 持有读句柄），短暂退避重试。
+    预算 2 秒（2026-10-26 由 0.5s 提高）：GitHub Actions 的 2 核 Windows
+    runner 上六线程并发压测可超 0.5s，重试耗尽会把瞬时占用当真失败抛出。
 
     fallback_direct=True 时重试耗尽后把 src 内容直写 dst（engine 的既有兜底
     语义），否则抛出最后一个 OSError。
@@ -355,12 +357,14 @@ def read_state_or_none(path):
         return {}, None, None
     # 读句柄持有可能与写方的 os.replace 撞车（Windows 对正被打开的目标执行
     # replace 报拒绝访问），短暂退避重试——只影响撞上的那一瞬
-    for i in range(5):
+    # 预算 2 秒（与 replace_with_retry 同步由 0.5s 提高，2026-10-26）：
+    # 慢速机器上多写方并发时读侧同样会饿过 0.5s。
+    for i in range(20):
         try:
             with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except PermissionError:
-            if i == 4:
+            if i == 19:
                 return (None,
                         PermissionError("读 %s 被占用（重试后仍失败）" % path),
                         stat_fingerprint(path))

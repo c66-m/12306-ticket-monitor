@@ -7341,10 +7341,12 @@ class TestMonitorLogP3(TempDirCase):
         try:
             h.emit(logging.LogRecord("t", logging.INFO, __file__, 1,
                                      "hello-flush", None, None))
-            import datetime as dt
+            # 文件名日期必须用北京日期：DayFileHandler 按 _beijing_today()
+            # 命名。用运行机器本地日期在非 UTC+8 时区（如 CI 的 UTC runner）
+            # 会找错文件——北京已跨日时本地还是前一天。
             path = os.path.join(
                 log_dir,
-                "m_{0}.log".format(dt.date.today().strftime("%Y%m%d")))
+                "m_{0}.log".format(logutil._beijing_today().strftime("%Y%m%d")))
             with open(path, encoding="utf-8") as f:
                 content = f.read()
         finally:
