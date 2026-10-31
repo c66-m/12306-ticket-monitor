@@ -161,7 +161,7 @@ export async function openGrabForm(edit, preset) {
     '<div class="form-row"><label>截止日期（可选）</label><input type="date" id="gDateTo" value="' + esc(t.date_to || "") + '"></div>' +
     "</div>" +
     '<div class="form-grid">' +
-    '<div class="form-row"><label>开抢时间（可选，留空 = 手动）</label><input type="datetime-local" id="gStart" value="' + esc((t.start_time || "").replace(" ", "T")) + '"></div>' +
+    '<div class="form-row"><label>开抢时间（可选，留空 = 保存后立即开抢）</label><input type="datetime-local" id="gStart" value="' + esc((t.start_time || "").replace(" ", "T")) + '"></div>' +
     '<div class="form-row"><label>提前提醒（分钟）</label><input type="number" id="gRemind" value="' + esc(t.remind_minutes ?? 10) + '"></div>' +
     "</div>" +
     '<div class="form-grid">' +
@@ -303,7 +303,15 @@ export async function openGrabForm(edit, preset) {
     });
     const saved = await call("saveGrabTask", task);
     if (saved && saved.error) return toast("保存失败：" + saved.error, "err");
-    close(); toast("已保存"); refreshGrab();
+    close();
+    if (!edit && !task.start_time) {
+      const started = await call("startGrab", { id: task.id });
+      if (started && started.error) { toast("已保存，但自动开抢失败：" + started.error, "err"); refreshGrab(); return; }
+      toast("已保存并开始抢票");
+    } else {
+      toast("已保存");
+    }
+    refreshGrab();
   };
   const savePresetBtn = modal.querySelector("#gPresetSave");
   if (savePresetBtn) savePresetBtn.onclick = async () => {

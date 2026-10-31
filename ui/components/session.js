@@ -3,21 +3,30 @@ import { S, call } from "../store.js";
 import { $, esc } from "./dom.js";
 import { openModal, modalKind, onModalClosed } from "./modal.js";
 import { toast } from "./toast.js";
+import { autoSyncPax } from "../pages/pax.js";
 
 
 export async function refreshSession(opts) {
   try {
-    S.session = await call("checkSession", undefined, opts);
-    S.account = await call("getAccount", undefined, opts);
+    const sess = await call("checkSession", undefined, opts);
+    const acc = await call("getAccount", undefined, opts);
     // unknown：这一轮没验成（浏览器正忙 / 风控 / 网络），不是掉线的证据 ——
-    // 保留上一次结论，免得登录成功后界面又显示「未登录」
-    if (S.session.unknown) { renderSessionCard(); return; }
+    // 保留上一次结论，免得登录成功后界面又显示「未登录」（S.session 不动）
+    if (sess.unknown) { renderSessionCard(); return; }
+    const prevOk = !!(S.session && S.session.ok);
+    S.session = sess;
+    S.account = acc;
     const ok = S.session.ok;
     // 会话恢复：复位「已忽略」与冷却窗口，下次真失效时重新提示；
     // 同时作废待弹的失效提示——会话已恢复，业务弹窗关掉后不该再补弹。
     if (ok) { S._expiredDismissed = false; S._expiredAt = 0; S._expiredPending = null; writeExpiredDismissed(false); }
-    const name = ok ? ((S.account && S.account.name) || "已登录") : "未登录";
-    const sub = ok ? "会话有效 · 点击管理" : "点击此处登录";
+    // 每次登录（未登录→已登录，含启动时已是登录态）自动扫描一次乘车人
+    if (ok && !prevOk && !S._paxAutoDone) {
+      S._paxAutoDone = true;
+      autoSyncPax();
+    } else if (!ok) {
+      S._paxAutoDone = false;
+    }
     renderSessionCard();
   } catch (e) { /* ignore */ }
 }

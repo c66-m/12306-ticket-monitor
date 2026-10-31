@@ -55,6 +55,8 @@ export const S = {
 const _renderers = {};
 const _enterHooks = {};
 let _closePanelHook = null;
+// 当前页面节点：切页只让它退场；其余已退场/快速点击留下的页面立即移除。
+let _pageEl = null;
 export function registerPage(name, renderer, onEnter) {
   _renderers[name] = renderer;
   if (onEnter) _enterHooks[name] = onEnter;
@@ -112,18 +114,23 @@ function afterAnim(el, name, fn) {
 
 export function renderPage(animate) {
   const c = $("#content");
-  const hasOld = c.firstElementChild !== null;
-  // 动画切换：不清空，旧页执行退回动画后移除，新页从抽屉拉出
-  if (animate && hasOld) {
-    const old = c.firstElementChild;
+  const old = _pageEl && _pageEl.parentNode === c ? _pageEl : null;
+  // 动画切换：只保留当前页退场；连续快速点击留下的历史节点立即移除，
+  // 否则多个 absolute .page 会同时铺在 #content 上，表现为模块重叠。
+  if (animate && old) {
+    old.classList.remove("page-in");
     old.classList.add("page-out");
     afterAnim(old, "page-draw-out", () => old.remove());
   } else if (!animate) {
     c.innerHTML = ""; // 刷新重建路径：无动画直接清空
   }
+  for (const node of Array.from(c.children)) {
+    if (node !== old && node.classList && node.classList.contains("page")) node.remove();
+  }
   const el = document.createElement("div");
   el.className = "page" + (animate ? " page-in" : "");
   c.appendChild(el);
+  _pageEl = el;
   if (animate) {
     // 进入动画结束移除 page-in：恢复毛玻璃（动画期间禁用 backdrop-filter 防模糊）
     afterAnim(el, "page-draw-in", () => el.classList.remove("page-in"));

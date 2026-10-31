@@ -356,6 +356,41 @@ def verify_session(session, timeout=15, retries=3):
     return False, last_err, False
 
 
+BOOKING_CHECK_URL = "https://kyfw.12306.cn/otn/login/checkUser"
+
+
+def verify_booking_session(session, timeout=10, retries=1):
+    """校验「下单票据」是否有效（POST /otn/login/checkUser 的 data.flag）。
+
+    这是比 initMy12306Api 更深的判据：cookie 重放后页头仍能显示姓名，
+    checkUser 却返回 flag=false，点「预订」只会弹「您尚未登录」。
+    返回 (ok, why, permanent)：
+    - flag=true -> (True, "", True)
+    - flag=false -> (False, "...checkUser flag=false", True) 确认失效
+    - 风控/非 JSON/网络异常 -> (False, "...", False) 仅是没验成，不能当掉线
+    """
+    last_err = "未知错误"
+    for _ in range(max(1, int(retries))):
+        try:
+            r = session.post(BOOKING_CHECK_URL, data={"_json": "true"},
+                             timeout=timeout)
+            text = r.text or ""
+            if text.lstrip().startswith("{") or "json" in r.headers.get("Content-Type", ""):
+                data = r.json()
+                if (data.get("data") or {}).get("flag"):
+                    return True, "", True
+                return False, "下单票据已失效（checkUser flag=false）", True
+            final_url = r.url or ""
+            if "/passport" in final_url or ("/login" in final_url
+                                            and "checkUser" not in final_url):
+                return False, "checkUser 被跳到登录门户：%s" % final_url, True
+            last_err = "checkUser 响应非 JSON（疑似风控/网关拦截）"
+        except Exception as e:
+            last_err = "{0}: {1}".format(type(e).__name__, e)
+        time.sleep(1.2)
+    return False, last_err, False
+
+
 def check_login(session):
     """校验会话是否有效（调用需登录接口）。返回 (ok, 用户名或错误)。
     兼容旧调用方：临时故障也返回 False（提示信息说明原因，稍后可重试）。"""
@@ -1021,7 +1056,7 @@ def order_ticket(config, task, ticket, seat_name, should_stop=None):
     （服务端伪装成「余票不足 / 系统繁忙」），浏览器才不会。
     should_stop 一路透传，让浏览器链的滑块等待/付款页驻留可被停止事件打断。
     """
-    if (config.get("order_mode") or "http") == "browser":
+    if (config.get("order_mode") or "browser") == "browser":
         try:
             import browser_order
         except ImportError:

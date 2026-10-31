@@ -1193,6 +1193,13 @@ class TestEngineFlow(TempDirCase):
         self._run((True, "ok 订单号: E123", {"order_no": "E123", "passengers": "张三"}),
                   expect_status="success", notify_calls=1)
 
+    def test_e2e_success_always_stops_when_not_stop_after(self):
+        # 2026-10-31 用户实测：任务 stop_after_order=false，席位锁定、订单
+        # 已提交后仍保持监控并再次尝试下单。真实成功必须收尾，不能靠
+        # 「继续监控其它日期」把同一任务留在活动状态重复提交。
+        self._run((True, "ok 订单号: E123", {"order_no": "E123", "passengers": "张三"}),
+                  expect_status="success", notify_calls=1, stop_after_order=False)
+
     def test_dup_unpaid_stops(self):
         # 官方核验=待支付且非本次提交(更早旧单):按 stop_after_order 停止
         with mock.patch.object(engine_mod.order_mod, "classify_with_time",
@@ -1608,6 +1615,15 @@ class TestLauncherIntegration(TempDirCase):
         lc = {"trains": ["K225", "G1"], "synced_trains": []}
         self.assertTrue(grabber.merge_trains_from_monitor(lc))
         self.assertIn("K925", lc["trains"])
+
+    def test_append_monitor_task_missing_config_creates_it(self):
+        """首跑没有 config.json 时创建任务不得抛 FileNotFoundError。"""
+        self._with_here()
+        name = grabber.append_monitor_task({"name": "首跑任务"}, start_now=False)
+        self.assertEqual(name, "首跑任务")
+        with open(os.path.join(self.tmp, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.assertEqual([t["name"] for t in cfg["tasks"]], ["首跑任务"])
 
     def test_append_corrupt_state_keeps_bad_and_skips(self):
         self._with_here()
@@ -3467,6 +3483,81 @@ class TestBookingLoginTicket(unittest.TestCase):
         self.assertEqual(page.waited, [3000], "只做一次 3 秒探测，不再干等 27 秒")
 
 
+class TestVerifyBookingSession(unittest.TestCase):
+    """下单票据（checkUser）必须纳入会话/登录态判定。
+
+    2026-10-30 实测：cookie 重放后 initMy12306Api 仍 status=true，页头有姓名，
+    但 checkUser flag=false。旧 probe 只看 init 接口，顶栏显示「会话有效」，
+    任务一开浏览器就因 need_relogin 在几秒内关窗，用户看到「任务闪退」。
+    """
+
+    CHECK_URL = "https://kyfw.12306.cn/otn/login/checkUser"
+
+    class _Resp:
+        def __init__(self, text, url="https://kyfw.12306.cn/otn/login/checkUser"):
+            self.text = text
+            self.url = url
+
+        def json(self):
+            return json.loads(self.text)
+
+    def _call(self, resp):
+        sess = mock.Mock()
+        sess.post.return_value = resp
+        return order_mod.verify_booking_session(sess, timeout=1, retries=1)
+
+    def test_flag_true_ok(self):
+        ok, why, perm = self._call(self._Resp('{"status":true,"data":{"flag":true}}'))
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+        self.assertTrue(perm)
+
+    def test_flag_false_is_permanent(self):
+        ok, why, perm = self._call(self._Resp('{"status":true,"data":{"flag":false}}'))
+        self.assertFalse(ok)
+        self.assertIn("checkUser", why)
+        self.assertTrue(perm, "flag=false 是确认失效，不能当瞬时故障重试")
+
+    def test_non_json_is_transient(self):
+        ok, why, perm = self._call(self._Resp("<html>当前访问存在异常</html>"))
+        self.assertFalse(ok)
+        self.assertFalse(perm, "风控/非 JSON 不能把有效会话误判为掉线")
+
+class TestBrowserCheckSessionDeep(unittest.TestCase):
+    """browser_order.check_session 也必须查 checkUser，不然启动器预检仍放过半失效会话。"""
+
+    def test_half_login_rejected(self):
+        ctx = mock.Mock()
+        ctx.pages = [object()]
+        with mock.patch.object(browser_order, "session_ok", return_value=(True, "王子昊")), \
+             mock.patch.object(browser_order, "_page_booking_ok",
+                               return_value=(False, "下单票据已失效（页头仍显示已登录，但 checkUser flag=false）")):
+            ok, why = browser_order._check_ctx_session(ctx)
+        self.assertFalse(ok)
+        self.assertIn("checkUser", why)
+
+    def test_half_login_is_permanent_failure(self):
+        # 半登录：页头有姓名但 checkUser flag=false。这不是「没验成」，
+        # 必须能被 session_failure_is_permanent 识别，否则引擎会当瞬时故障
+        # 无限重试、永不标记任务失败。
+        ctx = mock.Mock()
+        ctx.pages = [object()]
+        with mock.patch.object(browser_order, "session_ok", return_value=(True, "王子昊")), \
+             mock.patch.object(browser_order, "_page_booking_ok",
+                               return_value=(False, "下单票据已失效（checkUser flag=false）")):
+            ok, why = browser_order._check_ctx_session(ctx)
+        self.assertFalse(ok)
+        self.assertTrue(browser_order.session_failure_is_permanent(why))
+
+    def test_valid_session_passes(self):
+        ctx = mock.Mock()
+        ctx.pages = [object()]
+        with mock.patch.object(browser_order, "session_ok", return_value=(True, "王子昊")), \
+             mock.patch.object(browser_order, "_page_booking_ok", return_value=(True, "")):
+            ok, why = browser_order._check_ctx_session(ctx)
+        self.assertTrue(ok)
+        self.assertEqual(why, "王子昊")
+
 class TestSessionProbeUnknown(unittest.TestCase):
     """顶栏「未登录」的数据源是 `rpc.session._probe_browser_session`。
 
@@ -3503,6 +3594,82 @@ class TestSessionProbeUnknown(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertFalse(res["unknown"])
         self.assertTrue(res["permanent"])
+
+    def _probe_with_booking_check(self, booking_result):
+        from rpc import session as sm
+        sm.reset_session_cache()
+        with mock.patch.object(sm, "load_config",
+                               return_value={"order_mode": "browser"}), \
+             mock.patch.object(sm.os.path, "exists", return_value=True), \
+             mock.patch.object(sm.order_mod, "session_from_browser_state",
+                               return_value=object()), \
+             mock.patch.object(sm.order_mod, "verify_session",
+                               return_value=(True, "王子昊", True)), \
+             mock.patch.object(sm.order_mod, "verify_booking_session",
+                               return_value=booking_result), \
+             mock.patch.object(sm.browser_order, "busy", return_value=False):
+            return sm.probe_session(force=True)
+
+    def test_booking_ticket_false_is_permanent(self):
+        res = self._probe_with_booking_check(
+            (False, "下单票据已失效（checkUser flag=false）", True))
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["unknown"])
+        self.assertTrue(res["permanent"], "checkUser 明确 false 不能显示为有效会话")
+        self.assertIn("checkUser", res["message"])
+
+    def test_booking_ticket_transient_keeps_valid_session(self):
+        res = self._probe_with_booking_check(
+            (False, "checkUser 响应非 JSON（风控页）", False))
+        self.assertTrue(res["ok"], "一次验不成不能把有效会话误判为掉线")
+        self.assertEqual(res["name"], "王子昊")
+
+
+class TestOrderModeDefaults(unittest.TestCase):
+    """缺 config.json 时 order_mode 必须与 schema/example 一致（browser）。
+
+    旧代码各入口用 `or "http"`：安装包首次运行没有 config.json，登录明明成功，
+    probe_session 却走 HTTP 读不存在的 session_cookies.json，界面永远「未登录」，
+    自动下单也走 HTTP 被 12306 拦。这里钉住三处入口的缺省值。
+    """
+
+    def test_probe_defaults_to_browser(self):
+        from rpc import session as sm
+        sm.reset_session_cache()
+        with mock.patch.object(sm, "load_config", return_value={}), \
+             mock.patch.object(sm, "_probe_browser_session",
+                               return_value={"ok": True, "unknown": False,
+                                             "permanent": True,
+                                             "message": "张三", "name": "张三"}) as pb, \
+             mock.patch.object(sm.order_mod, "load_session", return_value=object()), \
+             mock.patch.object(sm.order_mod, "verify_session",
+                               return_value=(True, "张三", True)):
+            res = sm.probe_session(force=True)
+        self.assertTrue(res["ok"])
+        pb.assert_called_once()
+
+    def test_settings_defaults_to_browser(self):
+        from rpc import settings as st
+        with mock.patch.object(st, "load_config", return_value={}):
+            self.assertEqual(st.rpc_get_settings({})["order_mode"], "browser")
+
+    def test_orders_classify_defaults_to_browser(self):
+        from rpc import orders as om
+        with mock.patch.object(om, "load_config", return_value={}), \
+             mock.patch.object(om.order_mod, "session_from_browser_state",
+                               return_value="browser-session") as sbs, \
+             mock.patch.object(om.order_mod, "load_session",
+                               return_value="http-session"):
+            self.assertEqual(om._classify_session(), "browser-session")
+        sbs.assert_called_once()
+
+
+class TestEngineModeDefault(TempDirCase):
+    def test_classify_session_defaults_to_browser(self):
+        e = make_engine(self.tmp)
+        with mock.patch.object(order_mod, "load_session") as ls:
+            self.assertIsNone(e._classify_session())
+        ls.assert_not_called()
 
 
 class TestEngineIdleKeepalive(TempDirCase):
@@ -4138,6 +4305,61 @@ class TestLoginQueueNotice(unittest.TestCase):
 
     def _tmp(self):
         d = tempfile.mkdtemp(prefix="t12306_queue_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
+class TestLoginRequiresBookingTicket(unittest.TestCase):
+    """登录成功必须同时通过 checkUser：页头显示姓名不等于能下单。
+
+    2026-10-30 实测：login 只看 initMy12306Api 的 status=true 就 save_state 并
+    报「已登录」，但同一会话的 checkUser flag=false —— 点「预订」12306 只弹
+    「您尚未登录」。保存这种半残会话，界面随后又显示未登录。
+    """
+
+    def test_half_session_not_reported_as_success(self):
+        import browser_order as bo
+        logs = []
+        clock = _FakeClock()
+        orig_lock = bo._PROFILE_LOCK
+        bo._PROFILE_LOCK = bo._ProfileLock(os.path.join(self._tmp(), "half.lock"))
+
+        class HalfPage(_FakePage):
+            def evaluate(self, js, arg=None):
+                if "checkUser" in js:
+                    return {"status": 200,
+                            "url": "https://kyfw.12306.cn/otn/login/checkUser",
+                            "body": '{"status":true,"data":{"flag":false}}'}
+                return {}
+
+        class HalfCtx(_FakeCtx):
+            def __init__(self):
+                self.pages = [HalfPage()]
+
+            def cookies(self):
+                return [{"name": "tk", "value": "1"}]
+
+        try:
+            with mock.patch.object(bo, "busy", return_value=False), \
+                    mock.patch.object(bo, "time", clock), \
+                    mock.patch.object(bo, "launch",
+                                      lambda _p, headless=False, extra_args=None: HalfCtx()), \
+                    mock.patch.object(bo, "_page_session_ok",
+                                      lambda _page: (True, "张三")), \
+                    mock.patch.object(bo, "save_state") as save, \
+                    mock.patch.object(bo, "_log", lambda line: logs.append(line)), \
+                    mock.patch("playwright.sync_api.sync_playwright",
+                               lambda: _FakePlaywright()):
+                ok = bo.login(timeout_sec=2, lock_timeout=30)
+        finally:
+            bo._PROFILE_LOCK = orig_lock
+        self.assertFalse(ok)
+        save.assert_not_called()
+        self.assertTrue(any("checkUser" in s or "登录态" in s for s in logs),
+                        "必须记录半残登录态，实际日志：%r" % (logs,))
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="t12306_half_")
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         return d
 
@@ -5725,7 +5947,7 @@ class TestOrderQueryFixes(TempDirCase):
                   "start_time": "08:00", "arrive_time": "12:00",
                   "train_location": "P3", "secret_str": "x"}
         task = {"passenger_names": ["张三"]}
-        config = {}
+        config = {"order_mode": "http"}
         seen = {}
 
         def fake_submit(sess, ticket_, seat_code, date, tries, delay,
@@ -5866,7 +6088,7 @@ class TestOrderQueryFixes(TempDirCase):
                                return_value=(True, "")) as m_check, \
              mock.patch.object(order_mod, "confirm_with_busy_retry",
                                return_value=(True, "ok")) as m_confirm:
-            ok, msg, extra = order_mod.order_ticket({}, task, ticket, "二等座")
+            ok, msg, extra = order_mod.order_ticket({"order_mode": "http"}, task, ticket, "二等座")
         self.assertFalse(ok)
         self.assertIn("保守", msg)
         self.assertIsNone(extra)
@@ -7261,7 +7483,7 @@ class TestMonitorLogP3(TempDirCase):
         # 应与 :601 一致补 default "session_cookies.json"。
         import monitor as monitor_mod
         with mock.patch.object(monitor_mod, "load_config",
-                               return_value={"tasks": []}), \
+                               return_value={"tasks": [], "order_mode": "http"}), \
              mock.patch.object(monitor_mod.os.path, "exists",
                                return_value=True), \
              mock.patch.object(order_mod, "load_session") as m_ls, \
@@ -8385,6 +8607,11 @@ class TestTask69CaptureSession(TempDirCase):
         # 绝对路径：os.path.join(HERE, abs) == abs，与 monitor.py:684 同口径
         self.assertEqual(capture_session._cookie_path(cfg), "/tmp/abs_cookies.json")
 
+    def test_order_mode_defaults_to_browser(self):
+        import capture_session
+        with mock.patch.object(capture_session, "HERE", self.tmp):
+            self.assertEqual(capture_session._order_mode(), "browser")
+
     # ---- (b) browser 分支友好失败 ----
 
     def test_browser_mode_login_passthrough(self):
@@ -8896,7 +9123,7 @@ class TestTask72EngineState(TempDirCase):
         e._sync_config()
         self.assertLessEqual(len(e._deleted_names), 500)
 
-class TestMergeStateForSave(unittest.TestCase):
+class TestMergeStateForSave(TempDirCase):
     """_merge_state_for_save 直接参数化单测：磁盘为底、内存覆盖、墓碑剔除。
 
     旧覆盖仅通过 _save_state 端到端间接验证（test_pruned_orphan_stays_dead_on_disk）。
@@ -9006,6 +9233,40 @@ class TestMergeStateForSave(unittest.TestCase):
         got = engine_mod._merge_state_for_save({}, mem, set())
         got["retry"]["k2"] = True
         self.assertNotIn("k2", mem_retry)
+
+    def test_extra_top_level_keys_preserved_mem_wins(self):
+        # 清理闸门等非 tasks/retry 字段也必须落盘；否则每天首次启动只清一次
+        # 的闸门永远读不回来，_cleanup_old_snaps 会每轮空跑并刷日志。
+        disk = {"tasks": {}, "retry": {},
+                "snap_cleanup_last": "2026-10-30",
+                "profile_cleanup_last": "2026-10-30"}
+        mem = {"tasks": {}, "retry": {}, "snap_cleanup_last": "2026-10-31"}
+        got = engine_mod._merge_state_for_save(disk, mem, set())
+        self.assertEqual(got["snap_cleanup_last"], "2026-10-31")
+        self.assertEqual(got["profile_cleanup_last"], "2026-10-30")
+
+    def test_cleanup_gate_survives_save_and_reload(self):
+        e = make_engine(self.tmp)
+        e.state["snap_cleanup_last"] = "2026-10-31"
+        e._save_state()
+        with open(e.state_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved.get("snap_cleanup_last"), "2026-10-31")
+
+
+class TestMonitorTaskAutoOrderDefault(unittest.TestCase):
+    """新建任务弹窗的「自动下单」不能被历史 task_defaults 悄悄关掉。"""
+
+    def test_new_task_auto_order_defaults_on(self):
+        with open(os.path.join(HERE, "ui", "pages", "monitor.js"),
+                  encoding="utf-8") as f:
+            js = f.read()
+        m = re.search(r"const autoOn = .*?;", js, re.S)
+        self.assertIsNotNone(m, "ui/pages/monitor.js 里找不到 autoOn")
+        body = m.group(0)
+        self.assertIn("isEdit ? t.auto_order !== false : true", body)
+        self.assertNotIn("task_defaults", body,
+                         "新建任务自动下单应默认开启，不能被历史配置关掉")
 
 
 class TestTask73MonitorCreateCancel(TempDirCase):
@@ -9540,7 +9801,7 @@ class TestTask77Order(unittest.TestCase):
                                return_value=(True, "ok")), \
              mock.patch.object(order_mod, "fetch_unpaid_order_no",
                                return_value="E1"):
-            ok, msg, extra = order_mod.order_ticket({}, task, ticket, "无座")
+            ok, msg, extra = order_mod.order_ticket({"order_mode": "http"}, task, ticket, "无座")
         self.assertTrue(ok, msg)
         # 旧代码：extra 无 alias_seat/selected_seat，seat 显示改判前的"无座"
         self.assertEqual(extra.get("alias_seat"), "二等座")
@@ -13964,7 +14225,8 @@ class TestB2AmbiguousTerminal(TempDirCase):
     def test_classify_session_http_mode_loads_cookie_session(self):
         import rpc.orders as orders_rpc
         sentinel = object()
-        with mock.patch.object(orders_rpc, "load_config", return_value={}), \
+        with mock.patch.object(orders_rpc, "load_config",
+                               return_value={"order_mode": "http"}), \
              mock.patch.object(orders_rpc.order_mod, "load_session",
                                return_value=sentinel) as m:
             self.assertIs(orders_rpc._classify_session(), sentinel)
@@ -14523,6 +14785,29 @@ class TestKeepPayPage(unittest.TestCase):
         with mock.patch.object(bo, "_log"):
             bo._hold_pay_page(p, 60)
         self.assertEqual(p.n, 1, "关窗后必须立刻返回，不再空等")
+
+    def test_holds_full_seconds_even_with_waiting_tasks(self):
+        import browser_order as bo
+
+        clock = {"t": 0.0}
+
+        class _P:
+            def __init__(self):
+                self.waits = 0
+
+            def is_closed(self):
+                return False
+
+            def wait_for_timeout(self, ms):
+                self.waits += 1
+                clock["t"] += ms / 1000.0
+
+        p = _P()
+        with mock.patch.object(bo, "_log"), \
+             mock.patch.object(bo.time, "time", lambda: clock["t"]), \
+             mock.patch.object(bo, "_lock_waiter_count", return_value=1):
+            bo._hold_pay_page(p, 5)
+        self.assertEqual(p.waits, 10, "排队任务不能把锁定页 5 秒停留截断")
 
     def test_hold_aborts_on_manual_stop(self):
         import browser_order as bo

@@ -1163,13 +1163,13 @@ class MonitorEngine(object):
                         self.state.setdefault("dup_streak", {}).pop(key, None)
                         self._save_state()
                         self._record_success(task, info, date, seat_name, extra)
-                        if stop_after:
-                            self.set_task_status(task, "success",
-                                "已成功下单 %s %s %s %s" % (date, train_code, seat_name,
-                                extra.get("passengers") if extra else ""))
-                            return True, False
-                        if self.task_status(task) == "retrying":
-                            self.set_task_status(task, "monitoring", "下单成功，恢复正常监控")
+                        # 下单已真实提交：无论 stop_after_order 都不能继续监控，
+                        # 否则下一轮会再次提交同一行程（2026-10-31 实测：订单
+                        # EC72599319 已生成后任务仍监控，连续触发 12306
+                        #「您还有未处理的订单」并尝试 D114）。
+                        self.set_task_status(task, "success",
+                            "已成功下单 %s %s %s %s" % (date, train_code, seat_name,
+                            extra.get("passengers") if extra else ""))
                         return True, False  # 本轮不再继续（避免同轮重复下单）
                     elif result_msg == "dup":
                         # 本地记录仅作线索:以 12306 官方接口的订单状态为准决策
@@ -1439,7 +1439,7 @@ class MonitorEngine(object):
                         if ("会话已失效" in msg or "未找到会话文件" in msg
                                 or browser_order.session_failure_is_permanent(msg)):
                             hint = ("请点界面上的「重新登录」后恢复任务"
-                                    if (self.config.get("order_mode") or "http") == "browser"
+                                    if (self.config.get("order_mode") or "browser") == "browser"
                                     else "请重新运行 capture_session.py 登录后恢复任务")
                             # 文案带「登录会话失效」：check_session_if_needed 靠它做
                             # 会话恢复后的自动重启监控
@@ -1781,7 +1781,7 @@ class MonitorEngine(object):
         http 模式显式 load_session(session_cookies.json)，修正旧代码中 classify
         无条件回退 .browser_state.json 导致的载体错配（http 下单写 session_cookies
         但分类读 .browser_state → 防重核查误判 error）。"""
-        if (self.config.get("order_mode") or "http") == "browser":
+        if (self.config.get("order_mode") or "browser") == "browser":
             return None
         try:
             return order_mod.load_session(
@@ -1801,7 +1801,7 @@ class MonitorEngine(object):
         self._last_session_check = now
         auto_tasks = [t for t in self.tasks if t.get("auto_order", True)
                       and self.task_status(t) in ACTIVE_STATUSES]
-        browser_mode = (self.config.get("order_mode") or "http") == "browser"
+        browser_mode = (self.config.get("order_mode") or "browser") == "browser"
         if not auto_tasks and not browser_mode:
             # http 模式待命时不体检（该模式已弃用）；浏览器模式待命也要保活，
             # 登录失效才能被及时发现并弹窗提醒（api 会话看门狗同步在跑）。
@@ -2184,14 +2184,23 @@ def _merge_state_for_save(disk_state, mem_state, tombstoned, status_seen=None):
         merged_tasks.pop(name, None)
     mem_retry = mem_state.get("retry")
     mem_dup = mem_state.get("dup_streak")
-    return {
+    # 其余顶层字段（snap_cleanup_last / profile_cleanup_last / retry_reason 等）
+    # 也要保留：旧实现只回这三个固定节，任何一次性闸门落盘后立刻被重载丢掉，
+    # 导致 _cleanup_old_snaps 每轮都当天首次、日志刷屏。磁盘为底、内存覆盖；
+    # 已下线的 dedup 永远不输出。
+    out = {k: v for k, v in disk_state.items()
+           if k not in ("tasks", "retry", "dup_streak", "dedup")}
+    out.update({k: v for k, v in mem_state.items()
+                if k not in ("tasks", "retry", "dup_streak", "dedup")})
+    out.update({
         "retry": dict(mem_retry) if isinstance(mem_retry, dict) else {},
         # dup_streak 必须落盘：它是跨轮累加的「网页连续判 dup 而官方查无此单」
         # 计数，攒到 3 就判定账号被限流并停手。不落盘这个阈值永远攒不满，
         # 每次重启都清零，等于刹车片根本没装上。
         "dup_streak": dict(mem_dup) if isinstance(mem_dup, dict) else {},
         "tasks": merged_tasks,
-    }
+    })
+    return out
 
 
 if __name__ == "__main__":

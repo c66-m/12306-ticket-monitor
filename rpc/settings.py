@@ -61,7 +61,7 @@ def rpc_get_settings(_p):
             _warn("邮箱授权码脱敏", e)
             out["password"] = "******"
     return {
-        "order_mode": cfg.get("order_mode") or "http",
+        "order_mode": cfg.get("order_mode") or "browser",
         "email": out,
         "notify_enabled": bool(_notify_dict(cfg).get("email", {}).get("enabled")),
         "poll_interval_seconds": cfg.get("poll_interval_seconds"),

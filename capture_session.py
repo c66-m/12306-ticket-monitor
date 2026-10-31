@@ -55,9 +55,9 @@ GUI_SUBPROCESS_TIMEOUT = MAX_WAIT_SEC + 120
 def _order_mode():
     try:
         with open(os.path.join(HERE, "config.json"), encoding="utf-8-sig") as f:
-            return json.load(f).get("order_mode") or "http"
+            return json.load(f).get("order_mode") or "browser"
     except Exception:
-        return "http"
+        return "browser"
 
 
 def _cookie_path(config_path=None):

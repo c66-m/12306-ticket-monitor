@@ -41,7 +41,7 @@ def _classify_session():
     对账守护从未真正运行）。
     """
     cfg = load_config()
-    if (cfg.get("order_mode") or "http") == "browser":
+    if (cfg.get("order_mode") or "browser") == "browser":
         return order_mod.session_from_browser_state()
     return order_mod.load_session(
         appcommon.data_path(

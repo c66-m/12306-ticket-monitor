@@ -7,6 +7,21 @@ const { StringDecoder } = require("string_decoder");
 
 const PY_DIR = path.join(__dirname, "..");          // C:\develep\产物\12306
 let quitting = false;                                 // 用户退出：不再自动重启 Python
+
+// 单实例锁：桌面版后端（config.json / state.json / .browser_profile）不允许两个
+// 应用进程并发读写，否则会互相覆盖任务状态（此前实机看到 2 个 api.exe 竞态）。
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (win && !win.isDestroyed()) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    }
+  });
+}
 const UI_DIR = path.join(PY_DIR, "ui");
 let win = null;
 let py = null;
@@ -294,12 +309,12 @@ ipcMain.on("mini-win", (e, action) => {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 1440,
-    height: 900,
+    width: 1180,
+    height: 720,
     minWidth: 1180,
     minHeight: 720,
     frame: false,             // 无边框（顶栏自绘）
-    backgroundColor: "#00000000",
+    backgroundColor: "#E8EBF2",   // 与 body 底色一致；透明窗口在 Windows 上会拖慢输入合成
     icon: path.join(__dirname, "icon.ico"),   // 多尺寸 ico（16…256）
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -328,13 +343,15 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
-  startPython();
-  createWindow();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+if (gotLock) {
+  app.whenReady().then(() => {
+    startPython();
+    createWindow();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
+}
 
 // 退出前先让后端优雅收尾（停引擎落盘状态），再到点强杀。
 // 直接 kill 会跳过 Python finally：state 节流缓冲丢失、Playwright 浏览器

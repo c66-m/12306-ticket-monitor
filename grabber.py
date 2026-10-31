@@ -865,8 +865,12 @@ def append_monitor_task(task, start_now=True):
                         before = os.path.getmtime(cfg_path)
                     except OSError:
                         before = None
-                    with open(cfg_path, "r", encoding="utf-8-sig") as f:
-                        cfg = json.load(f)
+                    try:
+                        with open(cfg_path, "r", encoding="utf-8-sig") as f:
+                            cfg = json.load(f)
+                    except FileNotFoundError:
+                        # 首次运行还没有 config.json：从空配置起，写任务时一并创建。
+                        cfg = {}
                     cfg.setdefault("tasks", []).append(task)
                     with open(tmp, "w", encoding="utf-8") as f:
                         json.dump(cfg, f, ensure_ascii=False, indent=2)

@@ -22,22 +22,50 @@ async function savePaxList(passengers) {
   return true;
 }
 
+// 从 12306 同步乘车人（quiet=true 用于登录后自动同步：失败不打扰，成功轻提示）
+export async function syncFrom12306(opts) {
+  const quiet = !!(opts && opts.quiet);
+  let r;
+  try {
+    r = await call("sync12306Passengers", undefined, { quiet });
+  } catch (e) { return false; }
+  if (!r || r.error) {
+    if (!quiet) toast((r && r.error) || "同步失败", "err");
+    return false;
+  }
+  const rows = Array.isArray(r.passengers) ? r.passengers : [];
+  // 空列表不覆盖本地：登录后自动同步时，接口风控/账号切换都可能返回空，
+  // 直接 savePaxList([]) 会把用户已有的乘车人清空。保留本地，等下次同步。
+  if (!rows.length) {
+    if (!quiet) toast("12306 未返回乘车人，已保留本地列表", "warn");
+    return false;
+  }
+  const ok = await savePaxList(rows);
+  if (ok && !quiet) toast("已同步 " + rows.length + " 位");
+  if (ok) refreshPax();
+  return ok;
+}
+
+let _autoSyncBusy = false;
+// 登录成功后自动扫描乘车人：并发防重，只提示一次
+export async function autoSyncPax() {
+  if (_autoSyncBusy) return false;
+  _autoSyncBusy = true;
+  try {
+    const ok = await syncFrom12306({ quiet: true });
+    if (ok) toast("已自动同步乘车人");
+    return ok;
+  } finally { _autoSyncBusy = false; }
+}
+
 // ================= 乘车人页 =================
 export function renderPax(root) {
   root.innerHTML =
-    '<div class="sec-head"><h3>乘车人</h3><span style="display:flex;gap:8px">' +
-    '<button class="btn btn-mini btn-ghost" id="pSync">从 12306 同步</button>' +
+    '<div class="sec-head"><h3>乘车人</h3><span class="pax-head-actions" style="display:flex;gap:8px">' +
     '<button class="btn btn-mini btn-call" id="pNew">＋ 新增</button></span></div>' +
     '<div class="card glass glass-surface" style="flex:1"><div class="pax" id="pList">' + S.pax.map(paxRow).join("") + "</div></div>";
 
   root.querySelector("#pNew").onclick = () => openPaxForm();
-  root.querySelector("#pSync").onclick = async () => {
-    const r = await call("sync12306Passengers");
-    if (r.error) return toast(r.error, "err");
-    // 落盘成功才报「已同步」；失败时 savePaxList 已 toast 报错，只刷新对齐
-    if (await savePaxList(r.passengers || [])) toast("已同步 " + (r.passengers || []).length + " 位");
-    refreshPax();
-  };
   root.querySelectorAll("#pList .p").forEach((el) => {
     el.ondblclick = () => { const p = S.pax.find((x) => x.name === el.dataset.name); if (p) openPaxForm(p); };
     el.oncontextmenu = (e) => {

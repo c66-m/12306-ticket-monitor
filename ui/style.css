@@ -402,22 +402,13 @@ nav { display: flex; flex-direction: column; gap: .3rem; overflow-y: auto; margi
 
 .page { height: 100%; display: flex; flex-direction: column; gap: var(--gap); min-height: 0; }
 
-/* ---- 页面抽屉切换动画（导航时）：新页清晰拉入，旧页镶设置页式渐变模糊退回 ---- */
-.page { position: absolute; inset: 0; transform-origin: left center; }
-.page.page-in { z-index: 2; animation: page-draw-in .22s cubic-bezier(.22, 1, .36, 1); }
+/* ---- 页面抽屉切换动画（导航时）：新页在上层拉入，旧页快速淡出 ---- */
+.page { position: absolute; inset: 0; transform-origin: left center; z-index: 2; }
+.page.page-in { animation: page-draw-in .18s cubic-bezier(.22, 1, .36, 1); }
 .page.page-out {
   z-index: 1;
-  animation: page-draw-out .4s ease forwards;
-}
-/* 仿设置页遮罩：旧页退出时 backdrop 渐变模糊（只模糊不变暗），新页清晰滑入覆盖 */
-.page.page-out::after {
-  content: "";
-  position: absolute; inset: 0; z-index: 3;
   pointer-events: none;
-  backdrop-filter: blur(calc(var(--blur) + 6px));
-  -webkit-backdrop-filter: blur(calc(var(--blur) + 6px));
-  opacity: 0;
-  animation: page-fade-blur .4s ease forwards;
+  animation: page-draw-out .2s ease forwards;
 }
 @keyframes page-draw-in {
   from { opacity: 0; transform: translateX(-8%) scale(.96); }
@@ -426,10 +417,6 @@ nav { display: flex; flex-direction: column; gap: .3rem; overflow-y: auto; margi
 @keyframes page-draw-out {
   from { opacity: 1; transform: translateX(0) scale(1); }
   to   { opacity: 0; transform: translateX(-8%) scale(.96); }
-}
-@keyframes page-fade-blur {
-  from { opacity: 0; }
-  to   { opacity: 1; }
 }
 .grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr); gap: var(--gap); flex: 1; min-height: 0; }
 .col { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; min-height: 0; }
@@ -492,6 +479,7 @@ nav { display: flex; flex-direction: column; gap: .3rem; overflow-y: auto; margi
 }
 .btn-ghost:hover { background: rgba(var(--glass-rgb), calc(var(--glass-a) * .95)); transform: translateY(-1px); }
 .btn-mini { padding: .3rem .6rem; font-size: .76rem; border-radius: 9px; }
+
 .btn-round {
   width: 2.7rem; height: 2.7rem; border-radius: 50%;
   display: grid; place-items: center;
@@ -832,8 +820,6 @@ input[type="range"] { padding: 0; height: 1.2rem; background: transparent; borde
   position: fixed; inset: 0; z-index: 50;
   display: grid; place-items: center;
   background: color-mix(in srgb, var(--ink) 22%, transparent);
-  backdrop-filter: blur(3px);
-  -webkit-backdrop-filter: blur(3px);
 }
 .modal {
   width: min(42rem, 88vw);
@@ -1087,5 +1073,4 @@ input[type="range"] { padding: 0; height: 1.2rem; background: transparent; borde
 /* -------- 窄窗兜底 -------- */
 @media (max-width: 1180px) {
   .grid { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1.4fr) minmax(0, 1fr); }
-  .session-chip .meta { display: none; }
 }

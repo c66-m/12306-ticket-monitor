@@ -373,9 +373,10 @@ export async function openMonitorTaskForm(edit) {
   if (!S.pax.length) { try { await refreshPax(); } catch (e) { /* 不挡开窗 */ } }
   const t = edit || {};
   const isEdit = !!edit;
-  // 「自动下单」开关：编辑取任务原值，新建取设置里的任务默认值（与后端 _req_on 同口径）
-  const autoOn = isEdit ? t.auto_order !== false
-    : (((S.settings || {}).task_defaults || {}).auto_order) !== false;
+  // 「自动下单」开关：编辑取任务原值；新建默认开启。表单既然显式展示这个开关，
+  // 就不能让历史 task_defaults 把刚建的任务悄悄变成「仅提醒」——用户看到的勾选
+  // 状态必须就是最终行为，想只提醒就自己取消勾选。
+  const autoOn = isEdit ? t.auto_order !== false : true;
   const { modal, close } = openModal(
     "<h3>" + (isEdit ? "编辑任务" : "新建" + PAGES.monitor.title + "任务") + "</h3>" +
     '<div class="mt-top"><div class="form-row grow"><label>出发站</label>' + stationInput("from", t.from) + "</div>" +
@@ -461,15 +462,27 @@ export async function openMonitorTaskForm(edit) {
     } catch (e) { qRes.innerHTML = '<div class="muted" style="padding:6px 2px">查询失败：' + esc(e.message) + "</div>"; }
   };
 
-  // 首选席别即时反馈
+  // 首选席别即时反馈：输入防抖 + 请求序号，避免每按一键都打 RPC、
+  // 也避免旧响应晚到覆盖新输入（两个 async 请求并发时顺序不保证）。
   const pri = modal.querySelector("#fPri");
   const priFb = modal.querySelector("#fPriFb");
-  const refreshPri = async () => {
-    const r = await call("seatPriorityFeedback", {
-      text: pri.value, checked: checkedSeats(modal),
-      trains: modal.querySelector("#fTrains").value.split(/[,，\s]+/).filter(Boolean),
-    });
-    priFb.textContent = r.text; priFb.className = "feedback" + (r.warn ? " warn" : "");
+  let priTimer = null, priSeq = 0;
+  const refreshPriNow = async () => {
+    const seq = ++priSeq;
+    let r;
+    try {
+      r = await call("seatPriorityFeedback", {
+        text: pri.value, checked: checkedSeats(modal),
+        trains: modal.querySelector("#fTrains").value.split(/[,，\s]+/).filter(Boolean),
+      });
+    } catch (e) { return; } // 后端短暂不可用：保留上次反馈，不抛未处理异常
+    if (seq !== priSeq) return; // 已有更新的输入，丢弃这份旧结果
+    if (!r || r.error) return;
+    priFb.textContent = r.text || ""; priFb.className = "feedback" + (r.warn ? " warn" : "");
+  };
+  const refreshPri = () => {
+    if (priTimer) clearTimeout(priTimer);
+    priTimer = setTimeout(() => { priTimer = null; refreshPriNow(); }, 100);
   };
   pri.addEventListener("input", refreshPri);
   modal.querySelector("#fTrains").addEventListener("input", refreshPri);

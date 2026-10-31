@@ -31,7 +31,7 @@ def current_session():
     注意：返回的 Session 只在调用线程内用（requests 的连接池不跨线程共享）。
     """
     reset_session_cache()
-    if (load_config().get("order_mode") or "http") == "browser":
+    if (load_config().get("order_mode") or "browser") == "browser":
         return order_mod.session_from_browser_state()
     return order_mod.load_session()
 
@@ -71,6 +71,16 @@ def _probe_browser_session(verify_timeout=None, verify_retries=None,
         timeout=15 if verify_timeout is None else verify_timeout,
         retries=3 if verify_retries is None else verify_retries)
     if ok:
+        # 第二道：initMy12306Api 只证明页头会话在，真正决定能否下单的是
+        # checkUser 的 data.flag。cookie 重放后常见「页头有名字、flag=false」，
+        # 旧快路直接报「会话有效」，任务一开浏览器就因 need_relogin 秒退。
+        bok, bmsg, bperm = order_mod.verify_booking_session(
+            sess,
+            timeout=10 if verify_timeout is None else verify_timeout,
+            retries=1 if verify_retries is None else verify_retries)
+        if not bok and bperm:
+            return {"ok": False, "unknown": False, "permanent": True,
+                    "message": str(bmsg or "下单票据已失效"), "name": ""}
         return {"ok": True, "unknown": False, "permanent": True,
                 "message": str(msg or ""), "name": str(msg or "")}
     if not permanent:
@@ -115,7 +125,7 @@ def probe_session(force=False, verify_timeout=None, verify_retries=None,
     if (not force and _SESSION_CACHE["res"] is not None
             and now - _SESSION_CACHE["at"] < _SESSION_TTL):
         return _SESSION_CACHE["res"]
-    if (load_config().get("order_mode") or "http") != "browser":
+    if (load_config().get("order_mode") or "browser") != "browser":
         try:
             ok, msg, permanent = order_mod.verify_session(
                 order_mod.load_session(),

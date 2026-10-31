@@ -470,6 +470,22 @@ def busy():
     return True
 
 
+def _check_ctx_session(ctx):
+    """在已打开的浏览器里做完整登录校验：页头会话 + checkUser 下单票据。
+
+    session_ok 只看 initMy12306Api.status，cookie 重放常见的半失效态
+    （页头有姓名、checkUser flag=false）会被它放过；这里补上第二道。
+    """
+    page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
+    ok, who = session_ok(ctx, page=page)
+    if not ok:
+        return False, who
+    ok2, why = _page_booking_ok(page)
+    if not ok2:
+        return False, "登录票据不完整（%s），请重新登录" % why
+    return True, who
+
+
 def check_session(headless=True, timeout=90):
     """独占地开一次浏览器校验会话，返回 (ok, who)。引擎与 GUI 统一走这里。
 
@@ -480,7 +496,7 @@ def check_session(headless=True, timeout=90):
         with sync_playwright() as p:
             ctx = launch(p, headless=headless)
             try:
-                ok, who = session_ok(ctx)
+                ok, who = _check_ctx_session(ctx)
             finally:
                 save_state(ctx)
                 try:
@@ -734,7 +750,8 @@ def _page_body(page):
 # 会话失效判据：只有这两类算"确认失效"，其余（goto 超时 / 网络抖动 / 风控
 # 非 JSON 页）都是瞬时故障。默认方向取"重试"——误把任务标 failed 要人工恢复，
 # 代价比多试几轮大，所以拿白名单而不是把"校验异常"整类当永久。
-_PERMANENT_FAILURE_MARKS = ("已跳转登录门户", "接口返回 status=false")
+_PERMANENT_FAILURE_MARKS = ("已跳转登录门户", "接口返回 status=false",
+                             "登录票据不完整", "checkUser flag=false")
 
 
 def session_failure_is_permanent(who):
@@ -796,6 +813,7 @@ def _login_locked(timeout_sec=300, stop_event=None):
         next_slow = time.time() + min(5.0, timeout_sec / 2.0)
         miss = 0          # 校验连续抛异常的次数（页面被关 / 被导航走）
         ok, who = False, ""
+        half_logged = False   # 「页头有名字但 checkUser flag=false」只提示一次
         while time.time() < deadline:
             if stop_event is not None:
                 if stop_event.wait(1):
@@ -839,7 +857,13 @@ def _login_locked(timeout_sec=300, stop_event=None):
                     ok, who = False, ""
                     miss += 1
                 if ok:
-                    break
+                    booking_ok, booking_why = _page_booking_ok(page)
+                    if booking_ok:
+                        break
+                    ok = False
+                    if not half_logged:
+                        _log("[等待] 登录态不完整（checkUser 未通过）：%s" % booking_why)
+                        half_logged = True
                 if miss >= 10:      # 约 20 秒都读不到页面：窗口已被关闭/接管
                     _log("[停止] 登录窗口已关闭或页面不可用。")
                     break
@@ -852,7 +876,13 @@ def _login_locked(timeout_sec=300, stop_event=None):
                     ok, who = False, ""
                     miss += 1
                 if ok:
-                    break
+                    booking_ok, booking_why = _page_booking_ok(page)
+                    if booking_ok:
+                        break
+                    ok = False
+                    if not half_logged:
+                        _log("[等待] 登录态不完整（checkUser 未通过）：%s" % booking_why)
+                        half_logged = True
                 if miss >= 10:
                     _log("[停止] 登录窗口已关闭或页面不可用。")
                     break
@@ -901,11 +931,10 @@ def _pay_page_hold_seconds():
 def _hold_pay_page(page, seconds, should_stop=None):
     """把锁定座位的付款页留在屏幕上 seconds 秒后收尾（页面随后由调用方关闭）。
 
-    提前收尾条件：用户关窗 / 手动停止 / 有其它任务在等独占锁。
-    留窗全程占着 profile 独占锁：若已有任务在 exclusive() 里排队等锁，
-    继续留窗只会让对方等锁超时、错过放票窗口（审查第 10 条）——每轮
-    检查等待者登记，有等待者即提前结束留窗；无人等待时保持原时长。
-    订单结论在进留窗前已经落定，提前结束不影响本次下单结果。
+    提前收尾条件只有用户关窗 / 手动停止。不能因为有其它任务在等独占锁就
+    提前关：用户明确要求看到「座位已锁定」后保留 5 秒（2026-10-30 反馈，
+    多任务排队时锁定页一闪即关）。等待者由 exclusive() 自己排队，本页
+    留满时长后再释放。
 
     只对真实 Playwright 页面生效：测试替身没有 is_closed，直接返回，
     避免单元测试被这段等待挂住。
@@ -924,10 +953,6 @@ def _hold_pay_page(page, seconds, should_stop=None):
                 _log("  [浏览器] 付款页已关闭，继续后续流程。")
                 return
         except Exception:
-            return
-        if _lock_waiter_count() > 0:
-            _log("  [浏览器] 已有其它任务在等待使用浏览器，提前结束付款页"
-                 "停留（订单已生成，可在「未完成订单」里继续支付）。")
             return
         if should_stop is not None and should_stop():
             _log("  [浏览器] 已手动停止，结束付款页停留。")

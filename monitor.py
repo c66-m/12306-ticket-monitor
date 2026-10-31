@@ -1014,7 +1014,7 @@ def menu_notify():
 def menu_session():
     print("\n===== 登录会话 =====")
     config = load_config()
-    browser_mode = (config.get("order_mode") or "http") == "browser"
+    browser_mode = (config.get("order_mode") or "browser") == "browser"
     if browser_mode:
         import browser_order
         state_path = getattr(browser_order, "STATE_PATH",
