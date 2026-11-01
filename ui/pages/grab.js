@@ -1,67 +1,23 @@
-/* pages/grab.js —— 抢票任务页（卡片网格/任务表单/预设/查询历史）。 */
-import { S, call, goto, renderPage, localDate, SEAT_CHOICES, registerPage } from "../store.js";
+/* pages/grab.js —— 抢票任务页（卡片网格/任务表单/开售日期查询）。 */
+import { S, call, renderPage, localDate, SEAT_CHOICES, registerPage } from "../store.js";
 import { $, esc } from "../components/dom.js";
 import { toast } from "../components/toast.js";
 import { openModal, confirmBox } from "../components/modal.js";
-import { showDD } from "../components/dd.js";
 import { stationInput, bindStation, resolveStation } from "../components/station.js";
+import { openSaleQuery } from "../components/sale-query.js";
 import { refreshPax } from "./pax.js";
-import { runSearch } from "./monitor.js";
 
 
 // ================= 抢票页 =================
 export function renderGrab(root) {
   root.innerHTML =
     '<div class="sec-head"><h3>抢票任务</h3><span style="display:flex;gap:8px">' +
-    '<button class="btn btn-mini btn-ghost" id="gPreset">预设 ▾</button>' +
-    '<button class="btn btn-mini btn-ghost" id="gHist">🕘 查询历史</button>' +
+    '<button class="btn btn-mini btn-ghost" id="gSale">📅 查询开售日期</button>' +
     '<button class="btn btn-mini btn-call" id="gNew">＋ 新任务</button></span></div>' +
     '<div class="grid-3" id="gGrid"></div>';
   root.querySelector("#gNew").onclick = () => openGrabForm();
-  root.querySelector("#gPreset").onclick = (e) => {
-    const items = S.presets.map((p, i) => ({ i, label: "▸ " + p.name, fn: () => openGrabForm(null, p) }));
-    items.push({ i: 98, label: "🗑 删除预设…", danger: true, fn: () => pickPresetToDelete(e) });
-    items.push({ i: 99, label: "＋ 存当前为预设", fn: () => { toast("在任务表单里点「存为预设」"); } });
-    showDD(items, e.clientX, e.clientY);
-  };
-  // B6 查询历史：点击回填到监控页并发起查票
-  root.querySelector("#gHist").onclick = (e) => {
-    const hist = S.queryHistory || [];
-    if (!hist.length) return toast("暂无查询历史");
-    showDD(hist.map((h, i) => ({
-      i, label: h.from + " → " + h.to, fn: () => applyQueryHistory(h),
-    })), e.clientX, e.clientY);
-  };
+  root.querySelector("#gSale").onclick = () => openSaleQuery();
   renderGrabGrid(root.querySelector("#gGrid"));
-}
-
-// 删除预设（B4）：先选预设再确认
-export function pickPresetToDelete(e) {
-  const ps = S.presets || [];
-  if (!ps.length) return toast("暂无预设");
-  showDD(ps.map((p, i) => ({
-    i, label: "🗑 " + p.name, danger: true, fn: async () => {
-      if (!await confirmBox("删除预设", "删除预设「" + p.name + "」？")) return;
-      const r = await call("deletePreset", { name: p.name });
-      if (r && r.error) return toast(r.error, "err");
-      toast("预设已删除"); refreshPresets();
-    },
-  })), e.clientX, e.clientY);
-}
-
-// 查询历史回填：解析站名 → 监控页查票
-export async function applyQueryHistory(h) {
-  if (!h) return;
-  goto("monitor");
-  try {
-    const r = await call("searchStation", { q: h.from });
-    const fr = (r.stations || [])[0];
-    if (!fr) return toast("站名无法解析：" + h.from, "err");
-    const r2 = await call("searchStation", { q: h.to });
-    const to = (r2.stations || [])[0];
-    if (!to) return toast("站名无法解析：" + h.to, "err");
-    runSearch({ name: fr.name, code: fr.code }, { name: to.name, code: to.code }, "", h.date);
-  } catch (err) { /* call 已提示 */ }
 }
 
 // 抢票结果详情（A2 续）：后端 grabResult 返回内存中的完整 result 对象
@@ -122,14 +78,11 @@ export function renderGrabGrid(el) {
 }
 
 // 抢票任务表单
-export async function openGrabForm(edit, preset) {
+export async function openGrabForm(edit) {
   // 预拉乘车人只是给表单备数据：refreshPax 内部已吞错保底，这里再兜一层，
   // 保证后端抖动时表单照样能打开（大不了乘车人列表为空/旧缓存）。
   if (!S.pax.length) { try { await refreshPax(); } catch (e) { /* 不挡开窗 */ } }
-  const t = Object.assign({}, _DEFAULT_LC, edit || {}, preset ? {
-    from: preset.from, to: preset.to, trains: preset.trains || [], seat_types: preset.seat_types || [],
-    seat_priority: preset.seat_priority || "",
-  } : {});
+  const t = Object.assign({}, _DEFAULT_LC, edit || {});
   // 逐车席别（车次 → Set<席别名>）：删除整排席别勾选后，唯一的席别入口
   const perTrain = {};
   const prioRaw = Array.isArray(t.seat_priority) ? t.seat_priority.join(",") : (t.seat_priority || "");
@@ -174,7 +127,6 @@ export async function openGrabForm(edit, preset) {
       '<select class="gpax-purpose" style="margin-left:8px"><option value="ADULT"' + (((t.pax_purpose || {})[p.name] || "ADULT") === "ADULT" ? " selected" : "") + '>成人票</option><option value="0X00"' + (((t.pax_purpose || {})[p.name] || "") === "0X00" ? " selected" : "") + '>学生票</option></select></div></div>').join("") +
     (S.pax.length ? "" : '<span class="muted">暂无乘车人</span>') + "</div></div>" +
     '<div class="form-actions"><button class="btn btn-ghost" id="gCancel">取消</button>' +
-    (edit ? "" : '<button class="btn btn-ghost" id="gPresetSave">存为预设</button>') +
     (edit ? '<button class="btn btn-ghost" id="gDelete">删除</button>' : "") +
     '<button class="btn btn-call" id="gSave">' + (edit ? "保存" : "创建") + "</button></div>");
 
@@ -313,23 +265,6 @@ export async function openGrabForm(edit, preset) {
     }
     refreshGrab();
   };
-  const savePresetBtn = modal.querySelector("#gPresetSave");
-  if (savePresetBtn) savePresetBtn.onclick = async () => {
-    const from = await resolveStation(modal, "gfrom"), to = await resolveStation(modal, "gto");
-    if (!from || !to) return toast("先选出发/到达站", "err");
-    const name = modal.querySelector("#gName").value.trim() || ("预设 " + (S.presets.length + 1));
-    const trains = modal.querySelector("#gTrains").value.split(/[,，\s]+/).filter(Boolean).map((x) => x.toUpperCase());
-    const pUnion = new Set(); trains.forEach((code) => (perTrain[code] || []).forEach((s) => pUnion.add(s)));
-    const saved = await call("savePreset", {
-      name, from: from.name, to: to.name,
-      trains,
-      seat_types: SEAT_CHOICES.filter((s) => pUnion.has(s)),
-      seat_priority: trains.map((code) => code + "=" + [...(perTrain[code] || [])].join("/")).join(","),
-      date: modal.querySelector("#gDate").value,
-    });
-    if (saved && saved.error) return toast("保存失败：" + saved.error, "err");
-    toast("预设已保存"); refreshPresets();
-  };
 }
 
 // 秒级刷新只在「除倒计时以外的内容」变化时重建整页；只变倒计时就原地改文本
@@ -369,16 +304,6 @@ export async function refreshGrab() {
   S.grabBusy = false;
 }
 
-export async function refreshPresets() {
-  if (S.presetBusy) return;
-  S.presetBusy = true;
-  try {
-    const r = await call("listPresets");
-    S.presets = r.presets || [];
-    S.queryHistory = r.query_history || [];
-  } catch (e) { /* ignore */ }
-  S.presetBusy = false;
-}
 export const _DEFAULT_LC = {
   version: 1, passenger_names: [], from: "", to: "", fromCode: "", toCode: "",
   trains: [], seat_types: [], seat_priority: "", date: "", date_to: "",

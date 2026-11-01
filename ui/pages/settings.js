@@ -2,7 +2,7 @@
 import { S, call, renderPage, registerPage, registerClosePanelHook } from "../store.js";
 import { esc } from "../components/dom.js";
 import { toast } from "../components/toast.js";
-import { confirmBox } from "../components/modal.js";
+import { confirmBox, openModal } from "../components/modal.js";
 import { APPEAR_DEF, ACCENTS, applyAppearance } from "../components/appearance.js";
 
 
@@ -38,11 +38,13 @@ export function statusOfSetting(key) {
 }
 
 // 打开设置面板：从气泡位置放大到主区正中（15/20 ≈ 75%），关闭时缩回气泡
+let panelKey = null; // 当前面板 key，用于判断“外观 ↔ 邮件”是同层切换
 export function openSettingPanel(key, bubbleEl) {
   const panel = document.getElementById("setPanel");
   if (!panel) return;
   const html = settingsPanelHtml(key);
   if (!html) return;
+  const isSwitch = panel.classList.contains("show") && panelKey && panelKey !== key;
   // 记录气泡中心坐标，作为放大/缩回的动画原点
   if (bubbleEl) {
     const r = bubbleEl.getBoundingClientRect();
@@ -56,13 +58,24 @@ export function openSettingPanel(key, bubbleEl) {
   panel.onanimationend = null;
   // 同理清掉上一次关闭的超时兜底：重开后面板不能再被旧定时器收走
   if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
-  panel.classList.remove("closing", "done");
+  panel.classList.remove("closing", "done", "switching");
   panel.innerHTML =
     '<div class="set-panel-head"><h3>' + panelTitle(key) + "</h3>" +
-    '<button class="btn btn-mini btn-ghost btn-panel-close" id="setPanelClose">✕ 关闭</button></div>' +
+    '<div class="set-panel-actions">' +
+    (key === "mail" ? '<button class="btn btn-mini btn-ghost btn-panel-help" id="setPanelHelp">帮助</button>' : "") +
+    '<button class="btn btn-mini btn-ghost btn-panel-close" id="setPanelClose">✕ 关闭</button></div></div>' +
     '<div class="set-panel-content">' + html + "</div>";
   panel.classList.add("show");
-  // 背景模糊遮罩：1s 渐变（透明→模糊）
+  panelKey = key;
+  // 面板已打开时换内容：外层 setpop 不会重播，给头部/内容加一层轻微上浮
+  if (isSwitch) {
+    void panel.offsetWidth;
+    panel.classList.add("switching");
+    panel.onanimationend = (e) => {
+      if (e.animationName === "setcontent") panel.classList.remove("switching");
+    };
+  }
+  // 背景 scrim：0.2s 渐变（透明→压暗），不再用全屏 backdrop-filter
   const bd = document.getElementById("setBackdrop");
   if (bd) bd.classList.add("show");
   panel.querySelector("#setPanelClose").onclick = closeSettingPanel;
@@ -74,12 +87,13 @@ export function closeSettingPanel() {
   if (!panel) return;
   panel.onanimationend = null;
   if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
-  // 背景模糊遮罩同步淡出
+  // 背景 scrim 同步淡出
   const bd = document.getElementById("setBackdrop");
   if (bd) bd.classList.remove("show");
   // 未在展示状态时直接复位，不挂动画（goto 切页等场景）
   if (!panel.classList.contains("show")) {
-    panel.classList.remove("closing", "done");
+    panel.classList.remove("closing", "done", "switching");
+    panelKey = null;
     return;
   }
   // 退出动画：缩小回气泡原点，动画结束后才真正隐藏
@@ -89,13 +103,19 @@ export function closeSettingPanel() {
     if (done) return;
     done = true;
     if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
-    panel.classList.remove("show", "closing", "done");
+    panel.classList.remove("show", "closing", "done", "switching");
     panel.onanimationend = null;
+    panelKey = null;
   };
-  panel.onanimationend = (e) => { if (e.animationName === "setpop-out") finish(); };
   // 关动效（data-motion="off"）时 animation 被 CSS 全禁，animationend 永不
-  // 触发，面板会永远停在屏上——450ms 超时兜底走同一收尾（幂等，只跑一次）。
-  panel._closeTimer = setTimeout(finish, 450);
+  // 触发：直接收尾，别让用户等兜底定时器（此前固定等 450ms，像卡住）。
+  if (document.documentElement.dataset.motion === "off" || (S.appear && S.appear.motion === "off")) {
+    finish();
+    return;
+  }
+  panel.onanimationend = (e) => { if (e.animationName === "setpop-out") finish(); };
+  // 正常动效 .12s；260ms 兜底防止动画事件丢失时面板残留。
+  panel._closeTimer = setTimeout(finish, 260);
 }
 
 export function panelTitle(key) {
@@ -138,7 +158,7 @@ export function settingsPanelHtml(key) {
   );
   if (key === "mail") return (
     '<div class="card glass glass-surface"><div class="sec-head"><h3>邮件通知（SMTP）</h3><span class="status ' + (s.notify_enabled ? "succ" : "canc") + '">' + (s.notify_enabled ? "已启用" : "未启用") + "</span></div>" +
-    '<div class="form-row"><label>启用</label><label class="check"><input type="checkbox" id="sEnabled"' + (email.enabled ? " checked" : "") + ">发送订单通知邮件</label></div>" +
+    '<div class="form-row"><label>启用</label><label class="check" id="sEnabledWrap" title="点击启用或关闭邮件通知"><input type="checkbox" id="sEnabled"' + (email.enabled ? " checked" : "") + ">发送订单通知邮件</label></div>" +
     '<div class="form-row"><label>SMTP 服务器</label><input id="sHost" value="' + esc(email.smtp_host || "") + '" placeholder="smtp.qq.com"></div>' +
     '<div class="form-row"><label>端口</label><input type="number" id="sPort" value="' + esc(email.smtp_port || 465) + '"></div>' +
     '<div class="form-row"><label>发件邮箱</label><input id="sUser" value="' + esc(email.username || "") + '"></div>' +
@@ -156,37 +176,140 @@ export function bindSettingsPanel(panel, key) {
   if (key === "mail") bindMailPanel(panel);
 }
 
-export function bindMailPanel(p) {
-  p.querySelector("#sSave").onclick = async () => {
-    const emailNew = {
-      enabled: p.querySelector("#sEnabled").checked,
-      smtp_host: p.querySelector("#sHost").value.trim(),
-      smtp_port: Number(p.querySelector("#sPort").value) || 465,
-      username: p.querySelector("#sUser").value.trim(),
-      password: p.querySelector("#sPwd").value,
-      from: p.querySelector("#sUser").value.trim(),
-      to: p.querySelector("#sTo").value.split(/[,，\s]+/).filter(Boolean),
-    };
-    if (!await saveSettings({ email: emailNew })) return;
-    toast("设置已保存");
-    // 保存后重开面板：refreshSettings 会重渲染气泡，面板浮层独立保留
-    closeSettingPanel();
-    openSettingPanel("mail");
+function readMailForm(p) {
+  return {
+    enabled: p.querySelector("#sEnabled").checked,
+    smtp_host: p.querySelector("#sHost").value.trim(),
+    smtp_port: Number(p.querySelector("#sPort").value) || 465,
+    username: p.querySelector("#sUser").value.trim(),
+    password: p.querySelector("#sPwd").value,
+    from: p.querySelector("#sUser").value.trim(),
+    to: p.querySelector("#sTo").value.split(/[,，\s]+/).filter(Boolean),
   };
+}
+
+function syncMailStatus(p, emailNew) {
+  if (!S.settings) S.settings = {};
+  const old = S.settings.email || {};
+  S.settings.email = Object.assign({}, old, emailNew, {
+    password: old.password || (emailNew.password ? "******" : ""),
+  });
+  S.settings.notify_enabled = !!emailNew.enabled;
+  const text = emailNew.enabled ? "已启用" : "未启用";
+  const badge = p.querySelector(".sec-head .status");
+  if (badge) {
+    badge.textContent = text;
+    badge.className = "status " + (emailNew.enabled ? "succ" : "canc");
+  }
+  const bubble = document.querySelector('.set-bubble[data-set="mail"] .b-status');
+  if (bubble) bubble.textContent = text;
+}
+
+function mailHelpHtml() {
+  return '<h3>邮件通知设置帮助</h3><div class="mail-help">' +
+    '<p>启用邮件通知后，抢票成功与订单状态变化会发送到收件人邮箱。授权码不是邮箱登录密码，按下面步骤单独获取。</p>' +
+    '<h4>一、获取 QQ 邮箱授权码</h4><ol>' +
+    '<li>电脑浏览器打开 <b>mail.qq.com</b>，登录要作为发件人的 QQ 邮箱。</li>' +
+    '<li>点右上角「设置」→「账号与安全」→「安全设置」。</li>' +
+    '<li>找到「IMAP/SMTP 服务」或「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务」，点「开启」。</li>' +
+    '<li>按提示完成短信验证，页面会显示 16 位授权码；它只显示一次，先复制保存。</li>' +
+    '<li>回到本页，把授权码填到「授权码」，不要填 QQ 登录密码。</li></ol>' +
+    '<h4>二、详细邮件设置</h4>' +
+    '<table><thead><tr><th>邮箱</th><th>SMTP 服务器</th><th>端口</th></tr></thead><tbody>' +
+    '<tr><td>QQ 邮箱</td><td>smtp.qq.com</td><td>465（SSL）</td></tr>' +
+    '<tr><td>163 邮箱</td><td>smtp.163.com</td><td>465（SSL）</td></tr>' +
+    '<tr><td>126 邮箱</td><td>smtp.126.com</td><td>465（SSL）</td></tr>' +
+    '<tr><td>Gmail</td><td>smtp.gmail.com</td><td>587（STARTTLS）</td></tr>' +
+    '<tr><td>Outlook</td><td>smtp.office365.com</td><td>587（STARTTLS）</td></tr>' +
+    '</tbody></table>' +
+    '<p>发件邮箱和授权码必须属于同一个邮箱账号；收件人可以填多个，用逗号分隔。保存后点「发送测试邮件」，失败时先检查授权码是否过期、SMTP 服务是否开启、端口是否被防火墙拦截。</p>' +
+    '</div><div class="form-actions"><button class="btn btn-call" id="mailHelpOk">知道了</button></div>';
+}
+
+export function bindMailPanel(p) {
+  const enabled = p.querySelector("#sEnabled");
+  const wrap = p.querySelector("#sEnabledWrap") || enabled.closest("label");
+  const syncToggle = () => {
+    wrap.classList.toggle("on", enabled.checked);
+    wrap.setAttribute("aria-checked", enabled.checked ? "true" : "false");
+  };
+  syncToggle();
+  enabled.addEventListener("change", syncToggle);
+
+  const help = p.querySelector("#setPanelHelp");
+  if (help) help.onclick = () => {
+    const { modal, close } = openModal(mailHelpHtml(), "business");
+    modal.querySelector("#mailHelpOk").onclick = close;
+  };
+
+  const save = async () => {
+    const emailNew = readMailForm(p);
+    if (!await saveSettings({ email: emailNew })) return false;
+    // 保存成功后就地更新面板与气泡状态，不再关闭重开面板。
+    syncMailStatus(p, emailNew);
+    toast("设置已保存");
+    return true;
+  };
+  p.querySelector("#sSave").onclick = save;
   p.querySelector("#sTest").onclick = async () => {
+    const emailNew = readMailForm(p);
+    if (!emailNew.username || !emailNew.to.length) {
+      toast("请先填写发件邮箱和收件人", "err");
+      return;
+    }
+    // 测试前先保存当前表单，避免测到旧配置（旧逻辑只读磁盘）。
+    if (!await save()) return;
     toast("正在发送测试邮件…");
     const r = await call("testEmail");
     toast((r.message || "") + (r.ok ? "" : "（失败）"), r.ok ? "" : "err");
   };
 }
 
-export function bindAppearPanel(p) {
-  const save = () => {
-    applyAppearance();
-    const content = document.getElementById("content");
-    if (content) renderSettings(content);
+// 面板是独立浮层，不在 #content 里；保存后必须就地同步面板控件状态，
+// 不能靠 renderSettings(content)（它只重画设置页气泡，管不到 #setPanel）。
+export function syncAppearControls(p) {
+  const a = S.appear || {};
+  const setSeg = (id, value) => {
+    const box = p.querySelector("#" + id);
+    if (!box) return;
+    box.querySelectorAll("button[data-v]").forEach((b) => b.classList.toggle("on", b.dataset.v === String(value)));
   };
-  p.querySelectorAll("#aTheme button").forEach((b) => b.onclick = () => { S.appear.theme = b.dataset.v; save(); });
+  setSeg("aTheme", a.theme || "light");
+  setSeg("aDensity", a.density || "normal");
+  setSeg("aMotion", a.motion || "on");
+  setSeg("aWall", a.wall || "image");
+  p.querySelectorAll("#aAccent .swatch").forEach((x) => x.classList.toggle("on", x.dataset.v === a.accent));
+  const setRange = (id, key, unit, def) => {
+    const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
+    if (!el) return;
+    const v = a[key] ?? def;
+    el.value = v;
+    if (lab) lab.textContent = v + unit;
+  };
+  setRange("aBlur", "blur", "px", 16);
+  setRange("aRadius", "radius", "px", 18);
+  setRange("aGlass", "glass", "%", 55);
+  setRange("aFs", "fs", "px", 15);
+  setRange("aLogh", "logh", "rem", 8.6);
+  const font = p.querySelector("#aFont");
+  if (font) font.value = a.font || "system";
+  const row = p.querySelector("#aWRow");
+  if (row) row.style.display = a.wall === "custom" ? "" : "none";
+  const url = p.querySelector("#aWallUrl");
+  if (url) url.value = a.custom || "";
+}
+
+export function bindAppearPanel(p) {
+  // 主题切换走 View Transition：整页 0.28s 交叉淡入，比瞬间换色自然。
+  // 关闭动效（motion=off）时退回直接应用，尊重用户设置。
+  const save = (animateTheme) => {
+    const run = () => { applyAppearance(); syncAppearControls(p); };
+    if (animateTheme && S.appear.motion !== "off" && typeof document.startViewTransition === "function") {
+      try { document.startViewTransition(run); return; } catch (e) { /* 忽略并直接应用 */ }
+    }
+    run();
+  };
+  p.querySelectorAll("#aTheme button").forEach((b) => b.onclick = () => { S.appear.theme = b.dataset.v; save(true); });
   const bindRange = (id, key) => {
     const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
     if (!el) return;
@@ -208,9 +331,8 @@ export function bindAppearPanel(p) {
   });
   p.querySelectorAll("#aAccent .swatch").forEach((b) => b.onclick = () => { S.appear.accent = b.dataset.v; save(); });
   p.querySelectorAll("#aWall button").forEach((b) => b.onclick = () => {
-    S.appear.wall = b.dataset.v; applyAppearance();
-    p.querySelector("#aWRow").style.display = b.dataset.v === "custom" ? "" : "none";
-    p.querySelectorAll("#aWall button").forEach((x) => x.classList.toggle("on", x === b));
+    S.appear.wall = b.dataset.v;
+    save();
   });
   const wurl = p.querySelector("#aWallUrl");
   if (wurl) wurl.onchange = () => { S.appear.custom = wurl.value.trim(); save(); };

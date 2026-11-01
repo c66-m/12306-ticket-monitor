@@ -3702,6 +3702,19 @@ class TestEngineIdleKeepalive(TempDirCase):
             e.check_session_if_needed()
         self.assertEqual(e.task_status(t), "paused")
 
+    def test_idle_permanent_logs_tip_not_error(self):
+        # 无活动任务时登录失效是正常待命状态，只记提示，不得写红色错误。
+        e, t = self._idle_engine()
+        with mock.patch.object(browser_order, "busy", return_value=False), \
+             mock.patch.object(browser_order, "check_session",
+                               return_value=(False, "已跳转登录门户")), \
+             mock.patch.object(browser_order, "session_failure_is_permanent",
+                               return_value=True), \
+             self.assertLogs("monitor", level="INFO") as cm:
+            e.check_session_if_needed()
+        self.assertTrue(any("[提示]" in line for line in cm.output), cm.output)
+        self.assertFalse(any("[错误]" in line for line in cm.output), cm.output)
+
 
 class TestTask101ReloginPrecheck(unittest.TestCase):
     """Task 101：relogin 预检 —— 会话有效不拉窗口，force 才强制重登。
@@ -14381,7 +14394,7 @@ class TestApiRpcContract(TempDirCase):
     # ---- 1. 注册完整性 ----
 
     def test_methods_registry_complete(self):
-        self.assertEqual(len(self.api.METHODS), 39,
+        self.assertEqual(len(self.api.METHODS), 43,
                          "方法数变化必须同步契约测试：%s" % sorted(self.api.METHODS))
         for name, fn in self.api.METHODS.items():
             self.assertTrue(callable(fn), "%s 不可调用" % name)
@@ -14861,7 +14874,7 @@ class TestProblemLog(TempDirCase):
         self.assertTrue(logutil.clear_problem_log(path=self.path))
         self.assertEqual(logutil.read_problem_log(path=self.path), [])
 
-    def test_handler_captures_warning_and_error_only(self):
+    def test_handler_captures_warning_error_and_explicit_tip(self):
         import logutil
         h = logutil.ProblemLogHandler(path=self.path)
         logger = logging.getLogger("t12306_test_problem")
@@ -14874,12 +14887,39 @@ class TestProblemLog(TempDirCase):
             raise ValueError("炸了")
         except ValueError:
             logger.exception("异常也要")
+        logger.info("[提示] 当前无活动任务，等待重新登录")
         recs = logutil.read_problem_log(path=self.path)
         msgs = [r["message"] for r in recs]
         self.assertIn("要这条 警告", msgs)
         self.assertIn("异常也要", msgs)
         self.assertNotIn("不要这条", msgs)
-        self.assertIn("ValueError: 炸了", recs[0]["trace"])
+        self.assertIn("[提示] 当前无活动任务，等待重新登录", msgs)
+        tip = next(r for r in recs if r["message"].startswith("[提示]"))
+        self.assertEqual(tip["level"], "INFO")
+        self.assertIn("ValueError: 炸了", recs[1]["trace"])
+
+    def test_normal_logout_entry_is_info_not_error(self):
+        # 旧台账已按 logging level 写死 ERROR；读取时要用新口径重新定级。
+        import logutil
+        logutil.append_problem(
+            "ERROR", "engine:1849",
+            "[错误] 登录会话已失效：已跳转登录门户（当前无活动任务，等待重新登录）",
+            path=self.path)
+        got = logutil.read_problem_log(path=self.path)
+        self.assertEqual(got[0]["level"], "INFO")
+
+    def test_message_prefix_overrides_logging_level(self):
+        # 日志级别和文案前缀不一致时，以面向用户的前缀为准：
+        # [警告] 不能因为调用方用了 LOG.error 就显示成红色错误。
+        import logutil
+        logutil.append_problem("ERROR", "passengers:373",
+                               "[警告] 乘车人文件读取失败", path=self.path)
+        logutil.append_problem("WARNING", "engine:1753",
+                               "[错误] 任务「t1」失败", path=self.path)
+        got = logutil.read_problem_log(path=self.path, limit=10)
+        by_msg = {r["message"]: r["level"] for r in got}
+        self.assertEqual(by_msg["[警告] 乘车人文件读取失败"], "WARNING")
+        self.assertEqual(by_msg["[错误] 任务「t1」失败"], "ERROR")
 
     def test_trim_keeps_recent_entries(self):
         import logutil
@@ -16005,6 +16045,149 @@ class TestR3SupportCluster(TempDirCase):
         self.assertEqual(json.load(open(dst, encoding="utf-8")), {"k": 1})
         # RED on old code: 直写分支从不 fsync → fsync_calls 为空
         self.assertGreaterEqual(len(fsync_calls), 1)
+
+
+class TestSaleCalendar(unittest.TestCase):
+    """预售日期计算：纯函数，不碰网络/文件。"""
+
+    def test_parse_sale_time(self):
+        import sale_calendar
+        self.assertEqual(sale_calendar.parse_sale_time("1245").strftime("%H:%M"), "12:45")
+        self.assertEqual(sale_calendar.parse_sale_time("0905").strftime("%H:%M"), "09:05")
+        self.assertEqual(sale_calendar.parse_sale_time("0000").strftime("%H:%M"), "00:00")
+        self.assertIsNone(sale_calendar.parse_sale_time(""))
+        self.assertIsNone(sale_calendar.parse_sale_time("2460"))
+
+    def test_build_sale_rows_skips_past_sales(self):
+        import sale_calendar
+        now = datetime.datetime(2026, 11, 1, 10, 0)
+        rows = sale_calendar.build_sale_rows(
+            datetime.date(2026, 11, 1), 20, "12:45", now=now, presale_days=14)
+        self.assertEqual(len(rows), 6)
+        first = rows[0]
+        self.assertEqual(first["travelDate"], "2026-11-15")
+        self.assertEqual(first["saleDate"], "2026-11-01")
+        self.assertEqual(first["saleTime"], "12:45")
+        self.assertEqual(first["saleAt"], "2026-11-01 12:45:00")
+        self.assertEqual(first["weekday"], "周日")
+        self.assertEqual(first["minutesUntilSale"], 165)
+        self.assertTrue(all(r["saleAtTs"] > now.timestamp() for r in rows))
+
+    def test_build_sale_rows_today_after_sale_time_is_past(self):
+        import sale_calendar
+        now = datetime.datetime(2026, 11, 1, 13, 0)
+        rows = sale_calendar.build_sale_rows(
+            datetime.date(2026, 11, 1), 20, "12:45", now=now, presale_days=14)
+        self.assertEqual(rows[0]["travelDate"], "2026-11-16")
+
+
+class TestSaleRpc(TempDirCase):
+    """预售查询与开售邮件提醒的 RPC 行为。"""
+
+    def setUp(self):
+        super().setUp()
+        from rpc import sale as sale_mod
+        self.sale = sale_mod
+        self.email_cfg = {"notify": {"email": {"enabled": True}}}
+        p = mock.patch.object(sale_mod, "_reminders_path",
+                              return_value=os.path.join(self.tmp, "sale_reminders.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        p2 = mock.patch.object(sale_mod, "load_config", return_value=self.email_cfg)
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _stations(self):
+        return {
+            "VNP": {"name": "北京南", "saleTime": "12:45"},
+            "AOH": {"name": "上海虹桥", "saleTime": "13:45"},
+        }
+
+    def _now(self):
+        return datetime.datetime(2026, 11, 1, 10, 0)
+
+    def _query(self, days=20):
+        with mock.patch.object(self.sale, "_fetch_sale_times",
+                               return_value=self._stations()), \
+             mock.patch.object(self.sale, "_now", return_value=self._now()):
+            return self.sale.rpc_query_sale_dates(
+                {"fromCode": "VNP", "toCode": "AOH", "days": days})
+
+    def _create(self):
+        with mock.patch.object(self.sale, "_fetch_sale_times",
+                               return_value=self._stations()), \
+             mock.patch.object(self.sale, "_now", return_value=self._now()):
+            return self.sale.rpc_create_sale_reminder(
+                {"fromCode": "VNP", "toCode": "AOH", "travelDate": "2026-11-15"})
+
+    def test_query_sale_dates_returns_first_sale_and_rows(self):
+        r = self._query()
+        self.assertEqual(r["from"]["name"], "北京南")
+        self.assertEqual(r["from"]["saleTime"], "12:45")
+        self.assertEqual(r["to"]["name"], "上海虹桥")
+        self.assertEqual(r["presaleDays"], 14)
+        self.assertEqual(r["rows"][0]["travelDate"], "2026-11-15")
+        self.assertEqual(r["rows"][0]["saleAt"], "2026-11-01 12:45:00")
+        self.assertTrue(r["mailEnabled"])
+
+    def test_query_rejects_unknown_station(self):
+        with mock.patch.object(self.sale, "_fetch_sale_times",
+                               return_value=self._stations()), \
+             mock.patch.object(self.sale, "_now", return_value=self._now()):
+            r = self.sale.rpc_query_sale_dates(
+                {"fromCode": "XXX", "toCode": "AOH", "days": 20})
+        self.assertIn("error", r)
+        self.assertIn("XXX", r["error"])
+
+    def test_create_requires_enabled_email(self):
+        self.sale.load_config.return_value = {"notify": {"email": {"enabled": False}}}
+        r = self._create()
+        self.assertFalse(r.get("ok"))
+        self.assertIn("邮件", r["error"])
+
+    def test_create_and_duplicate_reminder(self):
+        r = self._create()
+        self.assertTrue(r["ok"], r)
+        rid = r["reminder"]["id"]
+        self.assertEqual(r["reminder"]["travelDate"], "2026-11-15")
+        self.assertEqual(r["reminder"]["triggerAt"], "2026-11-01 12:15:00")
+        r2 = self._create()
+        self.assertTrue(r2["ok"], r2)
+        self.assertTrue(r2.get("duplicate"))
+        self.assertEqual(r2["reminder"]["id"], rid)
+
+    def test_query_marks_existing_reminder(self):
+        created = self._create()
+        r = self._query()
+        row = [x for x in r["rows"] if x["travelDate"] == "2026-11-15"][0]
+        self.assertEqual(row["reminderId"], created["reminder"]["id"])
+
+    def test_tick_sends_due_reminder_once(self):
+        created = self._create()
+        self.assertTrue(created["ok"], created)
+        with mock.patch.object(self.sale.notify, "send_email",
+                               return_value=(True, "邮件已发送")) as m:
+            res = self.sale.sale_reminder_tick(
+                now=datetime.datetime(2026, 11, 1, 12, 20))
+        self.assertEqual(res["sent"], 1)
+        m.assert_called_once()
+        subject = m.call_args[0][1]
+        body = m.call_args[0][2]
+        self.assertIn("开售提醒", subject)
+        self.assertIn("北京南", subject)
+        self.assertIn("2026-11-15", body)
+        listed = self.sale.rpc_list_sale_reminders(
+            {"fromCode": "VNP", "toCode": "AOH"})
+        self.assertEqual(listed["reminders"][0]["status"], "sent")
+
+    def test_tick_skips_after_sale_started(self):
+        created = self._create()
+        self.assertTrue(created["ok"], created)
+        with mock.patch.object(self.sale.notify, "send_email") as m:
+            res = self.sale.sale_reminder_tick(
+                now=datetime.datetime(2026, 11, 1, 12, 46))
+        self.assertEqual(res["sent"], 0)
+        m.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -115,17 +115,13 @@ function afterAnim(el, name, fn) {
 export function renderPage(animate) {
   const c = $("#content");
   const old = _pageEl && _pageEl.parentNode === c ? _pageEl : null;
-  // 动画切换：只保留当前页退场；连续快速点击留下的历史节点立即移除，
-  // 否则多个 absolute .page 会同时铺在 #content 上，表现为模块重叠。
-  if (animate && old) {
-    old.classList.remove("page-in");
-    old.classList.add("page-out");
-    afterAnim(old, "page-draw-out", () => old.remove());
-  } else if (!animate) {
-    c.innerHTML = ""; // 刷新重建路径：无动画直接清空
-  }
+  // 旧页必须在插入新页前移除：两页同时 absolute inset:0，旧页还保持 opacity 1，
+  // 会从玻璃卡片后面整页透出来（视频里的“任务列表 + 车次查询”叠层）。
+  // 只保留新页自己的进入动画，不再做新旧交叉淡入。
+  if (old) old.remove();
+  if (!animate) c.innerHTML = ""; // 刷新重建路径：无动画直接清空
   for (const node of Array.from(c.children)) {
-    if (node !== old && node.classList && node.classList.contains("page")) node.remove();
+    if (node.classList && node.classList.contains("page")) node.remove();
   }
   const el = document.createElement("div");
   el.className = "page" + (animate ? " page-in" : "");

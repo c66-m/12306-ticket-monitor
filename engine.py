@@ -1845,8 +1845,9 @@ class MonitorEngine(object):
                     self.set_task_status(t, "monitoring", "会话已恢复，自动重新监控")
         elif permanent:
             if not auto_tasks:
-                # 没有活动任务就不标任务；界面弹窗（api 会话看门狗）负责提醒
-                LOG.error("[错误] 登录会话已失效：%s（当前无活动任务，等待重新登录）", who)
+                # 没有活动任务就不标任务；界面弹窗（api 会话看门狗）负责提醒。
+                # 正常待命不是故障，写「提示」而不是红色错误。
+                LOG.info("[提示] 登录会话已失效：%s（当前无活动任务，等待重新登录）", who)
             else:
                 LOG.error("[错误] 登录会话已失效：%s", who)
                 LOG.error("[错误] 以下任务的抢票已停止：%s",
@@ -1977,7 +1978,8 @@ class MonitorEngine(object):
                      "启用（优先级 %s，间隔约 %.0fs）" % (t.get("priority", 5), self.task_interval(t))
                      if t in active_tasks else "")
         if not active_tasks:
-            LOG.warning("没有处于「监控中/等待重试」状态的任务，引擎将空转（请在界面选择要启动的任务）")
+            # 启动即暂停是产品设定；没有活动任务属于正常待命，不是故障。
+            LOG.info("[提示] 没有处于「监控中/等待重试」状态的任务：引擎待命（请在界面选择要启动的任务）")
         LOG.info("基准间隔 %ss / 最小间隔 %ss / 日志目录 %s",
                  self.base_interval, self.min_interval, self.config.get("log_dir", "logs"))
         LOG.info("按 Ctrl+C 停止监控")

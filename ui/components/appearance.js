@@ -24,10 +24,16 @@ export function hexToRgbStr(h) {
   if (!m) return null;
   return parseInt(m[1], 16) + "," + parseInt(m[2], 16) + "," + parseInt(m[3], 16);
 }
+function systemTheme() {
+  try { return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; }
+  catch (e) { return "light"; }
+}
+
 export function applyAppearance() {
   const a = S.appear = Object.assign({}, APPEAR_DEF, S.appear || {});
   const rt = document.documentElement;
-  rt.dataset.theme = a.theme;
+  const theme = a.theme === "sys" ? systemTheme() : a.theme;
+  rt.dataset.theme = theme === "dark" ? "dark" : "light";
   rt.dataset.density = a.density;
   rt.dataset.motion = a.motion;
   rt.style.setProperty("--blur", a.blur + "px");
@@ -37,7 +43,7 @@ export function applyAppearance() {
   rt.style.setProperty("--font", FONTS[a.font] || FONTS.system);
   // 玻璃透明度：55 → 1.0 系数（白 55% 基准）
   const ga = Math.max(0.15, (Number(a.glass) || 55) / 55);
-  rt.style.setProperty("--glass-a", (a.theme === "dark" ? 0.52 : 0.55) * ga);
+  rt.style.setProperty("--glass-a", (theme === "dark" ? 0.52 : 0.55) * ga);
   const rgb = hexToRgbStr(a.accent);
   if (rgb) {
     rt.style.setProperty("--accent", a.accent);
@@ -52,13 +58,19 @@ export function applyAppearance() {
     : a.wall === "flat-green" ? "linear-gradient(150deg,#DDEBE2,#EAF3EC)" : "linear-gradient(140deg,#DCE4F5,#EEF1F8)");
   try { localStorage.setItem(APPEAR_KEY, JSON.stringify(a)); } catch (e) { /* 忽略 */ }
 }
+let _sysThemeBound = false;
+
 export function loadAppearance() {
   try { S.appear = Object.assign({}, APPEAR_DEF, JSON.parse(localStorage.getItem(APPEAR_KEY) || "{}")); }
   catch (e) { S.appear = Object.assign({}, APPEAR_DEF); }
   if (S.appear.wall === "flat-sunset" || S.appear.wall === "flat-green") document.body.dataset.wall = "flat";
-  if (S.appear.theme === "sys") {
-    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    S.appear.theme = dark ? "dark" : "light";
-  }
   applyAppearance();
+  // 「跟随系统」保留原选择值，只把实际 light/dark 落到 DOM；系统主题变化时重算。
+  if (!_sysThemeBound && window.matchMedia) {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => { if (S.appear && S.appear.theme === "sys") applyAppearance(); };
+    if (mq.addEventListener) mq.addEventListener("change", onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+    _sysThemeBound = true;
+  }
 }

@@ -52,6 +52,7 @@ from rpc import passengers as _rpc_passengers
 from rpc import settings as _rpc_settings
 from rpc import history as _rpc_history
 from rpc import session as _rpc_session
+from rpc import sale as _rpc_sale
 
 from rpc.common import (CONFIG_PATH, _warn, _stream, OUT_LOCK, WRITE, FLUSH, emit, push, reply, STATUS_COLOR, _CONFIG_CORRUPT_WARNED, _STAMP_UNSET, _config_stamp, load_config, load_state, remove_task_from_config, update_config_locked, update_state_locked, delete_task_everywhere, normalize_email_settings, read_history_records, _engine, _engine_lock, _engine_start_lock, _engine_thread, _engine_stop, get_engine, engine_running, start_engine, stop_engine, rpc_shutdown, _mark_running_tasks_paused, _pause_all_tasks_on_startup, _auto_start_engine, _log_tag, log_pump, TASK_DEFAULTS_DEF, _task_defaults, _stream)
 from rpc.tasks import (rpc_list_monitor_tasks, _split_date_input, _req_on, rpc_create_task, _TASK_STATUSES, rpc_set_task_status, rpc_resume_all, rpc_pause_all, rpc_delete_task, rpc_start_engine, rpc_stop_engine)
@@ -61,10 +62,12 @@ from rpc.passengers import (rpc_list_passengers, rpc_passenger_detail, rpc_save_
 from rpc.settings import (rpc_ip_locate, rpc_check_update, rpc_get_settings, rpc_save_settings, rpc_test_email)
 from rpc.history import (rpc_list_problem_logs, rpc_clear_problem_logs)
 from rpc.session import (current_session, _SESSION_CACHE, _SESSION_TTL, reset_session_cache, _probe_browser_session, probe_session, _SESSION_WATCH, _session_watch_step, _session_watch_loop, rpc_check_session, _LOGIN_GUARD, rpc_relogin, rpc_get_account)
+from rpc.sale import (rpc_query_sale_dates, rpc_list_sale_reminders, rpc_create_sale_reminder, rpc_delete_sale_reminder, sale_reminder_tick)
 
 
 _RPC_MODULES = (_rpc_common, _rpc_tasks, _rpc_grab, _rpc_orders,
-                _rpc_passengers, _rpc_settings, _rpc_history, _rpc_session)
+                _rpc_passengers, _rpc_settings, _rpc_history, _rpc_session,
+                _rpc_sale)
 
 
 class _FacadeModule(_types.ModuleType):
@@ -106,6 +109,10 @@ METHODS = {
     "grabResult": rpc_grab_result,
     "grabTicker": rpc_grab_ticker,
     "queryTickets": rpc_query_tickets,
+    "querySaleDates": rpc_query_sale_dates,
+    "listSaleReminders": rpc_list_sale_reminders,
+    "createSaleReminder": rpc_create_sale_reminder,
+    "deleteSaleReminder": rpc_delete_sale_reminder,
     "searchStation": rpc_search_station,
     "seatPriorityFeedback": rpc_seat_priority_feedback,
     "listPresets": rpc_list_presets,
@@ -151,6 +158,10 @@ _NS_TO_OLD = {
     "grab.result": "grabResult",
     "grab.ticker": "grabTicker",
     "tickets.query": "queryTickets",
+    "sales.query_dates": "querySaleDates",
+    "sales.list_reminders": "listSaleReminders",
+    "sales.create_reminder": "createSaleReminder",
+    "sales.delete_reminder": "deleteSaleReminder",
     "seats.priority_feedback": "seatPriorityFeedback",
     "stations.search": "searchStation",
     "presets.list": "listPresets",
@@ -183,7 +194,8 @@ _NS_METHODS = {ns: METHODS[old] for ns, old in _NS_TO_OLD.items()}
 # startEngine/stopEngine/shutdown 同列：启停引擎要建引擎（首次联网加载
 # 车站表）/ join 引擎线程最长 10s，同步跑同样会冻结全量 RPC（深审 RPC 簇）。
 _SLOW_METHODS = frozenset({
-    "queryTickets", "checkSession", "relogin", "sync12306Passengers",
+    "queryTickets", "querySaleDates", "createSaleReminder",
+    "checkSession", "relogin", "sync12306Passengers",
     "reconcileHistory", "testEmail", "ipLocate", "getAccount",
     "startEngine", "stopEngine", "shutdown",
 })
@@ -305,6 +317,8 @@ def main():
     _SCHED.add_daemon("session_watch", _session_watch_loop)  # 会话看门狗
     _SCHED.add_periodic("reconcile_guard", 300,
                         _reconcile_tick, immediate=False)  # 对账守护（P3）
+    _SCHED.add_periodic("sale_reminder", 30,
+                        sale_reminder_tick, immediate=False)  # 开售邮件提醒
     _SCHED.start()
     # 启动软件即启动监控引擎（config.json: auto_start_engine=false 可关）。
     # 必须接住异常：get_engine() 里会 load_station_map()（首次要联网）、读 config，

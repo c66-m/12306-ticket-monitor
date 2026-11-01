@@ -9,7 +9,7 @@ import { pushLog, pushLogBatch } from "./components/log.js";
 import { loadAppearance } from "./components/appearance.js";
 import { _SESSION_DEAD_RE, showSessionExpiredDialog, refreshSession } from "./components/session.js";
 import { bindSearch, toggleEngine, refreshMonitor } from "./pages/monitor.js";
-import { refreshGrab, refreshPresets } from "./pages/grab.js";
+import { refreshGrab } from "./pages/grab.js";
 import { refreshPax } from "./pages/pax.js";
 import { refreshSettings } from "./pages/settings.js";
 import { refreshHistory } from "./pages/history.js";
@@ -113,7 +113,7 @@ export function bindGlobal() {
 }
 
 export async function refreshAll() {
-  await Promise.allSettled([refreshMonitor(), refreshGrab(), refreshPax(), refreshPresets(), refreshSettings(), refreshSession(), refreshHistory(), refreshProblemLogs()]);
+  await Promise.allSettled([refreshMonitor(), refreshGrab(), refreshPax(), refreshSettings(), refreshSession(), refreshHistory(), refreshProblemLogs()]);
 }
 // 主进程关掉小窗后会调它对齐数据（主窗隐藏期间轮询被降频）
 window.refreshAll = refreshAll;

@@ -7,11 +7,12 @@ import { confirmBox } from "../components/modal.js";
 
 // ================= 问题日志页 =================
 // 数据源：后端 data/problem_log.jsonl（logutil.ProblemLogHandler 写入的
-// WARNING/ERROR 台账），不是底部「全局日志」那份内存缓冲——那份重启即丢。
+// 问题台账），不是底部「全局日志」那份内存缓冲——那份重启即丢。
+// INFO=提示：正常待命/等待重新登录等非故障状态，不参与侧栏红点计数。
 export const PROBLEM_LEVELS = {
   ERROR: ["错误", "fail"],
   WARNING: ["警告", "pause"],
-  INFO: ["信息", "run"],
+  INFO: ["提示", "run"],
 };
 
 export function problemRowHtml(r, i) {
@@ -42,12 +43,13 @@ export function renderProblemLog(root) {
     '<div class="card glass glass-surface" style="flex:1"><div class="sec-head"><h3>问题日志</h3>' +
     '<span style="display:flex;gap:8px;align-items:center">' +
     chip("all", "全部") + chip("ERROR", "错误") + chip("WARNING", "警告") +
+    chip("INFO", "提示") +
     '<button class="btn btn-mini btn-ghost" id="plRefresh">刷新</button>' +
     '<button class="btn btn-mini btn-ghost" id="plClear">清空</button></span></div>' +
     '<div class="set" style="overflow-y:auto">' +
     (rows.length ? rows.map(problemRowHtml).join("")
       : '<div class="empty-hint"><div class="big">🧾</div><p>暂无问题记录</p>' +
-        '<p class="muted">引擎告警与接口异常会自动记到这里，重启不丢</p></div>') +
+        '<p class="muted">引擎告警与接口异常会自动记到这里，重启不丢；等待登录等正常状态记为「提示」</p></div>') +
     "</div></div>";
 
   root.querySelectorAll("[data-fl]").forEach((b) => {

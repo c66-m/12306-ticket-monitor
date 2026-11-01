@@ -178,11 +178,43 @@ class DayFileHandler(logging.Handler):
 
 # ----------------------------- 问题台账（界面「问题日志」页数据源） -----------------------------
 # 与 DayFileHandler 的分工：那边是按天滚动的全文日志（给人 tail），这边是跨天
-# 保留的问题台账（给界面按条展示）。只收 WARNING 及以上，JSONL 一行一条，
-# 按文件大小裁剪，绝不参与按天清理——否则用户想看的历史问题会被 30 天规则删掉。
+# 保留的问题台账（给界面按条展示）。收 WARNING 及以上，另收显式 [提示] 的
+# 正常待命状态；JSONL 一行一条，按文件大小裁剪，绝不参与按天清理——否则用户
+# 想看的历史问题会被 30 天规则删掉。
 
 PROBLEM_LOG_MAX_BYTES = 512 * 1024
 PROBLEM_LOG_KEEP = 800
+
+
+def problem_level(level, message):
+    """问题台账的严重度口径（写入与读取共用，历史记录也按此重新定级）。
+
+    优先级：
+      1. 无活动任务时等待重新登录 = 正常待命，标 INFO（提示），不是故障；
+      2. 消息里的业务前缀优先于 logging level（历史上有 [警告] 用 LOG.error、
+         [错误] 用 LOG.warning 的调用，不能让颜色反过来）；
+      3. 没有前缀时才退回 logging level。
+    """
+    text = str(message or "").lstrip()
+    lv = str(level or "").upper()
+    if "当前无活动任务，等待重新登录" in text or "当前无活动任务，等待登录" in text:
+        return "INFO"
+    if "没有处于「监控中/等待重试」状态的任务" in text:
+        return "INFO"
+    if text.startswith("[提示]") or text.startswith("[信息]"):
+        return "INFO"
+    if text.startswith("[错误]") or text.startswith("[失败]"):
+        return "ERROR"
+    if (text.startswith("[警告]") or text.startswith("[提醒]") or
+            text.startswith("[重试]") or text.startswith("[暂停]")):
+        return "WARNING"
+    if lv in ("CRITICAL", "FATAL", "ERROR"):
+        return "ERROR"
+    if lv in ("WARN", "WARNING"):
+        return "WARNING"
+    if lv in ("INFO", "DEBUG", "NOTSET"):
+        return "INFO"
+    return "WARNING"
 
 
 def problem_log_path():
@@ -217,13 +249,14 @@ def _trim_problem_log(path):
 def append_problem(level, source, message, trace="", path=None):
     """追加一条问题记录（跨进程安全）。写失败静默——台账不能影响业务。
 
-    level: ERROR / WARNING；source: "engine:1234"（模块:行号）或 "api.xxx"；
-    trace: 异常堆栈原文，可为空；path: 测试注入用，默认 problem_log_path()。
+    level: ERROR / WARNING / INFO（最终按 problem_level 重算）；source:
+    "engine:1234"（模块:行号）或 "api.xxx"；trace: 异常堆栈原文，可为空；
+    path: 测试注入用，默认 problem_log_path()。
     """
     path = path or problem_log_path()
     rec = {
         "ts": datetime.datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-        "level": level,
+        "level": problem_level(level, message),
         "source": source,
         "message": message,
         "trace": trace or "",
@@ -262,6 +295,9 @@ def read_problem_log(path=None, limit=200):
         except ValueError:
             continue
         if isinstance(rec, dict):
+            # 旧版本按 logging level 写死了级别；读取时统一按现行标准重算，
+            # 这样升级后无需清空历史台账，旧的误报也会变成「提示」。
+            rec["level"] = problem_level(rec.get("level"), rec.get("message"))
             out.append(rec)
     return out
 
@@ -279,14 +315,20 @@ def clear_problem_log(path=None):
 
 
 class ProblemLogHandler(logging.Handler):
-    """把 WARNING 及以上记录写入问题台账，供界面「问题日志」页读取。"""
+    """把问题记录写入台账，供界面「问题日志」页读取。
 
-    def __init__(self, path=None, level=logging.WARNING):
+    默认收 WARNING 及以上；INFO 里只有显式 [提示] 才收，避免普通信息刷屏。
+    """
+
+    def __init__(self, path=None, level=logging.INFO):
         super().__init__(level)
         self._path = path
 
     def emit(self, record):
         try:
+            message = record.getMessage()
+            if record.levelno < logging.WARNING and not message.lstrip().startswith("[提示]"):
+                return
             trace = ""
             if record.exc_info:
                 # Handler 没有 formatException（那是 Formatter 的方法）
@@ -294,7 +336,7 @@ class ProblemLogHandler(logging.Handler):
             append_problem(
                 record.levelname,
                 "%s:%s" % (record.module, record.lineno),
-                record.getMessage(),
+                message,
                 trace,
                 self._path,
             )
