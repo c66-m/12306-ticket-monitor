@@ -62,7 +62,7 @@ from rpc.passengers import (rpc_list_passengers, rpc_passenger_detail, rpc_save_
 from rpc.settings import (rpc_ip_locate, rpc_check_update, rpc_get_settings, rpc_save_settings, rpc_test_email)
 from rpc.history import (rpc_list_problem_logs, rpc_clear_problem_logs)
 from rpc.session import (current_session, _SESSION_CACHE, _SESSION_TTL, reset_session_cache, _probe_browser_session, probe_session, _SESSION_WATCH, _session_watch_step, _session_watch_loop, rpc_check_session, _LOGIN_GUARD, rpc_relogin, rpc_get_account)
-from rpc.sale import (rpc_query_sale_dates, rpc_list_sale_reminders, rpc_create_sale_reminder, rpc_delete_sale_reminder, sale_reminder_tick)
+from rpc.sale import (rpc_query_sale_dates, rpc_list_sale_reminders, rpc_create_sale_reminder, rpc_delete_sale_reminder, rpc_list_stored_tasks, rpc_save_stored_task, rpc_delete_stored_task, sale_reminder_tick)
 
 
 _RPC_MODULES = (_rpc_common, _rpc_tasks, _rpc_grab, _rpc_orders,
@@ -113,6 +113,9 @@ METHODS = {
     "listSaleReminders": rpc_list_sale_reminders,
     "createSaleReminder": rpc_create_sale_reminder,
     "deleteSaleReminder": rpc_delete_sale_reminder,
+    "listStoredTasks": rpc_list_stored_tasks,
+    "saveStoredTask": rpc_save_stored_task,
+    "deleteStoredTask": rpc_delete_stored_task,
     "searchStation": rpc_search_station,
     "seatPriorityFeedback": rpc_seat_priority_feedback,
     "listPresets": rpc_list_presets,
@@ -162,6 +165,9 @@ _NS_TO_OLD = {
     "sales.list_reminders": "listSaleReminders",
     "sales.create_reminder": "createSaleReminder",
     "sales.delete_reminder": "deleteSaleReminder",
+    "sales.list_stored": "listStoredTasks",
+    "sales.save_stored": "saveStoredTask",
+    "sales.delete_stored": "deleteStoredTask",
     "seats.priority_feedback": "seatPriorityFeedback",
     "stations.search": "searchStation",
     "presets.list": "listPresets",
@@ -194,7 +200,7 @@ _NS_METHODS = {ns: METHODS[old] for ns, old in _NS_TO_OLD.items()}
 # startEngine/stopEngine/shutdown 同列：启停引擎要建引擎（首次联网加载
 # 车站表）/ join 引擎线程最长 10s，同步跑同样会冻结全量 RPC（深审 RPC 簇）。
 _SLOW_METHODS = frozenset({
-    "queryTickets", "querySaleDates", "createSaleReminder",
+    "queryTickets", "querySaleDates", "createSaleReminder", "saveStoredTask",
     "checkSession", "relogin", "sync12306Passengers",
     "reconcileHistory", "testEmail", "ipLocate", "getAccount",
     "startEngine", "stopEngine", "shutdown",

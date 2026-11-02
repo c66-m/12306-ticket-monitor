@@ -73,9 +73,9 @@ from grabber_utils import (
 )
 
 __version__ = "1.0.0"
-LAUNCHER_CFG_PATH = os.path.join(HERE, "launcher_config.json")
+LAUNCHER_CFG_PATH = appcommon.launcher_config_path(HERE)
 GRAB_TASKS_PATH = appcommon.data_path("grab_tasks.json")
-LOG_DIR = os.path.join(HERE, "logs")
+LOG_DIR = appcommon.logs_dir(HERE)
 
 
 def _monitor_cfg_path():
@@ -85,7 +85,7 @@ def _monitor_cfg_path():
     无法重定向（既有 9 个用例正是靠 patch HERE 隔离真实配置的）；函数每次
     读全局 HERE，patch 立即生效。
     """
-    return os.path.join(HERE, "config.json")
+    return appcommon.config_path(HERE)
 
 LOGQ = queue.Queue()
 

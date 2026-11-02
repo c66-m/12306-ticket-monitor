@@ -212,7 +212,7 @@ def unprotect_secret(text):
 
 
 def _fernet_key_path():
-    return os.path.join(HERE, ".passengers_key")
+    return appcommon.data_path(".passengers_key")
 
 
 def _read_valid_fernet_key(key_path):

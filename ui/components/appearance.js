@@ -24,7 +24,10 @@ export function hexToRgbStr(h) {
   if (!m) return null;
   return parseInt(m[1], 16) + "," + parseInt(m[2], 16) + "," + parseInt(m[3], 16);
 }
+// 主进程 nativeTheme 的真实系统值；null 表示还没拿到，退回 matchMedia。
+let _systemDark = null;
 function systemTheme() {
+  if (typeof _systemDark === "boolean") return _systemDark ? "dark" : "light";
   try { return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; }
   catch (e) { return "light"; }
 }
@@ -59,6 +62,8 @@ export function applyAppearance() {
   try { localStorage.setItem(APPEAR_KEY, JSON.stringify(a)); } catch (e) { /* 忽略 */ }
 }
 let _sysThemeBound = false;
+let _sysThemeApiBound = false;
+let _sysFocusBound = false;
 
 export function loadAppearance() {
   try { S.appear = Object.assign({}, APPEAR_DEF, JSON.parse(localStorage.getItem(APPEAR_KEY) || "{}")); }
@@ -72,5 +77,24 @@ export function loadAppearance() {
     if (mq.addEventListener) mq.addEventListener("change", onChange);
     else if (mq.addListener) mq.addListener(onChange);
     _sysThemeBound = true;
+  }
+  // 主进程 nativeTheme 是 OS 口径真源：启动拉一次、updated 推送订阅、重新聚焦再兜底。
+  const applySys = (dark) => {
+    if (typeof dark !== "boolean") return;
+    _systemDark = dark;
+    if (S.appear && S.appear.theme === "sys") applyAppearance();
+  };
+  if (window.api && window.api.sysTheme) window.api.sysTheme().then(applySys).catch(() => {});
+  if (!_sysThemeApiBound && window.api && window.api.onSysTheme) {
+    window.api.onSysTheme(applySys);
+    _sysThemeApiBound = true;
+  }
+  if (!_sysFocusBound) {
+    window.addEventListener("focus", () => {
+      if (S.appear && S.appear.theme === "sys" && window.api && window.api.sysTheme) {
+        window.api.sysTheme().then(applySys).catch(() => {});
+      }
+    });
+    _sysFocusBound = true;
   }
 }

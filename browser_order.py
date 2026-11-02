@@ -43,9 +43,9 @@ except ImportError:
     fcntl = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROFILE_DIR = os.path.join(HERE, ".browser_profile")
-# 注意：PROFILE_DIR 故意不迁进 data/——Playwright 持久化 profile 换路径等于
-# 换浏览器身份，登录态与设备指纹全丢；挪它的收益（目录整洁）远小于代价。
+# 用户数据目录（安装版由 T12306_DATA_DIR 指到 %APPDATA%）：升级覆盖程序目录不碰
+# 浏览器身份；旧安装目录的 profile 由 appcommon 首次启动一次性迁入。
+PROFILE_DIR = appcommon.data_path(".browser_profile")
 STATE_PATH = appcommon.data_path(".browser_state.json")
 LEFT_TICKET_URL = "https://kyfw.12306.cn/otn/leftTicket/init"
 LOGIN_URL = "https://kyfw.12306.cn/otn/resources/login.html"
@@ -101,7 +101,7 @@ _BROWSER_LOCK = threading.RLock()
 
 # 启动器（launcher.py）与监控系统（gui.py/engine.py）是各自独立的进程，却共用同一个
 # .browser_profile，RLock 只管得住本进程的线程，跨进程必须再上一层文件锁。
-_LOCK_PATH = os.path.join(HERE, ".browser_profile.lock")
+_LOCK_PATH = appcommon.data_path(".browser_profile.lock")
 
 
 class _ProfileLock:
@@ -917,7 +917,7 @@ _PAY_PAGE_DEFAULT_HOLD = 5
 def _pay_page_hold_seconds():
     """读 config.json 的付款页停留配置，返回秒数（0 = 不停留）。"""
     try:
-        cfg = appcommon.read_config_or_empty(os.path.join(HERE, "config.json"))
+        cfg = appcommon.read_config_or_empty(appcommon.config_path(HERE))
     except Exception:
         return _PAY_PAGE_DEFAULT_HOLD
     if cfg.get("keep_pay_page") is False:
@@ -967,7 +967,7 @@ def _hold_pay_page(page, seconds, should_stop=None):
 
 # 耗时记录落点：测试在 TempDirCase 里 patch 成临时文件，避免 mock 下单
 # 把 G101 之类的假记录写进真实 logs/order_timing.jsonl 淹没真实数据。
-TIMING_PATH = os.path.join(HERE, "logs", "order_timing.jsonl")
+TIMING_PATH = os.path.join(appcommon.logs_dir(HERE), "order_timing.jsonl")
 
 
 def _record_timing(tm, total, ok, msg, info, seat_name, warm):
@@ -1083,7 +1083,7 @@ def _dump_booking_failure(page, info, diag):
     if not hasattr(page, "screenshot"):
         return ""
     try:
-        d = os.path.join(HERE, "logs")
+        d = appcommon.logs_dir(HERE)
         os.makedirs(d, exist_ok=True)
         base = os.path.join(d, "booking_fail_%s_%s" % (
             info.get("train_code") or "x", time.strftime("%Y%m%d-%H%M%S")))
@@ -1129,7 +1129,7 @@ def snap_page_evidence(page, kind, train_code="", date=""):
     if not hasattr(page, "screenshot"):
         return ""
     try:
-        d = os.path.join(HERE, "logs")
+        d = appcommon.logs_dir(HERE)
         os.makedirs(d, exist_ok=True)
         # 毫秒后缀：同秒同车次同日期同类先后两张不再互相覆盖
         # （失败返回快，独占锁串行仍可同秒；2026-10-25 审）。

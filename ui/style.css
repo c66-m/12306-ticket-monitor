@@ -90,13 +90,22 @@ body[data-wall="flat"]::before, body[data-wall="flat-sunset"]::before, body[data
   background: linear-gradient(rgba(8, 10, 16, .84), rgba(8, 10, 16, .84)),
               #0B0E16 var(--wall-img) center / cover no-repeat fixed;
 }
+/* 深色主题的三种纯色壁纸必须各自保留色相，否则点「蓝白/晚霞/松绿」看起来完全没变 */
 [data-theme="dark"] body[data-wall="none"],
-[data-theme="dark"] body[data-wall="flat"],
-[data-theme="dark"] body[data-wall="flat-sunset"],
-[data-theme="dark"] body[data-wall="flat-green"] {
+[data-theme="dark"] body[data-wall="flat"] {
   background: radial-gradient(65% 55% at 12% 8%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%),
               radial-gradient(55% 45% at 88% 92%, color-mix(in srgb, var(--accent) 11%, transparent), transparent 70%),
               linear-gradient(145deg, #0B1020, #141A2A);
+}
+[data-theme="dark"] body[data-wall="flat-sunset"] {
+  background: radial-gradient(65% 55% at 12% 8%, rgba(226, 132, 86, .12), transparent 70%),
+              radial-gradient(55% 45% at 88% 92%, rgba(164, 116, 210, .10), transparent 70%),
+              linear-gradient(145deg, #1B1216, #241A21);
+}
+[data-theme="dark"] body[data-wall="flat-green"] {
+  background: radial-gradient(65% 55% at 12% 8%, rgba(74, 170, 122, .13), transparent 70%),
+              radial-gradient(55% 45% at 88% 92%, rgba(58, 150, 120, .09), transparent 70%),
+              linear-gradient(145deg, #0C1613, #13211B);
 }
 /* 主题切换的整页交叉淡入（由 settings.js 的 startViewTransition 触发） */
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: .28s; animation-timing-function: cubic-bezier(.22, 1, .36, 1); }
@@ -707,6 +716,11 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 
 .form-row { display: flex; flex-direction: column; gap: .3rem; margin-bottom: .6rem; }
 .form-row > label { font-size: .76rem; color: var(--ink-2); font-weight: 600; }
+.pax-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .45rem .55rem; }
+.pax-grid > .muted { grid-column: 1 / -1; }
+.pax-item { display: flex; align-items: center; gap: .35rem; min-width: 0; }
+.pax-item .check { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.pax-item .gpax-purpose { flex: 0 0 5.2rem; width: 5.2rem; padding: .3rem .35rem; font-size: .78rem; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
 .form-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: .8rem; }
 input:not([type="checkbox"]), select, textarea {
@@ -868,6 +882,22 @@ input[type="range"] { padding: 0; height: 1.2rem; background: transparent; borde
 .sale-reminder-row { display: flex; align-items: center; gap: .55rem; padding: .4rem .15rem; border-bottom: 1px solid var(--line-2); font-size: .8rem; }
 .sale-reminder-row:last-child { border-bottom: 0; }
 .sale-reminder-row > span:first-child { flex: 1; min-width: 0; }
+
+/* -------- 储存任务（新建抢票任务表单顶部） -------- */
+.stored-picker-overlay { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 1rem; background: color-mix(in srgb, var(--ink) 28%, transparent); animation: stored-fade .14s ease; }
+.stored-picker { width: min(36rem, 92vw); max-height: 82vh; overflow-y: auto; padding: 1.05rem 1.2rem 1.15rem; border-radius: 18px; animation: stored-pop .18s cubic-bezier(.22, 1, .36, 1); }
+.stored-picker .sec-head { align-items: center; margin-bottom: .2rem; }
+.stored-picker h3 { margin: 0; font-size: 1.02rem; }
+.stored-picker-hint { font-size: .76rem; margin-bottom: .55rem; }
+.stored-picker .stored-list { max-height: min(48vh, 24rem); margin-top: .2rem; }
+@keyframes stored-fade { from { opacity: 0; } }
+@keyframes stored-pop { from { opacity: 0; transform: translateY(8px) scale(.97); } }
+.stored-list { display: flex; flex-direction: column; gap: .35rem; max-height: 10.5rem; overflow-y: auto; margin-top: .45rem; }
+.stored-item { display: flex; align-items: baseline; justify-content: space-between; gap: .7rem; width: 100%; padding: .45rem .55rem; border: 1px solid var(--line-2); border-radius: 9px; background: rgba(var(--glass-rgb), calc(var(--glass-a) * .5)); color: var(--ink); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s, background .16s, transform .16s; }
+.stored-item:hover { border-color: color-mix(in srgb, var(--accent) 42%, transparent); background: color-mix(in srgb, var(--accent) 9%, transparent); transform: translateX(2px); }
+.stored-route { font-size: .82rem; font-weight: 700; white-space: nowrap; }
+.stored-item .muted { font-size: .73rem; text-align: right; }
+.stored-empty { padding: .15rem 0 .05rem; font-size: .78rem; }
 
 /* 右键菜单：毛玻璃（问题四） */
 .dd {

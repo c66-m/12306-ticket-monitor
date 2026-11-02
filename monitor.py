@@ -37,7 +37,7 @@ import order as order_mod
 import passengers as passengers_mod
 import ticket
 
-CONFIG_PATH = os.path.join(HERE, "config.json")
+CONFIG_PATH = appcommon.config_path(HERE)
 
 # 席别勾选列表：唯一定义在 ticket.py（含优选一等座与动卧），此处只引用
 SEAT_CHOICES = list(ticket.SEAT_CHOICES)

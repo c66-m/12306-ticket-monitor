@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -26,9 +27,18 @@ from adapters.store import dualwrite  # noqa: F401
 LOG = logging.getLogger("monitor")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 运行时数据 / 静态数据统一收纳目录。代码文件留在根目录，数据与代码分离；
-# config.json 与 launcher_config.json 属于「用户可手改的配置」，仍留在根目录。
-DATA_DIR = os.path.join(HERE, "data")
+
+
+def _env_dir(name: str) -> str:
+    """读取环境变量里的绝对目录；空值/空白按未设置处理。"""
+    raw = (os.environ.get(name) or "").strip()
+    return os.path.abspath(os.path.expanduser(raw)) if raw else ""
+
+
+# 运行时数据 / 静态数据统一收纳目录。代码文件留在根目录，数据与代码分离。
+# 安装版由 Electron 主进程传 T12306_DATA_DIR，指向 %APPDATA%/<app>/backend/data，
+# 升级覆盖程序目录时不再碰用户数据；未设置时保持项目内 data/（开发/测试）。
+DATA_DIR = _env_dir("T12306_DATA_DIR") or os.path.join(HERE, "data")
 
 
 def ensure_utf8_stdio() -> None:
@@ -640,6 +650,135 @@ EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 # 乐观并发检查/坏档守卫的哨兵：指纹取此值表示「不检查」。None 是合法指纹，
 # 表示「调用方取指纹时文件不存在」。
 _STAMP_UNSET = object()
+
+
+def config_path(base_dir=None, name="config.json") -> str:
+    """用户配置文件路径：T12306_CONFIG_DIR 优先，否则 base_dir（默认项目根）。
+
+    安装版把 config.json / launcher_config.json 放到用户目录，程序目录只读；
+    开发/测试不设环境变量时仍是项目根，现有调用点语义不变。
+    """
+    base = _env_dir("T12306_CONFIG_DIR") or (base_dir or HERE)
+    return os.path.join(base, name)
+
+
+def launcher_config_path(base_dir=None) -> str:
+    """抢票启动器配置路径（T12306_CONFIG_DIR 优先，缺省项目根）。"""
+    return config_path(base_dir, "launcher_config.json")
+
+
+def logs_dir(base_dir=None, config=None) -> str:
+    """日志目录：T12306_LOG_DIR 优先；否则 config.log_dir（相对 base_dir）。"""
+    env = _env_dir("T12306_LOG_DIR")
+    if env:
+        return env
+    sub = "logs"
+    if isinstance(config, dict):
+        value = config.get("log_dir", "logs")
+        if isinstance(value, str) and value.strip():
+            sub = value
+    return os.path.join(base_dir or HERE, sub)
+
+
+def _copy_file_if_absent(src: str, dst: str, copied: list, errors: list) -> None:
+    if not os.path.isfile(src) or os.path.exists(dst):
+        return
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append(dst)
+    except OSError as exc:
+        errors.append("%s: %s" % (src, exc))
+
+
+def _copy_tree_if_absent(src: str, dst: str, copied: list, errors: list,
+                         skip_names=()) -> None:
+    """递归复制缺失文件，不覆盖目标已有内容（用户后来的修改优先）。"""
+    if not os.path.isdir(src):
+        return
+    try:
+        for dirpath, _dirnames, filenames in os.walk(src):
+            rel = os.path.relpath(dirpath, src)
+            target_dir = dst if rel == "." else os.path.join(dst, rel)
+            os.makedirs(target_dir, exist_ok=True)
+            for name in filenames:
+                if name in skip_names:
+                    continue
+                target = os.path.join(target_dir, name)
+                if os.path.exists(target):
+                    continue
+                shutil.copy2(os.path.join(dirpath, name), target)
+                copied.append(target)
+    except OSError as exc:
+        errors.append("%s: %s" % (src, exc))
+
+
+def migrate_legacy_data(legacy_root=None) -> dict:
+    """把旧安装目录里的用户数据一次性搬到用户目录（不覆盖、不复活）。
+
+    Electron 主进程在安装版里设置 T12306_DATA_DIR / T12306_CONFIG_DIR /
+    T12306_LOG_DIR。首次启动 1.0.16 时，旧版数据还在 resources/backend，
+    这里复制到 %APPDATA%/<app>/backend；完成后写标记，用户以后删除某个文件
+    不会被旧安装目录的残留再次“复活”。
+
+    返回 {"skipped": bool, "copied": [...], "errors": [...]}。迁移失败不阻塞
+    启动（下次启动会重试），但错误会由调用点记入日志。
+    """
+    legacy = os.path.abspath(legacy_root or HERE)
+    data_dir = _env_dir("T12306_DATA_DIR")
+    config_dir = _env_dir("T12306_CONFIG_DIR")
+    log_dir = _env_dir("T12306_LOG_DIR")
+    user_root = config_dir or data_dir
+    if not user_root:
+        return {"skipped": True, "reason": "no user dir", "copied": [], "errors": []}
+    marker = os.path.join(user_root, ".migrated-to-user-data")
+    if os.path.exists(marker):
+        return {"skipped": True, "reason": "already migrated", "copied": [], "errors": []}
+
+    copied, errors = [], []
+    try:
+        os.makedirs(user_root, exist_ok=True)
+    except OSError as exc:
+        return {"skipped": False, "copied": [], "errors": ["%s: %s" % (user_root, exc)]}
+
+    for name in ("config.json", "launcher_config.json"):
+        _copy_file_if_absent(os.path.join(legacy, name),
+                             os.path.join(user_root, name), copied, errors)
+
+    target_data = data_dir or os.path.join(user_root, "data")
+    # 旧布局：运行数据散在项目根；新布局：data/ 子目录。两边都兼容。
+    for name in ("state.json", "orders.json", "order_history.json",
+                 "passengers.json", "grab_tasks.json", "session_cookies.json",
+                 ".browser_state.json", "problem_log.jsonl", "app.db",
+                 "app.db-wal", "app.db-shm"):
+        _copy_file_if_absent(os.path.join(legacy, name),
+                             os.path.join(target_data, name), copied, errors)
+    _copy_tree_if_absent(os.path.join(legacy, "data"), target_data, copied, errors,
+                         skip_names=("state.json.lock", "passengers.json.lock",
+                                     "orders.json.lock", "order_history.json.lock"))
+    _copy_file_if_absent(os.path.join(legacy, ".passengers_key"),
+                         os.path.join(target_data, ".passengers_key"), copied, errors)
+    _copy_tree_if_absent(os.path.join(legacy, ".browser_profile"),
+                         os.path.join(target_data, ".browser_profile"), copied, errors,
+                         skip_names=("SingletonLock", "SingletonCookie",
+                                     "SingletonSocket", ".browser_profile.lock"))
+    target_logs = log_dir or os.path.join(user_root, "logs")
+    _copy_tree_if_absent(os.path.join(legacy, "logs"), target_logs, copied, errors)
+
+    if not errors:
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("migrated from %s\n" % legacy)
+        except OSError as exc:
+            errors.append("%s: %s" % (marker, exc))
+    return {"skipped": False, "copied": copied, "errors": errors}
+
+
+# 安装版首次导入即完成一次性迁移；开发/测试不设用户目录环境变量时是空操作。
+_LEGACY_MIGRATION = migrate_legacy_data()
+if _LEGACY_MIGRATION.get("errors"):
+    LOG.warning("[数据] 旧数据迁移有 %d 项失败：%s",
+                len(_LEGACY_MIGRATION["errors"]), _LEGACY_MIGRATION["errors"][:3])
 
 
 def data_path(name: str) -> str:

@@ -84,6 +84,13 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("mini-pin", handler);
     return () => { ipcRenderer.removeListener("mini-pin", handler); };
   },
+  // 系统深浅色：主进程 nativeTheme 是 OS 口径真源；matchMedia 仅渲染层兜底。
+  sysTheme: () => ipcRenderer.invoke("sys-theme"),
+  onSysTheme: (cb) => {
+    const handler = (_e, dark) => cb(!!dark);
+    ipcRenderer.on("sys-theme", handler);
+    return () => { ipcRenderer.removeListener("sys-theme", handler); };
+  },
   // 小窗开局参数：主进程用 additionalArguments 把主窗的外观 JSON 传过来
   // （localStorage 在 file:// 下不保证跨页共享，preload 是唯一可靠的传递点）
   appearArgs: (() => {

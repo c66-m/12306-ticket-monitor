@@ -1,5 +1,5 @@
 // Electron 主进程：无边框窗口 + Python 子进程（JSON-RPC over stdin/stdout）
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, nativeTheme } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
@@ -228,6 +228,11 @@ function startPython() {
 
 // ---------- IPC ----------
 ipcMain.handle("rpc", (_e, method, params) => pyCall(method, params));
+// 「跟随系统」主题：渲染进程的 matchMedia 在部分 Windows/Electron 组合下不会随
+// 系统切换更新，主进程 nativeTheme 是 OS 口径的唯一真源。渲染层启动时拉一次，
+// 之后靠 updated 推送。
+ipcMain.handle("sys-theme", () => nativeTheme.shouldUseDarkColors);
+nativeTheme.on("updated", () => broadcast("sys-theme", nativeTheme.shouldUseDarkColors));
 // 置顶开关：返回切换后的状态（前端据此同步图标）
 ipcMain.handle("win-top", () => {
   if (!win) return false;

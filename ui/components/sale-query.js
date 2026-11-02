@@ -1,17 +1,11 @@
 /* components/sale-query.js —— 抢票页「查询开售日期」弹窗。
    数据来自后端 querySaleDates（12306 官方起售时间 + 本地 14 天预售期）。
    只负责展示与提醒按钮，计算全部在 sale_calendar.py。 */
-import { call, goto } from "../store.js";
+import { call } from "../store.js";
 import { esc } from "./dom.js";
 import { toast } from "./toast.js";
 import { openModal } from "./modal.js";
 import { stationInput, bindStation, resolveStation } from "./station.js";
-
-
-const STATUS_TEXT = {
-  pending: "待发送", sent: "已发送", failed: "发送失败", expired: "已过期",
-};
-const STATUS_CLASS = { pending: "warn", sent: "ok", failed: "err", expired: "err" };
 
 
 function countdownText(minutes) {
@@ -28,52 +22,48 @@ function countdownText(minutes) {
 }
 
 
-function reminderMap(data) {
+function storedMap(data) {
   const map = {};
-  (data.reminders || []).forEach((r) => { map[r.id] = r; });
+  (data.storedTasks || []).forEach((t) => { map[t.id] = t; });
   return map;
 }
 
 
 function resultHtml(data) {
-  const reminders = reminderMap(data);
+  const stored = storedMap(data);
   const rows = data.rows || [];
   const head = '<div class="sale-route"><b>' + esc(data.from.name) + " → " + esc(data.to.name) +
     '</b><span class="muted">出发站起售时间 ' + esc(data.from.saleTime) +
     " · 预售期 " + esc(data.presaleDays) + " 天</span></div>" +
-    (data.mailEnabled
-      ? '<div class="muted sale-hint">开售前 30 分钟发送邮件到设置中的收件邮箱。</div>'
-      : '<div class="sale-warn">邮件通知未启用，无法设置开售提醒。<button class="btn btn-mini btn-call" id="saleGoSettings">去设置</button></div>');
+    '<div class="muted sale-hint">点「储存任务」保存日期；新建抢票任务时可点一条直接回填出发站、到达站、日期和开抢时间。</div>';
   if (!rows.length) {
     return head + '<div class="muted sale-empty">未来 ' + esc(data.days) + " 天内没有尚未开售的日期。</div>";
   }
   const table = '<div class="sale-table-wrap"><table class="sale-table"><thead><tr>' +
-    "<th>乘车日期</th><th>开售日期</th><th>开售时间</th><th>距开售</th><th>邮件提醒</th>" +
+    "<th>乘车日期</th><th>开售日期</th><th>开售时间</th><th>距开售</th><th>储存任务</th>" +
     "</tr></thead><tbody>" +
     rows.map((r, i) => {
-      const rem = r.reminderId ? reminders[r.reminderId] : null;
+      const item = r.storedTaskId ? stored[r.storedTaskId] : null;
       let action;
-      if (rem) {
-        action = '<span class="sale-pill ' + (STATUS_CLASS[rem.status] || "warn") + '">' +
-          esc(STATUS_TEXT[rem.status] || "已设提醒") + "</span>";
+      if (item) {
+        action = '<span class="sale-pill ok">已储存</span>' +
+          '<button class="btn btn-mini btn-ghost" data-sale-del-store="' + esc(item.id) + '">取消</button>';
       } else {
-        action = '<button class="btn btn-mini btn-ghost" data-sale-remind="' + i + '"' +
-          (data.mailEnabled ? "" : " disabled") + ">设置提醒</button>";
+        action = '<button class="btn btn-mini btn-ghost" data-sale-store="' + i + '">储存任务</button>';
       }
       return "<tr><td><b>" + esc(r.travelDate) + '</b> <span class="muted">' + esc(r.weekday) +
         "</span></td><td>" + esc(r.saleDate) + "</td><td>" + esc(r.saleTime) +
         "</td><td>" + esc(countdownText(r.minutesUntilSale)) + "</td><td>" + action + "</td></tr>";
     }).join("") + "</tbody></table></div>";
 
-  const remRows = (data.reminders || []).map((r) =>
-    '<div class="sale-reminder-row"><span>' + esc(r.fromName) + " → " + esc(r.toName) +
-    " · " + esc(r.travelDate) + " 乘车（" + esc(r.saleAt) + " 开售）</span>" +
-    '<span class="sale-pill ' + (STATUS_CLASS[r.status] || "warn") + '">' +
-    esc(STATUS_TEXT[r.status] || r.status) + "</span>" +
-    '<button class="btn btn-mini btn-ghost" data-sale-del="' + esc(r.id) + '">取消</button></div>').join("");
-  const remBox = '<div class="sale-reminders"><h4>已设置提醒</h4>' +
-    (remRows || '<div class="muted">还没有设置提醒。</div>') + "</div>";
-  return head + table + remBox;
+  const storedRows = (data.storedTasks || []).map((t) =>
+    '<div class="sale-reminder-row"><span>' + esc(t.fromName) + " → " + esc(t.toName) +
+    " · " + esc(t.travelDate) + " 乘车（" + esc(t.saleAt) + " 开售）</span>" +
+    '<span class="sale-pill warn">待用</span>' +
+    '<button class="btn btn-mini btn-ghost" data-sale-del-store="' + esc(t.id) + '">取消</button></div>').join("");
+  const storedBox = '<div class="sale-reminders"><h4>已储存任务</h4>' +
+    (storedRows || '<div class="muted">还没有储存任务。</div>') + "</div>";
+  return head + table + storedBox;
 }
 
 
@@ -101,30 +91,28 @@ export function openSaleQuery() {
 
   const wire = () => {
     if (!data) return;
-    const go = modal.querySelector("#saleGoSettings");
-    if (go) go.onclick = () => { close(); goto("settings"); };
-    box.querySelectorAll("[data-sale-remind]").forEach((btn) => {
+    box.querySelectorAll("[data-sale-store]").forEach((btn) => {
       btn.onclick = async () => {
-        const row = data.rows[Number(btn.dataset.saleRemind)];
+        const row = data.rows[Number(btn.dataset.saleStore)];
         if (!row) return;
         btn.disabled = true;
         try {
-          const r = await call("createSaleReminder", {
+          const r = await call("saveStoredTask", {
             fromCode: data.from.code, toCode: data.to.code, travelDate: row.travelDate,
           });
           if (r && r.error) { toast(r.error, "err"); btn.disabled = false; return; }
-          toast(r && r.duplicate ? "该日期已设提醒" : "已设置开售提醒");
+          toast(r && r.duplicate ? "该日期已储存" : "已储存任务");
           await runQuery();
         } catch (e) { btn.disabled = false; }
       };
     });
-    box.querySelectorAll("[data-sale-del]").forEach((btn) => {
+    box.querySelectorAll("[data-sale-del-store]").forEach((btn) => {
       btn.onclick = async () => {
         btn.disabled = true;
         try {
-          const r = await call("deleteSaleReminder", { id: btn.dataset.saleDel });
+          const r = await call("deleteStoredTask", { id: btn.dataset.saleDelStore });
           if (r && r.error) { toast(r.error, "err"); btn.disabled = false; return; }
-          toast("提醒已取消");
+          toast("储存任务已取消");
           await runQuery();
         } catch (e) { btn.disabled = false; }
       };

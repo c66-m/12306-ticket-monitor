@@ -1198,7 +1198,7 @@ def order_ticket(config, task, ticket, seat_name, should_stop=None):
 if __name__ == "__main__":
     # 单独运行：先测会话有效性与乘车人列表
     try:
-        cfg = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8-sig"))
+        cfg = json.load(open(appcommon.config_path(HERE), encoding="utf-8-sig"))
         s = load_session(cfg.get("session_cookies_file", "session_cookies.json"))
         ok, who = check_login(s)
         print("会话有效: {0}".format(who) if ok else "会话失效: {0}".format(who))

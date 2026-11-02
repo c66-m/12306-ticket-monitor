@@ -14394,7 +14394,7 @@ class TestApiRpcContract(TempDirCase):
     # ---- 1. 注册完整性 ----
 
     def test_methods_registry_complete(self):
-        self.assertEqual(len(self.api.METHODS), 43,
+        self.assertEqual(len(self.api.METHODS), 46,
                          "方法数变化必须同步契约测试：%s" % sorted(self.api.METHODS))
         for name, fn in self.api.METHODS.items():
             self.assertTrue(callable(fn), "%s 不可调用" % name)
@@ -16096,6 +16096,10 @@ class TestSaleRpc(TempDirCase):
         p2 = mock.patch.object(sale_mod, "load_config", return_value=self.email_cfg)
         p2.start()
         self.addCleanup(p2.stop)
+        p3 = mock.patch.object(sale_mod, "_stored_tasks_path",
+                               return_value=os.path.join(self.tmp, "stored_tasks.json"))
+        p3.start()
+        self.addCleanup(p3.stop)
 
     def _stations(self):
         return {
@@ -16188,6 +16192,113 @@ class TestSaleRpc(TempDirCase):
                 now=datetime.datetime(2026, 11, 1, 12, 46))
         self.assertEqual(res["sent"], 0)
         m.assert_not_called()
+
+    # ---- 储存任务：不依赖邮件，开抢后自动删除 ----
+
+    def _save_stored(self, travel="2026-11-15"):
+        with mock.patch.object(self.sale, "_fetch_sale_times",
+                               return_value=self._stations()), \
+             mock.patch.object(self.sale, "_now", return_value=self._now()):
+            return self.sale.rpc_save_stored_task(
+                {"fromCode": "VNP", "toCode": "AOH", "travelDate": travel})
+
+    def test_save_stored_task_does_not_require_email(self):
+        self.sale.load_config.return_value = {"notify": {"email": {"enabled": False}}}
+        r = self._save_stored()
+        self.assertTrue(r["ok"], r)
+        task = r["task"]
+        self.assertEqual(task["fromName"], "北京南")
+        self.assertEqual(task["toName"], "上海虹桥")
+        self.assertEqual(task["travelDate"], "2026-11-15")
+        self.assertEqual(task["saleAt"], "2026-11-01 12:45:00")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "stored_tasks.json")))
+
+    def test_save_stored_task_duplicate_returns_same_id(self):
+        a = self._save_stored()
+        b = self._save_stored()
+        self.assertTrue(b.get("duplicate"), b)
+        self.assertEqual(a["task"]["id"], b["task"]["id"])
+
+    def test_list_stored_tasks_purges_expired(self):
+        self._save_stored()
+        with mock.patch.object(self.sale, "_now",
+                               return_value=datetime.datetime(2026, 11, 1, 12, 46)):
+            r = self.sale.rpc_list_stored_tasks({})
+        self.assertEqual(r["tasks"], [])
+        with open(os.path.join(self.tmp, "stored_tasks.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["tasks"], [])
+
+    def test_delete_stored_task(self):
+        created = self._save_stored()
+        rid = created["task"]["id"]
+        r = self.sale.rpc_delete_stored_task({"id": rid})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.sale.rpc_list_stored_tasks({})["tasks"], [])
+
+    def test_query_marks_existing_stored_task(self):
+        created = self._save_stored()
+        r = self._query()
+        row = [x for x in r["rows"] if x["travelDate"] == "2026-11-15"][0]
+        self.assertEqual(row["storedTaskId"], created["task"]["id"])
+
+
+class TestUserDataDir(TempDirCase):
+    """升级不丢数据：配置/运行数据解析到用户目录，旧安装目录只做一次性迁移。"""
+
+    def _env(self, user):
+        return {
+            "T12306_DATA_DIR": os.path.join(user, "data"),
+            "T12306_CONFIG_DIR": user,
+            "T12306_LOG_DIR": os.path.join(user, "logs"),
+            "T12306_APP_DB": os.path.join(user, "data", "app.db"),
+        }
+
+    def test_paths_prefer_user_dirs(self):
+        user = os.path.join(self.tmp, "user")
+        with mock.patch.dict(os.environ, self._env(user), clear=False):
+            self.assertEqual(appcommon.config_path(self.tmp),
+                             os.path.join(user, "config.json"))
+            self.assertEqual(appcommon.launcher_config_path(self.tmp),
+                             os.path.join(user, "launcher_config.json"))
+            self.assertEqual(appcommon.logs_dir(self.tmp),
+                             os.path.join(user, "logs"))
+
+    def test_migrate_copies_legacy_once_without_overwrite(self):
+        legacy = os.path.join(self.tmp, "legacy")
+        user = os.path.join(self.tmp, "user")
+        os.makedirs(os.path.join(legacy, "data"))
+        os.makedirs(os.path.join(user, "data"))
+        with open(os.path.join(legacy, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": "旧任务"}], "notify": {"email": {"enabled": True}}}, f)
+        with open(os.path.join(legacy, "launcher_config.json"), "w", encoding="utf-8") as f:
+            json.dump({"presets": [{"name": "旧预设"}]}, f)
+        with open(os.path.join(legacy, "data", "order_history.json"), "w", encoding="utf-8") as f:
+            json.dump([{"time": "2026-10-31 12:32:59", "order_no": "EC72599319"}], f)
+        os.makedirs(os.path.join(legacy, ".browser_profile"))
+        with open(os.path.join(legacy, ".browser_profile", "Cookies"), "w", encoding="utf-8") as f:
+            f.write("cookie")
+        os.makedirs(os.path.join(legacy, "logs"))
+        with open(os.path.join(legacy, "logs", "order_locked.png"), "w", encoding="utf-8") as f:
+            f.write("png")
+        # 用户目录已有配置：迁移不能覆盖用户后来的修改
+        with open(os.path.join(user, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"tasks": [{"name": "用户新任务"}]}, f)
+
+        with mock.patch.dict(os.environ, self._env(user), clear=False):
+            first = appcommon.migrate_legacy_data(legacy_root=legacy)
+            self.assertFalse(first["errors"])
+            with open(os.path.join(user, "config.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["tasks"][0]["name"], "用户新任务")
+            with open(os.path.join(user, "data", "order_history.json"), encoding="utf-8") as f:
+                self.assertEqual(len(json.load(f)), 1)
+            self.assertTrue(os.path.exists(os.path.join(user, "data", ".browser_profile", "Cookies")))
+            self.assertTrue(os.path.exists(os.path.join(user, "logs", "order_locked.png")))
+            self.assertTrue(os.path.exists(os.path.join(user, ".migrated-to-user-data")))
+
+            os.remove(os.path.join(user, "data", "order_history.json"))
+            second = appcommon.migrate_legacy_data(legacy_root=legacy)
+            self.assertTrue(second["skipped"])
+            self.assertFalse(os.path.exists(os.path.join(user, "data", "order_history.json")))
 
 
 if __name__ == "__main__":

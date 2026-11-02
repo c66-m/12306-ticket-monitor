@@ -165,6 +165,148 @@ def _station_or_error(stations, code, label):
     return st, None
 
 
+def _stored_tasks_path():
+    return appcommon.data_path("stored_tasks.json")
+
+
+def _load_stored_tasks():
+    path = _stored_tasks_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        _warn("读取储存任务文件失败", e)
+        return []
+    if isinstance(data, dict):
+        data = data.get("tasks")
+    if not isinstance(data, list):
+        _warn("储存任务数据形状非法已降级", type(data).__name__)
+        return []
+    return [dict(x) for x in data if isinstance(x, dict)]
+
+
+def _save_stored_tasks(tasks):
+    appcommon.atomic_write_json(_stored_tasks_path(),
+                                {"version": 1, "tasks": tasks})
+
+
+def _public_stored_task(t):
+    keys = ("id", "travelDate", "weekday", "fromCode", "toCode", "fromName",
+            "toName", "saleDate", "saleTime", "saleAt", "createdAt")
+    return {k: t.get(k) for k in keys if k in t}
+
+
+def _purge_expired_stored_tasks(tasks, now=None):
+    """开抢后自动删除：只保留 saleAt 仍在未来的储存任务。"""
+    now = now or _now()
+    kept = []
+    for t in tasks:
+        try:
+            sale_at = _parse_dt(t.get("saleAt"))
+        except Exception:
+            continue
+        if sale_at > now:
+            kept.append(t)
+    return kept
+
+
+def rpc_list_stored_tasks(p):
+    p = p or {}
+    try:
+        with filelock.file_lock(_stored_tasks_path() + ".lock", timeout=10):
+            tasks = _load_stored_tasks()
+            kept = _purge_expired_stored_tasks(tasks)
+            if len(kept) != len(tasks):
+                _save_stored_tasks(kept)
+        from_code = str(p.get("fromCode") or "").strip().upper()
+        to_code = str(p.get("toCode") or "").strip().upper()
+        if from_code:
+            kept = [t for t in kept if t.get("fromCode") == from_code]
+        if to_code:
+            kept = [t for t in kept if t.get("toCode") == to_code]
+        kept.sort(key=lambda t: str(t.get("saleAt") or ""))
+        return {"tasks": [_public_stored_task(t) for t in kept]}
+    except Exception as e:
+        _warn("读取储存任务失败", e)
+        return {"error": "读取储存任务失败：%s" % e}
+
+
+def rpc_save_stored_task(p):
+    """p = {fromCode, toCode, travelDate}：储存查询任务，不依赖邮件配置。"""
+    p = p or {}
+    try:
+        from_code = str(p.get("fromCode") or "").strip().upper()
+        to_code = str(p.get("toCode") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", from_code or "") or \
+                not re.fullmatch(r"[A-Z]{3}", to_code or ""):
+            return {"ok": False, "error": "请先选择有效的出发站和到达站"}
+        if from_code == to_code:
+            return {"ok": False, "error": "出发站和到达站不能相同"}
+        travel_text = str(p.get("travelDate") or "").strip()
+        try:
+            travel = datetime.datetime.strptime(travel_text, "%Y-%m-%d").date()
+        except ValueError:
+            return {"ok": False, "error": "乘车日期格式应为 YYYY-MM-DD"}
+        stations = _fetch_sale_times()
+        from_st, err = _station_or_error(stations, from_code, "出发")
+        if err:
+            return {"ok": False, "error": err}
+        to_st, err = _station_or_error(stations, to_code, "到达")
+        if err:
+            return {"ok": False, "error": err}
+        now = _now()
+        rows = sale_calendar.build_sale_rows(
+            travel, 1, from_st["saleTime"], now=now,
+            presale_days=PRESALE_DAYS)
+        if not rows:
+            return {"ok": False, "error": "该日期车票已开售，无法储存任务"}
+        row = rows[0]
+        task = {
+            "id": uuid.uuid4().hex[:12],
+            "travelDate": row["travelDate"],
+            "weekday": row["weekday"],
+            "fromCode": from_code,
+            "toCode": to_code,
+            "fromName": from_st["name"],
+            "toName": to_st["name"],
+            "saleDate": row["saleDate"],
+            "saleTime": row["saleTime"],
+            "saleAt": row["saleAt"],
+            "createdAt": _format_dt(now),
+        }
+        with filelock.file_lock(_stored_tasks_path() + ".lock", timeout=10):
+            tasks = _purge_expired_stored_tasks(_load_stored_tasks(), now)
+            for old in tasks:
+                if _route_key(old) == _route_key(task):
+                    return {"ok": True, "duplicate": True,
+                            "task": _public_stored_task(old)}
+            tasks.append(task)
+            _save_stored_tasks(tasks)
+        return {"ok": True, "task": _public_stored_task(task)}
+    except Exception as e:
+        _warn("保存储存任务失败", e)
+        return {"ok": False, "error": "保存储存任务失败：%s" % e}
+
+
+def rpc_delete_stored_task(p):
+    rid = str((p or {}).get("id") or "").strip()
+    if not rid:
+        return {"ok": False, "error": "缺少储存任务 id"}
+    try:
+        with filelock.file_lock(_stored_tasks_path() + ".lock", timeout=10):
+            tasks = _load_stored_tasks()
+            kept = [t for t in tasks if t.get("id") != rid]
+            if len(kept) == len(tasks):
+                return {"ok": False, "error": "储存任务不存在"}
+            _save_stored_tasks(kept)
+        return {"ok": True}
+    except Exception as e:
+        _warn("删除储存任务失败", e)
+        return {"ok": False, "error": "删除储存任务失败：%s" % e}
+
+
 def rpc_query_sale_dates(p):
     """查询尚未开售的乘车日期；只读，不建提醒。"""
     try:
@@ -196,8 +338,14 @@ def rpc_query_sale_dates(p):
         for r in reminders:
             if r.get("status") in ("pending", "sent", "failed"):
                 by_key[_route_key(r)] = r.get("id")
+        stored_tasks = _purge_expired_stored_tasks(_load_stored_tasks(), now)
+        stored_by_key = {}
+        for t in stored_tasks:
+            stored_by_key[_route_key(t)] = t.get("id")
         for row in rows:
             row["reminderId"] = by_key.get((from_code, to_code, row["travelDate"]))
+            row["storedTaskId"] = stored_by_key.get(
+                (from_code, to_code, row["travelDate"]))
         return {
             "from": {"code": from_code, "name": from_st["name"],
                      "saleTime": from_st["saleTime"]},
@@ -207,6 +355,9 @@ def rpc_query_sale_dates(p):
             "serverNow": _format_dt(now),
             "mailEnabled": _email_enabled(),
             "rows": rows,
+            "storedTasks": [_public_stored_task(t) for t in stored_tasks
+                            if t.get("fromCode") == from_code
+                            and t.get("toCode") == to_code],
             "reminders": [_public_reminder(r) for r in reminders
                           if r.get("fromCode") == from_code
                           and r.get("toCode") == to_code],

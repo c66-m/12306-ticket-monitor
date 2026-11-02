@@ -30,7 +30,7 @@ import order as order_mod
 import browser_order
 import notify as notify_mod
 
-CONFIG_PATH = os.path.join(HERE, "config.json")
+CONFIG_PATH = appcommon.config_path(HERE)
 
 # 中文 Windows 下 stdin/stdout 默认走 ANSI 代码页（GBK），而 Electron 侧写的是 UTF-8 字节，
 # 中文参数会被按 GBK 解码成乱码（症状：searchStation 查「长葛」返回空、拼音正常）。

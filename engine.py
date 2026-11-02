@@ -316,7 +316,7 @@ def _tasks_fingerprint(tasks):
 class MonitorEngine(object):
     def __init__(self, config_path=None, setup_logging=True):
         """setup_logging=False 时由调用方（如 GUI）自行接管日志处理器。"""
-        self.config_path = config_path or os.path.join(HERE, "config.json")
+        self.config_path = config_path or appcommon.config_path(HERE)
         try:
             with open(self.config_path, encoding="utf-8-sig") as f:
                 self.config = json.load(f)
@@ -360,6 +360,7 @@ class MonitorEngine(object):
 
         self.state_path = appcommon.state_path_of(self.config, HERE)
         self.history_path = appcommon.history_path_of(self.config, HERE)
+        self.log_dir = appcommon.logs_dir(HERE, self.config)
         # 订单库路径做成实例属性：测试用 object.__new__ 构造引擎时会注入临时
         # 目录，避免「官方回读未支付」分支把假订单写进真实 data/orders.json。
         self.orders_path = appcommon.data_path("orders.json")
@@ -416,7 +417,8 @@ class MonitorEngine(object):
     # ----------------------------- 日志 -----------------------------
 
     def _setup_logging(self):
-        log_dir = os.path.join(HERE, self.config.get("log_dir", "logs"))
+        log_dir = getattr(self, "log_dir", None) or appcommon.logs_dir(
+            HERE, getattr(self, "config", None))
         os.makedirs(log_dir, exist_ok=True)
         # 按天滚动：长跑跨天后日志自动切到新日期的文件
         fh = logutil.DayFileHandler(log_dir, "monitor")
@@ -1873,7 +1875,8 @@ class MonitorEngine(object):
             return
         self.state["snap_cleanup_last"] = today
         self._save_state()
-        d = os.path.join(HERE, "logs")
+        d = getattr(self, "log_dir", None) or appcommon.logs_dir(
+            HERE, getattr(self, "config", None))
         try:
             names = os.listdir(d)
         except Exception:
@@ -1912,7 +1915,7 @@ class MonitorEngine(object):
             pass
         self.state["profile_cleanup_last"] = today
         self._save_state()
-        prof = os.path.join(HERE, ".browser_profile")
+        prof = browser_order.PROFILE_DIR
         targets = [os.path.join(prof, "BrowserMetrics"),
                    os.path.join(prof, "Crashpad", "reports"),
                    os.path.join(prof, "Crashpad", "completed"),

@@ -54,7 +54,7 @@ GUI_SUBPROCESS_TIMEOUT = MAX_WAIT_SEC + 120
 
 def _order_mode():
     try:
-        with open(os.path.join(HERE, "config.json"), encoding="utf-8-sig") as f:
+        with open(appcommon.config_path(HERE), encoding="utf-8-sig") as f:
             return json.load(f).get("order_mode") or "browser"
     except Exception:
         return "browser"
@@ -67,7 +67,7 @@ def _cookie_path(config_path=None):
     绝对路径透传、相对名落 data/、缺省/非法值回退 session_cookies.json。
     """
     try:
-        with open(config_path or os.path.join(HERE, "config.json"), encoding="utf-8-sig") as f:
+        with open(config_path or appcommon.config_path(HERE), encoding="utf-8-sig") as f:
             name = json.load(f).get("session_cookies_file")
     except Exception:
         name = None

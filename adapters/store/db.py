@@ -37,6 +37,9 @@ def db_path(name="app.db"):
         return override
     if os.path.isabs(name):
         return name
+    data_dir = os.environ.get("T12306_DATA_DIR")
+    if data_dir:
+        return os.path.join(data_dir, name)
     candidate = os.path.join(HERE, "data", name)
     if os.path.exists(candidate):
         return candidate

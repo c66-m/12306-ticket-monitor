@@ -8,12 +8,38 @@ import { openSaleQuery } from "../components/sale-query.js";
 import { refreshPax } from "./pax.js";
 
 
+// 储存任务选择器：独立浮层，不占用全局唯一 #modal 槽，避免冲掉正在填写的任务表单。
+function openStoredTaskPicker(items, onPick) {
+  const layer = document.createElement("div");
+  layer.className = "stored-picker-overlay";
+  const list = items.length
+    ? '<div class="stored-list">' + items.map((x) =>
+      '<button class="stored-item" data-stored-task="' + esc(x.id) + '"><span class="stored-route">' +
+      esc(x.fromName) + " → " + esc(x.toName) + '</span><span class="muted">' +
+      esc(x.travelDate) + " 乘车 · " + esc(x.saleAt) + " 开售</span></button>").join("") + "</div>"
+    : '<div class="muted stored-empty">暂无储存任务。先到「查询开售日期」储存想抢的日期。</div>';
+  layer.innerHTML = '<div class="stored-picker glass glass-surface" role="dialog" aria-modal="true" aria-label="储存任务">' +
+    '<div class="sec-head"><h3>储存任务</h3><button class="btn btn-mini btn-ghost" id="storedPickClose">关闭</button></div>' +
+    '<div class="muted stored-picker-hint">点一条回填出发站、到达站、日期和开抢时间</div>' + list + "</div>";
+  document.body.appendChild(layer);
+  const close = () => layer.remove();
+  layer.addEventListener("click", (e) => { if (e.target === layer) close(); });
+  layer.querySelector("#storedPickClose").onclick = close;
+  layer.querySelectorAll("[data-stored-task]").forEach((btn) => {
+    btn.onclick = () => {
+      const item = items.find((x) => x.id === btn.dataset.storedTask);
+      if (item) { onPick(item); close(); }
+    };
+  });
+}
+
+
 // ================= 抢票页 =================
 export function renderGrab(root) {
   root.innerHTML =
     '<div class="sec-head"><h3>抢票任务</h3><span style="display:flex;gap:8px">' +
     '<button class="btn btn-mini btn-ghost" id="gSale">📅 查询开售日期</button>' +
-    '<button class="btn btn-mini btn-call" id="gNew">＋ 新任务</button></span></div>' +
+    '<button class="btn btn-mini btn-call" id="gNew">＋ 创建抢票任务</button></span></div>' +
     '<div class="grid-3" id="gGrid"></div>';
   root.querySelector("#gNew").onclick = () => openGrabForm();
   root.querySelector("#gSale").onclick = () => openSaleQuery();
@@ -35,7 +61,7 @@ export async function openGrabResult(t) {
 
 export function renderGrabGrid(el) {
   if (!S.grab.length) {
-    el.innerHTML = '<div class="muted" style="grid-column:1/-1;padding:24px;text-align:center">暂无抢票任务，点「＋ 新任务」创建</div>';
+    el.innerHTML = '<div class="muted" style="grid-column:1/-1;padding:24px;text-align:center">暂无抢票任务，点「＋ 创建抢票任务」创建</div>';
     return;
   }
   el.innerHTML = S.grab.map((t) => {
@@ -83,6 +109,14 @@ export async function openGrabForm(edit) {
   // 保证后端抖动时表单照样能打开（大不了乘车人列表为空/旧缓存）。
   if (!S.pax.length) { try { await refreshPax(); } catch (e) { /* 不挡开窗 */ } }
   const t = Object.assign({}, _DEFAULT_LC, edit || {});
+  // 新建任务时把已储存的查询结果列在表单顶部；编辑旧任务不显示，避免误改已填内容。
+  let storedTasks = [];
+  if (!edit) {
+    try {
+      const sr = await call("listStoredTasks", {});
+      storedTasks = (sr && sr.tasks) || [];
+    } catch (e) { /* 后端抖动不挡开窗 */ }
+  }
   // 逐车席别（车次 → Set<席别名>）：删除整排席别勾选后，唯一的席别入口
   const perTrain = {};
   const prioRaw = Array.isArray(t.seat_priority) ? t.seat_priority.join(",") : (t.seat_priority || "");
@@ -98,7 +132,7 @@ export async function openGrabForm(edit) {
   if (!Object.keys(perTrain).length && (t.seat_types || []).length && (t.trains || []).length)
     (t.trains || []).forEach((code) => { perTrain[String(code).toUpperCase()] = new Set(t.seat_types); });
   const { modal, close } = openModal(
-    "<h3>" + (edit ? "编辑抢票任务" : "新建抢票任务") + "</h3>" +
+    "<h3>" + (edit ? "编辑抢票任务" : "创建抢票任务") + "</h3>" +
     '<div class="form-row"><label>任务名</label><span style="display:flex;gap:8px;flex:1">' +
     '<input id="gName" value="' + esc(t.name || "") + '" style="flex:1">' +
     (edit ? '<button class="btn btn-mini btn-ghost" id="gRename">改名</button>' : "") +
@@ -107,7 +141,8 @@ export async function openGrabForm(edit) {
     '<div class="form-row grow"><label>到达站</label>' + stationInput("gto", t.to) + "</div></div>" +
     '<div class="form-row"><label>车次与席别（点查询后逐车选择席别）</label>' +
     '<div class="mt-qrow"><input id="gTrains" placeholder="点击下方车次加入，点击席别标签为该车选席别" value="' + esc((t.trains || []).join(",")) + '">' +
-    '<button class="btn btn-call mt-qbtn" id="gQuery" title="按出发/到达站与日期查询余票，识别各车次席别">🔍 查询</button></div>' +
+    '<button class="btn btn-call mt-qbtn" id="gQuery" title="按出发/到达站与日期查询余票，识别各车次席别">🔍 查询</button>' +
+    (!edit ? '<button class="btn btn-ghost mt-qbtn" id="gStored" title="查看储存任务并回填">📌 储存任务</button>' : '') + '</div>' +
     '<div class="mt-qresult hidden" id="gQResult"></div></div>' +
     '<div class="form-grid">' +
     '<div class="form-row"><label>日期</label><input type="date" id="gDate" value="' + esc(t.date || "") + '"></div>' +
@@ -121,10 +156,10 @@ export async function openGrabForm(edit) {
     '<div class="form-row"><label>预热窗口（分钟）</label><input type="number" id="gWarm" value="' + esc(t.warm_minutes ?? 10) + '"></div>' +
     '<div class="form-row"><label>轮询间隔（秒）</label><input type="number" id="gPoll" value="' + esc(t.poll_seconds ?? 3) + '"></div>' +
     "</div>" +
-    '<div class="form-row"><label>乘车人</label><div id="gPax">' +
+    '<div class="form-row"><label>乘车人</label><div id="gPax" class="pax-grid">' +
     S.pax.map((p) =>
-      '<div class="form-row" style="margin-bottom:4px"><div class="check-row"><label class="check' + ((t.passenger_names || []).includes(p.name) ? " on" : "") + '"><input type="checkbox" value="' + esc(p.name) + '"' + ((t.passenger_names || []).includes(p.name) ? " checked" : "") + ">" + esc(p.name) + '</label>' +
-      '<select class="gpax-purpose" style="margin-left:8px"><option value="ADULT"' + (((t.pax_purpose || {})[p.name] || "ADULT") === "ADULT" ? " selected" : "") + '>成人票</option><option value="0X00"' + (((t.pax_purpose || {})[p.name] || "") === "0X00" ? " selected" : "") + '>学生票</option></select></div></div>').join("") +
+      '<div class="pax-item"><label class="check' + ((t.passenger_names || []).includes(p.name) ? " on" : "") + '"><input type="checkbox" value="' + esc(p.name) + '"' + ((t.passenger_names || []).includes(p.name) ? " checked" : "") + ">" + esc(p.name) + '</label>' +
+      '<select class="gpax-purpose"><option value="ADULT"' + (((t.pax_purpose || {})[p.name] || "ADULT") === "ADULT" ? " selected" : "") + '>成人票</option><option value="0X00"' + (((t.pax_purpose || {})[p.name] || "") === "0X00" ? " selected" : "") + '>学生票</option></select></div>').join("") +
     (S.pax.length ? "" : '<span class="muted">暂无乘车人</span>') + "</div></div>" +
     '<div class="form-actions"><button class="btn btn-ghost" id="gCancel">取消</button>' +
     (edit ? '<button class="btn btn-ghost" id="gDelete">删除</button>' : "") +
@@ -133,6 +168,21 @@ export async function openGrabForm(edit) {
   modal.querySelector("#gCancel").onclick = close;
   bindStation(modal, "gfrom", t.from || "", t.fromCode || "");
   bindStation(modal, "gto", t.to || "", t.toCode || "");
+
+  // 点储存任务按钮：弹独立列表，选中后回填站名/站码/乘车日期/开抢时间，表单不丢。
+  const applyStoredTask = (item) => {
+    const fromInput = modal.querySelector('[data-st="gfrom"] input');
+    const toInput = modal.querySelector('[data-st="gto"] input');
+    if (fromInput) fromInput.value = item.fromName || "";
+    if (toInput) toInput.value = item.toName || "";
+    S["_stgfrom"] = { name: item.fromName || "", code: item.fromCode || "" };
+    S["_stgto"] = { name: item.toName || "", code: item.toCode || "" };
+    modal.querySelector("#gDate").value = item.travelDate || "";
+    modal.querySelector("#gStart").value = (item.saleAt || "").replace(" ", "T").slice(0, 16);
+    toast("已回填储存任务");
+  };
+  const storedBtn = modal.querySelector("#gStored");
+  if (storedBtn) storedBtn.onclick = () => openStoredTaskPicker(storedTasks, applyStoredTask);
 
   // 改名：编辑弹窗内独立按钮（复用 openRenameForm 逻辑）
   const renameBtn = modal.querySelector("#gRename");
@@ -234,7 +284,7 @@ export async function openGrabForm(edit) {
     const pax = Array.from(modal.querySelectorAll("#gPax input:checked")).map((x) => x.value);
     if (!pax.length) return toast("请勾选乘车人", "err");
     const paxPurpose = {};
-    modal.querySelectorAll("#gPax .form-row").forEach((row) => {
+    modal.querySelectorAll("#gPax .pax-item").forEach((row) => {
       const cb = row.querySelector("input:checked");
       if (cb) paxPurpose[cb.value] = row.querySelector("select").value;
     });
