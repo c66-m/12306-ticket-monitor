@@ -16,6 +16,8 @@ export function onModalClosed(fn) { _closedHooks.push(fn); }
 
 export function openModal(html, kind) {
   const modal = $("#modal");
+  // 每次打开重置修饰类：sale-wide / grab-form 等一次性宽度类不能残留到下一个弹窗
+  modal.className = "modal glass glass-surface";
   modal.innerHTML = html;
   $("#overlay").classList.remove("hidden");
   _kind = kind || "business";

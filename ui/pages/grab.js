@@ -131,43 +131,92 @@ export async function openGrabForm(edit) {
   // 老任务兼容：无逐车规则但存了全局席别 → 每车按全局席别标记
   if (!Object.keys(perTrain).length && (t.seat_types || []).length && (t.trains || []).length)
     (t.trains || []).forEach((code) => { perTrain[String(code).toUpperCase()] = new Set(t.seat_types); });
-  const { modal, close } = openModal(
-    "<h3>" + (edit ? "编辑抢票任务" : "创建抢票任务") + "</h3>" +
-    '<div class="form-row"><label>任务名</label><span style="display:flex;gap:8px;flex:1">' +
-    '<input id="gName" value="' + esc(t.name || "") + '" style="flex:1">' +
+  const storedPane = storedTasks.length
+    ? '<div class="stored-list grab-stored-list">' + storedTasks.map((x) =>
+      '<button class="stored-item" data-stored-inline="' + esc(x.id) + '"><span class="stored-route">' +
+      esc(x.fromName) + " → " + esc(x.toName) + '</span><span class="muted">' +
+      esc(x.travelDate) + " 乘车 · " + esc(x.saleAt) + " 开售</span></button>").join("") + "</div>"
+    : '<div class="muted grab-pane-hint">暂无储存任务。先到「查询开售日期」储存想抢的日期。</div>';
+
+  const { modal, close: closeRaw } = openModal(
+    '<div class="grab-form-head"><h3>' + (edit ? "编辑抢票任务" : "创建抢票任务") + "</h3>" +
+    (!edit ? '<button class="btn btn-mini btn-ghost" id="gStored" title="查看储存任务并回填">📌 储存任务</button>' : "") + "</div>" +
+    '<div class="form-row"><label>任务名</label><span class="grab-name-row">' +
+    '<input id="gName" value="' + esc(t.name || "") + '">' +
     (edit ? '<button class="btn btn-mini btn-ghost" id="gRename">改名</button>' : "") +
     "</span></div>" +
-    '<div class="mt-top"><div class="form-row grow"><label>出发站</label>' + stationInput("gfrom", t.from) + "</div>" +
-    '<div class="form-row grow"><label>到达站</label>' + stationInput("gto", t.to) + "</div></div>" +
-    '<div class="form-row"><label>车次与席别（点查询后逐车选择席别）</label>' +
-    '<div class="mt-qrow"><input id="gTrains" placeholder="点击下方车次加入，点击席别标签为该车选席别" value="' + esc((t.trains || []).join(",")) + '">' +
-    '<button class="btn btn-call mt-qbtn" id="gQuery" title="按出发/到达站与日期查询余票，识别各车次席别">🔍 查询</button>' +
-    (!edit ? '<button class="btn btn-ghost mt-qbtn" id="gStored" title="查看储存任务并回填">📌 储存任务</button>' : '') + '</div>' +
-    '<div class="mt-qresult hidden" id="gQResult"></div></div>' +
-    '<div class="form-grid">' +
-    '<div class="form-row"><label>日期</label><input type="date" id="gDate" value="' + esc(t.date || "") + '"></div>' +
-    '<div class="form-row"><label>截止日期（可选）</label><input type="date" id="gDateTo" value="' + esc(t.date_to || "") + '"></div>' +
+    '<div class="grab-searchbar">' +
+    '<div class="grab-field grow"><label>出发站</label>' + stationInput("gfrom", t.from) + "</div>" +
+    '<div class="grab-field date"><label>日期</label><input type="date" id="gDate" value="' + esc(t.date || "") + '"></div>' +
+    '<button class="btn btn-ghost grab-swap" id="gSwap" type="button" title="交换出发 / 到达站">⇄</button>' +
+    '<div class="grab-field grow"><label>到达站</label>' + stationInput("gto", t.to) + "</div>" +
+    '<div class="grab-field date"><label>截止日期（可选）</label><input type="date" id="gDateTo" value="' + esc(t.date_to || "") + '"></div>' +
+    '<button class="btn btn-call grab-query" id="gQuery" type="button" title="按出发/到达站与日期查询余票，识别各车次席别">查询</button>' +
     "</div>" +
-    '<div class="form-grid">' +
+    '<div class="grab-trains"><div class="form-row"><label>车次与席别（点查询后逐车选择席别）</label>' +
+    '<input id="gTrains" class="grab-train-input" readonly placeholder="点击下方车次加入，点击席别标签为该车选席别" value="' + esc((t.trains || []).join(", ")) + '">' +
+    "</div>" +
+    '<div class="grab-tabs" role="tablist">' +
+    '<button class="grab-tab on" data-tab="query" type="button" role="tab">查询</button>' +
+    (!edit ? '<button class="grab-tab" data-tab="stored" type="button" role="tab">储存任务</button>' : "") +
+    "</div>" +
+    '<div class="grab-pane mt-qresult" id="gQResult"><div class="muted grab-pane-hint">填好出发站、到达站和日期后点「查询」，再点车次与席别。</div></div>' +
+    (!edit ? '<div class="grab-pane hidden" id="gStoredPane">' + storedPane + "</div>" : "") +
+    "</div>" +
+    '<div class="form-grid grab-timegrid">' +
     '<div class="form-row"><label>开抢时间（可选，留空 = 保存后立即开抢）</label><input type="datetime-local" id="gStart" value="' + esc((t.start_time || "").replace(" ", "T")) + '"></div>' +
     '<div class="form-row"><label>提前提醒（分钟）</label><input type="number" id="gRemind" value="' + esc(t.remind_minutes ?? 10) + '"></div>' +
     "</div>" +
-    '<div class="form-grid">' +
+    '<details class="grab-advanced"><summary>高级设置</summary><div class="form-grid">' +
     '<div class="form-row"><label>预热窗口（分钟）</label><input type="number" id="gWarm" value="' + esc(t.warm_minutes ?? 10) + '"></div>' +
     '<div class="form-row"><label>轮询间隔（秒）</label><input type="number" id="gPoll" value="' + esc(t.poll_seconds ?? 3) + '"></div>' +
-    "</div>" +
+    "</div></details>" +
     '<div class="form-row"><label>乘车人</label><div id="gPax" class="pax-grid">' +
     S.pax.map((p) =>
       '<div class="pax-item"><label class="check' + ((t.passenger_names || []).includes(p.name) ? " on" : "") + '"><input type="checkbox" value="' + esc(p.name) + '"' + ((t.passenger_names || []).includes(p.name) ? " checked" : "") + ">" + esc(p.name) + '</label>' +
       '<select class="gpax-purpose"><option value="ADULT"' + (((t.pax_purpose || {})[p.name] || "ADULT") === "ADULT" ? " selected" : "") + '>成人票</option><option value="0X00"' + (((t.pax_purpose || {})[p.name] || "") === "0X00" ? " selected" : "") + '>学生票</option></select></div>').join("") +
     (S.pax.length ? "" : '<span class="muted">暂无乘车人</span>') + "</div></div>" +
-    '<div class="form-actions"><button class="btn btn-ghost" id="gCancel">取消</button>' +
+    '<div class="form-actions grab-actions"><span class="grab-selected muted" id="gSelected">未选择车次</span>' +
+    '<button class="btn btn-ghost" id="gCancel">取消</button>' +
     (edit ? '<button class="btn btn-ghost" id="gDelete">删除</button>' : "") +
     '<button class="btn btn-call" id="gSave">' + (edit ? "保存" : "创建") + "</button></div>");
+  modal.classList.add("grab-form");
+  const close = () => { modal.classList.remove("grab-form"); closeRaw(); };
+  $("#overlay").onclick = (e) => { if (e.target.id === "overlay") close(); };
 
   modal.querySelector("#gCancel").onclick = close;
   bindStation(modal, "gfrom", t.from || "", t.fromCode || "");
   bindStation(modal, "gto", t.to || "", t.toCode || "");
+
+  // 顶栏交换：只换站名与站码，不动日期
+  const swapBtn = modal.querySelector("#gSwap");
+  if (swapBtn) swapBtn.onclick = () => {
+    const a = modal.querySelector('[data-st="gfrom"] input');
+    const b = modal.querySelector('[data-st="gto"] input');
+    if (!a || !b) return;
+    const tv = a.value; a.value = b.value; b.value = tv;
+    const tc = S._stgfrom; S._stgfrom = S._stgto; S._stgto = tc;
+    toast("已交换出发 / 到达");
+  };
+
+  // 查询 / 储存任务两个 tab：查询面板与储存任务列表互斥显示
+  const activateTab = (name) => {
+    modal.querySelectorAll(".grab-tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
+    const qp = modal.querySelector("#gQResult");
+    const sp = modal.querySelector("#gStoredPane");
+    if (qp) qp.classList.toggle("hidden", name !== "query");
+    if (sp) sp.classList.toggle("hidden", name !== "stored");
+  };
+  modal.querySelectorAll(".grab-tab").forEach((b) => b.onclick = () => activateTab(b.dataset.tab));
+
+  // 摘要条：显示当前已选车次数，避免用户忘了点席别
+  const refreshSelected = () => {
+    const inp = modal.querySelector("#gTrains");
+    const n = (inp.value || "").split(/[,，\s]+/).filter(Boolean).length;
+    const el = modal.querySelector("#gSelected");
+    if (el) el.textContent = n ? "已选 " + n + " 趟车次" : "未选择车次";
+  };
+  refreshSelected();
 
   // 点储存任务按钮：弹独立列表，选中后回填站名/站码/乘车日期/开抢时间，表单不丢。
   const applyStoredTask = (item) => {
@@ -183,6 +232,14 @@ export async function openGrabForm(edit) {
   };
   const storedBtn = modal.querySelector("#gStored");
   if (storedBtn) storedBtn.onclick = () => openStoredTaskPicker(storedTasks, applyStoredTask);
+  modal.querySelectorAll("[data-stored-inline]").forEach((btn) => {
+    btn.onclick = () => {
+      const item = storedTasks.find((x) => x.id === btn.dataset.storedInline);
+      if (!item) return;
+      applyStoredTask(item);
+      activateTab("query");
+    };
+  });
 
   // 改名：编辑弹窗内独立按钮（复用 openRenameForm 逻辑）
   const renameBtn = modal.querySelector("#gRename");
@@ -219,7 +276,10 @@ export async function openGrabForm(edit) {
       modal.querySelector('[data-st="' + (!from ? "gfrom" : "gto") + '"] input').focus();
       return;
     }
-    const d1 = modal.querySelector("#gDate").value || localDate();
+    const dateInput = modal.querySelector("#gDate");
+    const d1 = dateInput.value || localDate();
+    if (!dateInput.value) dateInput.value = d1;
+    activateTab("query");
     qRes.classList.remove("hidden");
     qRes.innerHTML = '<div class="muted" style="padding:6px 2px">查询中…</div>';
     try {
@@ -245,6 +305,7 @@ export async function openGrabForm(edit) {
           if (i < 0) { cur.push(el.dataset.code); el.classList.add("sel"); toast("已加入车次 " + el.dataset.code + "，请点击席别标签"); }
           else { cur.splice(i, 1); el.classList.remove("sel"); delete perTrain[el.dataset.code]; toast("已移除车次 " + el.dataset.code); }
           inp.value = cur.join(", ");
+          refreshSelected();
         };
         el.querySelectorAll(".seat.pick").forEach((ch) => ch.onclick = (e) => {
           e.stopPropagation();

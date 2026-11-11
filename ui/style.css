@@ -706,6 +706,10 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 
 /* -------- 乘车人 -------- */
 .pax { display: flex; flex-direction: column; gap: .4rem; overflow-y: auto; flex: 1; }
+.pax-gate { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .45rem; text-align: center; padding: 2rem 1rem; }
+.pax-gate-ico { font-size: 2.2rem; opacity: .55; }
+.pax-gate h3 { margin: 0; font-size: 1.05rem; }
+.pax-gate p { margin: 0 0 .35rem; font-size: .84rem; }
 .p {
   display: flex;
   align-items: center;
@@ -811,6 +815,57 @@ input[type="range"] { padding: 0; height: 1.2rem; background: transparent; borde
 .mt-qresult .mt-train:hover { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
 .mt-qresult .mt-train.sel { border-color: var(--ink); box-shadow: 0 0 0 1.5px var(--ink) inset; }
 .mt-qresult .mt-train .top { justify-content: space-between; }
+
+/* -------- 抢票任务表单（截图版式） -------- */
+.modal.grab-form { width: min(54rem, 94vw); }
+.grab-form-head { display: flex; align-items: center; gap: .6rem; margin-bottom: .9rem; }
+.grab-form-head h3 { margin: 0; }
+.grab-form-head .btn { margin-left: auto; }
+.grab-name-row { display: flex; gap: 8px; flex: 1; min-width: 0; }
+.grab-name-row input { flex: 1; min-width: 0; }
+.grab-searchbar {
+  display: grid;
+  grid-template-columns: minmax(8.5rem, 1.25fr) minmax(8rem, .9fr) auto minmax(8.5rem, 1.25fr) minmax(8rem, .9fr) auto;
+  gap: .45rem; align-items: end;
+  padding: .55rem .6rem .65rem;
+  margin-bottom: .65rem;
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  background: rgba(var(--glass-rgb), calc(var(--glass-a) * .5));
+}
+.grab-searchbar .grab-field { display: flex; flex-direction: column; gap: .28rem; min-width: 0; }
+.grab-searchbar .grab-field label { font-size: .72rem; color: var(--ink-2); font-weight: 600; white-space: nowrap; }
+.grab-searchbar .station-box, .grab-searchbar .station-box input { width: 100%; min-width: 0; }
+.grab-searchbar input[type="date"] { width: 100%; min-width: 0; }
+.grab-swap { align-self: end; min-width: 2.1rem; padding: .45rem .5rem; }
+.grab-query { align-self: end; white-space: nowrap; padding: .45rem .9rem; }
+.grab-trains { margin-bottom: .2rem; }
+.grab-train-input { width: 100%; font-size: .85rem; }
+.grab-tabs { display: flex; gap: .35rem; margin: .15rem 0 .45rem; }
+.grab-tab {
+  border: 1px solid transparent; background: transparent; color: var(--ink-2);
+  border-radius: 999px; padding: .3rem .8rem; font: inherit; font-size: .78rem;
+  font-weight: 650; cursor: pointer; transition: background .16s, color .16s, box-shadow .16s;
+}
+.grab-tab:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--ink); }
+.grab-tab.on { background: var(--accent-grad); color: var(--on-accent); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .4); }
+.grab-pane { margin-top: 0; }
+.grab-pane.hidden { display: none; }
+.grab-pane-hint { padding: .55rem .2rem; font-size: .8rem; }
+.grab-pane.mt-qresult { max-height: 16rem; margin-top: 0; }
+.grab-stored-list { max-height: 15rem; margin-top: 0; }
+.grab-timegrid { margin-top: .15rem; }
+.grab-advanced { margin: .1rem 0 .75rem; border-top: 1px dashed var(--line-2); padding-top: .5rem; }
+.grab-advanced summary { cursor: pointer; font-size: .78rem; color: var(--ink-3); font-weight: 600; user-select: none; }
+.grab-advanced summary:hover { color: var(--ink); }
+.grab-advanced[open] summary { color: var(--ink-2); margin-bottom: .5rem; }
+.grab-advanced .form-grid { margin-top: .1rem; }
+.grab-actions { align-items: center; }
+.grab-selected { margin-right: auto; font-size: .76rem; }
+@media (max-width: 920px) {
+  .grab-searchbar { grid-template-columns: 1fr 1fr auto; }
+  .grab-searchbar .grab-field.grow { grid-column: span 2; }
+}
 
 /* 车站联想 */
 .station-box { position: relative; }

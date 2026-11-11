@@ -24,6 +24,8 @@ async function savePaxList(passengers) {
 
 // 从 12306 同步乘车人（quiet=true 用于登录后自动同步：失败不打扰，成功轻提示）
 export async function syncFrom12306(opts) {
+  // 未登录不主动请求 12306 乘车人接口（登录后 autoSyncPax 才会调用到这里）
+  if (!(S.session && S.session.ok)) return false;
   const quiet = !!(opts && opts.quiet);
   let r;
   try {
@@ -60,6 +62,19 @@ export async function autoSyncPax() {
 
 // ================= 乘车人页 =================
 export function renderPax(root) {
+  const loggedIn = !!(S.session && S.session.ok);
+  if (!loggedIn) {
+    // 未登录不展示本地缓存：乘车人是账号数据，登录后才同步/展示。
+    root.innerHTML =
+      '<div class="sec-head"><h3>乘车人</h3></div>' +
+      '<div class="card glass glass-surface pax-gate">' +
+      '<div class="pax-gate-ico">🔒</div><h3>未登录</h3>' +
+      '<p class="muted">登录 12306 后才会获取乘车人信息</p>' +
+      '<button class="btn btn-call" id="pLogin">去登录</button></div>';
+    const btn = root.querySelector("#pLogin");
+    if (btn) btn.onclick = () => { const chip = $("#sessionChip"); if (chip) chip.click(); };
+    return;
+  }
   root.innerHTML =
     '<div class="sec-head"><h3>乘车人</h3><span class="pax-head-actions" style="display:flex;gap:8px">' +
     '<button class="btn btn-mini btn-call" id="pNew">＋ 新增</button></span></div>' +
@@ -158,6 +173,15 @@ export async function openPaxForm(edit) {
 }
 
 export async function refreshPax() {
+  // 未登录不读取本地缓存：乘车人属于账号数据，登录成功后才允许展示/同步。
+  // S.session 还没探测完（null）时同样不加载，等 refreshSession 成功后由
+  // session.js 主动调 refreshPax()。
+  if (!(S.session && S.session.ok)) {
+    S.pax = [];
+    S.paxStamp = null;
+    if (S.page === "pax") renderPage();
+    return;
+  }
   // 内部吞错保底（与 history/errlog 刷新函数同口径）：后端抖动/重启时保留
   // 旧缓存与 stamp、不抛。否则抢票/监控表单打开前的预拉取一失败，异常会
   // 把整个开窗流程打断（表单根本打不开）。失败原因 call() 已 toast。

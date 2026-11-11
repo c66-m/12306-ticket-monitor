@@ -1,9 +1,9 @@
 /* components/session.js —— 会话状态卡、登录失效弹窗与「稍后」记忆。 */
-import { S, call } from "../store.js";
+import { S, call, renderPage } from "../store.js";
 import { $, esc } from "./dom.js";
 import { openModal, modalKind, onModalClosed } from "./modal.js";
 import { toast } from "./toast.js";
-import { autoSyncPax } from "../pages/pax.js";
+import { autoSyncPax, refreshPax } from "../pages/pax.js";
 
 
 export async function refreshSession(opts) {
@@ -20,12 +20,18 @@ export async function refreshSession(opts) {
     // 会话恢复：复位「已忽略」与冷却窗口，下次真失效时重新提示；
     // 同时作废待弹的失效提示——会话已恢复，业务弹窗关掉后不该再补弹。
     if (ok) { S._expiredDismissed = false; S._expiredAt = 0; S._expiredPending = null; writeExpiredDismissed(false); }
-    // 每次登录（未登录→已登录，含启动时已是登录态）自动扫描一次乘车人
+    // 每次登录（未登录→已登录，含启动时已是登录态）自动扫描一次乘车人。
+    // 先刷本地缓存让页面立即有内容，再后台向 12306 拉最新；未登录则清空
+    // S.pax —— 乘车人不在未登录状态展示（pages/pax.js 同一口径）。
     if (ok && !prevOk && !S._paxAutoDone) {
       S._paxAutoDone = true;
+      refreshPax();
       autoSyncPax();
     } else if (!ok) {
       S._paxAutoDone = false;
+      S.pax = [];
+      S.paxStamp = null;
+      if (S.page === "pax") renderPage();
     }
     renderSessionCard();
   } catch (e) { /* ignore */ }
