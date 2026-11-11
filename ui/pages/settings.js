@@ -1,179 +1,76 @@
-/* pages/settings.js —— 设置页（气泡 + 放大面板：外观 / 邮件通知）。 */
-import { S, call, renderPage, registerPage, registerClosePanelHook } from "../store.js";
+/* pages/settings.js —— 设置页（外观 / 窗口 / 邮件通知 / 维护，行级即改即存）。 */
+import { S, call, renderPage, registerPage } from "../store.js";
 import { esc } from "../components/dom.js";
 import { toast } from "../components/toast.js";
 import { confirmBox, openModal } from "../components/modal.js";
 import { APPEAR_DEF, ACCENTS, applyAppearance } from "../components/appearance.js";
 
+const SEG = (id, items, value) => '<div class="seg seg-compact" id="' + id + '">' +
+  items.map(([v, t]) => '<button data-v="' + v + '"' + (String(value) === v ? ' class="on"' : "") + ">" + t + "</button>").join("") + "</div>";
 
-// ================= 设置页 =================
-// 设置气泡：只保留外观 / 邮件通知（其余设置项已按用户要求彻底移除）
-export const SET_BUBBLES = [
-  { key: "appear", ic: "🎨", name: "外观", desc: "主题、模糊、圆角、主色与背景" },
-  { key: "mail", ic: "📧", name: "邮件通知", desc: "SMTP 服务器与订单通知" },
-];
+const ROW = (label, control, note) => '<div class="settings-row"><div class="settings-label"><span>' + label + "</span>" +
+  (note ? "<small>" + note + "</small>" : "") + '</div><div class="settings-control">' + control + "</div></div>";
 
-export function renderSettings(root) {
-  root.innerHTML =
-    '<div class="sec-head"><h3>设置</h3><span class="more">点击气泡查看与修改对应设置</span></div>' +
-    '<div class="set-wrap set-bubbles">' + SET_BUBBLES.map((b) => {
-      const st = statusOfSetting(b.key);
-      return '<div class="set-bubble" data-set="' + b.key + '" title="点击打开">' +
-        '<span class="b-ic">' + b.ic + "</span>" +
-        '<span class="b-name">' + b.name + "</span>" +
-        '<span class="b-desc">' + b.desc + "</span>" +
-        (st ? '<span class="b-status">' + st + "</span>" : "") +
-        "</div>";
-    }).join("") + "</div>";
-  root.querySelectorAll(".set-bubble").forEach((b) => {
-    b.onclick = () => openSettingPanel(b.dataset.set, b);
-  });
+const RANGE_ROW = (id, label, min, max, step, value, unit, note) => ROW(label,
+  '<div class="settings-range"><input type="range" id="' + id + '" min="' + min + '" max="' + max + '" step="' + step + '" value="' + value + '"><span class="val" id="' + id + 'V">' + value + unit + "</span></div>", note);
+
+const GROUP = (title, hint, body, extra) => '<section class="settings-group card">' +
+  '<div class="settings-group-head"><div><h4>' + title + "</h4>" + (hint ? "<span>" + hint + "</span>" : "") + "</div>" + (extra || "") + "</div>" +
+  '<div class="settings-list">' + body + "</div></section>";
+
+function appearanceGroupHtml() {
+  const a = S.appear || {};
+  return GROUP("外观", "主题、字体与主色",
+    ROW("主题", SEG("aTheme", [["light", "浅色"], ["dark", "深色"], ["sys", "跟随系统"]], a.theme || "light")) +
+    ROW("界面密度", SEG("aDensity", [["compact", "紧凑"], ["normal", "标准"], ["roomy", "宽松"]], a.density || "normal")) +
+    ROW("动效", SEG("aMotion", [["on", "开启"], ["off", "关闭"]], a.motion || "on"), "关闭后切换与弹窗不做动画") +
+    ROW("字体", '<select id="aFont" class="settings-input">' + [["system", "系统默认"], ["hei", "微软雅黑"], ["song", "宋体"], ["kai", "楷体"], ["mono", "等宽"]].map(([v, t]) => '<option value="' + v + '"' + ((a.font || "system") === v ? " selected" : "") + ">" + t + "</option>").join("") + "</select>") +
+    RANGE_ROW("aFs", "字号", 13, 18, 1, a.fs ?? 15, "px") +
+    ROW("主色", '<div class="swatches" id="aAccent">' + ACCENTS.map((c) => '<span class="swatch' + (a.accent === c ? " on" : "") + '" data-v="' + c + '" style="background:' + c + '"></span>').join("") + "</div>")
+  );
 }
 
-// 气泡底部小状态（邮件启用与否等）
-export function statusOfSetting(key) {
-  const s = S.settings || {};
-  if (key === "mail") return s.notify_enabled ? "已启用" : "未启用";
-  return "";
+function windowGroupHtml() {
+  const a = S.appear || {};
+  return GROUP("窗口", "模糊、圆角与背景",
+    RANGE_ROW("aBlur", "模糊度", 0, 40, 1, a.blur ?? 16, "px") +
+    RANGE_ROW("aRadius", "圆角", 6, 28, 1, a.radius ?? 18, "px") +
+    RANGE_ROW("aGlass", "玻璃透明度", 15, 100, 1, a.glass ?? 55, "%") +
+    RANGE_ROW("aLogh", "日志高度", 5, 22, 0.2, a.logh ?? 8.6, "rem") +
+    ROW("背景", '<select id="aWall" class="settings-input">' + [["image", "壁纸"], ["flat", "蓝白"], ["flat-sunset", "晚霞"], ["flat-green", "松绿"], ["custom", "自定义"]].map(([v, t]) => '<option value="' + v + '"' + ((a.wall || "image") === v ? " selected" : "") + ">" + t + "</option>").join("") + "</select>") +
+    '<div class="settings-row settings-row-sub" id="aWRow"' + (a.wall === "custom" ? "" : ' hidden') + '><div class="settings-label"><span>图片</span><small>支持链接或本地文件</small></div><div class="settings-control settings-control-wide"><input class="settings-input" id="aWallUrl" placeholder="https://... 或本地路径" value="' + esc(a.custom || "") + '"><button class="btn btn-mini btn-ghost" id="aWallPick">选文件</button><input type="file" id="aWallFile" accept="image/*" hidden></div></div>'
+  );
 }
 
-// 打开设置面板：从气泡位置放大到主区正中（15/20 ≈ 75%），关闭时缩回气泡
-let panelKey = null; // 当前面板 key，用于判断“外观 ↔ 邮件”是同层切换
-export function openSettingPanel(key, bubbleEl) {
-  const panel = document.getElementById("setPanel");
-  if (!panel) return;
-  const html = settingsPanelHtml(key);
-  if (!html) return;
-  const isSwitch = panel.classList.contains("show") && panelKey && panelKey !== key;
-  // 记录气泡中心坐标，作为放大/缩回的动画原点
-  if (bubbleEl) {
-    const r = bubbleEl.getBoundingClientRect();
-    const cx = r.left + r.width / 2;
-    const cy = r.top + r.height / 2;
-    const pr = panel.getBoundingClientRect();
-    panel.style.setProperty("--ox", (cx - pr.left) + "px");
-    panel.style.setProperty("--oy", (cy - pr.top) + "px");
-  }
-  // 清掉上一次关闭动画的残留监听（否则打开动画结束会被误判成关闭完成）
-  panel.onanimationend = null;
-  // 同理清掉上一次关闭的超时兜底：重开后面板不能再被旧定时器收走
-  if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
-  panel.classList.remove("closing", "done", "switching");
-  panel.innerHTML =
-    '<div class="set-panel-head"><h3>' + panelTitle(key) + "</h3>" +
-    '<div class="set-panel-actions">' +
-    (key === "mail" ? '<button class="btn btn-mini btn-ghost btn-panel-help" id="setPanelHelp">帮助</button>' : "") +
-    '<button class="btn btn-mini btn-ghost btn-panel-close" id="setPanelClose">✕ 关闭</button></div></div>' +
-    '<div class="set-panel-content">' + html + "</div>";
-  panel.classList.add("show");
-  panelKey = key;
-  // 面板已打开时换内容：外层 setpop 不会重播，给头部/内容加一层轻微上浮
-  if (isSwitch) {
-    void panel.offsetWidth;
-    panel.classList.add("switching");
-    panel.onanimationend = (e) => {
-      if (e.animationName === "setcontent") panel.classList.remove("switching");
-    };
-  }
-  // 背景 scrim：0.2s 渐变（透明→压暗），不再用全屏 backdrop-filter
-  const bd = document.getElementById("setBackdrop");
-  if (bd) bd.classList.add("show");
-  panel.querySelector("#setPanelClose").onclick = closeSettingPanel;
-  bindSettingsPanel(panel, key);
-}
-
-export function closeSettingPanel() {
-  const panel = document.getElementById("setPanel");
-  if (!panel) return;
-  panel.onanimationend = null;
-  if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
-  // 背景 scrim 同步淡出
-  const bd = document.getElementById("setBackdrop");
-  if (bd) bd.classList.remove("show");
-  // 未在展示状态时直接复位，不挂动画（goto 切页等场景）
-  if (!panel.classList.contains("show")) {
-    panel.classList.remove("closing", "done", "switching");
-    panelKey = null;
-    return;
-  }
-  // 退出动画：缩小回气泡原点，动画结束后才真正隐藏
-  panel.classList.add("closing");
-  let done = false;
-  const finish = () => {
-    if (done) return;
-    done = true;
-    if (panel._closeTimer) { clearTimeout(panel._closeTimer); panel._closeTimer = null; }
-    panel.classList.remove("show", "closing", "done", "switching");
-    panel.onanimationend = null;
-    panelKey = null;
-  };
-  // 关动效（data-motion="off"）时 animation 被 CSS 全禁，animationend 永不
-  // 触发：直接收尾，别让用户等兜底定时器（此前固定等 450ms，像卡住）。
-  if (document.documentElement.dataset.motion === "off" || (S.appear && S.appear.motion === "off")) {
-    finish();
-    return;
-  }
-  panel.onanimationend = (e) => { if (e.animationName === "setpop-out") finish(); };
-  // 正常动效 .12s；260ms 兜底防止动画事件丢失时面板残留。
-  panel._closeTimer = setTimeout(finish, 260);
-}
-
-export function panelTitle(key) {
-  const b = SET_BUBBLES.find((x) => x.key === key);
-  return b ? b.name : key;
-}
-
-// 各面板 HTML（保留全部原字段与 id；事件在 bindSettingsPanel 统一绑定）
-export function settingsPanelHtml(key) {
+function mailGroupHtml() {
   const s = S.settings || {};
   const email = s.email || {};
-  const a = S.appear || {};
-  const wallOpts = [["image", "壁纸"], ["flat", "蓝白"], ["flat-sunset", "晚霞"], ["flat-green", "松绿"], ["custom", "自定义"]];
-  if (key === "appear") return (
-    '<div class="card glass glass-surface"><div class="appear-row"><label>主题</label><div class="seg" id="aTheme">' +
-    ["light|浅色", "dark|深色", "sys|跟随系统"].map((x) => { const p = x.split("|"); return '<button data-v="' + p[0] + '"' + (a.theme === p[0] ? ' class="on"' : "") + ">" + p[1] + "</button>"; }).join("") +
-    "</div></div>" +
-    '<div class="appear-row"><label>模糊度</label><input type="range" id="aBlur" min="0" max="40" step="1" value="' + (a.blur ?? 16) + '"><span class="val" id="aBlurV">' + (a.blur ?? 16) + "px</span></div>" +
-    '<div class="appear-row"><label>圆角</label><input type="range" id="aRadius" min="6" max="28" step="1" value="' + (a.radius ?? 18) + '"><span class="val" id="aRadiusV">' + (a.radius ?? 18) + "px</span></div>" +
-    '<div class="appear-row"><label>玻璃透明度</label><input type="range" id="aGlass" min="15" max="100" step="1" value="' + (a.glass ?? 55) + '"><span class="val" id="aGlassV">' + (a.glass ?? 55) + "%</span></div>" +
-    '<div class="appear-row"><label>字号</label><input type="range" id="aFs" min="13" max="18" step="1" value="' + (a.fs ?? 15) + '"><span class="val" id="aFsV">' + (a.fs ?? 15) + "px</span></div>" +
-    '<div class="appear-row"><label>字体</label><select id="aFont" class="grow">' +
-    [["system", "系统默认"], ["hei", "微软雅黑"], ["song", "宋体"], ["kai", "楷体"], ["mono", "等宽"]].map(([v, t]) => '<option value="' + v + '"' + ((a.font || "system") === v ? " selected" : "") + ">" + t + "</option>").join("") +
-    "</select></div>" +
-    '<div class="appear-row"><label>界面密度</label><div class="seg" id="aDensity">' +
-    ["compact|紧凑", "normal|标准", "roomy|宽松"].map((x) => { const p = x.split("|"); return '<button data-v="' + p[0] + '"' + ((a.density || "normal") === p[0] ? ' class="on"' : "") + ">" + p[1] + "</button>"; }).join("") +
-    "</div></div>" +
-    '<div class="appear-row"><label>动效</label><div class="seg" id="aMotion">' +
-    ["on|开启", "off|关闭"].map((x) => { const p = x.split("|"); return '<button data-v="' + p[0] + '"' + ((a.motion || "on") === p[0] ? ' class="on"' : "") + ">" + p[1] + "</button>"; }).join("") +
-    "</div></div>" +
-    '<div class="appear-row"><label>日志高度</label><input type="range" id="aLogh" min="5" max="22" step="0.2" value="' + (a.logh ?? 8.6) + '"><span class="val" id="aLoghV">' + (a.logh ?? 8.6) + "rem</span></div>" +
-    '<div class="appear-row"><label>主色</label><div class="swatches" id="aAccent">' +
-    ACCENTS.map((c) => '<span class="swatch' + (a.accent === c ? " on" : "") + '" data-v="' + c + '" style="background:' + c + '"></span>').join("") +
-    "</div></div>" +
-    '<div class="appear-row"><label>背景</label><div class="seg" id="aWall">' +
-    wallOpts.map(([v, t]) => '<button data-v="' + v + '"' + (a.wall === v ? ' class="on"' : "") + ">" + t + "</button>").join("") +
-    "</div></div>" +
-    '<div class="appear-row" id="aWRow"' + (a.wall === "custom" ? "" : ' style="display:none"') + '><label>图片</label><input class="grow" id="aWallUrl" placeholder="https://... 或本地路径" value="' + esc(a.custom || "") + '"><button class="btn btn-mini btn-ghost" id="aWallPick">选文件</button><input type="file" id="aWallFile" accept="image/*" style="display:none"></div>' +
-    '<div class="form-actions"><button class="btn btn-ghost" id="aReset">恢复默认外观</button><button class="btn btn-ghost" id="aWipe">清空本地数据</button></div></div>'
-  );
-  if (key === "mail") return (
-    '<div class="card glass glass-surface"><div class="sec-head"><h3>邮件通知（SMTP）</h3><span class="status ' + (s.notify_enabled ? "succ" : "canc") + '">' + (s.notify_enabled ? "已启用" : "未启用") + "</span></div>" +
-    '<div class="form-row"><label>启用</label><label class="check" id="sEnabledWrap" title="点击启用或关闭邮件通知"><input type="checkbox" id="sEnabled"' + (email.enabled ? " checked" : "") + ">发送订单通知邮件</label></div>" +
-    '<div class="form-row"><label>SMTP 服务器</label><input id="sHost" value="' + esc(email.smtp_host || "") + '" placeholder="smtp.qq.com"></div>' +
-    '<div class="form-row"><label>端口</label><input type="number" id="sPort" value="' + esc(email.smtp_port || 465) + '"></div>' +
-    '<div class="form-row"><label>发件邮箱</label><input id="sUser" value="' + esc(email.username || "") + '"></div>' +
-    '<div class="form-row"><label>授权码</label><input type="password" id="sPwd" value="' + esc(email.password || "") + '" placeholder="******"></div>' +
-    '<div class="form-row"><label>收件人（逗号分隔）</label><input id="sTo" value="' + esc((email.to || []).join(",")) + '"></div>' +
-    '<div class="form-actions"><button class="btn btn-ghost" id="sTest">发送测试邮件</button>' +
-    '<button class="btn btn-call" id="sSave">保存设置</button></div></div>'
-  );
-  return "";
+  return GROUP("邮件通知", "SMTP 发信，改动自动保存",
+    ROW("启用", '<label class="switch"><input type="checkbox" id="sEnabled" data-mail' + (email.enabled ? " checked" : "") + '><span></span></label>', "抢票成功与订单变化时发信") +
+    ROW("SMTP 服务器", '<input class="settings-input" id="sHost" data-mail value="' + esc(email.smtp_host || "") + '" placeholder="smtp.qq.com">') +
+    ROW("端口", '<input class="settings-input" id="sPort" data-mail type="number" value="' + esc(email.smtp_port || 465) + '">') +
+    ROW("发件邮箱", '<input class="settings-input" id="sUser" data-mail value="' + esc(email.username || "") + '">') +
+    ROW("授权码", '<input class="settings-input" id="sPwd" data-mail type="password" value="' + esc(email.password || "") + '" placeholder="******">', "QQ 邮箱请填授权码，不是登录密码") +
+    ROW("收件人", '<input class="settings-input" id="sTo" data-mail value="' + esc((email.to || []).join(",")) + '" placeholder="多个邮箱用逗号分隔">'),
+    '<div class="settings-group-actions"><span class="status ' + (s.notify_enabled ? "succ" : "canc") + '" id="mailStatus">' + (s.notify_enabled ? "已启用" : "未启用") + '</span><button class="btn btn-mini btn-ghost" id="setPanelHelp">帮助</button></div>'
+  ).replace("</section>", '<div class="settings-group-foot"><span id="mailSaveState">修改任意项即保存</span><button class="btn btn-mini btn-ghost" id="sTest">发送测试邮件</button></div></section>');
 }
 
-// 面板事件绑定（原 renderSettings 的绑定逻辑整体迁移，查询范围改 panel）
-export function bindSettingsPanel(panel, key) {
-  if (key === "appear") bindAppearPanel(panel);
-  if (key === "mail") bindMailPanel(panel);
+function maintGroupHtml() {
+  return GROUP("维护", "本地偏好与缓存",
+    ROW("恢复默认外观", '<button class="btn btn-mini btn-ghost" id="aReset">恢复</button>', "主题、模糊、圆角与布局") +
+    ROW("清空本地数据", '<button class="btn btn-mini btn-ghost danger-ghost" id="aWipe">清空</button>', "不影响服务器上的任务与配置")
+  );
+}
+
+export function renderSettings(root) {
+  root.innerHTML = '<div class="settings-page">' +
+    '<div class="settings-head"><div><h3>设置</h3><p>外观、窗口和邮件通知，改动即时保存</p></div><span class="settings-auto"><i></i>自动保存</span></div>' +
+    '<div class="settings-scroll"><div class="settings-grid">' +
+      appearanceGroupHtml() + windowGroupHtml() + mailGroupHtml() + maintGroupHtml() +
+    "</div></div></div>";
+  bindAppearPanel(root);
+  bindMailPanel(root);
 }
 
 function readMailForm(p) {
@@ -196,13 +93,18 @@ function syncMailStatus(p, emailNew) {
   });
   S.settings.notify_enabled = !!emailNew.enabled;
   const text = emailNew.enabled ? "已启用" : "未启用";
-  const badge = p.querySelector(".sec-head .status");
+  const badge = p.querySelector("#mailStatus");
   if (badge) {
     badge.textContent = text;
     badge.className = "status " + (emailNew.enabled ? "succ" : "canc");
   }
-  const bubble = document.querySelector('.set-bubble[data-set="mail"] .b-status');
-  if (bubble) bubble.textContent = text;
+  const state = p.querySelector("#mailSaveState");
+  if (state) {
+    state.textContent = "已保存 " + new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+    state.classList.add("saved");
+    clearTimeout(state._timer);
+    state._timer = setTimeout(() => { state.classList.remove("saved"); state.textContent = "修改任意项即保存"; }, 2400);
+  }
 }
 
 function mailHelpHtml() {
@@ -227,30 +129,27 @@ function mailHelpHtml() {
 }
 
 export function bindMailPanel(p) {
-  const enabled = p.querySelector("#sEnabled");
-  const wrap = p.querySelector("#sEnabledWrap") || enabled.closest("label");
-  const syncToggle = () => {
-    wrap.classList.toggle("on", enabled.checked);
-    wrap.setAttribute("aria-checked", enabled.checked ? "true" : "false");
+  // 每个字段 change 立即保存；串行队列保证快速连续修改时不会带着旧 stamp
+  // 并发提交（后一次冲突会把前一次刚填的字段吞掉）。
+  let saveChain = Promise.resolve();
+  const runSave = async (quiet) => {
+    const emailNew = readMailForm(p);
+    if (!await saveSettings({ email: emailNew })) return false;
+    syncMailStatus(p, emailNew);
+    if (!quiet) toast("邮件设置已保存");
+    return true;
   };
-  syncToggle();
-  enabled.addEventListener("change", syncToggle);
-
+  const save = (quiet) => {
+    const task = saveChain.then(() => runSave(quiet), () => runSave(quiet));
+    saveChain = task.catch(() => false);
+    return task;
+  };
+  p.querySelectorAll("[data-mail]").forEach((el) => el.addEventListener("change", () => save(true)));
   const help = p.querySelector("#setPanelHelp");
   if (help) help.onclick = () => {
     const { modal, close } = openModal(mailHelpHtml(), "business");
     modal.querySelector("#mailHelpOk").onclick = close;
   };
-
-  const save = async () => {
-    const emailNew = readMailForm(p);
-    if (!await saveSettings({ email: emailNew })) return false;
-    // 保存成功后就地更新面板与气泡状态，不再关闭重开面板。
-    syncMailStatus(p, emailNew);
-    toast("设置已保存");
-    return true;
-  };
-  p.querySelector("#sSave").onclick = save;
   p.querySelector("#sTest").onclick = async () => {
     const emailNew = readMailForm(p);
     if (!emailNew.username || !emailNew.to.length) {
@@ -258,15 +157,15 @@ export function bindMailPanel(p) {
       return;
     }
     // 测试前先保存当前表单，避免测到旧配置（旧逻辑只读磁盘）。
-    if (!await save()) return;
+    if (!await save(true)) return;
     toast("正在发送测试邮件…");
     const r = await call("testEmail");
-    toast((r.message || "") + (r.ok ? "" : "（失败）"), r.ok ? "" : "err");
+    const msg = (r && (r.message || r.error)) || (r && r.ok ? "测试邮件已发送" : "测试邮件发送失败");
+    toast(msg, r && r.ok ? "" : "err");
   };
 }
 
-// 面板是独立浮层，不在 #content 里；保存后必须就地同步面板控件状态，
-// 不能靠 renderSettings(content)（它只重画设置页气泡，管不到 #setPanel）。
+// 设置控件就地同步：保存后只刷新值，不重建整页（避免滑块/选中态闪一下）。
 export function syncAppearControls(p) {
   const a = S.appear || {};
   const setSeg = (id, value) => {
@@ -277,7 +176,6 @@ export function syncAppearControls(p) {
   setSeg("aTheme", a.theme || "light");
   setSeg("aDensity", a.density || "normal");
   setSeg("aMotion", a.motion || "on");
-  setSeg("aWall", a.wall || "image");
   p.querySelectorAll("#aAccent .swatch").forEach((x) => x.classList.toggle("on", x.dataset.v === a.accent));
   const setRange = (id, key, unit, def) => {
     const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
@@ -293,8 +191,10 @@ export function syncAppearControls(p) {
   setRange("aLogh", "logh", "rem", 8.6);
   const font = p.querySelector("#aFont");
   if (font) font.value = a.font || "system";
+  const wall = p.querySelector("#aWall");
+  if (wall) wall.value = a.wall || "image";
   const row = p.querySelector("#aWRow");
-  if (row) row.style.display = a.wall === "custom" ? "" : "none";
+  if (row) row.hidden = a.wall !== "custom";
   const url = p.querySelector("#aWallUrl");
   if (url) url.value = a.custom || "";
 }
@@ -310,30 +210,22 @@ export function bindAppearPanel(p) {
     run();
   };
   p.querySelectorAll("#aTheme button").forEach((b) => b.onclick = () => { S.appear.theme = b.dataset.v; save(true); });
-  const bindRange = (id, key) => {
-    const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
-    if (!el) return;
-    el.oninput = () => { S.appear[key] = Number(el.value); lab.textContent = el.value + "px"; applyAppearance(); };
-    el.onchange = () => save();
-  };
-  bindRange("aBlur", "blur"); bindRange("aRadius", "radius"); bindRange("aFs", "fs");
-  const bindRange2 = (id, key, unit) => {
+  const bindRange = (id, key, unit) => {
     const el = p.querySelector("#" + id), lab = p.querySelector("#" + id + "V");
     if (!el) return;
     el.oninput = () => { S.appear[key] = Number(el.value); lab.textContent = el.value + unit; applyAppearance(); };
     el.onchange = () => save();
   };
-  bindRange2("aGlass", "glass", "%"); bindRange2("aLogh", "logh", "rem");
+  bindRange("aBlur", "blur", "px"); bindRange("aRadius", "radius", "px"); bindRange("aFs", "fs", "px");
+  bindRange("aGlass", "glass", "%"); bindRange("aLogh", "logh", "rem");
   const aFont = p.querySelector("#aFont");
   if (aFont) aFont.onchange = () => { S.appear.font = aFont.value; save(); };
   [["aDensity", "density"], ["aMotion", "motion"]].forEach(([bid, key]) => {
     p.querySelectorAll("#" + bid + " button").forEach((b) => b.onclick = () => { S.appear[key] = b.dataset.v; save(); });
   });
   p.querySelectorAll("#aAccent .swatch").forEach((b) => b.onclick = () => { S.appear.accent = b.dataset.v; save(); });
-  p.querySelectorAll("#aWall button").forEach((b) => b.onclick = () => {
-    S.appear.wall = b.dataset.v;
-    save();
-  });
+  const wall = p.querySelector("#aWall");
+  if (wall) wall.onchange = () => { S.appear.wall = wall.value; save(); };
   const wurl = p.querySelector("#aWallUrl");
   if (wurl) wurl.onchange = () => { S.appear.custom = wurl.value.trim(); save(); };
   const wfile = p.querySelector("#aWallFile");
@@ -373,4 +265,3 @@ export async function saveSettings(params) {
 }
 
 registerPage("settings", renderSettings);
-registerClosePanelHook(closeSettingPanel);

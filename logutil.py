@@ -201,6 +201,15 @@ def problem_level(level, message):
         return "INFO"
     if "没有处于「监控中/等待重试」状态的任务" in text:
         return "INFO"
+    # 登录会话类消息不是程序故障：正常退出/票据过期按提示处理；
+    # 只有确实导致任务停止时才升到警告，仍不标红。
+    if any(k in text for k in (
+            "登录会话已失效", "登录票据不完整", "已跳转登录门户",
+            "checkUser 返回 flag=false", "checkUser flag=false",
+            "接口返回 status=false（会话已失效）")):
+        if "抢票已停止" in text or "以下任务" in text:
+            return "WARNING"
+        return "INFO"
     if text.startswith("[提示]") or text.startswith("[信息]"):
         return "INFO"
     if text.startswith("[错误]") or text.startswith("[失败]"):

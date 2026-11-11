@@ -46,18 +46,26 @@
     <!-- ===== 侧边栏（位于顶栏下方，不与顶栏重叠） ===== -->
     <aside class="sidebar glass glass-chrome">
       <div class="brand">
-        <div class="name"><b id="crumb">抢票任务</b><small>车票监控与抢票</small></div>
+        <div class="logo">票</div>
+        <div class="name"><b>车票监控</b><small id="crumb">抢票任务</small></div>
       </div>
 
       <nav id="nav">
-        <div class="nav-item active" data-page="grab"><span class="ic">⚡</span><span class="tx">抢票任务</span><span class="badge" id="badge-grab">0</span></div>
-        <div class="nav-item" data-page="monitor"><span class="ic">📡</span><span class="tx">直接抢票</span><span class="badge" id="badge-monitor">0</span></div>
-        <div class="nav-item" data-page="pax"><span class="ic">👥</span><span class="tx">乘车人</span></div>
-        <div class="nav-item" data-page="history"><span class="ic">🕘</span><span class="tx">历史</span></div>
-        <div class="nav-item" data-page="errlog"><span class="ic">🧾</span><span class="tx">问题日志</span><span class="badge" id="badge-errlog">0</span></div>
+        <div class="nav-group">
+          <div class="nav-label">抢票</div>
+          <div class="nav-item active" data-page="grab"><span class="ic">⚡</span><span class="tx">抢票任务</span><span class="badge" id="badge-grab">0</span></div>
+          <div class="nav-item" data-page="monitor"><span class="ic">📡</span><span class="tx">直接抢票</span><span class="badge" id="badge-monitor">0</span></div>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">管理</div>
+          <div class="nav-item" data-page="pax"><span class="ic">👥</span><span class="tx">乘车人</span></div>
+          <div class="nav-item" data-page="history"><span class="ic">🕘</span><span class="tx">历史</span></div>
+          <div class="nav-item" data-page="errlog"><span class="ic">🧾</span><span class="tx">问题日志</span><span class="badge" id="badge-errlog">0</span></div>
+        </div>
       </nav>
 
       <div class="side-bottom">
+        <div class="nav-label">系统</div>
         <button class="btn-setting" id="btnSettings">
           <span class="ic">⚙️</span>
           <span class="tx"><b>设置</b><small>外观 · 通知 · 下单</small></span>
@@ -82,8 +90,6 @@
 <div class="overlay hidden" id="overlay"><div class="modal glass glass-surface" id="modal"></div></div>
 <div class="dd hidden" id="dd"></div>
 <div class="toast hidden" id="toast"></div>
-<div id="setBackdrop"></div>
-<div id="setPanel" class="glass glass-surface set-panel-body"></div>
 
 <script type="module" src="app.js"></script>
 </body>

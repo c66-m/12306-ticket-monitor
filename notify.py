@@ -120,7 +120,20 @@ def send_email(cfg, subject, body):
             else:
                 s = smtplib.SMTP(host, port, timeout=15)
                 s.starttls(context=ctx)
-            s.login(user, pwd)
+            # QQ 邮箱对 AUTH PLAIN 返回 535 后，smtplib.login 会继续试
+            # AUTH LOGIN，服务器直接断开，最终被误判成瞬时网络故障并重试。
+            # 服务端明确支持 PLAIN 时显式走 PLAIN，535 当场按认证失败返回。
+            # 旧测试替身没有 ehlo_or_helo_if_needed / esmtp_features，按普通
+            # login 处理（真实 smtplib 两个属性都存在）。
+            ehlo = getattr(s, "ehlo_or_helo_if_needed", None)
+            if callable(ehlo):
+                ehlo()
+            features = getattr(s, "esmtp_features", {}) or {}
+            auth_mechs = str(features.get("auth", "")).upper().split() if hasattr(features, "get") else []
+            if "PLAIN" in auth_mechs:
+                s.auth("PLAIN", lambda challenge=None: "\0%s\0%s" % (user, pwd))
+            else:
+                s.login(user, pwd)
             s.sendmail(from_addr, to_addrs, msg.as_string())
             try:
                 s.quit()

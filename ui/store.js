@@ -86,7 +86,7 @@ export function goto(page) {
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
   const bs = $("#btnSettings");
   if (bs) bs.classList.toggle("active", page === "settings");
-  $("#crumb").textContent = "/ " + PAGES[page].crumb;
+  $("#crumb").textContent = PAGES[page].crumb;
   // 切页即收起设置放大面板（面板只在设置页语境使用，避免跨页残留）
   if (_closePanelHook) _closePanelHook();
   renderPage(true); // 导航走抽屉动画

@@ -7412,6 +7412,23 @@ class TestNotifyP3(TempDirCase):
         self.assertEqual(m_ssl.call_count, 1)
         m_sleep.assert_not_called()
 
+    def test_smtp_plain_auth_535_is_explicit_auth_failure(self):
+        # QQ 邮箱：AUTH PLAIN 返回 535 后 smtplib 会继续试 AUTH LOGIN，
+        # 服务器直接断开，旧路径只剩模糊的 Connection unexpectedly closed。
+        # 服务端支持 PLAIN 时必须显式走 PLAIN，535 当场按认证失败返回。
+        import smtplib as _smtplib
+        inst = mock.MagicMock()
+        inst.esmtp_features = {"auth": "LOGIN PLAIN"}
+        inst.auth.side_effect = _smtplib.SMTPAuthenticationError(
+            535, b"Login fail. Account is abnormal")
+        with mock.patch("notify.smtplib.SMTP_SSL", return_value=inst):
+            ok, msg = notify_mod.send_email(self._email_cfg(), "s", "b")
+        self.assertFalse(ok)
+        self.assertIn("认证失败", msg)
+        self.assertIn("Login fail", msg)
+        inst.auth.assert_called_once()
+        inst.login.assert_not_called()
+
     def test_passengers_public_secrets_api(self):
         # passengers 暴露公开 protect_secret/unprotect_secret；notify 委托
         self.assertTrue(callable(pax_mod.protect_secret))
@@ -14907,6 +14924,26 @@ class TestProblemLog(TempDirCase):
             path=self.path)
         got = logutil.read_problem_log(path=self.path)
         self.assertEqual(got[0]["level"], "INFO")
+
+    def test_session_invalid_without_stopped_task_is_info(self):
+        # 正常退出：登录票据不完整/会话失效但没任务被停，按提示处理，不标红。
+        import logutil
+        logutil.append_problem(
+            "ERROR", "engine:1850",
+            "[错误] 登录票据不完整，请重新登录",
+            path=self.path)
+        got = logutil.read_problem_log(path=self.path)
+        self.assertEqual(got[0]["level"], "INFO")
+
+    def test_session_invalid_with_stopped_task_is_warning(self):
+        # 有任务因此停止：只升到警告（黄色），仍不是故障红。
+        import logutil
+        logutil.append_problem(
+            "ERROR", "engine:1851",
+            "[错误] 登录会话已失效，以下任务的抢票已停止：任务A、任务B",
+            path=self.path)
+        got = logutil.read_problem_log(path=self.path)
+        self.assertEqual(got[0]["level"], "WARNING")
 
     def test_message_prefix_overrides_logging_level(self):
         # 日志级别和文案前缀不一致时，以面向用户的前缀为准：
